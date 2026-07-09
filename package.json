@@ -5,6 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "node server/index.js",
+    "dev:vllm": "node --env-file-if-exists=.env.local server/index.js",
+    "runtime:vllm": "node --env-file-if-exists=.env.local server/vllmRuntimeAdapter.js",
     "start": "NODE_ENV=production node server/index.js",
     "build": "vite build",
     "test": "vitest run",

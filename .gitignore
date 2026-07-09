@@ -2,6 +2,7 @@ node_modules/
 dist/
 coverage/
 .vite/
+.env.local
 data/app-db.json
 uploads/
 *.log
