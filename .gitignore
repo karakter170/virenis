@@ -1,0 +1,7 @@
+node_modules/
+dist/
+coverage/
+.vite/
+data/app-db.json
+uploads/
+*.log
