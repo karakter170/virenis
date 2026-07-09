@@ -9,7 +9,7 @@ import { createStore, makeId, nowIso } from "./store.js";
 import {
   assertSafeSourcePath,
   chunkDocument,
-  extractTextFromUpload,
+  extractDocumentFromUpload,
   scoreChunks,
   slugify,
   writeDocumentFiles
@@ -544,16 +544,20 @@ export async function createApp({
 
   app.post("/api/agents", async (req, res, next) => {
     try {
-      requireAdmin(req);
       const agent = normalizeAgentPayload(req.body);
       const sourceText = normalizeSourceText(req.body.source_text);
+      Object.assign(agent, agentOwnershipForRequest(req, req.body));
       agent.last_edited_by = req.auth.user_id;
+      if (sourceText && agent.sources.length === 0) {
+        agent.sources = [ownedAgentSourcePath(agent.id)];
+      }
       if (agent.sources.some((sourcePath) => {
         assertSafeSourcePath(sourcePath);
         return false;
       })) {
         throwStatus(400, "Invalid source path.");
       }
+      assertOwnedAgentSources(req, agent.id, agent.sources);
       if (realRuntimeEnabled()) {
         const runtimeResult = await registerRuntimeAgent(sourceText ? { ...agent, source_text: sourceText } : agent);
         if (runtimeResult.status === "unchanged" || runtimeResult.result?.status === "unchanged") {
@@ -570,34 +574,43 @@ export async function createApp({
           data.agents.push({ ...agent, mounted, requires_vllm_reload: requiresReload });
           return agent;
         });
-        res.status(201).json({
+        res.status(201).json(redactAgentRegistrationForRequest({
           status: runtimeResult.status || "added",
           id: agent.id,
+          workspace_id: agent.workspace_id,
+          visibility: agent.visibility,
+          created_by: agent.created_by,
           manifest: runtimeResult.result?.manifest,
           adapter_path: runtimeResult.result?.adapter_path || agent.adapter_path,
           skill_path: runtimeResult.result?.skill_path || agent.skill_path,
           mounted,
           requires_vllm_reload: requiresReload,
           runtime: runtimeResult
-        });
+        }, req));
         return;
       }
       await store.mutate((data) => {
         if (data.agents.some((item) => item.id === agent.id)) {
           throwStatus(409, "Agent id already exists.");
         }
+        if (sourceText) {
+          agent.source_text_internal = sourceText;
+        }
         data.agents.push(agent);
         return agent;
       });
-      res.status(201).json({
+      res.status(201).json(redactAgentRegistrationForRequest({
         status: "added",
         id: agent.id,
+        workspace_id: agent.workspace_id,
+        visibility: agent.visibility,
+        created_by: agent.created_by,
         manifest: "configs/dummy_tcar_lora_suite.json",
         adapter_path: agent.adapter_path,
         skill_path: agent.skill_path,
         mounted: false,
         requires_vllm_reload: true
-      });
+      }, req));
     } catch (error) {
       next(error);
     }
@@ -605,9 +618,17 @@ export async function createApp({
 
   app.patch("/api/agents/:agent_id", async (req, res, next) => {
     try {
-      requireAdmin(req);
+      const localAgent = store.read().agents.find((item) => item.id === req.params.agent_id);
+      assertAgentMutationAccess(localAgent, req);
+      const patch = normalizeAgentPatchPayload(req.body);
+      if (localAgent?.document && patch.source_text !== undefined) {
+        throwStatus(400, "Document agent knowledge must be updated by registering a new document version.");
+      }
+      if (!isAdmin(req) && patch.source_text && !(patch.sources || localAgent?.sources || []).length) {
+        patch.sources = [ownedAgentSourcePath(localAgent.id)];
+      }
+      assertOwnedAgentSources(req, req.params.agent_id, patch.sources || localAgent?.sources || [], localAgent);
       if (realRuntimeEnabled()) {
-        const patch = normalizeAgentPatchPayload(req.body);
         const runtimeResult = await updateRuntimeAgent(req.params.agent_id, patch);
         const runtimeAgent = runtimeResult.agent || { id: req.params.agent_id, ...patch };
         await store.mutate((data) => {
@@ -626,33 +647,29 @@ export async function createApp({
           });
           return runtimeAgent;
         });
-        res.json({
+        res.json(redactAgentForRequest({
           ...runtimeAgent,
           runtime: runtimeResult
-        });
+        }, req));
         return;
       }
-      const allowed = ["title", "capability", "boundary", "routing_cues", "resources", "sources", "tools", "policies", "stage", "enabled"];
       const updated = await store.mutate((data) => {
         const agent = data.agents.find((item) => item.id === req.params.agent_id);
         if (!agent) {
           throwStatus(404, "Agent not found.");
         }
-        for (const key of allowed) {
-          if (key in req.body) {
-            if (key === "sources") {
-              for (const sourcePath of req.body.sources) {
-                assertSafeSourcePath(sourcePath);
-              }
-            }
-            agent[key] = req.body[key];
+        for (const [key, value] of Object.entries(patch)) {
+          if (key === "source_text") {
+            agent.source_text_internal = value;
+          } else {
+            agent[key] = value;
           }
         }
         agent.last_edited_by = req.auth.user_id;
         agent.last_edited_at = nowIso();
         return agent;
       });
-      res.json(updated);
+      res.json(redactAgentForRequest(updated, req));
     } catch (error) {
       next(error);
     }
@@ -660,7 +677,8 @@ export async function createApp({
 
   app.delete("/api/agents/:agent_id", async (req, res, next) => {
     try {
-      requireAdmin(req);
+      const localAgent = store.read().agents.find((item) => item.id === req.params.agent_id);
+      assertAgentMutationAccess(localAgent, req);
       if (realRuntimeEnabled()) {
         const runtimeResult = await archiveRuntimeAgent(req.params.agent_id);
         const archivedAt = nowIso();
@@ -679,11 +697,11 @@ export async function createApp({
           });
           return runtimeResult.agent || { id: req.params.agent_id, enabled: false };
         });
-        res.json({
+        res.json(redactAgentRegistrationForRequest({
           status: runtimeResult.status || "archived",
           id: req.params.agent_id,
           runtime: runtimeResult
-        });
+        }, req));
         return;
       }
       const archived = await store.mutate((data) => {
@@ -706,7 +724,7 @@ export async function createApp({
     try {
       const workspaceId = requestWorkspaceId(req, req.body.workspace_id);
       assertDocumentQuota(store.read(), req, workspaceId);
-      const text = await extractTextFromUpload(req.file);
+      const { text, pages } = await extractDocumentFromUpload(req.file);
       const title = cleanTitle(req.body.title || req.file.originalname.replace(/\.[^.]+$/, ""));
       const { agentId, slug } = documentUploadIdentity({ requestedAgentId: req.body.agent_id, title });
       assertDocumentAgentAvailable(store.read(), agentId);
@@ -714,6 +732,7 @@ export async function createApp({
       const documentOptions = normalizeDocumentOptions(req.body);
       const chunks = chunkDocument({
         text,
+        pages,
         slug,
         maxWords: documentOptions.max_words,
         overlapWords: documentOptions.overlap_words
@@ -727,6 +746,7 @@ export async function createApp({
           id: agentId,
           title,
           text,
+          pages,
           capability: req.body.capability || `Retrieves cited chunks from ${title}.`,
           custom_prompt: req.body.custom_prompt || `Act as the source agent for ${title}. Retrieve relevant chunks and cite chunk ids.`,
           routing_cues: cues,
@@ -751,9 +771,10 @@ export async function createApp({
           document_root: runtimeDoc.document_root || `sources/tcar_documents/${slug}`,
           index_path: runtimeDoc.index_path || `sources/tcar_documents/${slug}/index.jsonl`,
           chunks,
+          page_count: pages.length || null,
           custom_prompt: req.body.custom_prompt || "",
           routing_cues: cues,
-          visibility: ["private", "team", "global"].includes(req.body.visibility) ? req.body.visibility : "private",
+          visibility: agentVisibilityForRequest(req, req.body.visibility, "private"),
           top_k: documentOptions.top_k,
           max_excerpt_chars: documentOptions.max_excerpt_chars,
           created_by: req.auth.user_id,
@@ -822,9 +843,10 @@ export async function createApp({
         document_root: paths.document_root,
         index_path: paths.index_path,
         chunks,
+        page_count: pages.length || null,
         custom_prompt: req.body.custom_prompt || "",
         routing_cues: cues,
-        visibility: ["private", "team", "global"].includes(req.body.visibility) ? req.body.visibility : "private",
+        visibility: agentVisibilityForRequest(req, req.body.visibility, "private"),
         top_k: documentOptions.top_k,
         max_excerpt_chars: documentOptions.max_excerpt_chars,
         created_by: req.auth.user_id,
@@ -1402,6 +1424,56 @@ function canAccessResource(req, resource = {}) {
   return visibility === "team" || visibility === "global";
 }
 
+function agentVisibilityForRequest(req, requested, adminDefault = "global") {
+  if (!isAdmin(req)) {
+    return "private";
+  }
+  return ["private", "team", "global"].includes(requested) ? requested : adminDefault;
+}
+
+function agentOwnershipForRequest(req, body = {}) {
+  const visibility = agentVisibilityForRequest(req, body.visibility, "global");
+  return {
+    workspace_id: isAdmin(req) && visibility === "global" ? null : requestWorkspaceId(req, body.workspace_id),
+    visibility,
+    created_by: req.auth.user_id
+  };
+}
+
+function assertAgentMutationAccess(agent, req) {
+  if (isAdmin(req)) {
+    return;
+  }
+  if (
+    !agent ||
+    agent.visibility !== "private" ||
+    String(agent.workspace_id || "") !== String(req.auth?.workspace_id || "") ||
+    agent.created_by !== req.auth?.user_id
+  ) {
+    throwStatus(404, "Agent not found.");
+  }
+}
+
+function ownedAgentSourcePath(agentId) {
+  return `sources/tcar_dummy_loras/${agentId}/source.md`;
+}
+
+function assertOwnedAgentSources(req, agentId, sources, agent = null) {
+  if (isAdmin(req)) {
+    return;
+  }
+  const prefixes = [`sources/tcar_dummy_loras/${agentId}/`];
+  if (agent?.document?.slug) {
+    prefixes.push(`sources/tcar_documents/${agent.document.slug}/`);
+  }
+  for (const sourcePath of sources || []) {
+    const normalized = String(sourcePath).replaceAll("\\", "/");
+    if (!prefixes.some((prefix) => normalized.startsWith(prefix))) {
+      throwStatus(403, "Private agents may use only sources owned by that agent.");
+    }
+  }
+}
+
 function assertResourceAccess(req, resource) {
   if (!canAccessResource(req, resource)) {
     throwStatus(404, "Resource not found.");
@@ -1457,8 +1529,9 @@ function runtimeModelVisibleToRequest(model, baseModelId, localById, req) {
 }
 
 function redactAgentForRequest(agent = {}, req) {
+  const { source_text_internal: _sourceTextInternal, ...publicAgent } = agent;
   if (isAdmin(req)) {
-    return agent;
+    return publicAgent;
   }
   const {
     adapter_path: _adapterPath,
@@ -1467,8 +1540,22 @@ function redactAgentForRequest(agent = {}, req) {
     runtime_only: _runtimeOnly,
     skill_markdown: _skillMarkdown,
     ...safeAgent
-  } = agent;
+  } = publicAgent;
   return safeAgent;
+}
+
+function redactAgentRegistrationForRequest(payload = {}, req) {
+  if (isAdmin(req)) {
+    return payload;
+  }
+  const {
+    adapter_path: _adapterPath,
+    skill_path: _skillPath,
+    manifest: _manifest,
+    runtime: _runtime,
+    ...safePayload
+  } = payload;
+  return safePayload;
 }
 
 function redactRuntimeHealthForRequest(payload = {}, req) {
@@ -1477,6 +1564,7 @@ function redactRuntimeHealthForRequest(payload = {}, req) {
   }
   const manifest = payload.manifest && typeof payload.manifest === "object" ? payload.manifest : {};
   const vllm = payload.vllm && typeof payload.vllm === "object" ? payload.vllm : {};
+  const router = payload.router && typeof payload.router === "object" ? payload.router : null;
   const health = vllm.health && typeof vllm.health === "object" ? vllm.health : null;
   const response = {
     ok: Boolean(payload.ok),
@@ -1497,6 +1585,13 @@ function redactRuntimeHealthForRequest(payload = {}, req) {
       dynamic_lora_requested: vllm.dynamic_lora_requested
     }
   };
+  if (router) {
+    response.router = {
+      mode: router.mode,
+      model: router.model,
+      models_endpoint_ok: router.models_endpoint_ok
+    };
+  }
   if (health) {
     response.vllm.health = {
       ok: health.ok,
@@ -1759,8 +1854,8 @@ function normalizeChatOptions(options = {}) {
     throwStatus(400, `Unknown chat option(s): ${unknown.join(", ")}.`);
   }
   const plannerMode = String(options.planner_mode || process.env.TCAR_PLANNER_MODE || "cue").toLowerCase();
-  if (!["cue", "llm"].includes(plannerMode)) {
-    throwStatus(400, "planner_mode must be 'cue' or 'llm'.");
+  if (!["cue", "llm", "tcandon"].includes(plannerMode)) {
+    throwStatus(400, "planner_mode must be 'cue', 'llm', or 'tcandon'.");
   }
   return {
     show_route_details: options.show_route_details !== false,
@@ -1768,8 +1863,8 @@ function normalizeChatOptions(options = {}) {
     planner_max_tokens: boundedInt(options.planner_max_tokens, Number(process.env.TCAR_PLANNER_MAX_TOKENS || 384), 32, Number(process.env.TCAR_CLIENT_MAX_PLANNER_TOKENS || 512)),
     max_routing_adapters: boundedInt(options.max_routing_adapters, Number(process.env.TCAR_MAX_ROUTING_ADAPTERS || 12), 1, Number(process.env.TCAR_CLIENT_MAX_ROUTING_ADAPTERS || 24)),
     parallel_workers: boundedInt(options.parallel_workers, Number(process.env.TCAR_PARALLEL_WORKERS || 2), 1, Number(process.env.TCAR_CLIENT_MAX_PARALLEL_WORKERS || 4)),
-    max_tokens: boundedInt(options.max_tokens, Number(process.env.TCAR_MAX_TOKENS || 80), 16, Number(process.env.TCAR_CLIENT_MAX_TOKENS || 512)),
-    refiner_max_tokens: boundedInt(options.refiner_max_tokens, Number(process.env.TCAR_REFINER_MAX_TOKENS || 220), 32, Number(process.env.TCAR_CLIENT_MAX_REFINER_TOKENS || 1024)),
+    max_tokens: boundedInt(options.max_tokens, Number(process.env.TCAR_MAX_TOKENS || 512), 16, Number(process.env.TCAR_CLIENT_MAX_TOKENS || 512)),
+    refiner_max_tokens: boundedInt(options.refiner_max_tokens, Number(process.env.TCAR_REFINER_MAX_TOKENS || 768), 32, Number(process.env.TCAR_CLIENT_MAX_REFINER_TOKENS || 1024)),
     temperature: boundedFloat(options.temperature, Number(process.env.TCAR_TEMPERATURE || 0), 0, Number(process.env.TCAR_CLIENT_MAX_TEMPERATURE || 1))
   };
 }
@@ -2062,13 +2157,13 @@ function normalizeAgentPayload(body) {
 }
 
 function normalizeAgentPatchPayload(body = {}) {
-  const allowed = ["title", "capability", "boundary", "routing_cues", "resources", "sources", "tools", "policies", "stage", "enabled", "source_text"];
+  const allowed = ["title", "capability", "boundary", "consumes", "produces", "routing_cues", "resources", "sources", "tools", "policies", "stage", "enabled", "source_text"];
   const patch = {};
   for (const key of allowed) {
     if (!(key in body)) {
       continue;
     }
-    if (["routing_cues", "resources", "sources", "tools"].includes(key)) {
+    if (["consumes", "produces", "routing_cues", "resources", "sources", "tools"].includes(key)) {
       patch[key] = splitList(body[key]);
       if (key === "sources") {
         for (const sourcePath of patch[key]) {

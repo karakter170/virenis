@@ -1,6 +1,7 @@
 import {
   Activity,
   AlertTriangle,
+  Archive,
   Bot,
   CheckCircle2,
   Clipboard,
@@ -12,6 +13,7 @@ import {
   MessageSquarePlus,
   Network,
   PanelRightOpen,
+  Pencil,
   Plus,
   RefreshCcw,
   Route,
@@ -32,6 +34,18 @@ const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body)
     });
+    return parseResponse(response);
+  },
+  async patch(path, body) {
+    const response = await fetch(path, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    return parseResponse(response);
+  },
+  async delete(path) {
+    const response = await fetch(path, { method: "DELETE" });
     return parseResponse(response);
   },
   async postForm(path, formData) {
@@ -83,7 +97,7 @@ export default function App() {
     return window.matchMedia("(min-width: 1181px)").matches;
   });
   const [uploadOpen, setUploadOpen] = useState(false);
-  const [agentOpen, setAgentOpen] = useState(false);
+  const [agentEditor, setAgentEditor] = useState(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
   const threadRef = useRef(null);
@@ -189,7 +203,7 @@ export default function App() {
         attachments: [],
         options: {
           show_route_details: true,
-          planner_mode: "cue",
+          planner_mode: "tcandon",
           max_routing_adapters: 12,
           parallel_workers: 2,
           temperature: 0
@@ -274,6 +288,20 @@ export default function App() {
     if (reason === null) return;
     try {
       await api.post(`/api/chat/runs/${activeRun.run_id}/feedback`, { rating: "bad", reason });
+      await refreshSidebar();
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  async function archiveAgent(agent) {
+    if (!window.confirm(`Archive ${agent.title || agent.id}?`)) return;
+    try {
+      setError("");
+      await api.delete(`/api/agents/${encodeURIComponent(agent.id)}`);
+      if (agentEditor?.agent?.id === agent.id) {
+        setAgentEditor(null);
+      }
       await refreshSidebar();
     } catch (err) {
       setError(err.message);
@@ -418,7 +446,9 @@ export default function App() {
             runtime={runtime}
             metrics={metrics}
             auth={auth}
-            onCreateAgent={() => setAgentOpen(true)}
+            onCreateAgent={() => setAgentEditor({ mode: "create", agent: null })}
+            onEditAgent={(agent) => setAgentEditor({ mode: "edit", agent })}
+            onArchiveAgent={archiveAgent}
             onCreateDocument={() => setUploadOpen(true)}
             onRefresh={refreshSidebar}
           />
@@ -435,11 +465,13 @@ export default function App() {
         />
       )}
 
-      {agentOpen && (
+      {agentEditor && (
         <AgentDialog
-          onClose={() => setAgentOpen(false)}
-          onCreated={async () => {
-            setAgentOpen(false);
+          auth={auth}
+          agent={agentEditor.agent}
+          onClose={() => setAgentEditor(null)}
+          onSaved={async () => {
+            setAgentEditor(null);
             await refreshSidebar();
           }}
         />
@@ -489,7 +521,7 @@ function MessageBubble({ message }) {
   );
 }
 
-function GraphPanel({ run, events, routes, sources, agents, documents, runtime, metrics, auth, onCreateAgent, onCreateDocument, onRefresh }) {
+function GraphPanel({ run, events, routes, sources, agents, documents, runtime, metrics, auth, onCreateAgent, onEditAgent, onArchiveAgent, onCreateDocument, onRefresh }) {
   const [nodePositions, setNodePositions] = useState({});
   const [hoveredNodeId, setHoveredNodeId] = useState(null);
   const [validation, setValidation] = useState(null);
@@ -499,6 +531,7 @@ function GraphPanel({ run, events, routes, sources, agents, documents, runtime, 
     [run, routes, sources, agents, documents, runtime]
   );
   const graph = useMemo(() => applyNodePositions(baseGraph, nodePositions), [baseGraph, nodePositions]);
+  const canWrite = !auth?.is_viewer;
 
   async function runValidation() {
     if (!auth?.is_admin) return;
@@ -522,11 +555,11 @@ function GraphPanel({ run, events, routes, sources, agents, documents, runtime, 
       />
 
       <div className="graph-actions" aria-label="Graph actions">
-        <button className="graph-action" title={auth?.is_admin ? "Create agent" : "Admin only"} onClick={onCreateAgent} disabled={!auth?.is_admin}>
+        <button className="graph-action" title={auth?.is_admin ? "Create agent" : "Create private agent"} onClick={onCreateAgent} disabled={!canWrite}>
           <Plus size={18} />
           <span>Agent</span>
         </button>
-        <button className="graph-action" title="Register document agent" onClick={onCreateDocument}>
+        <button className="graph-action" title="Register document agent" onClick={onCreateDocument} disabled={!canWrite}>
           <FilePlus size={18} />
           <span>Doc</span>
         </button>
@@ -535,6 +568,13 @@ function GraphPanel({ run, events, routes, sources, agents, documents, runtime, 
           <span>Check</span>
         </button>
       </div>
+
+      <AgentCatalog
+        agents={agents}
+        auth={auth}
+        onEdit={onEditAgent}
+        onArchive={onArchiveAgent}
+      />
 
       <GraphCanvas
         graph={graph}
@@ -566,6 +606,64 @@ function GraphPanel({ run, events, routes, sources, agents, documents, runtime, 
         validation={validation}
       />
     </div>
+  );
+}
+
+function AgentCatalog({ agents, auth, onEdit, onArchive }) {
+  const canManage = (agent) => auth?.is_admin || (!auth?.is_viewer &&
+    agent.visibility === "private" &&
+    agent.created_by === auth?.user_id &&
+    agent.workspace_id === auth?.workspace_id
+  );
+  const ordered = [...agents].sort((left, right) => {
+    const ownershipOrder = Number(canManage(right)) - Number(canManage(left));
+    return ownershipOrder || String(left.title || left.id).localeCompare(String(right.title || right.id));
+  });
+  return (
+    <section className="agent-catalog" aria-label="Agent catalog">
+      <div className="catalog-heading">
+        <strong>Agent Catalog</strong>
+        <span>{agents.length}</span>
+      </div>
+      <div className="catalog-list">
+        {ordered.map((agent) => {
+          const manageable = canManage(agent);
+          const archived = agent.enabled === false;
+          return (
+            <div className="catalog-row" key={agent.id}>
+              <div className="catalog-copy">
+                <strong>{agent.title || agent.id}</strong>
+                <span>{archived ? "Archived" : agent.visibility === "private" ? "Private" : agent.visibility === "team" ? "Team" : "Global"}</span>
+              </div>
+              {manageable && (
+                <div className="catalog-actions">
+                  <button
+                    type="button"
+                    className="catalog-icon"
+                    title={`Edit ${agent.title || agent.id}`}
+                    aria-label={`Edit ${agent.title || agent.id}`}
+                    onClick={() => onEdit(agent)}
+                    disabled={archived}
+                  >
+                    <Pencil size={15} />
+                  </button>
+                  <button
+                    type="button"
+                    className="catalog-icon archive"
+                    title={`Archive ${agent.title || agent.id}`}
+                    aria-label={`Archive ${agent.title || agent.id}`}
+                    onClick={() => onArchive(agent)}
+                    disabled={archived}
+                  >
+                    <Archive size={15} />
+                  </button>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </section>
   );
 }
 
@@ -736,7 +834,7 @@ function OperationsPanel({ run, events, latestEvent, agents, documents, metrics,
         </div>
         <div>
           <span>Runtime</span>
-          <strong>{runtime?.vllm?.models_endpoint_ok === false ? "degraded" : runtime?.ok === false ? "offline" : "ready"}</strong>
+          <strong>{runtime?.vllm?.models_endpoint_ok === false || runtime?.router?.models_endpoint_ok === false ? "degraded" : runtime?.ok === false ? "offline" : "ready"}</strong>
         </div>
         <div>
           <span>Event</span>
@@ -861,8 +959,12 @@ function GraphNodePopover({ node, metrics, validation, latestEvent }) {
       {node.type === "runtime" && (
         <div className="runtime-details">
           <div><span>Base model</span><strong>{data.runtime?.vllm?.base_model}</strong></div>
-          <div><span>vLLM endpoint</span><strong>{data.runtime?.vllm?.base_url}</strong></div>
-          <div><span>Manifest</span><strong>{data.runtime?.manifest?.path}</strong></div>
+          {data.runtime?.vllm?.base_url && <div><span>vLLM endpoint</span><strong>{data.runtime.vllm.base_url}</strong></div>}
+          {data.runtime?.router && (
+            <div><span>Router</span><strong>{data.runtime.router.model || data.runtime.router.mode}</strong></div>
+          )}
+          {data.runtime?.router?.base_url && <div><span>Router endpoint</span><strong>{data.runtime.router.base_url}</strong></div>}
+          {data.runtime?.manifest?.path && <div><span>Manifest</span><strong>{data.runtime.manifest.path}</strong></div>}
           {validation && (
             <div className="validation-result">
               <strong>{validation.status}</strong>
@@ -1058,7 +1160,20 @@ function Metric({ label, value }) {
   );
 }
 
-function createDefaultAgentForm() {
+function createAgentForm(agent = null) {
+  if (agent) {
+    return {
+      id: agent.id,
+      title: agent.title || "",
+      capability: agent.capability || "",
+      boundary: agent.boundary || "",
+      routing_cues: (agent.routing_cues || []).join(", "),
+      produces: (agent.produces || []).join(", "),
+      tools: (agent.tools || []).join(", "),
+      sources: (agent.sources || []).join(", "),
+      source_text: ""
+    };
+  }
   const suffix = Date.now().toString(36).slice(-6);
   return {
     id: `custom_${suffix}_lora`,
@@ -1068,7 +1183,8 @@ function createDefaultAgentForm() {
     routing_cues: "",
     produces: "",
     tools: "",
-    sources: ""
+    sources: "",
+    source_text: ""
   };
 }
 
@@ -1131,8 +1247,9 @@ function DocumentUploadDialog({ onClose, onUploaded }) {
   );
 }
 
-function AgentDialog({ onClose, onCreated }) {
-  const [form, setForm] = useState(() => createDefaultAgentForm());
+function AgentDialog({ auth, agent, onClose, onSaved }) {
+  const editing = Boolean(agent);
+  const [form, setForm] = useState(() => createAgentForm(agent));
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -1145,8 +1262,16 @@ function AgentDialog({ onClose, onCreated }) {
     setError("");
     setBusy(true);
     try {
-      await api.post("/api/agents", form);
-      await onCreated();
+      if (editing) {
+        const patch = { ...form };
+        delete patch.id;
+        if (!patch.source_text || agent?.document) delete patch.source_text;
+        if (!auth?.is_admin) delete patch.sources;
+        await api.patch(`/api/agents/${encodeURIComponent(agent.id)}`, patch);
+      } else {
+        await api.post("/api/agents", form);
+      }
+      await onSaved();
     } catch (err) {
       setError(err.message);
     } finally {
@@ -1157,21 +1282,30 @@ function AgentDialog({ onClose, onCreated }) {
   return (
     <div className="dialog-backdrop">
       <form className="dialog" onSubmit={submit}>
-        <PanelHeader icon={<Bot size={18} />} title="Create Custom Route" subtitle="Zero-effect LoRA identity" />
+        <PanelHeader
+          icon={<Bot size={18} />}
+          title={editing ? `Edit ${agent.title || agent.id}` : auth?.is_admin ? "Create Custom Route" : "Create Private Agent"}
+          subtitle={editing ? agent.id : "Prompt-defined zero-effect LoRA identity"}
+        />
         {error && <div className="field-error">{error}</div>}
-        <label>Adapter id<input value={form.id} onChange={(event) => update("id", event.target.value)} /></label>
+        <label>Adapter id<input value={form.id} onChange={(event) => update("id", event.target.value)} disabled={editing} /></label>
         <label>Title<input value={form.title} onChange={(event) => update("title", event.target.value)} /></label>
         <label>Capability<textarea value={form.capability} onChange={(event) => update("capability", event.target.value)} /></label>
         <label>Boundary<textarea value={form.boundary} onChange={(event) => update("boundary", event.target.value)} /></label>
         <label>Routing cues<textarea value={form.routing_cues} onChange={(event) => update("routing_cues", event.target.value)} /></label>
         <label>Produces<input value={form.produces} onChange={(event) => update("produces", event.target.value)} /></label>
         <label>Allowed tools<input value={form.tools} onChange={(event) => update("tools", event.target.value)} /></label>
-        <label>Approved sources<input value={form.sources} onChange={(event) => update("sources", event.target.value)} /></label>
+        {!agent?.document && (
+          <label>{editing ? "Replace private knowledge" : "Private knowledge"}<textarea value={form.source_text} onChange={(event) => update("source_text", event.target.value)} /></label>
+        )}
+        {auth?.is_admin && (
+          <label>Approved sources<input value={form.sources} onChange={(event) => update("sources", event.target.value)} /></label>
+        )}
         <div className="dialog-actions">
           <button type="button" className="ghost-button" onClick={onClose} disabled={busy}>Cancel</button>
           <button className="send-button" disabled={busy}>
-            {busy ? <Loader2 className="spin" size={16} /> : <Plus size={16} />}
-            Create
+            {busy ? <Loader2 className="spin" size={16} /> : editing ? <Pencil size={16} /> : <Plus size={16} />}
+            {editing ? "Save" : "Create"}
           </button>
         </div>
       </form>

@@ -21,7 +21,7 @@ export function assertSafeSourcePath(sourcePath) {
   }
 }
 
-export async function extractTextFromUpload(file) {
+export async function extractDocumentFromUpload(file) {
   if (!file) {
     const error = new Error("A document file is required.");
     error.status = 400;
@@ -38,14 +38,46 @@ export async function extractTextFromUpload(file) {
   if (extension === ".pdf") {
     try {
       const { default: pdfParse } = await import("pdf-parse");
-      const parsed = await pdfParse(file.buffer);
-      const text = parsed.text.trim();
+      const pages = [];
+      const parsed = await pdfParse(file.buffer, {
+        pagerender: async (pageData) => {
+          const content = await pageData.getTextContent({
+            normalizeWhitespace: true,
+            disableCombineTextItems: false
+          });
+          let lastY = null;
+          const lines = [];
+          for (const item of content.items || []) {
+            const value = String(item?.str || "").replaceAll("\0", "").trim();
+            if (!value) continue;
+            const y = Array.isArray(item.transform) ? item.transform[5] : null;
+            if (lastY !== null && y !== null && y !== lastY) {
+              lines.push("\n");
+            } else if (lines.length > 0 && lines.at(-1) !== "\n") {
+              lines.push(" ");
+            }
+            lines.push(value);
+            lastY = y;
+          }
+          const pageText = lines.join("").replace(/[ \t]+\n/g, "\n").trim();
+          pages.push({
+            page: Number.isSafeInteger(pageData.pageNumber) ? pageData.pageNumber : pages.length + 1,
+            text: pageText
+          });
+          return pageText;
+        }
+      });
+      pages.sort((left, right) => left.page - right.page);
+      const text = pages.map((page) => page.text).filter(Boolean).join("\n\n").trim() || parsed.text.trim();
       if (!text) {
         const error = new Error("PDF did not contain extractable text.");
         error.status = 422;
         throw error;
       }
-      return assertDocumentTextLimit(text);
+      return {
+        text: assertDocumentTextLimit(text),
+        pages: pages.filter((page) => page.text)
+      };
     } catch (error) {
       if (error.status) {
         throw error;
@@ -62,7 +94,11 @@ export async function extractTextFromUpload(file) {
     error.status = 400;
     throw error;
   }
-  return assertDocumentTextLimit(text);
+  return { text: assertDocumentTextLimit(text), pages: [] };
+}
+
+export async function extractTextFromUpload(file) {
+  return (await extractDocumentFromUpload(file)).text;
 }
 
 function assertDocumentTextLimit(text) {
@@ -75,37 +111,43 @@ function assertDocumentTextLimit(text) {
   return text;
 }
 
-export function chunkDocument({ text, slug, maxWords = 350, overlapWords = 60 }) {
+export function chunkDocument({ text, pages = [], slug, maxWords = 350, overlapWords = 60 }) {
   const safeMax = Math.min(Math.max(Number(maxWords) || 350, 80), 1200);
   const safeOverlap = Math.min(Math.max(Number(overlapWords) || 60, 0), Math.floor(safeMax / 2));
-  const words = text.split(/\s+/).filter(Boolean);
   const chunks = [];
+  const normalizedPages = Array.isArray(pages)
+    ? pages
+      .map((page) => ({ page: Number(page?.page), text: String(page?.text || "").trim() }))
+      .filter((page) => Number.isSafeInteger(page.page) && page.page > 0 && page.text)
+    : [];
+  const segments = normalizedPages.length > 0
+    ? normalizedPages.map((page) => ({ text: page.text, pageStart: page.page, pageEnd: page.page }))
+    : [{ text: String(text || ""), pageStart: null, pageEnd: null }];
 
-  if (words.length === 0) {
-    return chunks;
-  }
-
-  let cursor = 0;
-  while (cursor < words.length) {
-    const chunkWords = words.slice(cursor, cursor + safeMax);
-    const body = chunkWords.join(" ");
-    const title = inferTitle(body, chunks.length);
-    const chunkId = `${slug}_${String(chunks.length + 1).padStart(4, "0")}`;
-    chunks.push({
-      chunk_id: chunkId,
-      title,
-      page_start: null,
-      page_end: null,
-      tags: inferTags(`${title} ${body}`),
-      path: `sources/tcar_documents/${slug}/chunks/${chunkId}.md`,
-      summary: summarize(body),
-      token_count_approx: Math.ceil(chunkWords.length * 1.3),
-      body
-    });
-    if (cursor + safeMax >= words.length) {
-      break;
+  for (const segment of segments) {
+    const words = segment.text.split(/\s+/).filter(Boolean);
+    let cursor = 0;
+    while (cursor < words.length) {
+      const chunkWords = words.slice(cursor, cursor + safeMax);
+      const body = chunkWords.join(" ");
+      const title = inferTitle(body, chunks.length);
+      const chunkId = `${slug}_${String(chunks.length + 1).padStart(4, "0")}`;
+      chunks.push({
+        chunk_id: chunkId,
+        title,
+        page_start: segment.pageStart,
+        page_end: segment.pageEnd,
+        tags: inferTags(`${title} ${body}`),
+        path: `sources/tcar_documents/${slug}/chunks/${chunkId}.md`,
+        summary: summarize(body),
+        token_count_approx: Math.ceil(chunkWords.length * 1.3),
+        body
+      });
+      if (cursor + safeMax >= words.length) {
+        break;
+      }
+      cursor += safeMax - safeOverlap;
     }
-    cursor += safeMax - safeOverlap;
   }
 
   return chunks;
@@ -142,7 +184,7 @@ export function scoreChunks(chunks, query, limit = 4) {
 
   return chunks
     .map((chunk) => {
-      const haystack = `${chunk.title} ${chunk.tags.join(" ")} ${chunk.summary} ${chunk.body}`.toLowerCase();
+      const haystack = `${chunk.title || ""} ${(chunk.tags || []).join(" ")} ${chunk.summary || ""} ${chunk.body || ""}`.toLowerCase();
       const score = terms.reduce((total, term) => {
         const matches = haystack.split(term).length - 1;
         return total + matches;
@@ -154,7 +196,7 @@ export function scoreChunks(chunks, query, limit = 4) {
         page_end: chunk.page_end,
         score: Number((score + (score > 0 ? 0.25 : 0)).toFixed(6)),
         summary: chunk.summary,
-        excerpt: chunk.body.slice(0, 420),
+        excerpt: String(chunk.body || "").slice(0, 420),
         path: chunk.path,
         injected: score > 0
       };
@@ -175,8 +217,8 @@ export async function writeDocumentFiles({ uploadRoot, slug, chunks }) {
       "---",
       `chunk_id: ${chunk.chunk_id}`,
       `title: ${JSON.stringify(chunk.title)}`,
-      "page_start: null",
-      "page_end: null",
+      `page_start: ${chunk.page_start ?? "null"}`,
+      `page_end: ${chunk.page_end ?? "null"}`,
       `tags: ${JSON.stringify(chunk.tags)}`,
       "---",
       "",

@@ -301,6 +301,8 @@ The route's safety, source, legal, financial, health, or capability boundary.
 
 The website must not display hidden chain-of-thought. It may display `AGENT_REASONING` as a short audit note if the product wants a transparent mode.
 
+Execution records also carry machine-readable `handoff_artifacts`. Each artifact preserves `name` (plus the web-compatible `artifact` alias), producer step and agent ids, `content_type`, concrete `value`, evidence ids, confidence, validation status, and `verified`. Downstream execution consumes these values rather than treating declared `produces` names as proof that data was generated. The text `HANDOFFS` section remains for backward-compatible display.
+
 ### Tool Policy
 
 Tool calls are recognized using:
@@ -338,11 +340,11 @@ Supported input types:
 - `.markdown`
 - `.txt`
 
-PDF ingestion requires `pypdf`.
+Direct GPU ingestion uses `pypdf`; browser uploads use `pdf-parse` in the web service.
 
 Ingestion steps:
 
-1. Extract text from PDF, Markdown, or text.
+1. Extract text from PDF, Markdown, or text. For PDFs, preserve ordered `{page, text}` records as well as flattened text.
 2. Split into heading-based blocks.
 3. Window text into chunks using `max_words` and `overlap_words`.
 4. Infer simple tags from title and text.
@@ -359,8 +361,8 @@ Chunk index rows contain:
 {
   "chunk_id": "linear_algebra_textbook_0003",
   "title": "Rank-Nullity Theorem",
-  "page_start": null,
-  "page_end": null,
+  "page_start": 18,
+  "page_end": 18,
   "tags": ["rank", "nullity", "linear"],
   "path": "sources/tcar_documents/linear_algebra_textbook/chunks/linear_algebra_textbook_0003.md",
   "summary": "Short summary",
@@ -375,13 +377,15 @@ Retrieval returns:
   "path": "sources/tcar_documents/.../chunks/chunk.md",
   "chunk_id": "linear_algebra_textbook_0003",
   "title": "Rank-Nullity Theorem",
-  "page_start": null,
-  "page_end": null,
+  "page_start": 18,
+  "page_end": 18,
   "score": 4.574471,
   "summary": "Short summary",
   "excerpt": "Retrieved text excerpt"
 }
 ```
+
+The web-to-runtime document registration payload includes both `text` and `pages: [{"page": 1, "text": "..."}]`. Page-aware chunking never crosses a PDF page boundary, so citations retain stable page metadata. Structured citations include optional `claim` and `verified`; the web service validates citation shape, approved source roots, page ranges, and route ownership before persistence. Legacy citations reconstructed from text are retained but marked `verified: false`.
 
 The executor injects retrieved chunks into the selected document route prompt under:
 
@@ -446,6 +450,7 @@ End users can:
 - Ask domain-rich questions.
 - Upload a PDF, Markdown, or text document.
 - Ask questions about uploaded documents.
+- Create, edit, archive, and explicitly invoke their own private agents.
 - See final answer.
 - See cited document chunks.
 - See route summary if enabled.
@@ -467,7 +472,11 @@ Power users can:
 - Review route output quality.
 - Enable or disable route visibility.
 
-Private sessions, uploaded documents, and document-backed route agents should remain visible only to their creator and admins in the same workspace. Non-admin users may inspect safe route status, citations, policy events, and domain answers, but raw route text and prompt previews are admin-only.
+Private sessions, uploaded documents, user-created agents, and document-backed route agents remain visible only to their creator and admins in the same workspace. Non-admin agent creation is forced to `private` visibility and the authenticated workspace regardless of client-supplied ownership fields. Only an owner may edit or archive that private agent; admins retain global and workspace management controls. Non-admin users may inspect safe route status, citations, policy events, and domain answers, but raw route text and prompt previews are admin-only.
+
+An explicit `@agent_id` or `@agent_id_without_lora` reference selects that agent when it is visible to the current session. Explicit references never bypass workspace or ownership filtering. The unmodified message, including mentions, is forwarded to the GPU runtime so TCAndon can apply the same rule.
+
+The inspector's compact Agent Catalog exposes edit and archive icon actions only for the authenticated owner of a private agent or for an admin. Global and team agents remain read-only to ordinary users, viewers receive no mutation controls, and archiving requires confirmation.
 
 Route planning must use the same visibility boundary. Before a chat run calls the GPU runtime, the web backend computes the session-visible adapter list and sends it as `allowed_adapters`; the GPU runtime filters TCAR's planner registry to that list before constructing the DAG. This keeps private document agents from being selected across tenants even though the GPU manifest is global.
 
@@ -1055,7 +1064,7 @@ Request:
   ],
   "options": {
     "show_route_details": true,
-    "planner_mode": "llm",
+    "planner_mode": "tcandon",
     "max_routing_adapters": 12,
     "parallel_workers": 2,
     "temperature": 0.0
@@ -1068,6 +1077,8 @@ stores only `type`, `name`, `document_id`, `url`, `mime_type`, `summary`, and
 `size_bytes`, strips unknown fields, requires safe `http(s)` or internal
 document URLs, and enforces `APP_MAX_MESSAGE_ATTACHMENTS` plus
 `APP_MAX_MESSAGE_ATTACHMENT_CHARS`.
+
+`planner_mode` accepts `tcandon` (the frontend default), `cue` (deterministic fallback), and `llm` (base-model JSON planner) for backward compatibility.
 
 Response:
 
@@ -1309,6 +1320,8 @@ Request:
   "source_text": "# Refund Policy Source..."
 }
 ```
+
+For a non-admin caller, the server ignores requested `workspace_id` and visibility, records the authenticated user as `created_by`, and forces `visibility: "private"`. When `source_text` is supplied without `sources`, it is assigned to `sources/tcar_dummy_loras/{id}/source.md`. Non-admin callers cannot bind their agents to another agent's or document's source path.
 
 Response:
 
@@ -1677,7 +1690,7 @@ Response should include:
   "user_message_id": "msg_123",
   "assistant_message_id": "msg_124",
   "status": "completed",
-  "planner_mode": "llm",
+  "planner_mode": "tcandon",
   "base_model": "qwen36-awq",
   "parallel_workers": 2,
   "max_routing_adapters": 12,
@@ -1987,8 +2000,8 @@ PHASE222_ADAPTER_MANIFEST=configs/dummy_tcar_lora_suite.json
 TCAR_PARALLEL_WORKERS=2
 TCAR_MAX_ROUTING_ADAPTERS=12
 TCAR_PLANNER_MAX_TOKENS=384
-TCAR_MAX_TOKENS=80
-TCAR_REFINER_MAX_TOKENS=220
+TCAR_MAX_TOKENS=512
+TCAR_REFINER_MAX_TOKENS=768
 QWEN_ENABLE_THINKING=0
 ```
 
@@ -2005,12 +2018,13 @@ The vLLM runner currently uses:
 
 ### Expected Production Services
 
-The website should be deployed as at least four logical services:
+The website should be deployed as at least five logical services:
 
 1. Frontend web app.
 2. API server.
 3. Async worker for planning/execution/validation.
-4. vLLM model server.
+4. Qwen/LoRA vLLM executor server.
+5. TCAndon vLLM router server.
 
 Optional services:
 
@@ -2060,12 +2074,14 @@ Optional services:
 
 - Dummy LoRAs are zero-effect route identities, not trained experts.
 - Agent expertise comes from skills, sources, tools, and base-model behavior.
-- Long-term memory must be implemented at the application layer.
 - New LoRA route availability depends on vLLM mounting or dynamic loading support.
-- Current document retrieval is lightweight lexical scoring, not dense embeddings.
-- Tool execution is currently policy-validated but not a complete tool runtime.
-- The current runtime is script-oriented and should be wrapped/refactored into a persistent API service for production.
-- A single RTX A6000 should start with low concurrency. More concurrency needs measurement.
+- Session memory is persisted and consumed by routing/execution; durable cross-session user-profile memory is not implemented.
+- Hybrid document retrieval requires a configured OpenAI-compatible embedding endpoint. Without one it falls back to lexical ranking, and scanned PDFs still require external OCR.
+- Citation verification is deliberately fail-closed but uses deterministic claim/evidence checks, not a full natural-language entailment model.
+- The tool runtime is a bounded local registry, not an arbitrary plugin or network-tool marketplace. Repository and document tools require explicit manifest scope.
+- Context budgeting may compact older memory and duplicate upstream values to stay inside the 4096-token executor window.
+- The file-backed manifest requires one Runtime API process. Chats run concurrently, while agent mutations wait for active executions to drain.
+- Co-resident Qwen and TCAndon concurrency on one RTX A6000 still requires workload-specific measurement.
 
 ## Example User Stories
 

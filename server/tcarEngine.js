@@ -1,6 +1,6 @@
 import { approvedSourceSnippets, BASE_MODEL, DEFAULT_VLLM_BASE_URL } from "./catalog.js";
 import { makeId, nowIso } from "./store.js";
-import { scoreChunks } from "./documents.js";
+import { scoreChunks, slugify } from "./documents.js";
 import { executeRuntimeChat, realRuntimeEnabled } from "./runtimeClient.js";
 
 const MAX_MESSAGE_CHARS = 12000;
@@ -30,7 +30,13 @@ export function planRoutes({ query, agents, documents = [] }) {
 
   const contains = (...terms) => terms.some((term) => lower.includes(term));
   const add = (adapter, task, dependencyAdapters = []) => {
-    if (!hasAgent(adapter) || idByAdapter.has(adapter)) {
+    if (!hasAgent(adapter)) {
+      return undefined;
+    }
+    if (idByAdapter.has(adapter)) {
+      const existing = steps.find((step) => step.adapter === adapter);
+      const dependencies = dependencyAdapters.map((dep) => idByAdapter.get(dep)).filter(Boolean);
+      existing.depends_on = [...new Set([...(existing.depends_on || []), ...dependencies])].filter((id) => id !== existing.id);
       return idByAdapter.get(adapter);
     }
     const id = `s${steps.length + 1}`;
@@ -39,6 +45,11 @@ export function planRoutes({ query, agents, documents = [] }) {
     idByAdapter.set(adapter, id);
     return id;
   };
+
+  for (const agent of resolveExplicitAgentMentions(query, enabled)) {
+    if (agent.id === "writing_synthesis_lora") continue;
+    add(agent.id, `Execute the explicitly requested @${agent.id} agent within its declared capability and boundary.`);
+  }
 
   const matchingDocuments = documents.filter((doc) => {
     const cues = [doc.title, doc.agent_id, ...(doc.routing_cues || [])].filter(Boolean).join(" ").toLowerCase();
@@ -87,6 +98,16 @@ export function planRoutes({ query, agents, documents = [] }) {
     add("project_planning_lora", "Sequence the work into milestones, owners, and checklist items.");
   }
 
+  const metadataMatches = enabled
+    .filter((agent) => agent.id !== "writing_synthesis_lora" && !idByAdapter.has(agent.id))
+    .map((agent) => ({ agent, score: agentMetadataScore(agent, lower) }))
+    .filter((match) => match.score > 0)
+    .sort((left, right) => right.score - left.score || left.agent.id.localeCompare(right.agent.id))
+    .slice(0, 2);
+  for (const { agent } of metadataMatches) {
+    add(agent.id, `Apply ${agent.title || agent.id} to the request using only its declared tools and approved sources.`);
+  }
+
   const currentAdapters = steps.map((step) => step.adapter);
   if (contains("support", "faq", "customer", "reply", "message") || currentAdapters.includes("refund_policy_lora") || currentAdapters.includes("health_safety_lora")) {
     add("customer_support_lora", "Draft support-ready language using upstream constraints.", [
@@ -105,6 +126,46 @@ export function planRoutes({ query, agents, documents = [] }) {
   add("writing_synthesis_lora", "Synthesize one concise final answer while preserving source and safety boundaries.", steps.map((step) => step.adapter));
 
   return { steps };
+}
+
+function resolveExplicitAgentMentions(query, agents) {
+  const aliases = new Map();
+  for (const agent of agents) {
+    const values = [
+      agent.id,
+      String(agent.id || "").replace(/_lora$/, ""),
+      agent.title,
+      agent.document?.title
+    ].filter(Boolean);
+    for (const value of values) {
+      aliases.set(slugify(value), agent);
+    }
+  }
+  const selected = [];
+  const seen = new Set();
+  const mentionPattern = /@(?:["']([^"']+)["']|([a-z0-9][a-z0-9_-]*))/gi;
+  for (const match of String(query || "").matchAll(mentionPattern)) {
+    const agent = aliases.get(slugify(match[1] || match[2]));
+    if (agent && !seen.has(agent.id)) {
+      selected.push(agent);
+      seen.add(agent.id);
+    }
+  }
+  return selected;
+}
+
+function agentMetadataScore(agent, lowerQuery) {
+  const phrases = [agent.title, agent.id, agent.document?.title, ...(agent.routing_cues || [])]
+    .map((value) => String(value || "").toLowerCase().trim())
+    .filter((value) => value.length >= 4);
+  let score = 0;
+  for (const phrase of phrases) {
+    const normalized = phrase.replace(/_lora$/, "").replaceAll("_", " ").replaceAll("-", " ");
+    if (lowerQuery.includes(phrase) || lowerQuery.includes(normalized)) {
+      score += phrase.includes(" ") ? 4 : 2;
+    }
+  }
+  return score;
 }
 
 export function scopedRoutingContext({ session, agents = [], documents = [] }) {
@@ -330,6 +391,7 @@ async function processLocalChatRun({ store, bus, run_id, options = {} }) {
           agent_reasoning: result.agent_reasoning,
           domain_answer: result.domain_answer,
           handoffs: result.handoffs,
+          handoff_artifacts: result.handoff_artifacts,
           boundary_check: result.boundary_check,
           allowed_tools: result.allowed_tools,
           approved_sources: result.approved_sources,
@@ -443,8 +505,8 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
         planner_mode: options.planner_mode || process.env.TCAR_PLANNER_MODE || "cue",
         max_routing_adapters: Number(options.max_routing_adapters) || Number(process.env.TCAR_MAX_ROUTING_ADAPTERS || 12),
         parallel_workers: Number(options.parallel_workers) || Number(process.env.TCAR_PARALLEL_WORKERS || 2),
-        max_tokens: Number(options.max_tokens) || Number(process.env.TCAR_MAX_TOKENS || 80),
-        refiner_max_tokens: Number(options.refiner_max_tokens) || Number(process.env.TCAR_REFINER_MAX_TOKENS || 220),
+        max_tokens: Number(options.max_tokens) || Number(process.env.TCAR_MAX_TOKENS || 512),
+        refiner_max_tokens: Number(options.refiner_max_tokens) || Number(process.env.TCAR_REFINER_MAX_TOKENS || 768),
         temperature: Number(options.temperature ?? process.env.TCAR_TEMPERATURE ?? 0),
         allowed_adapters: scoped.allowedAdapters
       }
@@ -570,10 +632,45 @@ function normalizeRuntimePlan(plan) {
       steps: plan.steps,
       adapters: plan.adapters || plan.steps.map((step) => step.adapter),
       edges: plan.edges || plan.steps.flatMap((step) => (step.depends_on || []).map((source) => ({ source, target: step.id }))),
-      acyclic: plan.acyclic !== false
+      acyclic: plan.acyclic !== false,
+      routing: normalizeRuntimeRouting(plan.routing)
     };
   }
-  return { steps: [], adapters: [], edges: [], acyclic: true };
+  return { steps: [], adapters: [], edges: [], acyclic: true, routing: null };
+}
+
+function normalizeRuntimeRouting(routing) {
+  if (!routing || typeof routing !== "object" || Array.isArray(routing)) {
+    return null;
+  }
+  const selected = Array.isArray(routing.selected)
+    ? routing.selected.slice(0, 64).flatMap((selection) => {
+      if (!selection || typeof selection !== "object" || Array.isArray(selection)) return [];
+      return [{
+        adapter: boundedText(selection.adapter, 240),
+        source: boundedText(selection.source, 120),
+        confidence: finiteProbabilityOrNull(selection.confidence),
+        reason: boundedText(selection.reason, 1000)
+      }];
+    }).filter((selection) => selection.adapter)
+    : [];
+  return {
+    mode: boundedText(routing.mode, 80),
+    candidate_count: Math.max(0, Math.min(Number(routing.candidate_count) || 0, 100000)),
+    candidate_adapters: boundedStringList(routing.candidate_adapters, 256, 240),
+    selected,
+    explicit_adapters: boundedStringList(routing.explicit_adapters, 64, 240),
+    unresolved_mentions: boundedStringList(routing.unresolved_mentions, 64, 500),
+    out_of_scope: routing.out_of_scope === true,
+    reason: boundedText(routing.reason, 1000),
+    fallback: boundedText(routing.fallback, 240)
+  };
+}
+
+function boundedStringList(value, maxItems, maxChars) {
+  return Array.isArray(value)
+    ? value.slice(0, maxItems).map((item) => boundedText(item, maxChars)).filter(Boolean)
+    : [];
 }
 
 function runtimeOutputToRunStep({ run_id, output, parallel }) {
@@ -591,9 +688,12 @@ function runtimeOutputToRunStep({ run_id, output, parallel }) {
     parallel_batch: batch,
     parallel_width: width,
     status: "completed",
-    agent_reasoning: sections.agent_reasoning,
+    agent_reasoning: output.agent_reasoning || sections.agent_reasoning,
     domain_answer: output.domain_answer || sections.domain_answer,
-    handoffs: sections.handoffs,
+    handoffs: typeof output.handoffs === "string" ? output.handoffs : sections.handoffs,
+    handoff_artifacts: normalizeHandoffArtifacts(output.handoff_artifacts || output.handoffs, output),
+    artifact_validation: normalizeArtifactValue(output.artifact_validation || {}),
+    consumption_validation: normalizeArtifactValue(output.consumption_validation || {}),
     boundary_check: output.boundary_check || sections.boundary_check,
     allowed_tools: output.allowed_tools || [],
     approved_sources: output.approved_sources || [],
@@ -614,6 +714,12 @@ function findBatchForStep(parallel, stepId) {
 
 function runtimeCitations(outputs) {
   return outputs.flatMap((output) => {
+    if (Array.isArray(output.citations)) {
+      return output.citations
+        .slice(0, 32)
+        .map((citation) => normalizeRuntimeCitation(citation, output))
+        .filter(Boolean);
+    }
     const context = output.retrieved_context || parseRouteSections(output.text || "").retrieved_context || "";
     if (!context) return [];
     return context.split(/\n+/).filter(Boolean).slice(0, 8).map((line, index) => {
@@ -629,10 +735,126 @@ function runtimeCitations(outputs) {
         page_end: null,
         score: null,
         excerpt: rest.join(" - ") || line,
-        injected: true
+        injected: true,
+        claim: "",
+        verified: false
       };
     });
   });
+}
+
+function normalizeRuntimeCitation(citation, output) {
+  if (!citation || typeof citation !== "object" || Array.isArray(citation)) {
+    return null;
+  }
+  const chunkId = boundedText(citation.chunk_id, 240);
+  const title = boundedText(citation.title, 500);
+  const excerpt = boundedText(citation.excerpt, 4000);
+  if (!chunkId && !title && !excerpt) {
+    return null;
+  }
+  const requestedPath = String(citation.path || "").replaceAll("\\", "/");
+  if (requestedPath && !isApprovedCitationPath(requestedPath, output.approved_sources || [])) {
+    return null;
+  }
+  const pageStart = positiveIntegerOrNull(citation.page_start ?? citation.page);
+  const requestedEnd = positiveIntegerOrNull(citation.page_end ?? citation.page);
+  const pageEnd = pageStart && requestedEnd && requestedEnd >= pageStart ? requestedEnd : pageStart;
+  const numericScore = Number(citation.score);
+  return {
+    citation_id: makeId("cit"),
+    step_id: output.id,
+    agent_id: output.adapter,
+    path: requestedPath,
+    chunk_id: chunkId,
+    title: title || output.adapter,
+    page_start: pageStart,
+    page_end: pageEnd,
+    score: Number.isFinite(numericScore) ? numericScore : null,
+    excerpt,
+    injected: citation.injected !== false,
+    claim: boundedText(citation.claim, 2000),
+    verified: citation.verified === true && Boolean(chunkId) && (!requestedPath || isApprovedCitationPath(requestedPath, output.approved_sources || []))
+  };
+}
+
+function isApprovedCitationPath(sourcePath, approvedSources) {
+  const normalized = String(sourcePath || "").replaceAll("\\", "/");
+  if (
+    normalized.startsWith("/") ||
+    normalized.includes("..") ||
+    !(normalized.startsWith("sources/tcar_documents/") || normalized.startsWith("sources/tcar_dummy_loras/"))
+  ) {
+    return false;
+  }
+  const approved = (approvedSources || []).map((value) => String(value || "").replaceAll("\\", "/"));
+  if (approved.length === 0) {
+    return false;
+  }
+  return approved.some((allowedPath) => {
+    if (normalized === allowedPath) return true;
+    if (allowedPath.endsWith("/index.jsonl")) {
+      return normalized.startsWith(`${allowedPath.slice(0, -"index.jsonl".length)}chunks/`);
+    }
+    return false;
+  });
+}
+
+function positiveIntegerOrNull(value) {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+function boundedText(value, maxChars) {
+  return String(value || "").replaceAll("\0", "").trim().slice(0, maxChars);
+}
+
+function normalizeHandoffArtifacts(value, output) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.slice(0, 32).flatMap((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      return [];
+    }
+    const artifact = boundedText(item.artifact || item.name || item.type, 160);
+    const artifactValue = item.value ?? item.content ?? item.data;
+    if (!artifact || artifactValue === undefined || artifactValue === null || artifactValue === "") {
+      return [];
+    }
+    return [{
+      name: artifact,
+      artifact,
+      producer_step_id: output.id || output.step_id || null,
+      producer_agent_id: output.adapter || null,
+      producer: output.adapter || null,
+      content_type: boundedText(item.content_type || "application/json", 120),
+      value: normalizeArtifactValue(artifactValue),
+      evidence: boundedStringList(item.evidence || item.citations, 50, 240),
+      confidence: finiteProbabilityOrNull(item.confidence),
+      status: boundedText(item.status || "runtime_structured", 120),
+      verified: item.verified === true
+    }];
+  });
+}
+
+function normalizeArtifactValue(value) {
+  if (typeof value === "string") {
+    return boundedText(value, 12000);
+  }
+  if (["number", "boolean"].includes(typeof value)) {
+    return value;
+  }
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch {
+    return boundedText(value, 12000);
+  }
+}
+
+function finiteProbabilityOrNull(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 && parsed <= 1 ? parsed : null;
 }
 
 async function updateRun(store, bus, run_id, patch, event) {
@@ -679,6 +901,13 @@ function buildRouteOutput({ step, query, agents, documents }) {
     .map((citation) => `${citation.chunk_id || citation.path}:${citation.title} - ${citation.excerpt}`)
     .join("\n");
   const domainAnswer = domainAnswerFor(step.adapter, query, citations, agent);
+  const handoffArtifacts = buildLocalHandoffArtifacts({
+    step,
+    agent,
+    domainAnswer,
+    citations,
+    retrievedContext
+  });
   const rawText = [
     "AGENT_REASONING:",
     `- Selected because the request matched ${agent?.title || step.adapter}.`,
@@ -687,7 +916,9 @@ function buildRouteOutput({ step, query, agents, documents }) {
     domainAnswer,
     "",
     "HANDOFFS:",
-    `- Produces ${(agent?.produces || []).join(", ") || "route output"} for downstream synthesis.`,
+    handoffArtifacts.length
+      ? handoffArtifacts.map((artifact) => `- ${artifact.artifact}`).join("\n")
+      : "- No validated handoff artifact was produced.",
     "",
     "BOUNDARY_CHECK:",
     agent?.boundary || "Stay within the route capability and surface uncertainty.",
@@ -703,6 +934,7 @@ function buildRouteOutput({ step, query, agents, documents }) {
     agent_reasoning: sections.agent_reasoning,
     domain_answer: sections.domain_answer,
     handoffs: sections.handoffs,
+    handoff_artifacts: handoffArtifacts,
     boundary_check: sections.boundary_check,
     retrieved_context: sections.retrieved_context,
     allowed_tools: agent?.tools || [],
@@ -718,8 +950,14 @@ function gatherCitations({ step, agent, query, documents }) {
   if (agent?.document || agent?.retrieval?.type === "document_markdown") {
     const document = documents.find((doc) => doc.agent_id === step.adapter || doc.agent_id === agent.id);
     if (document) {
+      const documentChunks = new Map((document.chunks || []).map((chunk) => [chunk.chunk_id, chunk]));
       citations.push(
-        ...scoreChunks(document.chunks || [], query, document.top_k || 4).map((chunk) => ({
+        ...scoreChunks(document.chunks || [], query, document.top_k || 4).flatMap((chunk) => {
+          const indexedChunk = documentChunks.get(chunk.chunk_id);
+          if (!indexedChunk || chunk.path !== indexedChunk.path || !isApprovedCitationPath(chunk.path, [document.index_path])) {
+            return [];
+          }
+          return [{
           citation_id: makeId("cit"),
           step_id: step.id,
           agent_id: step.adapter,
@@ -730,8 +968,11 @@ function gatherCitations({ step, agent, query, documents }) {
           page_end: chunk.page_end,
           score: chunk.score,
           excerpt: chunk.excerpt,
-          injected: chunk.injected
-        }))
+          injected: chunk.injected,
+          claim: "",
+          verified: true
+          }];
+        })
       );
     }
   }
@@ -750,12 +991,62 @@ function gatherCitations({ step, agent, query, documents }) {
         page_end: null,
         score: source.score,
         excerpt: source.excerpt,
-        injected: true
+        injected: true,
+        claim: "",
+        verified: true
+      });
+    } else if (agent?.source_text_internal && sourcePath === agent.sources[0] && isApprovedCitationPath(sourcePath, agent.sources)) {
+      citations.push({
+        citation_id: makeId("cit"),
+        step_id: step.id,
+        agent_id: step.adapter,
+        path: sourcePath,
+        chunk_id: `${step.adapter}_source_0001`,
+        title: `${agent.title || step.adapter} private knowledge`,
+        page_start: null,
+        page_end: null,
+        score: 1,
+        excerpt: selectSourceExcerpt(agent.source_text_internal, query),
+        injected: true,
+        claim: "",
+        verified: true
       });
     }
   }
 
   return citations;
+}
+
+function buildLocalHandoffArtifacts({ step, agent, domainAnswer, citations, retrievedContext }) {
+  const declared = [...new Set((agent?.produces || []).map((name) => boundedText(name, 160)).filter(Boolean))];
+  const names = declared.length > 0 ? declared : ["domain_answer"];
+  return names.flatMap((artifact) => {
+    let value = domainAnswer;
+    let contentType = "text/plain";
+    if (["retrieved_context", "cited_passages"].includes(artifact)) {
+      value = artifact === "retrieved_context" ? retrievedContext : citations;
+      contentType = artifact === "retrieved_context" ? "text/plain" : "application/json";
+    } else if (artifact === "source_confidence") {
+      value = citations.length > 0 ? 1 : 0;
+      contentType = "application/json";
+    }
+    if (value === "" || value === null || value === undefined || (Array.isArray(value) && value.length === 0)) {
+      return [];
+    }
+    return [{
+      name: artifact,
+      artifact,
+      producer_step_id: step.id,
+      producer_agent_id: step.adapter,
+      producer: step.adapter,
+      content_type: contentType,
+      value,
+      evidence: citations.map((citation) => citation.chunk_id).filter(Boolean),
+      confidence: citations.length > 0 ? 1 : null,
+      status: "local_executor_derived",
+      verified: true
+    }];
+  });
 }
 
 function domainAnswerFor(adapter, query, citations, agent) {
@@ -801,7 +1092,27 @@ function domainAnswerFor(adapter, query, citations, agent) {
   if (adapter === "writing_synthesis_lora") {
     return "Merge upstream route outputs into one clear answer, preserving legal, health, finance, source, and policy caveats where relevant.";
   }
+  if (citations.length > 0) {
+    return `Based on the agent's approved knowledge: ${citations.map((citation) => citation.excerpt).join(" ")}`;
+  }
   return `Apply ${agent?.title || adapter} to the request and return concise domain-specific guidance.`;
+}
+
+function selectSourceExcerpt(sourceText, query) {
+  const terms = String(query || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, " ")
+    .split(/\s+/)
+    .filter((term) => term.length > 2);
+  const passages = String(sourceText || "").split(/\n{2,}|(?<=[.!?])\s+/).map((value) => value.trim()).filter(Boolean);
+  const ranked = passages
+    .map((passage, index) => ({
+      passage,
+      index,
+      score: terms.reduce((total, term) => total + (passage.toLowerCase().includes(term) ? 1 : 0), 0)
+    }))
+    .sort((left, right) => right.score - left.score || left.index - right.index);
+  return boundedText(ranked[0]?.passage || sourceText, 1000);
 }
 
 function synthesizeFinalAnswer(query, outputs) {

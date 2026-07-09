@@ -2,10 +2,11 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import request from "supertest";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "../server/app.js";
 import { requireRuntimeConfigured } from "../server/runtimeClient.js";
 import { buildParallelBatches, normalizeSharedMemory, sanitizeToolCalls } from "../server/tcarEngine.js";
+import { chunkDocument } from "../server/documents.js";
 
 let tmpDir;
 let app;
@@ -457,6 +458,12 @@ describe("runtime and catalog", () => {
       executor: {
         reload_per_request: true,
         parallel_workers: 2
+      },
+      router: {
+        mode: "tcandon",
+        base_url: "http://127.0.0.1:8010/v1",
+        model: "tcandon-router",
+        models_endpoint_ok: true
       }
     };
     let prodApp;
@@ -495,6 +502,12 @@ describe("runtime and catalog", () => {
       expect(userHealth.body.vllm.base_model).toBe("qwen36-awq");
       expect(userHealth.body.vllm.base_url).toBeUndefined();
       expect(userHealth.body.vllm.health).toEqual({ ok: true, status: 200 });
+      expect(userHealth.body.router).toEqual({
+        mode: "tcandon",
+        model: "tcandon-router",
+        models_endpoint_ok: true
+      });
+      expect(userHealth.body.router.base_url).toBeUndefined();
       expect(userHealth.body.project_root).toBeUndefined();
       expect(userHealth.body.executor).toBeUndefined();
       expect(JSON.stringify(userHealth.body)).not.toContain("127.0.0.1");
@@ -508,6 +521,7 @@ describe("runtime and catalog", () => {
       expect(adminHealth.body.project_root).toBe("/srv/tcar-runtime");
       expect(adminHealth.body.manifest.path).toContain("dummy_tcar_lora_suite.json");
       expect(adminHealth.body.vllm.base_url).toBe("http://127.0.0.1:8000/v1");
+      expect(adminHealth.body.router.base_url).toBe("http://127.0.0.1:8010/v1");
       expect(adminHealth.body.executor.parallel_workers).toBe(2);
     } finally {
       await prodApp?.locals?.store?.close?.();
@@ -1272,7 +1286,53 @@ describe("runtime and catalog", () => {
     }
   });
 
-  it("scopes chat sessions to bearer-token workspaces and protects admin agent writes", async () => {
+  it("scopes user-authored source text to its private agent directory", async () => {
+    const previousTokens = process.env.APP_API_TOKENS_JSON;
+    process.env.APP_API_TOKENS_JSON = JSON.stringify({
+      private_source_user: { user_id: "source_owner", workspace_id: "workspace_sources", role: "user" }
+    });
+    try {
+      await request(app)
+        .post("/api/agents")
+        .set("Authorization", "Bearer private_source_user")
+        .send({
+          id: "cross_source_lora",
+          title: "Cross source",
+          capability: "Must not read another agent's source.",
+          boundary: "Use owned sources only.",
+          sources: "sources/tcar_dummy_loras/refund_policy/refund_policy.md"
+        })
+        .expect(403);
+
+      await request(app)
+        .post("/api/agents")
+        .set("Authorization", "Bearer private_source_user")
+        .send({
+          id: "owned_source_lora",
+          title: "Owned source",
+          capability: "Uses private source text.",
+          boundary: "Use owned sources only.",
+          source_text: "Owner-specific operating rule."
+        })
+        .expect(201);
+      const stored = app.locals.store.read().agents.find((agent) => agent.id === "owned_source_lora");
+      expect(stored.sources).toEqual(["sources/tcar_dummy_loras/owned_source_lora/source.md"]);
+
+      await request(app)
+        .patch("/api/agents/owned_source_lora")
+        .set("Authorization", "Bearer private_source_user")
+        .send({ sources: "sources/tcar_documents/someone_else/index.jsonl" })
+        .expect(403);
+    } finally {
+      if (previousTokens === undefined) {
+        delete process.env.APP_API_TOKENS_JSON;
+      } else {
+        process.env.APP_API_TOKENS_JSON = previousTokens;
+      }
+    }
+  });
+
+  it("scopes chat sessions and lets users manage only their own private agents", async () => {
     const previousTokens = process.env.APP_API_TOKENS_JSON;
     process.env.APP_API_TOKENS_JSON = JSON.stringify({
       token_a: { user_id: "alice", workspace_id: "workspace_a", role: "user" },
@@ -1323,16 +1383,55 @@ describe("runtime and catalog", () => {
         .set("Authorization", "Bearer token_a")
         .expect(403);
 
-      await request(app)
+      const userAgent = await request(app)
         .post("/api/agents")
         .set("Authorization", "Bearer token_a")
         .send({
-          id: "tenant_blocked_lora",
-          title: "Blocked",
-          capability: "Blocked",
-          boundary: "Blocked"
+          id: "tenant_private_lora",
+          title: "Tenant private route",
+          capability: "Handles Alice's private rules.",
+          boundary: "Stay within Alice's rules.",
+          visibility: "global",
+          workspace_id: "workspace_b"
         })
-        .expect(403);
+        .expect(201);
+      expect(userAgent.body).toMatchObject({
+        id: "tenant_private_lora",
+        workspace_id: "workspace_a",
+        visibility: "private",
+        created_by: "alice"
+      });
+      expect(userAgent.body.adapter_path).toBeUndefined();
+
+      const aliceEdit = await request(app)
+        .patch("/api/agents/tenant_private_lora")
+        .set("Authorization", "Bearer token_a")
+        .send({ boundary: "Use only Alice-approved facts.", produces: "alice_result" })
+        .expect(200);
+      expect(aliceEdit.body.boundary).toBe("Use only Alice-approved facts.");
+      expect(aliceEdit.body.produces).toEqual(["alice_result"]);
+      expect(aliceEdit.body.adapter_path).toBeUndefined();
+
+      await request(app)
+        .patch("/api/agents/tenant_private_lora")
+        .set("Authorization", "Bearer token_b")
+        .send({ boundary: "Bob must not edit this." })
+        .expect(404);
+      await request(app)
+        .delete("/api/agents/tenant_private_lora")
+        .set("Authorization", "Bearer token_b")
+        .expect(404);
+      await request(app)
+        .patch("/api/agents/legal_privacy_lora")
+        .set("Authorization", "Bearer token_b")
+        .send({ boundary: "Users cannot edit global agents." })
+        .expect(404);
+
+      const bobAgents = await request(app)
+        .get("/api/agents")
+        .set("Authorization", "Bearer token_b")
+        .expect(200);
+      expect(bobAgents.body.agents.map((agent) => agent.id)).not.toContain("tenant_private_lora");
 
       await request(app)
         .post("/api/agents")
@@ -1345,6 +1444,11 @@ describe("runtime and catalog", () => {
           routing_cues: "admin"
         })
         .expect(201);
+
+      await request(app)
+        .delete("/api/agents/tenant_private_lora")
+        .set("Authorization", "Bearer token_a")
+        .expect(200);
     } finally {
       if (previousTokens === undefined) {
         delete process.env.APP_API_TOKENS_JSON;
@@ -1392,6 +1496,12 @@ describe("runtime and catalog", () => {
         .field("routing_cues", "private-manual")
         .attach("file", Buffer.from("Only Alice should see this private manual."), "manual.txt")
         .expect(201);
+
+      await request(app)
+        .patch(`/api/agents/${upload.body.agent_id}`)
+        .set("Authorization", "Bearer token_alice")
+        .send({ source_text: "Do not overwrite a document index through agent editing." })
+        .expect(400);
 
       const bobAgents = await request(app)
         .get("/api/agents")
@@ -1462,6 +1572,59 @@ describe("chat execution", () => {
       .expect(201);
     const metrics = await request(app).get("/api/admin/metrics").expect(200);
     expect(metrics.body.bad_response_flags).toBe(1);
+  });
+
+  it("routes explicit @agent references to an accessible user-created agent", async () => {
+    const previousTokens = process.env.APP_API_TOKENS_JSON;
+    process.env.APP_API_TOKENS_JSON = JSON.stringify({
+      explicit_user_token: { user_id: "explicit_user", workspace_id: "workspace_explicit", role: "user" }
+    });
+    try {
+      await request(app)
+        .post("/api/agents")
+        .set("Authorization", "Bearer explicit_user_token")
+        .send({
+          id: "private_numbers_lora",
+          title: "Private numbers",
+          capability: "Applies the user's private number rules.",
+          boundary: "Use only the configured number rules.",
+          routing_cues: "unrelated-cue",
+          produces: "number_result",
+          source_text: "The private 2026 target is 42 units."
+        })
+        .expect(201);
+      const session = await request(app)
+        .post("/api/chat/sessions")
+        .set("Authorization", "Bearer explicit_user_token")
+        .send({ title: "Explicit route" })
+        .expect(201);
+      const queued = await request(app)
+        .post(`/api/chat/sessions/${session.body.session_id}/messages`)
+        .set("Authorization", "Bearer explicit_user_token")
+        .send({ content: "Ask @private_numbers for the private 2026 target." })
+        .expect(202);
+      const run = await waitForRunAs(queued.body.run_id, "Bearer explicit_user_token");
+      expect(run.status).toBe("completed");
+      expect(run.plan.steps.map((step) => step.adapter)).toContain("private_numbers_lora");
+      const route = run.expert_outputs.find((step) => step.adapter === "private_numbers_lora");
+      expect(route.handoff_artifacts).toEqual([
+        expect.objectContaining({
+          artifact: "number_result",
+          producer_agent_id: "private_numbers_lora"
+        })
+      ]);
+      expect(route.handoff_artifacts[0].value).toContain("42 units");
+      expect(route.domain_answer).toContain("42 units");
+      expect(route.citations).toEqual([
+        expect.objectContaining({ chunk_id: "private_numbers_lora_source_0001", verified: true })
+      ]);
+    } finally {
+      if (previousTokens === undefined) {
+        delete process.env.APP_API_TOKENS_JSON;
+      } else {
+        process.env.APP_API_TOKENS_JSON = previousTokens;
+      }
+    }
   });
 
   it("drains queued chat and validation background tasks", async () => {
@@ -1741,6 +1904,17 @@ describe("chat execution", () => {
     const run = await waitForRun(queued.body.run_id);
     expect(run.status).toBe("completed");
     expect(run.parallel.workers).toBe(4);
+
+    const tcandonQueued = await request(app)
+      .post(`/api/chat/sessions/${session.session_id}/messages`)
+      .send({
+        content: "Use the TCAndon planner for this support workflow.",
+        options: { planner_mode: "tcandon" }
+      })
+      .expect(202);
+    const tcandonRun = await waitForRun(tcandonQueued.body.run_id);
+    expect(tcandonRun.status).toBe("completed");
+    expect(app.locals.store.read().runs.find((item) => item.run_id === tcandonQueued.body.run_id).planner_mode).toBe("tcandon");
   });
 
   it("redacts route raw text and prompt previews for non-admin run readers", async () => {
@@ -1908,10 +2082,63 @@ describe("chat execution", () => {
                 }
               ],
               adapters: ["writing_synthesis_lora"],
-              edges: []
+              edges: [],
+              routing: {
+                mode: "tcandon",
+                candidate_count: 3,
+                candidate_adapters: ["writing_synthesis_lora"],
+                selected: [{
+                  adapter: "writing_synthesis_lora",
+                  source: "tcandon",
+                  confidence: 0.88,
+                  reason: "Explicit synthesis request."
+                }],
+                explicit_adapters: ["writing_synthesis_lora"],
+                unresolved_mentions: ["@alice_private_manual"],
+                out_of_scope: false,
+                reason: "One authorized route selected.",
+                fallback: ""
+              }
             },
             parallel: { workers: 1, batches: [{ batch: 1, width: 1, workers: 1, steps: ["s1"] }], maxBatchWidth: 1, parallelizable: false },
-            expertOutputs: [],
+            expertOutputs: [{
+              id: "s1",
+              adapter: "writing_synthesis_lora",
+              task: "Synthesize.",
+              domain_answer: "Structured runtime answer.",
+              approved_sources: ["sources/tcar_dummy_loras/writing_synthesis/source.md"],
+              citations: [
+                {
+                  chunk_id: "runtime_chunk_1",
+                  title: "Runtime source",
+                  path: "sources/tcar_dummy_loras/writing_synthesis/source.md",
+                  page_start: 3,
+                  page_end: 3,
+                  score: 0.9,
+                  excerpt: "Validated runtime evidence.",
+                  claim: "The runtime supplied evidence.",
+                  verified: true
+                },
+                {
+                  chunk_id: "unsafe_chunk",
+                  path: "../../etc/passwd",
+                  excerpt: "Must be rejected.",
+                  verified: true
+                }
+              ],
+              handoff_artifacts: [
+                {
+                  name: "final_draft",
+                  content_type: "text/plain",
+                  value: "Structured runtime answer.",
+                  evidence: ["runtime_chunk_1"],
+                  confidence: 0.9,
+                  status: "model_structured",
+                  verified: true
+                },
+                { artifact: "missing_value" }
+              ]
+            }],
             finalAnswer: "Scoped runtime answer."
           }),
           { status: 200, headers: { "Content-Type": "application/json" } }
@@ -1949,15 +2176,17 @@ describe("chat execution", () => {
       const queued = await request(realApp)
         .post(`/api/chat/sessions/${session.body.session_id}/messages`)
         .set("Authorization", `Bearer ${tokenBob}`)
-        .send({ content: "Use Alice private manual if available." })
+        .send({ content: "Use @alice_private_manual if available, then preserve this mention." })
         .expect(202);
 
+      let completedRun;
       for (let attempt = 0; attempt < 200; attempt += 1) {
         const response = await request(realApp)
           .get(`/api/chat/runs/${queued.body.run_id}`)
           .set("Authorization", `Bearer ${tokenBob}`)
           .expect(200);
         if (response.body.status === "completed") {
+          completedRun = response.body;
           break;
         }
         await new Promise((resolve) => setTimeout(resolve, 25));
@@ -1965,6 +2194,35 @@ describe("chat execution", () => {
 
       expect(chatBody.options.allowed_adapters).toContain("writing_synthesis_lora");
       expect(chatBody.options.allowed_adapters).not.toContain("alice_private_manual_lora");
+      expect(chatBody.options.max_tokens).toBe(512);
+      expect(chatBody.options.refiner_max_tokens).toBe(768);
+      expect(chatBody.query).toBe("Use @alice_private_manual if available, then preserve this mention.");
+      expect(completedRun.sources).toHaveLength(1);
+      expect(completedRun.sources[0]).toMatchObject({
+        chunk_id: "runtime_chunk_1",
+        page_start: 3,
+        page_end: 3,
+        verified: true,
+        claim: "The runtime supplied evidence."
+      });
+      expect(completedRun.expert_outputs[0].handoff_artifacts).toEqual([
+        expect.objectContaining({
+          name: "final_draft",
+          artifact: "final_draft",
+          value: "Structured runtime answer.",
+          evidence: ["runtime_chunk_1"],
+          confidence: 0.9,
+          status: "model_structured",
+          verified: true
+        })
+      ]);
+      expect(completedRun.plan.routing).toMatchObject({
+        mode: "tcandon",
+        selected: [expect.objectContaining({ adapter: "writing_synthesis_lora", confidence: 0.88 })],
+        unresolved_mentions: ["@alice_private_manual"],
+        out_of_scope: false,
+        reason: "One authorized route selected."
+      });
     } finally {
       await realApp?.locals?.drainBackgroundTasks?.({ timeoutMs: 5000 });
       await realApp?.locals?.store?.close?.();
@@ -2113,7 +2371,7 @@ describe("chat execution", () => {
     const metrics = await request(app).get("/api/admin/metrics").expect(200);
     expect(metrics.body.total_runs).toBe(25);
     expect(metrics.body.most_used_agents.length).toBeGreaterThan(0);
-  }, 30000);
+  }, 45000);
 });
 
 describe("documents and sources", () => {
@@ -2144,7 +2402,83 @@ describe("documents and sources", () => {
     const run = await waitForRun(queued.body.run_id);
     expect(run.status).toBe("completed");
     expect(run.sources.length).toBeGreaterThan(0);
+    expect(run.sources.every((source) => source.verified === true)).toBe(true);
+    const documentRoute = run.expert_outputs.find((route) => route.adapter === upload.body.agent_id);
+    expect(documentRoute.handoff_artifacts).toEqual(expect.arrayContaining([
+      expect.objectContaining({ artifact: "retrieved_context", producer_agent_id: upload.body.agent_id }),
+      expect.objectContaining({ artifact: "cited_passages", content_type: "application/json" })
+    ]));
     expect(run.final_answer).toContain("rank is 5");
+  });
+
+  it("preserves PDF pages in chunks and in the GPU registration payload", async () => {
+    const previous = {
+      TCAR_ENGINE_MODE: process.env.TCAR_ENGINE_MODE,
+      TCAR_RUNTIME_API_URL: process.env.TCAR_RUNTIME_API_URL,
+      TCAR_RUNTIME_API_KEY: process.env.TCAR_RUNTIME_API_KEY
+    };
+    const previousFetch = globalThis.fetch;
+    let runtimeBody;
+    vi.doMock("pdf-parse", () => ({
+      default: async (_buffer, options) => {
+        const page = (pageNumber, text) => ({
+          pageNumber,
+          getTextContent: async () => ({
+            items: [{ str: text, transform: [1, 0, 0, 1, 0, 700] }]
+          })
+        });
+        const rendered = [
+          await options.pagerender(page(1, "Revenue is 100 million.")),
+          await options.pagerender(page(2, "Expenses are 40 million."))
+        ];
+        return { text: rendered.join("\n\n"), numpages: 2 };
+      }
+    }));
+    try {
+      process.env.TCAR_ENGINE_MODE = "real";
+      process.env.TCAR_RUNTIME_API_URL = "http://gpu-runtime.internal:9000";
+      process.env.TCAR_RUNTIME_API_KEY = "runtime-secret-for-pdf-test";
+      globalThis.fetch = async (_url, options = {}) => {
+        runtimeBody = JSON.parse(options.body);
+        return new Response(JSON.stringify({
+          ok: true,
+          status: "added",
+          result: { status: "added", chunks: 2, mounted: true }
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      };
+
+      const upload = await request(app)
+        .post("/api/documents")
+        .field("title", "2026 Financial Data")
+        .attach("file", Buffer.from("mock-pdf"), "financial.pdf")
+        .expect(201);
+      expect(upload.body.chunks).toBe(2);
+      expect(runtimeBody.text).toBe("Revenue is 100 million.\n\nExpenses are 40 million.");
+      expect(runtimeBody.pages).toEqual([
+        { page: 1, text: "Revenue is 100 million." },
+        { page: 2, text: "Expenses are 40 million." }
+      ]);
+      const storedDocument = app.locals.store.read().documents.find((document) => document.document_id === upload.body.document_id);
+      expect(storedDocument.page_count).toBe(2);
+      expect(storedDocument.chunks.map((chunk) => [chunk.page_start, chunk.page_end])).toEqual([[1, 1], [2, 2]]);
+
+      const directChunks = chunkDocument({
+        slug: "financial",
+        text: runtimeBody.text,
+        pages: runtimeBody.pages
+      });
+      expect(directChunks.map((chunk) => chunk.page_start)).toEqual([1, 2]);
+    } finally {
+      vi.doUnmock("pdf-parse");
+      globalThis.fetch = previousFetch;
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) {
+          delete process.env[key];
+        } else {
+          process.env[key] = value;
+        }
+      }
+    }
   });
 
   it("uses collision-resistant ids for concurrent automatic document agents", async () => {
