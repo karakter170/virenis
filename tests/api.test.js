@@ -5,7 +5,7 @@ import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "../server/app.js";
 import { requireRuntimeConfigured } from "../server/runtimeClient.js";
-import { buildParallelBatches, normalizeSharedMemory, sanitizeToolCalls } from "../server/tcarEngine.js";
+import { buildParallelBatches, normalizeSharedMemory, sanitizeToolCalls, scopedRoutingContext } from "../server/tcarEngine.js";
 import { chunkDocument } from "../server/documents.js";
 
 let tmpDir;
@@ -78,6 +78,24 @@ async function waitForValidation(validationRunId) {
 }
 
 describe("runtime and catalog", () => {
+  it("excludes disabled and unmounted agents from the routing scope", () => {
+    const session = { workspace_id: "workspace_a", created_by: "alice" };
+    const context = scopedRoutingContext({
+      session,
+      agents: [
+        { id: "active_lora", workspace_id: "workspace_a", visibility: "private", created_by: "alice", enabled: true, mounted: true },
+        { id: "pending_lora", workspace_id: "workspace_a", visibility: "private", created_by: "alice", enabled: true, mounted: false },
+        { id: "archived_lora", workspace_id: "workspace_a", visibility: "private", created_by: "alice", enabled: false, mounted: true },
+        { id: "other_owner_lora", workspace_id: "workspace_a", visibility: "private", created_by: "bob", enabled: true, mounted: true },
+        { id: "legacy_active_lora", enabled: true }
+      ],
+      documents: []
+    });
+
+    expect(context.allowedAdapters).toEqual(["active_lora", "legacy_active_lora"]);
+    expect(context.agents.map((agent) => agent.id)).toEqual(["active_lora", "legacy_active_lora"]);
+  });
+
   it("fails closed for production real-mode runtime and auth configuration", () => {
     const previous = {
       NODE_ENV: process.env.NODE_ENV,
@@ -1139,6 +1157,124 @@ describe("runtime and catalog", () => {
     }
   });
 
+  it("allows only an agent owner to retry a pending runtime mount", async () => {
+    const previous = {
+      mode: process.env.TCAR_ENGINE_MODE,
+      url: process.env.TCAR_RUNTIME_API_URL,
+      key: process.env.TCAR_RUNTIME_API_KEY,
+      tokens: process.env.APP_API_TOKENS_JSON
+    };
+    const previousFetch = globalThis.fetch;
+    const realTmp = await fs.mkdtemp(path.join(os.tmpdir(), "tcar-chat-mount-"));
+    const calls = [];
+    let realApp;
+
+    process.env.TCAR_ENGINE_MODE = "real";
+    process.env.TCAR_RUNTIME_API_URL = "http://gpu-runtime.internal:9000";
+    process.env.TCAR_RUNTIME_API_KEY = "test-runtime-secret";
+    process.env.APP_API_TOKENS_JSON = JSON.stringify({
+      token_alice: { user_id: "alice", workspace_id: "workspace_a", role: "user" },
+      token_bob: { user_id: "bob", workspace_id: "workspace_a", role: "user" }
+    });
+    globalThis.fetch = async (url, options = {}) => {
+      calls.push({ method: options.method || "GET", pathName: new URL(url).pathname });
+      expect(options.headers["X-TCAR-API-Key"]).toBe("test-runtime-secret");
+      return new Response(JSON.stringify({
+        ok: true,
+        status: "mounted",
+        mounted: true,
+        requires_vllm_reload: false,
+        agent: {
+          id: "alice_pending_lora",
+          title: "Alice pending route",
+          capability: "Uses Alice-approved rules.",
+          boundary: "Private to Alice.",
+          enabled: true,
+          mounted: true,
+          requires_vllm_reload: false,
+          adapter_path: "/private/runtime/path"
+        },
+        vllm_dynamic_lora: { ok: true }
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    };
+
+    try {
+      realApp = await createApp({
+        dbPath: path.join(realTmp, "db.json"),
+        uploadRoot: realTmp
+      });
+      await realApp.locals.store.mutate((data) => {
+        data.agents.push({
+          id: "alice_pending_lora",
+          title: "Alice pending route",
+          capability: "Uses Alice-approved rules.",
+          boundary: "Private to Alice.",
+          workspace_id: "workspace_a",
+          visibility: "private",
+          created_by: "alice",
+          enabled: true,
+          mounted: false,
+          requires_vllm_reload: true
+        });
+        return data.agents.length;
+      });
+
+      await request(realApp)
+        .post("/api/agents/alice_pending_lora/mount")
+        .set("Authorization", "Bearer token_bob")
+        .send({})
+        .expect(404);
+      expect(calls).toHaveLength(0);
+
+      const mounted = await request(realApp)
+        .post("/api/agents/alice_pending_lora/mount")
+        .set("Authorization", "Bearer token_alice")
+        .send({})
+        .expect(200);
+      expect(mounted.body).toMatchObject({
+        ok: true,
+        status: "mounted",
+        id: "alice_pending_lora",
+        mounted: true,
+        requires_vllm_reload: false,
+        agent: {
+          id: "alice_pending_lora",
+          workspace_id: "workspace_a",
+          visibility: "private",
+          created_by: "alice",
+          mounted: true,
+          requires_vllm_reload: false
+        }
+      });
+      expect(mounted.body.runtime).toBeUndefined();
+      expect(mounted.body.agent.adapter_path).toBeUndefined();
+      expect(calls).toEqual([{ method: "POST", pathName: "/agents/alice_pending_lora/mount" }]);
+
+      const stored = realApp.locals.store.read().agents.find((agent) => agent.id === "alice_pending_lora");
+      expect(stored).toMatchObject({
+        workspace_id: "workspace_a",
+        visibility: "private",
+        created_by: "alice",
+        mounted: true,
+        requires_vllm_reload: false
+      });
+    } finally {
+      await realApp?.locals?.drainBackgroundTasks?.({ timeoutMs: 5000 });
+      await realApp?.locals?.store?.close?.();
+      globalThis.fetch = previousFetch;
+      for (const [name, value] of Object.entries({
+        TCAR_ENGINE_MODE: previous.mode,
+        TCAR_RUNTIME_API_URL: previous.url,
+        TCAR_RUNTIME_API_KEY: previous.key,
+        APP_API_TOKENS_JSON: previous.tokens
+      })) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+      await fs.rm(realTmp, { recursive: true, force: true });
+    }
+  });
+
   it("redacts runtime agent internals from non-admin catalog readers", async () => {
     const previous = {
       APP_API_TOKENS_JSON: process.env.APP_API_TOKENS_JSON,
@@ -1593,6 +1729,12 @@ describe("chat execution", () => {
           source_text: "The private 2026 target is 42 units."
         })
         .expect(201);
+      await app.locals.store.mutate((data) => {
+        const agent = data.agents.find((item) => item.id === "private_numbers_lora");
+        agent.mounted = true;
+        agent.requires_vllm_reload = false;
+        return agent;
+      });
       const session = await request(app)
         .post("/api/chat/sessions")
         .set("Authorization", "Bearer explicit_user_token")
@@ -2388,6 +2530,12 @@ describe("documents and sources", () => {
       .expect(201);
 
     expect(upload.body.status).toBe("indexed");
+    await app.locals.store.mutate((data) => {
+      const agent = data.agents.find((item) => item.id === upload.body.agent_id);
+      agent.mounted = true;
+      agent.requires_vllm_reload = false;
+      return agent;
+    });
     const search = await request(app)
       .post(`/api/documents/${upload.body.document_id}/search`)
       .send({ query: "rank-nullity dim(V)=8 nullity 3", top_k: 2 })
@@ -2535,6 +2683,12 @@ describe("documents and sources", () => {
       expect(upload.body.adapter_path).toBeUndefined();
       expect(upload.body.skill_path).toBeUndefined();
       expect(upload.body.runtime).toBeUndefined();
+      await app.locals.store.mutate((data) => {
+        const agent = data.agents.find((item) => item.id === upload.body.agent_id);
+        agent.mounted = true;
+        agent.requires_vllm_reload = false;
+        return agent;
+      });
 
       const userDocuments = await request(app)
         .get("/api/documents")

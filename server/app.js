@@ -30,6 +30,7 @@ import {
   fetchRuntimeAgents,
   fetchRuntimeHealth,
   fetchRuntimeModels,
+  mountRuntimeAgent,
   realRuntimeEnabled,
   registerRuntimeAgent,
   registerRuntimeDocument,
@@ -499,7 +500,7 @@ export async function createApp({
         policy_violation_count: data.runSteps
           .filter((step) => step.adapter === agent.id)
           .reduce((total, step) => total + (step.policy_violations?.length || 0), 0),
-        last_validation_status: agent.enabled === false ? "archived" : "valid",
+        last_validation_status: agent.mount_pending ? "pending_mount" : agent.enabled === false ? "archived" : "valid",
         last_edited_by: agent.last_edited_by || "system",
         last_edited_at: agent.last_edited_at || null
       }))
@@ -670,6 +671,60 @@ export async function createApp({
         return agent;
       });
       res.json(redactAgentForRequest(updated, req));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/agents/:agent_id/mount", async (req, res, next) => {
+    try {
+      const localAgent = store.read().agents.find((item) => item.id === req.params.agent_id);
+      assertAgentMutationAccess(localAgent, req);
+      if (localAgent?.enabled === false) {
+        throwStatus(409, "Archived agents cannot be mounted.");
+      }
+      if (!realRuntimeEnabled()) {
+        throwStatus(409, "Agent mounting requires the real TCAR runtime.");
+      }
+
+      const runtimeResult = await mountRuntimeAgent(req.params.agent_id);
+      const runtimeAgent = runtimeResult.agent || { id: req.params.agent_id };
+      const mounted = runtimeResult.mounted ?? runtimeAgent.mounted ?? false;
+      const requiresReload = Boolean(
+        runtimeResult.requires_vllm_reload ?? runtimeAgent.requires_vllm_reload ?? !mounted
+      );
+      const updated = await store.mutate((data) => {
+        const existing = data.agents.find((item) => item.id === req.params.agent_id);
+        const ownership = existing ? {
+          workspace_id: existing.workspace_id,
+          visibility: existing.visibility,
+          created_by: existing.created_by
+        } : {};
+        if (existing) {
+          Object.assign(existing, runtimeAgent, ownership, {
+            mounted,
+            requires_vllm_reload: requiresReload
+          });
+          return existing;
+        }
+        const created = {
+          ...runtimeAgent,
+          mounted,
+          requires_vllm_reload: requiresReload
+        };
+        data.agents.push(created);
+        return created;
+      });
+
+      res.json(redactAgentRegistrationForRequest({
+        ok: runtimeResult.ok !== false,
+        status: runtimeResult.status || "mounted",
+        id: req.params.agent_id,
+        agent: redactAgentForRequest(updated, req),
+        mounted,
+        requires_vllm_reload: requiresReload,
+        runtime: runtimeResult
+      }, req));
     } catch (error) {
       next(error);
     }
@@ -1494,6 +1549,7 @@ function mergeRuntimeAgentMetadata(agent, localById) {
     workspace_id: local.workspace_id,
     visibility: local.visibility,
     created_by: local.created_by,
+    enabled: agent.mount_pending ? local.enabled !== false : agent.enabled ?? local.enabled,
     mounted: agent.mounted ?? local.mounted,
     requires_vllm_reload: agent.requires_vllm_reload ?? local.requires_vllm_reload,
     runtime_only: false
@@ -2135,9 +2191,9 @@ function normalizeAgentPayload(body) {
     title: cleanTitle(body.title),
     capability: String(body.capability).trim(),
     boundary: String(body.boundary).trim(),
-    consumes: splitList(body.consumes),
-    produces: splitList(body.produces),
-    routing_cues: splitList(body.routing_cues),
+    consumes: splitList(body.consumes).length ? splitList(body.consumes) : ["user_request"],
+    produces: splitList(body.produces).length ? splitList(body.produces) : ["domain_outputs"],
+    routing_cues: splitList(body.routing_cues).length ? splitList(body.routing_cues) : [cleanTitle(body.title)],
     resources: splitList(body.resources),
     tools: splitList(body.tools),
     sources: splitList(body.sources),
@@ -2165,6 +2221,9 @@ function normalizeAgentPatchPayload(body = {}) {
     }
     if (["consumes", "produces", "routing_cues", "resources", "sources", "tools"].includes(key)) {
       patch[key] = splitList(body[key]);
+      if (["consumes", "produces", "routing_cues"].includes(key) && patch[key].length === 0) {
+        throwStatus(400, `${key} must contain at least one value.`);
+      }
       if (key === "sources") {
         for (const sourcePath of patch[key]) {
           assertSafeSourcePath(sourcePath);

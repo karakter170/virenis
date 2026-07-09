@@ -2048,6 +2048,7 @@ Optional services:
 - Source citations for document routes.
 - Agent catalog read-only.
 - Document upload and document agent creation.
+- Verified dynamic agent mount/unmount without restarting vLLM.
 - Basic admin health page.
 
 ### Should Have
@@ -2064,7 +2065,6 @@ Optional services:
 
 - Team workspaces.
 - Agent versioning.
-- Dynamic LoRA loading without vLLM restart.
 - Tool runner marketplace.
 - Human approval gates.
 - Evaluation datasets and benchmark dashboard.
@@ -2074,7 +2074,7 @@ Optional services:
 
 - Dummy LoRAs are zero-effect route identities, not trained experts.
 - Agent expertise comes from skills, sources, tools, and base-model behavior.
-- New LoRA route availability depends on vLLM mounting or dynamic loading support.
+- Failed or capacity-constrained mounts remain pending and non-routable until automatic reconciliation or an owner retry succeeds.
 - Session memory is persisted and consumed by routing/execution; durable cross-session user-profile memory is not implemented.
 - Hybrid document retrieval requires a configured OpenAI-compatible embedding endpoint. Without one it falls back to lexical ranking, and scanned PDFs still require external OCR.
 - Citation verification is deliberately fail-closed but uses deterministic claim/evidence checks, not a full natural-language entailment model.

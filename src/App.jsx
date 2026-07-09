@@ -129,6 +129,7 @@ export default function App() {
   });
   const [uploadOpen, setUploadOpen] = useState(false);
   const [agentEditor, setAgentEditor] = useState(null);
+  const [mountingAgentId, setMountingAgentId] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
   const threadRef = useRef(null);
@@ -343,6 +344,19 @@ export default function App() {
     }
   }
 
+  async function retryMountAgent(agent) {
+    try {
+      setError("");
+      setMountingAgentId(agent.id);
+      await api.post(`/api/agents/${encodeURIComponent(agent.id)}/mount`, {});
+      await refreshSidebar();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setMountingAgentId("");
+    }
+  }
+
   const statusText = useMemo(() => {
     if (!activeRun) return "Ready";
     if (activeRun.status === "queued") return "Queued";
@@ -501,6 +515,8 @@ export default function App() {
             onCreateAgent={() => setAgentEditor({ mode: "create", agent: null })}
             onEditAgent={(agent) => setAgentEditor({ mode: "edit", agent })}
             onArchiveAgent={archiveAgent}
+            onMountAgent={retryMountAgent}
+            mountingAgentId={mountingAgentId}
             onCreateDocument={() => setUploadOpen(true)}
             onRefresh={refreshSidebar}
             onClose={() => setShowInspector(false)}
@@ -702,7 +718,7 @@ function MessageBubble({ message }) {
   );
 }
 
-function GraphPanel({ run, events, routes, sources, agents, documents, runtime, metrics, auth, onCreateAgent, onEditAgent, onArchiveAgent, onCreateDocument, onRefresh, onClose }) {
+function GraphPanel({ run, events, routes, sources, agents, documents, runtime, metrics, auth, onCreateAgent, onEditAgent, onArchiveAgent, onMountAgent, mountingAgentId, onCreateDocument, onRefresh, onClose }) {
   const [nodePositions, setNodePositions] = useState({});
   const [hoveredNodeId, setHoveredNodeId] = useState(null);
   const [selectedNodeId, setSelectedNodeId] = useState(null);
@@ -800,7 +816,14 @@ function GraphPanel({ run, events, routes, sources, agents, documents, runtime, 
               <span>Document</span>
             </button>
           </div>
-          <AgentCatalog agents={agents} auth={auth} onEdit={onEditAgent} onArchive={onArchiveAgent} />
+          <AgentCatalog
+            agents={agents}
+            auth={auth}
+            onEdit={onEditAgent}
+            onArchive={onArchiveAgent}
+            onMount={onMountAgent}
+            mountingAgentId={mountingAgentId}
+          />
         </div>
       )}
 
@@ -826,7 +849,7 @@ function GraphPanel({ run, events, routes, sources, agents, documents, runtime, 
   );
 }
 
-function AgentCatalog({ agents, auth, onEdit, onArchive }) {
+function AgentCatalog({ agents, auth, onEdit, onArchive, onMount, mountingAgentId }) {
   const [query, setQuery] = useState("");
   const canManage = (agent) => auth?.is_admin || (!auth?.is_viewer &&
     agent.visibility === "private" &&
@@ -853,7 +876,8 @@ function AgentCatalog({ agents, auth, onEdit, onArchive }) {
       <div className="catalog-list">
         {ordered.map((agent) => {
           const manageable = canManage(agent);
-          const archived = agent.enabled === false;
+          const archived = agent.enabled === false && agent.mount_pending !== true;
+          const pending = !archived && (agent.mount_pending === true || agent.mounted === false);
           return (
             <div className="catalog-row" key={agent.id}>
               <i className={`catalog-status ${archived ? "archived" : agent.mounted === false ? "pending" : "mounted"}`} />
@@ -864,6 +888,18 @@ function AgentCatalog({ agents, auth, onEdit, onArchive }) {
               </div>
               {manageable && (
                 <div className="catalog-actions">
+                  {pending && (
+                    <button
+                      type="button"
+                      className="catalog-icon"
+                      title={`Retry mounting ${agent.title || agent.id}`}
+                      aria-label={`Retry mounting ${agent.title || agent.id}`}
+                      onClick={() => onMount(agent)}
+                      disabled={mountingAgentId === agent.id}
+                    >
+                      <RefreshCcw className={mountingAgentId === agent.id ? "spin" : ""} size={15} />
+                    </button>
+                  )}
                   <button
                     type="button"
                     className="catalog-icon"

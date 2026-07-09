@@ -169,7 +169,11 @@ function agentMetadataScore(agent, lowerQuery) {
 }
 
 export function scopedRoutingContext({ session, agents = [], documents = [] }) {
-  const visibleAgents = agents.filter((agent) => resourceVisibleToSession(agent, session));
+  const visibleAgents = agents.filter((agent) =>
+    agent.enabled !== false &&
+    agent.mounted !== false &&
+    resourceVisibleToSession(agent, session)
+  );
   const visibleDocuments = documents.filter((document) => resourceVisibleToSession(document, session));
   const allowedAdapters = [...new Set(visibleAgents.map((agent) => agent.id).filter(Boolean))];
   return {

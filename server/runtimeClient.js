@@ -221,6 +221,13 @@ export function updateRuntimeAgent(agentId, patch) {
   });
 }
 
+export function mountRuntimeAgent(agentId) {
+  return runtimeRequest(`/agents/${encodeURIComponent(agentId)}/mount`, {
+    method: "POST",
+    timeoutMs: Number(process.env.TCAR_RUNTIME_ADMIN_TIMEOUT_MS || 180000)
+  });
+}
+
 export function archiveRuntimeAgent(agentId) {
   return runtimeRequest(`/agents/${encodeURIComponent(agentId)}`, {
     method: "DELETE",
