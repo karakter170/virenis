@@ -3,13 +3,18 @@ import {
   AlertTriangle,
   Archive,
   Bot,
+  Boxes,
   CheckCircle2,
   Clipboard,
   Copy,
+  Cpu,
   Download,
+  Eye,
   FilePlus,
   FileText,
+  KeyRound,
   Loader2,
+  LockKeyhole,
   MessageSquarePlus,
   Network,
   PanelRightOpen,
@@ -17,9 +22,14 @@ import {
   Plus,
   RefreshCcw,
   Route,
+  Search,
   Send,
   ShieldCheck,
-  Upload
+  Sparkles,
+  Upload,
+  UserRound,
+  Workflow,
+  X
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
@@ -53,6 +63,27 @@ const api = {
     return parseResponse(response);
   }
 };
+
+const PROMPT_PRESETS = [
+  {
+    icon: ShieldCheck,
+    title: "Review an AI architecture",
+    meta: "Software + security",
+    prompt: "Review the software architecture and security boundaries for a web backend that connects to a private vLLM deployment."
+  },
+  {
+    icon: FileText,
+    title: "Synthesize source evidence",
+    meta: "Research + writing",
+    prompt: "Summarize the available source evidence, identify uncertainty, and produce a concise executive brief."
+  },
+  {
+    icon: Workflow,
+    title: "Plan a product rollout",
+    meta: "Strategy + planning",
+    prompt: "Create a practical product rollout plan with milestones, owners, risks, and measurable launch checks."
+  }
+];
 
 function emptyMetrics() {
   return {
@@ -114,6 +145,7 @@ export default function App() {
 
   const selectedSources = activeRun?.sources || [];
   const selectedRoutes = activeRun?.expert_outputs || [];
+  const canWrite = Boolean(auth && !auth.is_viewer);
 
   async function bootstrap() {
     try {
@@ -132,11 +164,16 @@ export default function App() {
       setDocuments(docList.documents);
       setMetrics(metricData);
       let nextSession = sessionList.sessions[0];
-      if (!nextSession) {
+      if (!nextSession && !me.is_viewer) {
         nextSession = await api.post("/api/chat/sessions", { title: "New chat", visibility: "private" });
       }
-      setSessions(sessionList.sessions.length ? sessionList.sessions : [nextSession]);
-      await openSession(nextSession.session_id);
+      setSessions(sessionList.sessions.length ? sessionList.sessions : nextSession ? [nextSession] : []);
+      if (nextSession) {
+        await openSession(nextSession.session_id);
+      } else {
+        setSession(null);
+        setMessages([]);
+      }
     } catch (err) {
       setError(err.message);
     } finally {
@@ -175,6 +212,7 @@ export default function App() {
   }
 
   async function newChat() {
+    if (!canWrite) return;
     try {
       const created = await api.post("/api/chat/sessions", { title: "New chat", visibility: "private" });
       await refreshSidebar();
@@ -187,7 +225,7 @@ export default function App() {
   async function sendMessage(event) {
     event?.preventDefault();
     const content = draft.trim();
-    if (!content || !session) return;
+    if (!content || !session || !canWrite) return;
     setDraft("");
     setError("");
     const optimistic = {
@@ -202,11 +240,7 @@ export default function App() {
         content,
         attachments: [],
         options: {
-          show_route_details: true,
-          planner_mode: "tcandon",
-          max_routing_adapters: 12,
-          parallel_workers: 2,
-          temperature: 0
+          show_route_details: true
         }
       });
       subscribeRun(queued.run_id);
@@ -245,6 +279,7 @@ export default function App() {
   }
 
   async function regenerate() {
+    if (!canWrite) return;
     const lastUser = [...messages].reverse().find((message) => message.role === "user");
     if (lastUser) {
       setDraft(lastUser.content);
@@ -318,6 +353,11 @@ export default function App() {
     return "Running selected routes";
   }, [activeRun]);
 
+  function usePrompt(prompt) {
+    if (!canWrite) return;
+    setDraft(prompt);
+  }
+
   return (
     <div className={`app-shell ${showInspector ? "" : "inspector-closed"}`}>
       <aside className="sidebar" aria-label="Conversations">
@@ -325,11 +365,12 @@ export default function App() {
           <div className="brand-mark"><Route size={22} /></div>
           <div>
             <strong>TCAR Chat</strong>
-            <span>Route-aware workspace</span>
+            <span>Agent orchestration</span>
           </div>
+          <i className={`brand-signal ${runtime?.ok === false ? "offline" : ""}`} aria-hidden="true" />
         </div>
 
-        <button className="primary-action" onClick={newChat}>
+        <button className="primary-action" onClick={newChat} disabled={!canWrite} title={canWrite ? "Create a private conversation" : "Viewer role is read-only"}>
           <MessageSquarePlus size={17} />
           New chat
         </button>
@@ -351,11 +392,9 @@ export default function App() {
           </div>
         </div>
 
-        <div className="feature-stack" aria-label="System status">
-          <Feature icon={<Network size={16} />} label={`${agents.length || 0} route identities`} />
-          <Feature icon={<FileText size={16} />} label={`${documents.length || 0} document agents`} />
-          <Feature icon={<ShieldCheck size={16} />} label={runtime?.vllm?.models_endpoint_ok === false ? "GPU runtime degraded" : "GPU runtime ready"} />
-          <Feature icon={<Activity size={16} />} label={metrics?.admin_available === false ? "Metrics gated" : `${metrics?.total_runs ?? 0} completed runs`} />
+        <div className="sidebar-footer">
+          <SystemFabric agents={agents} documents={documents} runtime={runtime} metrics={metrics} />
+          <AccessProfile auth={auth} />
         </div>
       </aside>
 
@@ -363,9 +402,14 @@ export default function App() {
         <header className="topbar">
           <div>
             <div className="eyebrow">Active chat workspace</div>
-            <h1>{session?.title || "TCAR Agent Router Chat"}</h1>
+            <h1 title={session?.title || "TCAR Agent Router Chat"}>{session?.title || "TCAR Agent Router Chat"}</h1>
+            <div className="session-meta">
+              <span><LockKeyhole size={12} />{session?.visibility === "team" ? "Team" : session?.visibility === "global" ? "Global" : "Private"} session</span>
+              <span>{messages.length} messages</span>
+            </div>
           </div>
           <div className="topbar-actions">
+            <RoleBadge auth={auth} compact />
             <StatusPill status={activeRun?.status} label={statusText} />
             <button className="icon-button" title="Copy latest answer" onClick={copyAnswer}>
               <Copy size={18} />
@@ -373,10 +417,10 @@ export default function App() {
             <button className="icon-button" title="Export markdown" onClick={exportMarkdown}>
               <Download size={18} />
             </button>
-            <button className="icon-button" title="Flag response" onClick={flagResponse}>
+            <button className="icon-button" title={canWrite ? "Flag response" : "Viewer role is read-only"} onClick={flagResponse} disabled={!canWrite}>
               <AlertTriangle size={18} />
             </button>
-            <button className="icon-button" title="Regenerate from latest user message" onClick={regenerate}>
+            <button className="icon-button" title={canWrite ? "Regenerate from latest user message" : "Viewer role is read-only"} onClick={regenerate} disabled={!canWrite}>
               <RefreshCcw size={18} />
             </button>
             <button className="icon-button" title="Toggle inspector" onClick={() => setShowInspector((value) => !value)}>
@@ -395,9 +439,12 @@ export default function App() {
         <section className="message-thread" ref={threadRef} aria-live="polite">
           {loading && <EmptyState title="Loading workspace" text="Preparing sessions, agents, documents, and runtime health." />}
           {!loading && messages.length === 0 && (
-            <EmptyState
-              title="Ask one question. TCAR will route it."
-              text="Try: Review a clinic patient newsletter signup flow for consent and patient privacy, suggest health-safe wording, and draft a customer support FAQ."
+            <WorkspaceEmptyState
+              auth={auth}
+              agents={agents}
+              documents={documents}
+              runtime={runtime}
+              onPrompt={usePrompt}
             />
           )}
           {messages.map((message) => (
@@ -412,7 +459,11 @@ export default function App() {
         </section>
 
         <form className="composer" onSubmit={sendMessage}>
-          <button type="button" className="icon-button" title="Upload document" onClick={() => setUploadOpen(true)}>
+          <div className="composer-context">
+            <span><ShieldCheck size={13} />Server-secured</span>
+            <span><Boxes size={13} />{agents.length} routes available</span>
+          </div>
+          <button type="button" className="icon-button" title={canWrite ? "Upload document" : "Viewer role is read-only"} onClick={() => setUploadOpen(true)} disabled={!canWrite}>
             <Upload size={18} />
           </button>
           <textarea
@@ -424,11 +475,12 @@ export default function App() {
                 sendMessage(event);
               }
             }}
-            placeholder="Message TCAR Agent Router Chat..."
+            placeholder={canWrite ? "Ask TCAR anything..." : "Viewer access is read-only"}
             rows={1}
             maxLength={12000}
+            disabled={!canWrite}
           />
-          <button className="send-button" type="submit" disabled={!draft.trim()}>
+          <button className="send-button" type="submit" disabled={!draft.trim() || !canWrite} title="Send message">
             <Send size={18} />
           </button>
         </form>
@@ -451,6 +503,7 @@ export default function App() {
             onArchiveAgent={archiveAgent}
             onCreateDocument={() => setUploadOpen(true)}
             onRefresh={refreshSidebar}
+            onClose={() => setShowInspector(false)}
           />
         </aside>
       )}
@@ -480,12 +533,98 @@ export default function App() {
   );
 }
 
-function Feature({ icon, label }) {
+function SystemFabric({ agents, documents, runtime, metrics }) {
+  const simulator = String(runtime?.vllm?.mode || "").toLowerCase().includes("simulator");
+  const runtimeReady = runtime?.ok !== false && (simulator || runtime?.vllm?.models_endpoint_ok !== false);
+  const metricValue = metrics?.admin_available === false ? "Gated" : String(metrics?.total_runs ?? 0);
   return (
-    <div className="feature-row">
-      {icon}
+    <section className="system-fabric" aria-label="System fabric">
+      <div className="section-label">System fabric</div>
+      <div className="fabric-grid">
+        <SystemSignal icon={<Network size={15} />} label="Routes" value={agents.length} tone="green" />
+        <SystemSignal icon={<FileText size={15} />} label="Docs" value={documents.length} tone="amber" />
+        <SystemSignal icon={<Cpu size={15} />} label="Runtime" value={runtimeReady ? "Ready" : "Degraded"} tone={runtimeReady ? "cyan" : "danger"} />
+        <SystemSignal icon={<Activity size={15} />} label="Runs" value={metricValue} tone="coral" />
+      </div>
+    </section>
+  );
+}
+
+function SystemSignal({ icon, label, value, tone }) {
+  return (
+    <div className={`system-signal ${tone}`}>
+      <span className="signal-icon">{icon}</span>
       <span>{label}</span>
+      <strong>{value}</strong>
     </div>
+  );
+}
+
+function roleDetails(auth) {
+  if (auth?.is_admin) {
+    return {
+      label: "Admin",
+      scope: "Workspace control",
+      icon: ShieldCheck,
+      permissions: ["Agents", "Validation", "Metrics"]
+    };
+  }
+  if (auth?.is_viewer) {
+    return {
+      label: "Viewer",
+      scope: "Read-only access",
+      icon: Eye,
+      permissions: ["Chats", "Runs", "Sources"]
+    };
+  }
+  return {
+    label: "User",
+    scope: "Private workspace",
+    icon: UserRound,
+    permissions: ["Chat", "Private agents", "Documents"]
+  };
+}
+
+function RoleBadge({ auth, compact = false }) {
+  const details = roleDetails(auth);
+  const Icon = details.icon;
+  return (
+    <div className={`role-badge ${compact ? "compact" : ""}`} title={`${details.label}: ${details.scope}`}>
+      <Icon size={compact ? 14 : 16} />
+      <span>{details.label}</span>
+    </div>
+  );
+}
+
+function AccessProfile({ auth }) {
+  const details = roleDetails(auth);
+  const Icon = details.icon;
+  const initials = String(auth?.user_id || "local user")
+    .split(/[^a-z0-9]+/i)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((part) => part[0])
+    .join("")
+    .toUpperCase();
+  return (
+    <section className="access-profile" aria-label="Authentication and role">
+      <div className="access-head">
+        <div className="access-avatar">{initials || <Icon size={16} />}</div>
+        <div>
+          <strong>{auth?.user_id || "Local user"}</strong>
+          <span>{details.scope}</span>
+        </div>
+        <RoleBadge auth={auth} compact />
+      </div>
+      <div className="permission-row" aria-label={`${details.label} permissions`}>
+        {details.permissions.map((permission) => <span key={permission}>{permission}</span>)}
+      </div>
+      <div className="auth-method">
+        <KeyRound size={13} />
+        <span>{auth?.auth_type || "local session"}</span>
+        <small>{auth?.workspace_id || "workspace_default"}</small>
+      </div>
+    </section>
   );
 }
 
@@ -509,6 +648,48 @@ function EmptyState({ title, text }) {
   );
 }
 
+function WorkspaceEmptyState({ auth, agents, documents, runtime, onPrompt }) {
+  const runtimeReady = runtime?.ok !== false;
+  if (auth?.is_viewer) {
+    return (
+      <div className="empty-state viewer-empty">
+        <Eye size={28} />
+        <strong>No accessible conversation</strong>
+        <p>Viewer role: chats, runs, and sources.</p>
+      </div>
+    );
+  }
+  return (
+    <section className="workspace-empty" aria-label="Start a routed analysis">
+      <div className="orchestration-visual" aria-hidden="true">
+        <div className="visual-node request"><MessageSquarePlus size={18} /></div>
+        <i />
+        <div className="visual-node routes"><Network size={19} /></div>
+        <i />
+        <div className="visual-node synthesis"><Sparkles size={18} /></div>
+      </div>
+      <div className="empty-heading">
+        <span>Routed workspace</span>
+        <h2>Start a multi-agent analysis</h2>
+      </div>
+      <div className="empty-stats" aria-label="Available system resources">
+        <span><strong>{agents.length}</strong> specialists</span>
+        <span><strong>{documents.length}</strong> knowledge agents</span>
+        <span className={runtimeReady ? "ready" : "degraded"}><strong>{runtimeReady ? "Live" : "Check"}</strong> runtime</span>
+      </div>
+      <div className="prompt-grid">
+        {PROMPT_PRESETS.map(({ icon: Icon, title, meta, prompt }) => (
+          <button type="button" className="prompt-option" key={title} onClick={() => onPrompt(prompt)}>
+            <Icon size={17} />
+            <span><strong>{title}</strong><small>{meta}</small></span>
+            <span className="prompt-arrow">+</span>
+          </button>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 function MessageBubble({ message }) {
   return (
     <article className={`message ${message.role}`}>
@@ -521,9 +702,11 @@ function MessageBubble({ message }) {
   );
 }
 
-function GraphPanel({ run, events, routes, sources, agents, documents, runtime, metrics, auth, onCreateAgent, onEditAgent, onArchiveAgent, onCreateDocument, onRefresh }) {
+function GraphPanel({ run, events, routes, sources, agents, documents, runtime, metrics, auth, onCreateAgent, onEditAgent, onArchiveAgent, onCreateDocument, onRefresh, onClose }) {
   const [nodePositions, setNodePositions] = useState({});
   const [hoveredNodeId, setHoveredNodeId] = useState(null);
+  const [selectedNodeId, setSelectedNodeId] = useState(null);
+  const [activeView, setActiveView] = useState("graph");
   const [validation, setValidation] = useState(null);
   const latestEvent = events.at(-1);
   const baseGraph = useMemo(
@@ -548,92 +731,136 @@ function GraphPanel({ run, events, routes, sources, agents, documents, runtime, 
 
   return (
     <div className="panel-body graph-panel">
-      <PanelHeader
-        icon={<Network size={18} />}
-        title="Execution Graph"
-        subtitle={run ? `${graph.activeCount} active nodes · ${graph.edges.length} links` : `${agents.length} agents · ${documents.length} documents`}
-      />
-
-      <div className="graph-actions" aria-label="Graph actions">
-        <button className="graph-action" title={auth?.is_admin ? "Create agent" : "Create private agent"} onClick={onCreateAgent} disabled={!canWrite}>
-          <Plus size={18} />
-          <span>Agent</span>
-        </button>
-        <button className="graph-action" title="Register document agent" onClick={onCreateDocument} disabled={!canWrite}>
-          <FilePlus size={18} />
-          <span>Doc</span>
-        </button>
-        <button className="graph-action" title={auth?.is_admin ? "Run validation" : "Admin only"} onClick={runValidation} disabled={!auth?.is_admin}>
-          <Clipboard size={18} />
-          <span>Check</span>
+      <div className="inspector-heading">
+        <PanelHeader
+          icon={<Network size={18} />}
+          title="Execution fabric"
+          subtitle={run ? `${graph.activeCount} selected routes / ${graph.edges.length} connections` : `${agents.length} routes available / ${documents.length} knowledge agents`}
+        />
+        <button className="icon-button inspector-close" type="button" title="Close inspector" onClick={onClose}>
+          <X size={17} />
         </button>
       </div>
 
-      <AgentCatalog
-        agents={agents}
-        auth={auth}
-        onEdit={onEditAgent}
-        onArchive={onArchiveAgent}
-      />
-
-      <GraphCanvas
-        graph={graph}
-        hoveredNodeId={hoveredNodeId}
-        onHoverNode={setHoveredNodeId}
-        onMoveNode={(nodeId, position) => {
-          setNodePositions((current) => ({ ...current, [nodeId]: position }));
-        }}
-        metrics={metrics}
-        validation={validation}
-        latestEvent={latestEvent}
-      />
-
-      <div className="graph-legend">
-        <span><i className="legend-dot route" />active LoRA</span>
-        <span><i className="legend-dot agent" />available agent</span>
-        <span><i className="legend-dot document" />document</span>
-        <span><i className="legend-dot source" />source</span>
+      <div className="inspector-tabs" role="tablist" aria-label="Inspector views">
+        <button type="button" role="tab" aria-selected={activeView === "graph"} className={activeView === "graph" ? "active" : ""} onClick={() => setActiveView("graph")}>
+          <Workflow size={15} />Graph
+        </button>
+        <button type="button" role="tab" aria-selected={activeView === "agents"} className={activeView === "agents" ? "active" : ""} onClick={() => setActiveView("agents")}>
+          <Bot size={15} />Agents <span>{agents.length}</span>
+        </button>
+        <button type="button" role="tab" aria-selected={activeView === "ops"} className={activeView === "ops" ? "active" : ""} onClick={() => setActiveView("ops")}>
+          <Activity size={15} />Ops
+        </button>
       </div>
 
-      <OperationsPanel
-        run={run}
-        events={events}
-        latestEvent={latestEvent}
-        agents={agents}
-        documents={documents}
-        metrics={metrics}
-        runtime={runtime}
-        validation={validation}
-      />
+      {activeView === "graph" && (
+        <div className="inspector-view graph-view" role="tabpanel">
+          <div className="graph-toolbar">
+            <div className={`live-state ${run?.status || "ready"}`}>
+              <i />
+              <span>{run ? run.status : "Topology ready"}</span>
+            </div>
+            <span>{graph.layers} execution stages</span>
+            <button type="button" className="catalog-icon" title="Reset node positions" onClick={() => setNodePositions({})}>
+              <RefreshCcw size={14} />
+            </button>
+          </div>
+          <GraphCanvas
+            graph={graph}
+            hoveredNodeId={hoveredNodeId}
+            selectedNodeId={selectedNodeId}
+            onHoverNode={setHoveredNodeId}
+            onSelectNode={setSelectedNodeId}
+            onMoveNode={(nodeId, position) => {
+              setNodePositions((current) => ({ ...current, [nodeId]: position }));
+            }}
+            metrics={metrics}
+            validation={validation}
+            latestEvent={latestEvent}
+          />
+          <div className="graph-legend">
+            <span><i className="legend-dot route" />selected route</span>
+            <span><i className="legend-dot runtime" />GPU runtime</span>
+            <span><i className="legend-dot agent" />standby route</span>
+            <span><i className="legend-dot source" />knowledge</span>
+          </div>
+        </div>
+      )}
+
+      {activeView === "agents" && (
+        <div className="inspector-view" role="tabpanel">
+          <div className="graph-actions" aria-label="Agent actions">
+            <button className="graph-action" title={auth?.is_admin ? "Create agent" : "Create private agent"} onClick={onCreateAgent} disabled={!canWrite}>
+              <Plus size={18} />
+              <span>Agent</span>
+            </button>
+            <button className="graph-action" title="Register document agent" onClick={onCreateDocument} disabled={!canWrite}>
+              <FilePlus size={18} />
+              <span>Document</span>
+            </button>
+          </div>
+          <AgentCatalog agents={agents} auth={auth} onEdit={onEditAgent} onArchive={onArchiveAgent} />
+        </div>
+      )}
+
+      {activeView === "ops" && (
+        <div className="inspector-view" role="tabpanel">
+          <button className="validation-action" title={auth?.is_admin ? "Run validation" : "Admin only"} onClick={runValidation} disabled={!auth?.is_admin}>
+            <Clipboard size={16} />
+            <span>Run validation suite</span>
+          </button>
+          <OperationsPanel
+            run={run}
+            events={events}
+            latestEvent={latestEvent}
+            agents={agents}
+            documents={documents}
+            metrics={metrics}
+            runtime={runtime}
+            validation={validation}
+          />
+        </div>
+      )}
     </div>
   );
 }
 
 function AgentCatalog({ agents, auth, onEdit, onArchive }) {
+  const [query, setQuery] = useState("");
   const canManage = (agent) => auth?.is_admin || (!auth?.is_viewer &&
     agent.visibility === "private" &&
     agent.created_by === auth?.user_id &&
     agent.workspace_id === auth?.workspace_id
   );
-  const ordered = [...agents].sort((left, right) => {
+  const ordered = [...agents].filter((agent) => {
+    const searchText = `${agent.id} ${agent.title || ""} ${agent.capability || ""}`.toLowerCase();
+    return !query || searchText.includes(query.toLowerCase());
+  }).sort((left, right) => {
     const ownershipOrder = Number(canManage(right)) - Number(canManage(left));
     return ownershipOrder || String(left.title || left.id).localeCompare(String(right.title || right.id));
   });
   return (
     <section className="agent-catalog" aria-label="Agent catalog">
       <div className="catalog-heading">
-        <strong>Agent Catalog</strong>
-        <span>{agents.length}</span>
+        <strong>Route catalog</strong>
+        <span>{ordered.length} of {agents.length}</span>
       </div>
+      <label className="catalog-search">
+        <Search size={15} />
+        <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search routes" />
+      </label>
       <div className="catalog-list">
         {ordered.map((agent) => {
           const manageable = canManage(agent);
           const archived = agent.enabled === false;
           return (
             <div className="catalog-row" key={agent.id}>
+              <i className={`catalog-status ${archived ? "archived" : agent.mounted === false ? "pending" : "mounted"}`} />
               <div className="catalog-copy">
                 <strong>{agent.title || agent.id}</strong>
-                <span>{archived ? "Archived" : agent.visibility === "private" ? "Private" : agent.visibility === "team" ? "Team" : "Global"}</span>
+                <span>{agent.capability || agent.id}</span>
+                <small className={`visibility-chip ${agent.visibility || "global"}`}>{archived ? "Archived" : agent.visibility === "private" ? "Private" : agent.visibility === "team" ? "Team" : "Global"}</small>
               </div>
               {manageable && (
                 <div className="catalog-actions">
@@ -667,23 +894,28 @@ function AgentCatalog({ agents, auth, onEdit, onArchive }) {
   );
 }
 
-function GraphCanvas({ graph, hoveredNodeId, onHoverNode, onMoveNode, metrics, validation, latestEvent }) {
+const GRAPH_WIDTH = 420;
+const GRAPH_HEIGHT = 620;
+
+function GraphCanvas({ graph, hoveredNodeId, selectedNodeId, onHoverNode, onSelectNode, onMoveNode, metrics, validation, latestEvent }) {
   const svgRef = useRef(null);
   const [drag, setDrag] = useState(null);
-  const hoveredNode = hoveredNodeId ? graph.nodeMap.get(hoveredNodeId) : null;
+  const candidateNodeId = hoveredNodeId || selectedNodeId;
+  const activeNodeId = graph.nodeMap.has(candidateNodeId) ? candidateNodeId : null;
+  const activeNode = activeNodeId ? graph.nodeMap.get(activeNodeId) : null;
 
   function pointFromEvent(event) {
     const rect = svgRef.current.getBoundingClientRect();
     return {
-      x: ((event.clientX - rect.left) / rect.width) * 360,
-      y: ((event.clientY - rect.top) / rect.height) * 560
+      x: ((event.clientX - rect.left) / rect.width) * GRAPH_WIDTH,
+      y: ((event.clientY - rect.top) / rect.height) * GRAPH_HEIGHT
     };
   }
 
   function clampNode(node, position) {
     return {
-      x: Math.min(344 - node.r, Math.max(16 + node.r, position.x)),
-      y: Math.min(544 - node.r, Math.max(16 + node.r, position.y))
+      x: Math.min(GRAPH_WIDTH - 18 - node.r, Math.max(18 + node.r, position.x)),
+      y: Math.min(GRAPH_HEIGHT - 28 - node.r, Math.max(28 + node.r, position.y))
     };
   }
 
@@ -698,6 +930,7 @@ function GraphCanvas({ graph, hoveredNodeId, onHoverNode, onMoveNode, metrics, v
       offsetY: point.y - node.y
     });
     onHoverNode(node.id);
+    onSelectNode(node.id);
   }
 
   function moveDrag(event) {
@@ -732,30 +965,44 @@ function GraphCanvas({ graph, hoveredNodeId, onHoverNode, onMoveNode, metrics, v
   }
 
   return (
-    <div className="graph-canvas" role="img" aria-label="TCAR route graph">
+    <div className="graph-canvas" role="group" aria-label="TCAR route graph">
       <svg
         ref={svgRef}
-        viewBox="0 0 360 560"
+        viewBox={`0 0 ${GRAPH_WIDTH} ${GRAPH_HEIGHT}`}
         onPointerMove={moveDrag}
         onPointerUp={endDrag}
         onPointerCancel={endDrag}
       >
         <defs>
-          <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="3.5" orient="auto">
+          <pattern id="graph-grid" width="24" height="24" patternUnits="userSpaceOnUse">
+            <path d="M 24 0 L 0 0 0 24" className="graph-grid-line" />
+          </pattern>
+          <filter id="node-glow" x="-60%" y="-60%" width="220%" height="220%">
+            <feGaussianBlur stdDeviation="4" result="blur" />
+            <feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge>
+          </filter>
+          <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="3.5" orient="auto" markerUnits="strokeWidth">
             <path d="M0,0 L8,3.5 L0,7 Z" />
           </marker>
         </defs>
+        <rect className="graph-grid" width={GRAPH_WIDTH} height={GRAPH_HEIGHT} fill="url(#graph-grid)" />
+        <text className="graph-zone-label" x="22" y="32">REQUEST</text>
+        <text className="graph-zone-label" x="22" y="152">{graph.routeZoneLabel}</text>
+        {graph.standbyCount > 0 && <text className="graph-zone-label" x="22" y="555">STANDBY FABRIC</text>}
+        <line className="graph-lane" x1="20" y1="126" x2="400" y2="126" />
+        {graph.standbyCount > 0 && <line className="graph-lane" x1="20" y1="535" x2="400" y2="535" />}
         {graph.edges.map((edge, index) => {
           const source = graph.nodeMap.get(edge.source);
           const target = graph.nodeMap.get(edge.target);
           if (!source || !target) return null;
           const pathId = edgePathId(edge, index);
+          const connected = !activeNodeId || edge.source === activeNodeId || edge.target === activeNodeId;
           return (
             <path
               key={pathId}
               id={pathId}
-              className={`graph-edge ${edge.kind || ""}`}
-              d={`M ${source.x} ${source.y} L ${target.x} ${target.y}`}
+              className={`graph-edge ${edge.kind || ""} ${connected ? "connected" : "muted"}`}
+              d={graphEdgePath(source, target, edge.kind)}
               markerEnd={edge.directed ? "url(#arrow)" : undefined}
             />
           );
@@ -780,11 +1027,14 @@ function GraphCanvas({ graph, hoveredNodeId, onHoverNode, onMoveNode, metrics, v
         {graph.nodes.map((node) => (
           <g
             key={node.id}
-            className={`graph-node ${node.type} ${node.status || ""} ${graph.isActive && node.type === "route" ? "firing" : ""} ${drag?.nodeId === node.id ? "dragging" : ""}`}
-            tabIndex="0"
+            className={`graph-node ${node.type} ${node.status || ""} ${graph.isActive && node.type === "route" ? "firing" : ""} ${drag?.nodeId === node.id ? "dragging" : ""} ${activeNodeId === node.id ? "selected" : ""}`}
+            transform={`translate(${node.x} ${node.y})`}
+            tabIndex={0}
             role="button"
             aria-label={node.label}
+            aria-pressed={selectedNodeId === node.id}
             onPointerDown={(event) => startDrag(event, node)}
+            onClick={() => onSelectNode(selectedNodeId === node.id ? null : node.id)}
             onPointerEnter={() => onHoverNode(node.id)}
             onPointerLeave={() => {
               if (!drag) onHoverNode(null);
@@ -795,14 +1045,23 @@ function GraphCanvas({ graph, hoveredNodeId, onHoverNode, onMoveNode, metrics, v
             }}
             onKeyDown={(event) => nudgeNode(event, node)}
           >
-            <circle cx={node.x} cy={node.y} r={node.r} />
-            <text x={node.x} y={node.y + 3}>{node.shortLabel}</text>
+            <circle className="node-ring" r={node.r + 6} />
+            {node.type === "chat" || node.type === "runtime" ? (
+              <rect className="node-core" x={-node.r * 1.24} y={-node.r * 0.78} width={node.r * 2.48} height={node.r * 1.56} rx="10" />
+            ) : node.type === "document" || node.type === "source" ? (
+              <rect className="node-core" x={-node.r} y={-node.r} width={node.r * 2} height={node.r * 2} rx="7" />
+            ) : (
+              <circle className="node-core" r={node.r} />
+            )}
+            <text className="node-monogram" y="3">{node.shortLabel}</text>
+            <circle className="node-status" cx={node.r * 0.78} cy={-node.r * 0.72} r="3.5" />
+            {node.showLabel !== false && <text className="node-name" y={node.r + 18}>{node.displayLabel || node.label}</text>}
           </g>
         ))}
       </svg>
-      {hoveredNode && (
+      {activeNode && (
         <GraphNodePopover
-          node={hoveredNode}
+          node={activeNode}
           metrics={metrics}
           validation={validation}
           latestEvent={latestEvent}
@@ -810,6 +1069,16 @@ function GraphCanvas({ graph, hoveredNodeId, onHoverNode, onMoveNode, metrics, v
       )}
     </div>
   );
+}
+
+function graphEdgePath(source, target, kind) {
+  if (kind === "runtime") {
+    const midX = (source.x + target.x) / 2;
+    return `M ${source.x} ${source.y} C ${midX} ${source.y}, ${midX} ${target.y}, ${target.x} ${target.y}`;
+  }
+  const direction = target.y >= source.y ? 1 : -1;
+  const offset = Math.max(28, Math.abs(target.y - source.y) * 0.48) * direction;
+  return `M ${source.x} ${source.y} C ${source.x} ${source.y + offset}, ${target.x} ${target.y - offset}, ${target.x} ${target.y}`;
 }
 
 function OperationsPanel({ run, events, latestEvent, agents, documents, metrics, runtime, validation }) {
@@ -877,14 +1146,14 @@ function OperationsPanel({ run, events, latestEvent, agents, documents, metrics,
 function GraphNodePopover({ node, metrics, validation, latestEvent }) {
   const data = node.data || {};
   const style = {
-    left: `${(node.x / 360) * 100}%`,
-    top: `${(node.y / 560) * 100}%`
+    left: `${(node.x / GRAPH_WIDTH) * 100}%`,
+    top: `${(node.y / GRAPH_HEIGHT) * 100}%`
   };
   const edgeClass = [
-    node.x > 250 ? "near-right" : "",
-    node.x < 110 ? "near-left" : "",
-    node.y > 430 ? "near-bottom" : "",
-    node.y < 130 ? "near-top" : ""
+    node.x > GRAPH_WIDTH * 0.68 ? "near-right" : "",
+    node.x < GRAPH_WIDTH * 0.32 ? "near-left" : "",
+    node.y > GRAPH_HEIGHT * 0.72 ? "near-bottom" : "",
+    node.y < GRAPH_HEIGHT * 0.2 ? "near-top" : ""
   ].filter(Boolean).join(" ");
 
   return (
@@ -1002,125 +1271,193 @@ function buildGraphModel({ run, routes, sources, agents, documents, runtime }) {
     if (source !== target) edges.push({ source, target, kind, directed });
   };
 
-  addNode({
-    id: "chat",
-    type: "chat",
-    label: run?.status ? `Chat · ${run.status}` : "Chat",
-    shortLabel: "CHAT",
-    x: 180,
-    y: 178,
-    r: 38,
-    status: run?.status || "ready",
-    data: { run }
-  });
-
   const routeByStep = new Map(routes.map((route) => [route.step_id, route]));
   const planSteps = run?.plan?.steps || [];
   const activeAdapters = new Set(planSteps.map((step) => step.adapter));
-  const routeCount = Math.max(planSteps.length, 1);
+  const stepById = new Map(planSteps.map((step) => [step.id, step]));
+  const depthMemo = new Map();
+  const stepDepth = (step, visiting = new Set()) => {
+    if (depthMemo.has(step.id)) return depthMemo.get(step.id);
+    if (visiting.has(step.id) || !step.depends_on?.length) return 0;
+    const nextVisiting = new Set(visiting).add(step.id);
+    const depth = 1 + Math.max(...step.depends_on.map((id) => stepById.has(id) ? stepDepth(stepById.get(id), nextVisiting) : 0));
+    depthMemo.set(step.id, depth);
+    return depth;
+  };
+  const routeGroups = new Map();
+  for (const step of planSteps) {
+    const depth = stepDepth(step);
+    routeGroups.set(depth, [...(routeGroups.get(depth) || []), step]);
+  }
+  const maxDepth = Math.max(0, ...routeGroups.keys());
 
-  planSteps.forEach((step, index) => {
-    const angle = -Math.PI / 2 + (Math.PI * 2 * index) / routeCount;
-    const route = routeByStep.get(step.id);
-    const nodeId = `route:${step.id}`;
-    addNode({
-      id: nodeId,
-      type: "route",
-      label: step.adapter,
-      shortLabel: shortNodeLabel(step.adapter),
-      x: 180 + Math.cos(angle) * 118,
-      y: 178 + Math.sin(angle) * 118,
-      r: step.adapter === "writing_synthesis_lora" ? 31 : 28,
-      status: route?.status || (run?.status === "completed" ? "complete" : "running"),
-      data: { step, route }
-    });
+  addNode({
+    id: "chat",
+    type: "chat",
+    label: run?.status ? `Request / ${run.status}` : "Request",
+    displayLabel: "User request",
+    shortLabel: "IN",
+    x: 210,
+    y: 72,
+    r: 27,
+    status: run?.status || "ready",
+    data: { run }
   });
+  addNode({
+    id: "router",
+    type: "router",
+    label: "Cue router",
+    displayLabel: "Cue router",
+    shortLabel: "R",
+    x: 210,
+    y: 145,
+    r: 19,
+    status: planSteps.length ? "complete" : "ready",
+    data: { run }
+  });
+  addEdge("chat", "router", "activation", true);
+
+  for (const [depth, steps] of [...routeGroups.entries()].sort(([left], [right]) => left - right)) {
+    const y = 230 + (maxDepth ? (depth / maxDepth) * 190 : 0);
+    const spacing = steps.length > 1 ? 300 / (steps.length - 1) : 0;
+    steps.forEach((step, index) => {
+      const route = routeByStep.get(step.id);
+      const nodeId = `route:${step.id}`;
+      const x = steps.length === 1 ? 210 : 60 + spacing * index;
+      addNode({
+        id: nodeId,
+        type: "route",
+        label: step.adapter,
+        displayLabel: compactNodeLabel(step.adapter),
+        shortLabel: shortNodeLabel(step.adapter),
+        x,
+        y,
+        r: step.adapter === "writing_synthesis_lora" ? 27 : 23,
+        status: route?.status || (run?.status === "completed" ? "complete" : "running"),
+        data: { step, route }
+      });
+    });
+  }
 
   for (const step of planSteps) {
     const target = `route:${step.id}`;
     if (step.depends_on?.length) {
       for (const dep of step.depends_on) addEdge(`route:${dep}`, target, "dependency", true);
     } else {
-      addEdge("chat", target, "activation", true);
+      addEdge("router", target, "activation", true);
     }
   }
 
   const agentNodes = agents.filter((agent) => !activeAdapters.has(agent.id));
-  const agentCenter = { x: 180, y: 394 };
-  const agentRadiusX = 146;
-  const agentRadiusY = 102;
-  agentNodes.forEach((agent, index) => {
-    const angle = -Math.PI / 2 + (Math.PI * 2 * index) / Math.max(agentNodes.length, 1);
+  const visibleAgentLimit = planSteps.length ? 3 : 11;
+  const visibleAgents = agentNodes.slice(0, visibleAgentLimit);
+  visibleAgents.forEach((agent, index) => {
+    const columns = planSteps.length ? Math.max(visibleAgents.length, 1) : 3;
+    const x = planSteps.length ? 70 + index * 93 : 82 + (index % columns) * 128;
+    const y = planSteps.length ? 574 : 235 + Math.floor(index / columns) * 78;
     const nodeId = `agent:${agent.id}`;
     addNode({
       id: nodeId,
       type: "agent",
       label: agent.id,
+      displayLabel: compactNodeLabel(agent.id),
       shortLabel: shortNodeLabel(agent.id),
-      x: agentCenter.x + Math.cos(angle) * agentRadiusX,
-      y: agentCenter.y + Math.sin(angle) * agentRadiusY,
-      r: 17,
+      x,
+      y,
+      r: planSteps.length ? 14 : 17,
+      showLabel: !planSteps.length,
       status: agent.mounted ? "mounted" : "unmounted",
       data: { agent }
     });
-    addEdge("chat", nodeId, "catalog", false);
+    addEdge("router", nodeId, "catalog", false);
   });
 
-  documents.slice(0, 8).forEach((document, index) => {
-    const x = 48 + (index % 4) * 88;
-    const y = 520 + Math.floor(index / 4) * 30;
+  const remainingAgents = agentNodes.length - visibleAgents.length;
+  if (remainingAgents > 0) {
+    const index = visibleAgents.length;
+    const columns = planSteps.length ? 4 : 3;
+    const x = planSteps.length ? 70 + index * 93 : 82 + (index % columns) * 128;
+    const y = planSteps.length ? 574 : 235 + Math.floor(index / columns) * 78;
+    const aggregateId = "agent:remaining";
+    addNode({
+      id: aggregateId,
+      type: "agent",
+      label: `${remainingAgents} additional routes`,
+      displayLabel: `${remainingAgents} more routes`,
+      shortLabel: `+${remainingAgents}`,
+      x,
+      y,
+      r: planSteps.length ? 14 : 17,
+      showLabel: !planSteps.length,
+      status: "mounted",
+      data: { agent: { title: `${remainingAgents} additional mounted routes`, mounted: true, tools: [], sources: [] } }
+    });
+    addEdge("router", aggregateId, "catalog", false);
+  }
+
+  documents.slice(0, 4).forEach((document, index) => {
+    const x = 34;
+    const y = 210 + index * 66;
     const nodeId = `doc:${document.document_id}`;
     addNode({
       id: nodeId,
       type: "document",
       label: document.title,
+      displayLabel: compactNodeLabel(document.title),
       shortLabel: "DOC",
       x,
       y,
-      r: 18,
+      r: 14,
+      showLabel: false,
       data: { document }
     });
     const routeStep = planSteps.find((step) => step.adapter === document.agent_id);
     const agentNode = nodeMap.has(`route:${routeStep?.id}`) ? `route:${routeStep.id}` : `agent:${document.agent_id}`;
-    addEdge(nodeMap.has(agentNode) ? agentNode : "chat", nodeId, "source", false);
+    addEdge(nodeId, nodeMap.has(agentNode) ? agentNode : "router", "source", true);
   });
 
-  sources.slice(0, 6).forEach((source, index) => {
-    const x = 52 + index * 51;
-    const y = 38;
+  sources.slice(0, 4).forEach((source, index) => {
+    const x = 386;
+    const y = 210 + index * 66;
     const nodeId = `source:${source.citation_id || source.chunk_id || index}`;
     addNode({
       id: nodeId,
       type: "source",
       label: source.title || source.chunk_id,
+      displayLabel: compactNodeLabel(source.title || source.chunk_id),
       shortLabel: "SRC",
       x,
       y,
-      r: 15,
+      r: 13,
+      showLabel: false,
       data: { source }
     });
     const routeStep = planSteps.find((step) => step.id === source.step_id || step.adapter === source.agent_id);
-    addEdge(nodeMap.has(`route:${routeStep?.id}`) ? `route:${routeStep.id}` : "chat", nodeId, "source", false);
+    addEdge(nodeId, nodeMap.has(`route:${routeStep?.id}`) ? `route:${routeStep.id}` : "router", "source", true);
   });
 
   addNode({
     id: "runtime",
     type: "runtime",
     label: runtime?.vllm?.base_model || "Runtime",
-    shortLabel: "RT",
-    x: 316,
-    y: 178,
-    r: 18,
+    displayLabel: "GPU runtime",
+    shortLabel: "GPU",
+    x: 64,
+    y: 72,
+    r: 21,
     status: runtime?.ok ? "ready" : "failed",
     data: { runtime }
   });
-  addEdge("runtime", "chat", "runtime", false);
+  addEdge("runtime", "router", "runtime", false);
 
   return {
     nodes,
     edges: edges.filter((edge) => nodeMap.has(edge.source) && nodeMap.has(edge.target)),
     nodeMap,
     activeCount: planSteps.length,
+    layers: planSteps.length ? maxDepth + 2 : 1,
+    routeZoneLabel: planSteps.length ? "ACTIVE ROUTE DAG" : "AVAILABLE ROUTES",
+    standbyCount: planSteps.length ? agentNodes.length : 0,
     isActive: Boolean(run && !["completed", "failed"].includes(run.status))
   };
 }
@@ -1137,6 +1474,14 @@ function shortNodeLabel(label) {
     .join("")
     .slice(0, 4)
     .toUpperCase();
+}
+
+function compactNodeLabel(label) {
+  const normalized = String(label || "")
+    .replace(/_lora$/, "")
+    .replace(/_/g, " ")
+    .replace(/\b\w/g, (letter) => letter.toUpperCase());
+  return normalized.length > 20 ? `${normalized.slice(0, 19)}...` : normalized;
 }
 
 function PanelHeader({ icon, title, subtitle }) {
