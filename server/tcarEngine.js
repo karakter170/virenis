@@ -1,8 +1,12 @@
 import { approvedSourceSnippets, BASE_MODEL, DEFAULT_VLLM_BASE_URL } from "./catalog.js";
 import { makeId, nowIso } from "./store.js";
 import { scoreChunks } from "./documents.js";
+import { executeRuntimeChat, realRuntimeEnabled } from "./runtimeClient.js";
 
 const MAX_MESSAGE_CHARS = 12000;
+const DEFAULT_MEMORY_ENTRIES = 40;
+const DEFAULT_MEMORY_ENTRY_CHARS = 2000;
+const DEFAULT_MEMORY_TOTAL_CHARS = 20000;
 
 export function validateUserMessage(content) {
   if (typeof content !== "string" || content.trim().length === 0) {
@@ -103,6 +107,31 @@ export function planRoutes({ query, agents, documents = [] }) {
   return { steps };
 }
 
+export function scopedRoutingContext({ session, agents = [], documents = [] }) {
+  const visibleAgents = agents.filter((agent) => resourceVisibleToSession(agent, session));
+  const visibleDocuments = documents.filter((document) => resourceVisibleToSession(document, session));
+  const allowedAdapters = [...new Set(visibleAgents.map((agent) => agent.id).filter(Boolean))];
+  return {
+    agents: visibleAgents,
+    documents: visibleDocuments,
+    allowedAdapters
+  };
+}
+
+function resourceVisibleToSession(resource = {}, session = {}) {
+  if (!resource.workspace_id) {
+    return true;
+  }
+  if (String(resource.workspace_id) !== String(session?.workspace_id || "workspace_default")) {
+    return false;
+  }
+  const visibility = resource.visibility || "team";
+  if (visibility === "private") {
+    return !resource.created_by || resource.created_by === session?.created_by;
+  }
+  return visibility === "team" || visibility === "global";
+}
+
 export function buildParallelBatches(steps, workers = 2) {
   const ids = new Set();
   for (const step of steps) {
@@ -198,11 +227,55 @@ export function parseRouteSections(text) {
   };
 }
 
+export function normalizeSharedMemory(
+  entries,
+  {
+    maxEntries = Number(process.env.TCAR_SHARED_MEMORY_MAX_ENTRIES || DEFAULT_MEMORY_ENTRIES),
+    maxEntryChars = Number(process.env.TCAR_SHARED_MEMORY_MAX_ENTRY_CHARS || DEFAULT_MEMORY_ENTRY_CHARS),
+    maxTotalChars = Number(process.env.TCAR_SHARED_MEMORY_MAX_TOTAL_CHARS || DEFAULT_MEMORY_TOTAL_CHARS)
+  } = {}
+) {
+  if (!Array.isArray(entries)) {
+    return [];
+  }
+  const normalized = entries
+    .filter((entry) => entry && typeof entry === "object" && !Array.isArray(entry))
+    .map((entry) => ({
+      tag: String(entry.tag || "memory").trim().slice(0, 120) || "memory",
+      source: String(entry.source || "application").trim().slice(0, 120) || "application",
+      content: String(entry.content || "").replaceAll("\0", "").trim().slice(0, maxEntryChars)
+    }))
+    .filter((entry) => entry.content.length > 0);
+
+  const retained = [];
+  let totalChars = 0;
+  for (const entry of normalized.slice(-maxEntries).reverse()) {
+    if (totalChars + entry.content.length > maxTotalChars && retained.length > 0) {
+      break;
+    }
+    retained.push(entry);
+    totalChars += entry.content.length;
+  }
+  return retained.reverse();
+}
+
+function nextSharedMemory(existing, additions) {
+  return normalizeSharedMemory([...(Array.isArray(existing) ? existing : []), ...additions]);
+}
+
 export async function processChatRun({ store, bus, run_id, options = {} }) {
+  if (realRuntimeEnabled()) {
+    return processRemoteChatRun({ store, bus, run_id, options });
+  }
+  return processLocalChatRun({ store, bus, run_id, options });
+}
+
+async function processLocalChatRun({ store, bus, run_id, options = {} }) {
   const started = Date.now();
   try {
     const snapshot = store.read((data) => ({
       run: data.runs.find((item) => item.run_id === run_id),
+      session: data.sessions.find((item) => item.session_id === data.runs.find((run) => run.run_id === run_id)?.session_id),
       agents: data.agents,
       documents: data.documents,
       messages: data.messages
@@ -212,9 +285,14 @@ export async function processChatRun({ store, bus, run_id, options = {} }) {
     }
 
     const query = snapshot.run.query;
+    const scoped = scopedRoutingContext({
+      session: snapshot.session,
+      agents: snapshot.agents,
+      documents: snapshot.documents
+    });
     await updateRun(store, bus, run_id, { status: "planning", started_at: nowIso() }, { type: "run.started", run_id });
     await appendEvent(store, bus, run_id, { type: "planner.started" });
-    const plan = planRoutes({ query, agents: snapshot.agents, documents: snapshot.documents });
+    const plan = planRoutes({ query, agents: scoped.agents, documents: scoped.documents });
     const parallel = buildParallelBatches(plan.steps, Number(options.parallel_workers) || 2);
     await updateRun(store, bus, run_id, { plan, parallel }, { type: "planner.completed", steps: plan.steps });
 
@@ -232,8 +310,8 @@ export async function processChatRun({ store, bus, run_id, options = {} }) {
         const result = buildRouteOutput({
           step,
           query,
-          agents: snapshot.agents,
-          documents: snapshot.documents,
+          agents: scoped.agents,
+          documents: scoped.documents,
           upstream: routeOutputs
         });
         const elapsed = Number(((Date.now() - routeStarted) / 1000 + 0.015).toFixed(3));
@@ -306,8 +384,7 @@ export async function processChatRun({ store, bus, run_id, options = {} }) {
       if (session) {
         session.updated_at = completedAt;
         session.last_message_at = completedAt;
-        session.shared_memory = [
-          ...(session.shared_memory || []),
+        session.shared_memory = nextSharedMemory(session.shared_memory, [
           { tag: "user_request", source: "user", content: query },
           ...routeOutputs.map((output) => ({
             tag: `${output.adapter}.final`,
@@ -315,26 +392,247 @@ export async function processChatRun({ store, bus, run_id, options = {} }) {
             content: output.domain_answer
           })),
           { tag: "base.synthesis", source: BASE_MODEL, content: finalAnswer }
-        ].slice(-40);
+        ]);
       }
       run.events.push({ type: "final.completed", message_id: assistantMessageId, elapsed_sec: elapsedSec, at: completedAt });
       return run;
     });
     bus.publish(run_id, { type: "final.completed", message_id: assistantMessageId, elapsed_sec: elapsedSec });
   } catch (error) {
-    const message = error.message || "Run failed.";
+    const failure = normalizeRunFailure(error, "run_failed");
     await store.mutate((data) => {
       const run = data.runs.find((item) => item.run_id === run_id);
       if (run) {
         run.status = "failed";
-        run.error = { code: error.code || "run_failed", message };
+        run.error = failure.public;
+        run.error_admin_only = failure.admin;
         run.completed_at = nowIso();
-        run.events.push({ type: "run.failed", message, at: nowIso() });
+        run.events.push({ type: "run.failed", message: failure.public.message, at: nowIso() });
       }
       return run;
     });
-    bus.publish(run_id, { type: "run.failed", message });
+    bus.publish(run_id, { type: "run.failed", message: failure.public.message });
   }
+}
+
+async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
+  const started = Date.now();
+  try {
+    const snapshot = store.read((data) => ({
+      run: data.runs.find((item) => item.run_id === run_id),
+      session: data.sessions.find((item) => item.session_id === data.runs.find((run) => run.run_id === run_id)?.session_id),
+      agents: data.agents,
+      documents: data.documents
+    }));
+    if (!snapshot.run) {
+      throw new Error("Run not found.");
+    }
+
+    const query = snapshot.run.query;
+    const scoped = scopedRoutingContext({
+      session: snapshot.session,
+      agents: snapshot.agents,
+      documents: snapshot.documents
+    });
+    await updateRun(store, bus, run_id, { status: "planning", started_at: nowIso() }, { type: "run.started", run_id });
+    await appendEvent(store, bus, run_id, { type: "runtime.requested" });
+    const result = await executeRuntimeChat({
+      query,
+      sharedMemory: normalizeSharedMemory(snapshot.session?.shared_memory || []),
+      options: {
+        planner_mode: options.planner_mode || process.env.TCAR_PLANNER_MODE || "cue",
+        max_routing_adapters: Number(options.max_routing_adapters) || Number(process.env.TCAR_MAX_ROUTING_ADAPTERS || 12),
+        parallel_workers: Number(options.parallel_workers) || Number(process.env.TCAR_PARALLEL_WORKERS || 2),
+        max_tokens: Number(options.max_tokens) || Number(process.env.TCAR_MAX_TOKENS || 80),
+        refiner_max_tokens: Number(options.refiner_max_tokens) || Number(process.env.TCAR_REFINER_MAX_TOKENS || 220),
+        temperature: Number(options.temperature ?? process.env.TCAR_TEMPERATURE ?? 0),
+        allowed_adapters: scoped.allowedAdapters
+      }
+    });
+    if (result.ok === false) {
+      throw new Error(result.error || "TCAR runtime returned an unsuccessful response.");
+    }
+
+    const plan = normalizeRuntimePlan(result.plan);
+    const parallel = result.parallel || { workers: Number(options.parallel_workers) || 2, batches: [], maxBatchWidth: 0, parallelizable: false };
+    await updateRun(store, bus, run_id, { plan, parallel, status: "running" }, { type: "planner.completed", steps: plan.steps });
+
+    const outputs = Array.isArray(result.expertOutputs) ? result.expertOutputs : [];
+    for (const output of outputs) {
+      await appendEvent(store, bus, run_id, {
+        type: "route.started",
+        step_id: output.id,
+        adapter: output.adapter,
+        batch: output.parallel_batch || null
+      });
+      await upsertRunStep(store, run_id, runtimeOutputToRunStep({ run_id, output, parallel }));
+      await appendEvent(store, bus, run_id, {
+        type: "route.completed",
+        step_id: output.id,
+        adapter: output.adapter,
+        elapsed_sec: output.elapsed_sec || null
+      });
+    }
+
+    await updateRun(store, bus, run_id, { status: "synthesizing" }, { type: "synthesis.started" });
+    const citations = runtimeCitations(outputs);
+    const policyEvents = outputs.flatMap((output) =>
+      (output.policy_violations || []).map((violation) => ({ step_id: output.id, adapter: output.adapter, violation }))
+    );
+    const finalAnswer = result.finalAnswer || result.fallbackFinalAnswer || "";
+    const assistantMessageId = makeId("msg");
+    const completedAt = nowIso();
+    const elapsedSec = Number(((Date.now() - started) / 1000).toFixed(3));
+
+    await store.mutate((data) => {
+      const run = data.runs.find((item) => item.run_id === run_id);
+      const session = data.sessions.find((item) => item.session_id === run.session_id);
+      run.status = "completed";
+      run.final_answer = finalAnswer;
+      run.expert_outputs = outputs;
+      run.sources = citations;
+      run.policy_events = policyEvents;
+      run.assistant_message_id = assistantMessageId;
+      run.completed_at = completedAt;
+      run.elapsed_sec = elapsedSec;
+      run.runtime_result_admin_only = {
+        mode: result.mode,
+        plannerMode: result.plannerMode,
+        vllmBaseUrl: result.vllmBaseUrl,
+        baseModel: result.baseModel,
+        apiElapsedSec: result.apiElapsedSec,
+        executorElapsedSec: result.elapsedSec
+      };
+      data.messages.push({
+        message_id: assistantMessageId,
+        session_id: run.session_id,
+        role: "assistant",
+        content: finalAnswer,
+        attachments: [],
+        run_id,
+        created_at: completedAt
+      });
+      if (session) {
+        session.updated_at = completedAt;
+        session.last_message_at = completedAt;
+        session.shared_memory = nextSharedMemory(session.shared_memory, [
+          { tag: "user_request", source: "user", content: query },
+          ...outputs.map((output) => ({
+            tag: `${output.adapter}.final`,
+            source: output.adapter,
+            content: output.domain_answer || output.text || ""
+          })),
+          { tag: "base.synthesis", source: result.baseModel || BASE_MODEL, content: finalAnswer }
+        ]);
+      }
+      run.events.push({ type: "final.completed", message_id: assistantMessageId, elapsed_sec: elapsedSec, at: completedAt });
+      return run;
+    });
+    bus.publish(run_id, { type: "final.completed", message_id: assistantMessageId, elapsed_sec: elapsedSec });
+  } catch (error) {
+    const failure = normalizeRunFailure(error, "runtime_failed");
+    await store.mutate((data) => {
+      const run = data.runs.find((item) => item.run_id === run_id);
+      if (run) {
+        run.status = "failed";
+        run.error = failure.public;
+        run.error_admin_only = failure.admin;
+        run.completed_at = nowIso();
+        run.events.push({ type: "run.failed", message: failure.public.message, at: nowIso() });
+      }
+      return run;
+    });
+    bus.publish(run_id, { type: "run.failed", message: failure.public.message });
+  }
+}
+
+function normalizeRunFailure(error, fallbackCode) {
+  const code = String(error?.code || fallbackCode || "run_failed");
+  const message = String(error?.message || "Run failed.");
+  return {
+    public: {
+      code,
+      message: "The run failed before completion. Try again or contact support with the run id."
+    },
+    admin: {
+      code,
+      message,
+      status: error?.status || null,
+      payload: error?.payload || null,
+      stack: error?.stack || null
+    }
+  };
+}
+
+function normalizeRuntimePlan(plan) {
+  if (plan?.steps) {
+    return {
+      steps: plan.steps,
+      adapters: plan.adapters || plan.steps.map((step) => step.adapter),
+      edges: plan.edges || plan.steps.flatMap((step) => (step.depends_on || []).map((source) => ({ source, target: step.id }))),
+      acyclic: plan.acyclic !== false
+    };
+  }
+  return { steps: [], adapters: [], edges: [], acyclic: true };
+}
+
+function runtimeOutputToRunStep({ run_id, output, parallel }) {
+  const sections = parseRouteSections(output.text || output.raw_text || "");
+  const batch = output.parallel_batch || findBatchForStep(parallel, output.id);
+  const width = output.parallel_width || parallel?.batches?.find((item) => item.batch === batch)?.width || 1;
+  return {
+    run_step_id: makeId("run_step"),
+    run_id,
+    step_id: output.id,
+    adapter: output.adapter,
+    task: output.task || "",
+    depends_on: output.depends_on || [],
+    used_upstream: output.used_upstream || [],
+    parallel_batch: batch,
+    parallel_width: width,
+    status: "completed",
+    agent_reasoning: sections.agent_reasoning,
+    domain_answer: output.domain_answer || sections.domain_answer,
+    handoffs: sections.handoffs,
+    boundary_check: output.boundary_check || sections.boundary_check,
+    allowed_tools: output.allowed_tools || [],
+    approved_sources: output.approved_sources || [],
+    policy_violations: output.policy_violations || [],
+    retrieved_context: output.retrieved_context || sections.retrieved_context,
+    citations: runtimeCitations([output]),
+    raw_text_admin_only: output.raw_text || output.text || "",
+    prompt_preview_admin_only: output.prompt_preview || "",
+    started_at: nowIso(),
+    completed_at: nowIso(),
+    elapsed_sec: output.elapsed_sec || null
+  };
+}
+
+function findBatchForStep(parallel, stepId) {
+  return parallel?.batches?.find((batch) => (batch.steps || []).includes(stepId))?.batch || null;
+}
+
+function runtimeCitations(outputs) {
+  return outputs.flatMap((output) => {
+    const context = output.retrieved_context || parseRouteSections(output.text || "").retrieved_context || "";
+    if (!context) return [];
+    return context.split(/\n+/).filter(Boolean).slice(0, 8).map((line, index) => {
+      const [label, ...rest] = line.split(" - ");
+      return {
+        citation_id: makeId("cit"),
+        step_id: output.id,
+        agent_id: output.adapter,
+        path: "",
+        chunk_id: label?.split(":")[0] || `${output.id}_${index + 1}`,
+        title: label?.split(":").slice(1).join(":") || output.adapter,
+        page_start: null,
+        page_end: null,
+        score: null,
+        excerpt: rest.join(" - ") || line,
+        injected: true
+      };
+    });
+  });
 }
 
 async function updateRun(store, bus, run_id, patch, event) {

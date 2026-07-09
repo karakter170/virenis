@@ -45,7 +45,7 @@ export async function extractTextFromUpload(file) {
         error.status = 422;
         throw error;
       }
-      return text;
+      return assertDocumentTextLimit(text);
     } catch (error) {
       if (error.status) {
         throw error;
@@ -60,6 +60,16 @@ export async function extractTextFromUpload(file) {
   if (!text) {
     const error = new Error("Document file is empty.");
     error.status = 400;
+    throw error;
+  }
+  return assertDocumentTextLimit(text);
+}
+
+function assertDocumentTextLimit(text) {
+  const maxChars = Number(process.env.APP_MAX_DOCUMENT_TEXT_CHARS || 2_000_000);
+  if (text.length > maxChars) {
+    const error = new Error(`Document text is too large. Limit is ${maxChars} characters after extraction.`);
+    error.status = 413;
     throw error;
   }
   return text;

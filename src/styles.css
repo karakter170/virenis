@@ -53,7 +53,8 @@ button {
   min-height: 0;
   overflow: hidden;
   background:
-    linear-gradient(180deg, rgba(220, 252, 231, 0.65), transparent 360px),
+    linear-gradient(180deg, rgba(220, 252, 231, 0.62), transparent 320px),
+    linear-gradient(90deg, rgba(224, 242, 254, 0.38), transparent 42%),
     var(--bg);
 }
 
@@ -212,8 +213,8 @@ button {
 .feature-row {
   grid-template-columns: auto minmax(0, 1fr);
   color: var(--green-900);
-  background: rgba(220, 252, 231, 0.58);
-  border: 1px solid var(--mint);
+  background: rgba(255, 255, 255, 0.78);
+  border: 1px solid rgba(170, 188, 167, 0.72);
   border-radius: 8px;
   padding: 9px;
   font-size: 13px;
@@ -227,6 +228,7 @@ button {
 }
 
 .topbar {
+  grid-row: 1;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -308,11 +310,13 @@ h1 {
 }
 
 .error-banner {
+  grid-row: 2;
   margin: 14px 24px 0;
   border-radius: 8px;
 }
 
 .message-thread {
+  grid-row: 3;
   min-height: 0;
   overflow-y: auto;
   padding: 28px 24px 18px;
@@ -419,6 +423,7 @@ h1 {
 }
 
 .composer {
+  grid-row: 4;
   margin: 0 24px 22px;
   display: grid;
   grid-template-columns: 40px minmax(0, 1fr) 46px;
@@ -482,7 +487,7 @@ h1 {
   background: var(--pane);
   color: var(--green-800);
   min-height: 58px;
-  border-radius: 999px;
+  border-radius: 8px;
   display: grid;
   place-items: center;
   align-content: center;
@@ -495,11 +500,19 @@ h1 {
   background: var(--green-100);
 }
 
+.graph-action:disabled {
+  color: var(--muted);
+  background: #f4f7f2;
+  cursor: not-allowed;
+  opacity: 0.7;
+}
+
 .graph-canvas {
   position: relative;
   border: 1px solid var(--line);
   background:
     radial-gradient(circle at 50% 32%, rgba(220, 252, 231, 0.88), transparent 34%),
+    radial-gradient(circle at 88% 20%, rgba(224, 242, 254, 0.72), transparent 25%),
     linear-gradient(180deg, #fbfdf9, #f1f7ef);
   border-radius: 8px;
   overflow: hidden;
@@ -516,6 +529,7 @@ h1 {
 }
 
 .graph-edge {
+  fill: none;
   stroke: #9bb69c;
   stroke-width: 1.35;
   opacity: 0.72;
@@ -539,6 +553,26 @@ h1 {
 .graph-edge.runtime,
 .graph-edge.catalog {
   stroke-dasharray: 2 5;
+}
+
+.edge-pulse {
+  fill: var(--green-700);
+  filter: drop-shadow(0 0 5px rgba(22, 101, 52, 0.45));
+  opacity: 0.86;
+  pointer-events: none;
+}
+
+.edge-pulse.dependency {
+  fill: var(--green-900);
+}
+
+.edge-pulse.source {
+  fill: var(--gold);
+}
+
+.edge-pulse.runtime,
+.edge-pulse.catalog {
+  fill: #0369a1;
 }
 
 .graph-canvas marker path {
@@ -597,6 +631,23 @@ h1 {
 .graph-node.route.synthesizing circle {
   fill: #bbf7d0;
   stroke: var(--green-900);
+}
+
+.graph-node.firing circle {
+  animation: node-fire 1.35s ease-in-out infinite;
+}
+
+@keyframes node-fire {
+  0%,
+  100% {
+    filter: drop-shadow(0 6px 8px rgba(14, 43, 25, 0.14));
+    stroke-width: 2;
+  }
+
+  50% {
+    filter: drop-shadow(0 0 14px rgba(22, 101, 52, 0.34));
+    stroke-width: 3;
+  }
 }
 
 .graph-node.agent circle {
@@ -739,6 +790,137 @@ h1 {
 .legend-dot.document,
 .legend-dot.source {
   background: var(--gold);
+}
+
+.ops-panel {
+  display: grid;
+  gap: 10px;
+  border: 1px solid var(--line);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.92), rgba(245, 248, 243, 0.92)),
+    var(--pane);
+  border-radius: 8px;
+  padding: 10px;
+}
+
+.ops-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.ops-grid .metric {
+  min-height: 66px;
+  padding: 9px;
+}
+
+.ops-grid .metric strong {
+  font-size: 17px;
+}
+
+.ops-strip {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.ops-strip div,
+.agent-signal,
+.validation-chip {
+  border: 1px solid var(--line);
+  background: var(--pane);
+  border-radius: 8px;
+  padding: 8px;
+}
+
+.ops-strip span,
+.agent-signal span {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.ops-strip strong,
+.agent-signal strong {
+  display: block;
+  margin-top: 3px;
+  color: var(--green-900);
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-signal-list {
+  display: grid;
+  gap: 7px;
+}
+
+.signal-trail {
+  display: grid;
+  gap: 7px;
+}
+
+.signal-step {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  min-height: 30px;
+  color: var(--green-900);
+  background: rgba(220, 252, 231, 0.42);
+  border: 1px solid rgba(183, 228, 199, 0.78);
+  border-radius: 8px;
+  padding: 6px 8px;
+}
+
+.signal-step span {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--green-700);
+  box-shadow: 0 0 0 4px rgba(22, 101, 52, 0.08);
+}
+
+.signal-step strong {
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 700;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-signal {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.agent-signal strong {
+  min-width: 26px;
+  min-height: 26px;
+  display: grid;
+  place-items: center;
+  margin-top: 0;
+  color: white;
+  background: var(--green-700);
+  border-radius: 8px;
+}
+
+.validation-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  justify-content: center;
+  color: var(--muted);
+}
+
+.validation-chip.ok {
+  color: var(--green-900);
+  background: var(--green-100);
+  border-color: var(--mint);
 }
 
 .panel-header {
@@ -987,9 +1169,43 @@ h1 {
 @media (max-width: 780px) {
   .app-shell {
     grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(0, 1fr);
+    overflow-y: auto;
+  }
+
+  .app-shell.inspector-closed {
+    grid-template-columns: 1fr;
+  }
+
+  .sidebar,
+  .chat-workspace {
+    height: auto;
   }
 
   .sidebar {
+    position: relative;
+    top: auto;
+    max-height: 34vh;
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+    padding: 12px;
+    gap: 10px;
+  }
+
+  .brand-mark {
+    width: 32px;
+    height: 32px;
+  }
+
+  .primary-action {
+    min-height: 38px;
+  }
+
+  .conversation-list {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .feature-stack {
     display: none;
   }
 
@@ -1027,5 +1243,33 @@ h1 {
 
   .composer {
     margin: 0 14px 14px;
+  }
+
+  .inspector {
+    width: min(420px, 96vw);
+  }
+
+  .graph-canvas,
+  .graph-canvas svg {
+    min-height: 430px;
+  }
+
+  .ops-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .ops-strip {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spin,
+  .graph-node.firing circle {
+    animation: none;
+  }
+
+  .edge-pulse {
+    display: none;
   }
 }

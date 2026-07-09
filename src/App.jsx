@@ -40,8 +40,26 @@ const api = {
   }
 };
 
+function emptyMetrics() {
+  return {
+    total_runs: 0,
+    p95_end_to_end_latency: 0,
+    bad_response_flags: 0,
+    most_used_agents: [],
+    admin_available: false
+  };
+}
+
 async function parseResponse(response) {
-  const payload = await response.json();
+  const text = await response.text();
+  let payload = {};
+  if (text) {
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      payload = { message: text };
+    }
+  }
   if (!response.ok) {
     throw new Error(payload.message || "Request failed");
   }
@@ -56,10 +74,14 @@ export default function App() {
   const [documents, setDocuments] = useState([]);
   const [runtime, setRuntime] = useState(null);
   const [metrics, setMetrics] = useState(null);
+  const [auth, setAuth] = useState(null);
   const [activeRun, setActiveRun] = useState(null);
   const [runEvents, setRunEvents] = useState([]);
   const [draft, setDraft] = useState("");
-  const [showInspector, setShowInspector] = useState(true);
+  const [showInspector, setShowInspector] = useState(() => {
+    if (typeof window === "undefined") return true;
+    return window.matchMedia("(min-width: 1181px)").matches;
+  });
   const [uploadOpen, setUploadOpen] = useState(false);
   const [agentOpen, setAgentOpen] = useState(false);
   const [error, setError] = useState("");
@@ -82,13 +104,15 @@ export default function App() {
   async function bootstrap() {
     try {
       setLoading(true);
-      const [sessionList, health, agentList, docList, metricData] = await Promise.all([
+      const [me, sessionList, health, agentList, docList] = await Promise.all([
+        api.get("/api/auth/me"),
         api.get("/api/chat/sessions"),
         api.get("/api/runtime/health"),
         api.get("/api/agents"),
-        api.get("/api/documents"),
-        api.get("/api/admin/metrics")
+        api.get("/api/documents")
       ]);
+      const metricData = me.is_admin ? await api.get("/api/admin/metrics") : emptyMetrics();
+      setAuth(me);
       setRuntime(health);
       setAgents(agentList.agents);
       setDocuments(docList.documents);
@@ -107,13 +131,15 @@ export default function App() {
   }
 
   async function refreshSidebar() {
-    const [sessionList, agentList, docList, metricData, health] = await Promise.all([
+    const [me, sessionList, agentList, docList, health] = await Promise.all([
+      api.get("/api/auth/me"),
       api.get("/api/chat/sessions"),
       api.get("/api/agents"),
       api.get("/api/documents"),
-      api.get("/api/admin/metrics"),
       api.get("/api/runtime/health")
     ]);
+    const metricData = me.is_admin ? await api.get("/api/admin/metrics") : emptyMetrics();
+    setAuth(me);
     setSessions(sessionList.sessions);
     setAgents(agentList.agents);
     setDocuments(docList.documents);
@@ -163,7 +189,7 @@ export default function App() {
         attachments: [],
         options: {
           show_route_details: true,
-          planner_mode: "deterministic",
+          planner_mode: "cue",
           max_routing_adapters: 12,
           parallel_workers: 2,
           temperature: 0
@@ -297,11 +323,11 @@ export default function App() {
           </div>
         </div>
 
-        <div className="feature-stack" aria-label="Feature highlights">
-          <Feature icon={<Network size={16} />} label="Parallel DAG execution" />
-          <Feature icon={<ShieldCheck size={16} />} label="Tool and source policy checks" />
-          <Feature icon={<FileText size={16} />} label="Document agents with citations" />
-          <Feature icon={<Activity size={16} />} label="Runtime validation and metrics" />
+        <div className="feature-stack" aria-label="System status">
+          <Feature icon={<Network size={16} />} label={`${agents.length || 0} route identities`} />
+          <Feature icon={<FileText size={16} />} label={`${documents.length || 0} document agents`} />
+          <Feature icon={<ShieldCheck size={16} />} label={runtime?.vllm?.models_endpoint_ok === false ? "GPU runtime degraded" : "GPU runtime ready"} />
+          <Feature icon={<Activity size={16} />} label={metrics?.admin_available === false ? "Metrics gated" : `${metrics?.total_runs ?? 0} completed runs`} />
         </div>
       </aside>
 
@@ -391,6 +417,7 @@ export default function App() {
             documents={documents}
             runtime={runtime}
             metrics={metrics}
+            auth={auth}
             onCreateAgent={() => setAgentOpen(true)}
             onCreateDocument={() => setUploadOpen(true)}
             onRefresh={refreshSidebar}
@@ -462,10 +489,11 @@ function MessageBubble({ message }) {
   );
 }
 
-function GraphPanel({ run, events, routes, sources, agents, documents, runtime, metrics, onCreateAgent, onCreateDocument, onRefresh }) {
+function GraphPanel({ run, events, routes, sources, agents, documents, runtime, metrics, auth, onCreateAgent, onCreateDocument, onRefresh }) {
   const [nodePositions, setNodePositions] = useState({});
   const [hoveredNodeId, setHoveredNodeId] = useState(null);
   const [validation, setValidation] = useState(null);
+  const latestEvent = events.at(-1);
   const baseGraph = useMemo(
     () => buildGraphModel({ run, routes, sources, agents, documents, runtime }),
     [run, routes, sources, agents, documents, runtime]
@@ -473,6 +501,7 @@ function GraphPanel({ run, events, routes, sources, agents, documents, runtime, 
   const graph = useMemo(() => applyNodePositions(baseGraph, nodePositions), [baseGraph, nodePositions]);
 
   async function runValidation() {
+    if (!auth?.is_admin) return;
     const queued = await api.post("/api/admin/validation/run", { suite: "mock_smoke", case_filter: "patient_newsletter_faq" });
     let result = queued;
     for (let attempt = 0; attempt < 20; attempt += 1) {
@@ -493,7 +522,7 @@ function GraphPanel({ run, events, routes, sources, agents, documents, runtime, 
       />
 
       <div className="graph-actions" aria-label="Graph actions">
-        <button className="graph-action" title="Create agent" onClick={onCreateAgent}>
+        <button className="graph-action" title={auth?.is_admin ? "Create agent" : "Admin only"} onClick={onCreateAgent} disabled={!auth?.is_admin}>
           <Plus size={18} />
           <span>Agent</span>
         </button>
@@ -501,7 +530,7 @@ function GraphPanel({ run, events, routes, sources, agents, documents, runtime, 
           <FilePlus size={18} />
           <span>Doc</span>
         </button>
-        <button className="graph-action" title="Run validation" onClick={runValidation}>
+        <button className="graph-action" title={auth?.is_admin ? "Run validation" : "Admin only"} onClick={runValidation} disabled={!auth?.is_admin}>
           <Clipboard size={18} />
           <span>Check</span>
         </button>
@@ -516,7 +545,7 @@ function GraphPanel({ run, events, routes, sources, agents, documents, runtime, 
         }}
         metrics={metrics}
         validation={validation}
-        latestEvent={events.at(-1)}
+        latestEvent={latestEvent}
       />
 
       <div className="graph-legend">
@@ -525,6 +554,17 @@ function GraphPanel({ run, events, routes, sources, agents, documents, runtime, 
         <span><i className="legend-dot document" />document</span>
         <span><i className="legend-dot source" />source</span>
       </div>
+
+      <OperationsPanel
+        run={run}
+        events={events}
+        latestEvent={latestEvent}
+        agents={agents}
+        documents={documents}
+        metrics={metrics}
+        runtime={runtime}
+        validation={validation}
+      />
     </div>
   );
 }
@@ -607,26 +647,42 @@ function GraphCanvas({ graph, hoveredNodeId, onHoverNode, onMoveNode, metrics, v
             <path d="M0,0 L8,3.5 L0,7 Z" />
           </marker>
         </defs>
-        {graph.edges.map((edge) => {
+        {graph.edges.map((edge, index) => {
           const source = graph.nodeMap.get(edge.source);
           const target = graph.nodeMap.get(edge.target);
           if (!source || !target) return null;
+          const pathId = edgePathId(edge, index);
           return (
-            <line
-              key={`${edge.source}-${edge.target}`}
+            <path
+              key={pathId}
+              id={pathId}
               className={`graph-edge ${edge.kind || ""}`}
-              x1={source.x}
-              y1={source.y}
-              x2={target.x}
-              y2={target.y}
+              d={`M ${source.x} ${source.y} L ${target.x} ${target.y}`}
               markerEnd={edge.directed ? "url(#arrow)" : undefined}
             />
+          );
+        })}
+        {graph.isActive && graph.edges.map((edge, index) => {
+          const source = graph.nodeMap.get(edge.source);
+          const target = graph.nodeMap.get(edge.target);
+          if (!source || !target) return null;
+          const pathId = edgePathId(edge, index);
+          return (
+            <circle key={`pulse-${pathId}`} className={`edge-pulse ${edge.kind || ""}`} r={edge.kind === "dependency" ? 3.3 : 2.7}>
+              <animateMotion
+                dur={`${1.35 + (index % 4) * 0.18}s`}
+                begin={`${index * 0.11}s`}
+                repeatCount="indefinite"
+              >
+                <mpath href={`#${pathId}`} />
+              </animateMotion>
+            </circle>
           );
         })}
         {graph.nodes.map((node) => (
           <g
             key={node.id}
-            className={`graph-node ${node.type} ${node.status || ""} ${drag?.nodeId === node.id ? "dragging" : ""}`}
+            className={`graph-node ${node.type} ${node.status || ""} ${graph.isActive && node.type === "route" ? "firing" : ""} ${drag?.nodeId === node.id ? "dragging" : ""}`}
             tabIndex="0"
             role="button"
             aria-label={node.label}
@@ -658,6 +714,68 @@ function GraphCanvas({ graph, hoveredNodeId, onHoverNode, onMoveNode, metrics, v
   );
 }
 
+function OperationsPanel({ run, events, latestEvent, agents, documents, metrics, runtime, validation }) {
+  const mountedAgents = agents.filter((agent) => agent.mounted !== false).length;
+  const topAgents = metrics?.most_used_agents?.slice?.(0, 3) || [];
+  const runStatus = run?.status || "ready";
+  const metricsAvailable = metrics?.admin_available !== false;
+  const recentEvents = (events?.length ? events : latestEvent ? [latestEvent] : []).slice(-5);
+  return (
+    <div className="ops-panel" aria-label="Runtime operations">
+      <div className="ops-grid">
+        <Metric label="Agents" value={`${mountedAgents}/${agents.length}`} />
+        <Metric label="Docs" value={documents.length} />
+        <Metric label="Runs" value={metricsAvailable ? (metrics?.total_runs ?? 0) : "n/a"} />
+        <Metric label="p95" value={metricsAvailable ? `${metrics?.p95_end_to_end_latency ?? 0}s` : "n/a"} />
+      </div>
+
+      <div className="ops-strip">
+        <div>
+          <span>Run</span>
+          <strong>{runStatus}</strong>
+        </div>
+        <div>
+          <span>Runtime</span>
+          <strong>{runtime?.vllm?.models_endpoint_ok === false ? "degraded" : runtime?.ok === false ? "offline" : "ready"}</strong>
+        </div>
+        <div>
+          <span>Event</span>
+          <strong>{latestEvent?.type || "idle"}</strong>
+        </div>
+      </div>
+
+      {recentEvents.length > 0 && (
+        <div className="signal-trail" aria-label="Execution event trail">
+          {recentEvents.map((event, index) => (
+            <div className="signal-step" key={`${event.type}-${event.ts || index}-${index}`}>
+              <span />
+              <strong>{event.type}</strong>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {topAgents.length > 0 && (
+        <div className="agent-signal-list">
+          {topAgents.map((agent) => (
+            <div className="agent-signal" key={agent.adapter || agent.agent_id || agent.id}>
+              <span>{agent.adapter || agent.agent_id || agent.id}</span>
+              <strong>{agent.count}</strong>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {validation && (
+        <div className={`validation-chip ${validation.ok ? "ok" : ""}`}>
+          <CheckCircle2 size={15} />
+          <span>{validation.status}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function GraphNodePopover({ node, metrics, validation, latestEvent }) {
   const data = node.data || {};
   const style = {
@@ -680,9 +798,9 @@ function GraphNodePopover({ node, metrics, validation, latestEvent }) {
 
       {node.type === "chat" && (
         <div className="metric-grid">
-          <Metric label="Runs" value={metrics?.total_runs ?? 0} />
-          <Metric label="p95" value={`${metrics?.p95_end_to_end_latency ?? 0}s`} />
-          <Metric label="Flags" value={metrics?.bad_response_flags ?? 0} />
+          <Metric label="Runs" value={metrics?.admin_available === false ? "n/a" : (metrics?.total_runs ?? 0)} />
+          <Metric label="p95" value={metrics?.admin_available === false ? "n/a" : `${metrics?.p95_end_to_end_latency ?? 0}s`} />
+          <Metric label="Flags" value={metrics?.admin_available === false ? "n/a" : (metrics?.bad_response_flags ?? 0)} />
           <Metric label="Latest" value={latestEvent?.type || "ready"} />
         </div>
       )}
@@ -900,8 +1018,13 @@ function buildGraphModel({ run, routes, sources, agents, documents, runtime }) {
     nodes,
     edges: edges.filter((edge) => nodeMap.has(edge.source) && nodeMap.has(edge.target)),
     nodeMap,
-    activeCount: planSteps.length
+    activeCount: planSteps.length,
+    isActive: Boolean(run && !["completed", "failed"].includes(run.status))
   };
+}
+
+function edgePathId(edge, index) {
+  return `edge-${index}-${String(edge.source).replace(/[^a-z0-9_-]/gi, "_")}-${String(edge.target).replace(/[^a-z0-9_-]/gi, "_")}`;
 }
 
 function shortNodeLabel(label) {
@@ -933,6 +1056,20 @@ function Metric({ label, value }) {
       <strong>{value}</strong>
     </div>
   );
+}
+
+function createDefaultAgentForm() {
+  const suffix = Date.now().toString(36).slice(-6);
+  return {
+    id: `custom_${suffix}_lora`,
+    title: "",
+    capability: "",
+    boundary: "",
+    routing_cues: "",
+    produces: "",
+    tools: "",
+    sources: ""
+  };
 }
 
 function DocumentUploadDialog({ onClose, onUploaded }) {
@@ -995,17 +1132,9 @@ function DocumentUploadDialog({ onClose, onUploaded }) {
 }
 
 function AgentDialog({ onClose, onCreated }) {
-  const [form, setForm] = useState({
-    id: "custom_route_lora",
-    title: "",
-    capability: "",
-    boundary: "",
-    routing_cues: "",
-    produces: "",
-    tools: "",
-    sources: ""
-  });
+  const [form, setForm] = useState(() => createDefaultAgentForm());
   const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
 
   function update(key, value) {
     setForm((current) => ({ ...current, [key]: value }));
@@ -1014,11 +1143,14 @@ function AgentDialog({ onClose, onCreated }) {
   async function submit(event) {
     event.preventDefault();
     setError("");
+    setBusy(true);
     try {
       await api.post("/api/agents", form);
       await onCreated();
     } catch (err) {
       setError(err.message);
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -1036,8 +1168,11 @@ function AgentDialog({ onClose, onCreated }) {
         <label>Allowed tools<input value={form.tools} onChange={(event) => update("tools", event.target.value)} /></label>
         <label>Approved sources<input value={form.sources} onChange={(event) => update("sources", event.target.value)} /></label>
         <div className="dialog-actions">
-          <button type="button" className="ghost-button" onClick={onClose}>Cancel</button>
-          <button className="send-button"><Plus size={16} />Create</button>
+          <button type="button" className="ghost-button" onClick={onClose} disabled={busy}>Cancel</button>
+          <button className="send-button" disabled={busy}>
+            {busy ? <Loader2 className="spin" size={16} /> : <Plus size={16} />}
+            Create
+          </button>
         </div>
       </form>
     </div>

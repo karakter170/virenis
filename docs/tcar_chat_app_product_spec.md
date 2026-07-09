@@ -47,7 +47,7 @@ This gives the website a strong story: users get the convenience of one chat box
 
 ## Existing Runtime Components
 
-The current repository provides the backend runtime and validation harness. It does not yet provide a full web application. The website should wrap these runtime capabilities behind stable HTTP APIs.
+The current repository now includes a web application prototype in `web/virenis` and a GPU-side runtime API wrapper. The web API surface exists, but production deployments should still treat the GPU runtime as the source of truth for TCAR planning, vLLM execution, manifest-backed agents, and document-agent registration.
 
 ### Base Model Runtime
 
@@ -467,6 +467,14 @@ Power users can:
 - Review route output quality.
 - Enable or disable route visibility.
 
+Private sessions, uploaded documents, and document-backed route agents should remain visible only to their creator and admins in the same workspace. Non-admin users may inspect safe route status, citations, policy events, and domain answers, but raw route text and prompt previews are admin-only.
+
+Route planning must use the same visibility boundary. Before a chat run calls the GPU runtime, the web backend computes the session-visible adapter list and sends it as `allowed_adapters`; the GPU runtime filters TCAR's planner registry to that list before constructing the DAG. This keeps private document agents from being selected across tenants even though the GPU manifest is global.
+
+Runtime model listings must also use the same boundary. The web backend should filter GPU `/models` output to the base model plus route identities visible to the requester, and raw GPU model payloads should be admin-only.
+
+Agent catalog responses must also be role-filtered. Non-admin users can inspect safe route capability, boundary, tools, mounted status, and usage metadata. Runtime manifest paths, adapter paths, skill paths, generated skill markdown, and raw GPU agent payloads are admin-only diagnostics.
+
 #### Admin
 
 An admin manages production operation and validation.
@@ -593,7 +601,7 @@ The product should persist conversation memory outside the model context window.
 }
 ```
 
-The website should let users ask follow-up questions. The backend should decide how much prior conversation to include in planning and route execution. For long conversations, use summaries and tagged memory rather than blindly stuffing the full history into every route prompt.
+The website should let users ask follow-up questions. The backend should decide how much prior conversation to include in planning and route execution. For long conversations, use summaries and tagged memory rather than blindly stuffing the full history into every route prompt. The current web backend bounds JSON API bodies with `APP_MAX_JSON_BODY_BYTES` and bounds shared memory before reuse with `TCAR_SHARED_MEMORY_MAX_ENTRIES`, `TCAR_SHARED_MEMORY_MAX_ENTRY_CHARS`, and `TCAR_SHARED_MEMORY_MAX_TOTAL_CHARS`; the GPU runtime applies its own second boundary with `TCAR_RUNTIME_MAX_MEMORY_ENTRIES`, `TCAR_RUNTIME_MAX_MEMORY_ENTRY_CHARS`, and `TCAR_RUNTIME_MAX_MEMORY_CHARS`.
 
 ### Document Upload Flow
 
@@ -613,16 +621,26 @@ User flow:
 
 Backend behavior:
 
+- Reject raw uploads above `APP_MAX_UPLOAD_FILE_BYTES`.
+- Reject oversized multipart metadata above `APP_MAX_UPLOAD_FIELD_BYTES`, `APP_MAX_UPLOAD_FIELDS`, and `APP_MAX_UPLOAD_PARTS`.
+- Reject oversized JSON API payloads above `APP_MAX_JSON_BODY_BYTES`.
 - Upload file to object storage or local staging.
 - Run extraction and chunking.
 - Write chunks and index.
 - Create dummy adapter route identity.
 - Generate `SKILL.md`.
 - Upsert manifest.
-- Reload or restart vLLM if static LoRA mounting is used.
-- Confirm the new route appears in `/v1/models`.
+- Dynamically load the LoRA through the protected TCAR Runtime API when enabled.
+- Fall back to a controlled vLLM reload/restart only when dynamic loading is disabled or rejected.
+- Confirm the new route appears in `/v1/models` before showing it as mounted.
 
-Important production note: if vLLM is started with a fixed list of `--lora-modules`, a newly created route may require dynamic LoRA loading support or a server restart. The website should communicate "agent ready" only after the model name is actually available.
+Automatic document-agent ids include a short random suffix derived at upload
+time, for example `linear_algebra_notes_a1b2c3d4_lora`, so concurrent uploads
+with the same title do not share source paths or route identities. If the user
+or admin supplies `agent_id`, that id is treated as an explicit reservation and
+duplicates return `409`.
+
+Important production note: dynamic LoRA loading requires vLLM runtime LoRA updating to be enabled while vLLM remains loopback/private. The website should communicate "agent ready" only after the model name is actually available.
 
 ### Custom Agent Creation Flow
 
@@ -893,7 +911,7 @@ Request shape:
       "content": "Route prompt"
     }
   ],
-  "max_tokens": 160,
+  "max_tokens": 80,
   "temperature": 0.0,
   "extra_body": {
     "chat_template_kwargs": {
@@ -932,9 +950,9 @@ The vLLM server exposes operational routes such as:
 
 The website backend should proxy only the safe operational data needed for admins. End users should never call vLLM directly.
 
-## Proposed Website API
+## Website API
 
-The following HTTP API should be built for the website. These are proposed application-level endpoints. They do not exist yet as stable web endpoints in the repository.
+The following HTTP API is implemented by the website backend. Some endpoints run against the local simulator in development mode and call the GPU Runtime API when `TCAR_ENGINE_MODE=real`.
 
 ### Chat Sessions
 
@@ -967,8 +985,14 @@ Response:
 #### List Chat Sessions
 
 ```http
-GET /api/chat/sessions?workspace_id=workspace_123
+GET /api/chat/sessions?workspace_id=workspace_123&limit=100&offset=0
 ```
+
+Query parameters:
+
+- `workspace_id`
+- `limit`: optional bounded list size. Defaults to `WEB_LIST_DEFAULT_LIMIT` and is capped by `WEB_LIST_MAX_LIMIT`.
+- `offset`: optional zero-based page offset. Defaults to `0`.
 
 Response:
 
@@ -981,7 +1005,10 @@ Response:
       "last_message_at": "2026-07-09T00:00:00Z",
       "message_count": 4
     }
-  ]
+  ],
+  "total": 1,
+  "limit": 100,
+  "offset": 0
 }
 ```
 
@@ -1017,7 +1044,15 @@ Request:
 ```json
 {
   "content": "Review a clinic patient newsletter signup flow for consent and patient privacy, suggest health-safe wording, and draft a customer support FAQ.",
-  "attachments": [],
+  "attachments": [
+    {
+      "type": "url",
+      "name": "Planning note",
+      "url": "https://example.com/planning-note",
+      "mime_type": "text/markdown",
+      "size_bytes": 128
+    }
+  ],
   "options": {
     "show_route_details": true,
     "planner_mode": "llm",
@@ -1027,6 +1062,12 @@ Request:
   }
 }
 ```
+
+Attachments are optional metadata references, not raw file payloads. The server
+stores only `type`, `name`, `document_id`, `url`, `mime_type`, `summary`, and
+`size_bytes`, strips unknown fields, requires safe `http(s)` or internal
+document URLs, and enforces `APP_MAX_MESSAGE_ATTACHMENTS` plus
+`APP_MAX_MESSAGE_ATTACHMENT_CHARS`.
 
 Response:
 
@@ -1050,6 +1091,11 @@ Recommended transport:
 
 - Server-Sent Events for MVP.
 - WebSocket for richer interactive UI.
+
+SSE events must use the same role-based redaction rules as `GET
+/api/chat/runs/{run_id}`. Non-admin subscribers should never receive raw route
+text, prompt previews, runtime payloads, stack details, document source paths,
+index paths, adapter paths, or skill paths through historical or live events.
 
 Event examples:
 
@@ -1169,18 +1215,20 @@ Admin-only fields:
 #### List Agents
 
 ```http
-GET /api/agents
+GET /api/agents?limit=100&offset=0
 ```
 
 Query parameters:
 
 - `q`
 - `tool`
-- `source_type`
-- `enabled`
+- `source_type`: `document`, `document_markdown`, `source`, `runtime`, or `manifest`
+- `enabled`: `true` or `false`
 - `mounted`
-- `stage_min`
-- `stage_max`
+- `stage_min`: numeric lower bound
+- `stage_max`: numeric upper bound
+- `limit`: optional bounded list size. Defaults to `WEB_LIST_DEFAULT_LIMIT` and is capped by `WEB_LIST_MAX_LIMIT`.
+- `offset`: optional zero-based page offset. Defaults to `0`.
 
 Response:
 
@@ -1195,12 +1243,16 @@ Response:
       "tools": [],
       "sources": [],
       "stage": 15,
-      "mounted": true,
-      "skill_path": "skills/tcar_dummy_loras/legal_privacy_lora/SKILL.md"
+      "mounted": true
     }
-  ]
+  ],
+  "total": 1,
+  "limit": 100,
+  "offset": 0
 }
 ```
+
+For admin callers, the same response may additionally include runtime diagnostics such as `skill_path` and `adapter_path`. Those fields are redacted from non-admin responses.
 
 #### Get Agent
 
@@ -1267,8 +1319,8 @@ Response:
   "manifest": "configs/dummy_tcar_lora_suite.json",
   "adapter_path": "adapters/dummy_tcar_loras/refund_policy_lora",
   "skill_path": "skills/tcar_dummy_loras/refund_policy_lora/SKILL.md",
-  "mounted": false,
-  "requires_vllm_reload": true
+  "mounted": true,
+  "requires_vllm_reload": false
 }
 ```
 
@@ -1332,20 +1384,29 @@ Response:
 ```json
 {
   "document_id": "doc_123",
-  "agent_id": "linear_algebra_textbook_lora",
+  "agent_id": "linear_algebra_textbook_a1b2c3d4_lora",
   "status": "indexed",
   "chunks": 5,
-  "index_path": "sources/tcar_documents/linear_algebra_textbook/index.jsonl",
-  "adapter_path": "adapters/dummy_tcar_loras/linear_algebra_textbook_lora",
-  "skill_path": "skills/tcar_dummy_loras/linear_algebra_textbook_lora/SKILL.md"
+  "mounted": true,
+  "requires_vllm_reload": false
 }
 ```
+
+For admin callers, the same response may additionally include `index_path`,
+`adapter_path`, `skill_path`, and raw runtime registration diagnostics. Those
+fields are redacted from non-admin upload responses.
 
 #### List Documents
 
 ```http
-GET /api/documents
+GET /api/documents?limit=100&offset=0
 ```
+
+Query parameters:
+
+- `workspace_id`
+- `limit`: optional bounded list size. Defaults to `WEB_LIST_DEFAULT_LIMIT` and is capped by `WEB_LIST_MAX_LIMIT`.
+- `offset`: optional zero-based page offset. Defaults to `0`.
 
 Response:
 
@@ -1360,15 +1421,23 @@ Response:
       "visibility": "private",
       "created_at": "2026-07-09T00:00:00Z"
     }
-  ]
+  ],
+  "total": 1,
+  "limit": 100,
+  "offset": 0
 }
 ```
 
 #### Get Document Chunks
 
 ```http
-GET /api/documents/{document_id}/chunks
+GET /api/documents/{document_id}/chunks?limit=100&offset=0
 ```
+
+Query parameters:
+
+- `limit`: optional bounded list size. Defaults to `WEB_LIST_DEFAULT_LIMIT` and is capped by `WEB_LIST_MAX_LIMIT`.
+- `offset`: optional zero-based page offset. Defaults to `0`.
 
 Response:
 
@@ -1384,7 +1453,10 @@ Response:
       "summary": "For a linear map...",
       "token_count_approx": 100
     }
-  ]
+  ],
+  "total": 5,
+  "limit": 100,
+  "offset": 0
 }
 ```
 
@@ -1432,18 +1504,17 @@ Response:
 {
   "ok": true,
   "vllm": {
-    "base_url": "http://127.0.0.1:8000/v1",
     "models_endpoint_ok": true,
-    "base_model": "qwen36-awq",
-    "mounted_loras": 17
+    "base_model": "qwen36-awq"
   },
   "manifest": {
-    "path": "configs/dummy_tcar_lora_suite.json",
     "adapters": 17,
     "valid": true
   }
 }
 ```
+
+Non-admin callers receive a redacted readiness payload. Admin callers may also receive runtime diagnostics such as vLLM URLs, manifest paths, executor settings, and raw health details.
 
 #### vLLM Models
 
@@ -1916,7 +1987,8 @@ PHASE222_ADAPTER_MANIFEST=configs/dummy_tcar_lora_suite.json
 TCAR_PARALLEL_WORKERS=2
 TCAR_MAX_ROUTING_ADAPTERS=12
 TCAR_PLANNER_MAX_TOKENS=384
-TCAR_MAX_TOKENS=260
+TCAR_MAX_TOKENS=80
+TCAR_REFINER_MAX_TOKENS=220
 QWEN_ENABLE_THINKING=0
 ```
 
