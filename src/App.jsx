@@ -158,6 +158,7 @@ export default function App() {
   const [messages, setMessages] = useState([]);
   const [agents, setAgents] = useState([]);
   const [documents, setDocuments] = useState([]);
+  const [chatDocuments, setChatDocuments] = useState([]);
   const [runtime, setRuntime] = useState(null);
   const [metrics, setMetrics] = useState(null);
   const [auth, setAuth] = useState(null);
@@ -172,6 +173,7 @@ export default function App() {
   const [resourceView, setResourceView] = useState("agents");
   const [detailsRunId, setDetailsRunId] = useState(null);
   const [uploadOpen, setUploadOpen] = useState(false);
+  const [uploadScope, setUploadScope] = useState("knowledge");
   const [agentEditor, setAgentEditor] = useState(undefined);
   const [adoptionTarget, setAdoptionTarget] = useState(null);
   const [archiveTarget, setArchiveTarget] = useState(null);
@@ -232,10 +234,13 @@ export default function App() {
   }
 
   async function refreshResources() {
+    const agentPath = session?.session_id
+      ? `/api/agents?session_id=${encodeURIComponent(session.session_id)}`
+      : "/api/agents";
     const [me, sessionList, agentList, docList, health] = await Promise.all([
       api.get("/api/auth/me"),
       api.get("/api/chat/sessions"),
-      api.get("/api/agents"),
+      api.get(agentPath),
       api.get("/api/documents"),
       api.get("/api/runtime/health")
     ]);
@@ -267,9 +272,14 @@ export default function App() {
 
   async function openSession(sessionId) {
     setError("");
-    const payload = await api.get(`/api/chat/sessions/${encodeURIComponent(sessionId)}`);
+    const [payload, agentList] = await Promise.all([
+      api.get(`/api/chat/sessions/${encodeURIComponent(sessionId)}`),
+      api.get(`/api/agents?session_id=${encodeURIComponent(sessionId)}`)
+    ]);
     setSession(payload);
     setMessages(payload.messages || []);
+    setChatDocuments(payload.chat_documents || []);
+    setAgents(agentList.agents || []);
     setHistoryOpen(false);
     nearBottomRef.current = true;
     const assistantRunIds = [...new Set(
@@ -426,8 +436,14 @@ export default function App() {
     await api.delete(`/api/documents/${encodeURIComponent(document.document_id)}`);
     setDeleteDocumentTarget(null);
     await refreshResources();
-    setResourcesOpen(true);
-    setResourceView("knowledge");
+    if (document.scope === "chat") {
+      setChatDocuments((items) => items.filter((item) => item.document_id !== document.document_id));
+      setResourcesOpen(false);
+      setFocusComposer((value) => value + 1);
+    } else {
+      setResourcesOpen(true);
+      setResourceView("knowledge");
+    }
   }
 
   async function mountAgent(agent) {
@@ -455,6 +471,13 @@ export default function App() {
 
   function openKnowledgeUpload() {
     setResourcesOpen(false);
+    setUploadScope("knowledge");
+    setUploadOpen(true);
+  }
+
+  function openChatUpload() {
+    if (!session?.session_id) return;
+    setUploadScope("chat");
     setUploadOpen(true);
   }
 
@@ -590,8 +613,11 @@ export default function App() {
             value={draft}
             onChange={setDraft}
             onSubmit={sendMessage}
-            onAddKnowledge={() => setUploadOpen(true)}
+            onAttachFile={openChatUpload}
+            chatDocuments={chatDocuments}
+            onDeleteChatDocument={setDeleteDocumentTarget}
             agents={agents}
+            sessionId={session?.session_id}
             canWrite={canWrite}
             focusRequest={focusComposer}
           />
@@ -656,12 +682,22 @@ export default function App() {
 
       {uploadOpen && (
         <DocumentUploadDialog
+          scope={uploadScope}
+          sessionId={uploadScope === "chat" ? session?.session_id : null}
           onClose={() => setUploadOpen(false)}
-          onUploaded={async () => {
+          onUploaded={async (uploaded) => {
             setUploadOpen(false);
             await refreshResources();
-            setResourcesOpen(true);
-            setResourceView("knowledge");
+            if (uploadScope === "chat") {
+              setChatDocuments((items) => [
+                ...items.filter((item) => item.document_id !== uploaded.document_id),
+                uploaded
+              ]);
+              setFocusComposer((value) => value + 1);
+            } else {
+              setResourcesOpen(true);
+              setResourceView("knowledge");
+            }
           }}
         />
       )}
@@ -712,15 +748,17 @@ export default function App() {
 
       {deleteDocumentTarget && (
         <ConfirmDialog
-          title="Delete knowledge?"
+          title={deleteDocumentTarget.scope === "chat" ? "Remove file from this chat?" : "Delete knowledge?"}
           message={`${deleteDocumentTarget.title || "This file"} and its searchable contents will be permanently removed.`}
-          confirmLabel="Delete"
+          confirmLabel={deleteDocumentTarget.scope === "chat" ? "Remove" : "Delete"}
           destructive
           icon={Trash2}
           onClose={() => {
             setDeleteDocumentTarget(null);
-            setResourcesOpen(true);
-            setResourceView("knowledge");
+            if (deleteDocumentTarget.scope !== "chat") {
+              setResourcesOpen(true);
+              setResourceView("knowledge");
+            }
           }}
           onConfirm={() => deleteDocument(deleteDocumentTarget)}
         />
@@ -1105,7 +1143,18 @@ function mentionMatchScore(agent, query) {
   return 0;
 }
 
-function Composer({ value, onChange, onSubmit, onAddKnowledge, agents, canWrite, focusRequest }) {
+function Composer({
+  value,
+  onChange,
+  onSubmit,
+  onAttachFile,
+  chatDocuments,
+  onDeleteChatDocument,
+  agents,
+  sessionId,
+  canWrite,
+  focusRequest
+}) {
   const inputRef = useRef(null);
   const listId = useId();
   const [mention, setMention] = useState(null);
@@ -1116,13 +1165,14 @@ function Composer({ value, onChange, onSubmit, onAddKnowledge, agents, canWrite,
     const query = mention.query.toLowerCase();
     return agents
       .filter((agent) => agent.enabled !== false && agent.mounted !== false)
+      .filter((agent) => agent.scope !== "chat" || agent.session_id === sessionId)
       .map((agent) => ({ agent, score: mentionMatchScore(agent, query) }))
       .filter(({ score }) => score > 0)
       .sort((left, right) => right.score - left.score
         || formatAgentName(left.agent.id, agents).localeCompare(formatAgentName(right.agent.id, agents)))
       .map(({ agent }) => agent)
       .slice(0, 6);
-  }, [agents, mention]);
+  }, [agents, mention, sessionId]);
 
   useEffect(() => {
     if (focusRequest) inputRef.current?.focus();
@@ -1219,7 +1269,25 @@ function Composer({ value, onChange, onSubmit, onAddKnowledge, agents, canWrite,
           ))}
         </div>
       )}
-      <IconButton label="Add knowledge" className="composer-control" onClick={onAddKnowledge} disabled={!canWrite}>
+      {chatDocuments.length > 0 && (
+        <div className="chat-file-list" aria-label="Files available in this chat">
+          {chatDocuments.map((document) => (
+            <span className="chat-file-chip" key={document.document_id}>
+              <BookOpen size={14} aria-hidden="true" />
+              <span>{document.title}</span>
+              <IconButton
+                label={`Remove ${document.title || "file"} from this chat`}
+                compact
+                onClick={() => onDeleteChatDocument(document)}
+                disabled={!canWrite}
+              >
+                <X size={13} />
+              </IconButton>
+            </span>
+          ))}
+        </div>
+      )}
+      <IconButton label="Attach file to this chat" className="composer-control" onClick={onAttachFile} disabled={!canWrite || !sessionId}>
         <Paperclip size={19} />
       </IconButton>
       <label className="composer-input">
@@ -1444,7 +1512,7 @@ function KnowledgeList({ documents, agents, auth, canWrite, onAdd, onDelete }) {
       <div className="section-heading">
         <div>
           <h3 id="knowledge-heading">Knowledge</h3>
-          <p>Files that your agents can use as sources.</p>
+          <p>Reusable files available to your agents in every chat.</p>
         </div>
         <IconButton label="Add knowledge" onClick={onAdd} disabled={!canWrite}>
           <FilePlus2 size={18} />
@@ -1457,7 +1525,7 @@ function KnowledgeList({ documents, agents, auth, canWrite, onAdd, onDelete }) {
             <div className="row-copy">
               <strong>{document.title}</strong>
               <span>{document.chunks ? `${document.chunks} indexed sections` : "Ready to search"}</span>
-              <small>{document.visibility === "private" ? "Private" : document.visibility || "Available"}</small>
+              <small>{document.visibility === "private" ? "Private · All chats" : `${document.visibility || "Available"} · All chats`}</small>
             </div>
             {canManageDocument(document, agents, auth) && (
               <div className="row-actions">
@@ -1931,7 +1999,7 @@ function AdoptionDialog({ auth, agent, onClose, onSaved }) {
   );
 }
 
-function DocumentUploadDialog({ onClose, onUploaded }) {
+function DocumentUploadDialog({ scope = "knowledge", sessionId = null, onClose, onUploaded }) {
   const [file, setFile] = useState(null);
   const [title, setTitle] = useState("");
   const [routingCues, setRoutingCues] = useState("");
@@ -1951,8 +2019,10 @@ function DocumentUploadDialog({ onClose, onUploaded }) {
       form.append("title", title || file.name.replace(/\.[^.]+$/, ""));
       form.append("routing_cues", routingCues || title || file.name);
       form.append("visibility", "private");
-      await api.postForm("/api/documents", form);
-      await onUploaded();
+      form.append("scope", scope);
+      if (scope === "chat" && sessionId) form.append("session_id", sessionId);
+      const uploaded = await api.postForm("/api/documents", form);
+      await onUploaded(uploaded);
     } catch (uploadError) {
       setError(friendlyError(uploadError));
     } finally {
@@ -1960,7 +2030,14 @@ function DocumentUploadDialog({ onClose, onUploaded }) {
     }
   }
   return (
-    <ModalSurface title="Add knowledge" description="Upload a PDF, Markdown, or text file." onClose={onClose} className="form-dialog">
+    <ModalSurface
+      title={scope === "chat" ? "Attach file to this chat" : "Add to Knowledge"}
+      description={scope === "chat"
+        ? "This file will be available only in this chat."
+        : "This file will be available to your agents across all chats."}
+      onClose={onClose}
+      className="form-dialog"
+    >
       <form className="dialog-form" onSubmit={submit}>
         {error && <div className="form-error" role="alert">{error}</div>}
         <label className="file-field">
@@ -1981,7 +2058,7 @@ function DocumentUploadDialog({ onClose, onUploaded }) {
           <button type="button" className="text-button ghost" onClick={onClose} disabled={busy}>Cancel</button>
           <button type="submit" className="text-button primary" disabled={busy || !file}>
             {busy ? <LoaderCircle className="spin" size={16} /> : <Upload size={16} />}
-            {busy ? "Adding" : "Add"}
+            {busy ? "Adding" : scope === "chat" ? "Attach" : "Add to Knowledge"}
           </button>
         </div>
       </form>

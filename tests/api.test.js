@@ -100,6 +100,27 @@ describe("runtime and catalog", () => {
     expect(context.agents.map((agent) => agent.id)).toEqual(["active_lora", "legacy_active_lora"]);
   });
 
+  it("keeps chat-scoped document agents in their chat while reusing Knowledge agents", () => {
+    const session = { session_id: "session_a", workspace_id: "workspace_a", created_by: "alice" };
+    const context = scopedRoutingContext({
+      session,
+      agents: [
+        { id: "knowledge_lora", scope: "knowledge", workspace_id: "workspace_a", visibility: "private", created_by: "alice", enabled: true, mounted: true },
+        { id: "legacy_knowledge_lora", workspace_id: "workspace_a", visibility: "private", created_by: "alice", enabled: true, mounted: true },
+        { id: "chat_a_lora", scope: "chat", session_id: "session_a", workspace_id: "workspace_a", visibility: "private", created_by: "alice", enabled: true, mounted: true },
+        { id: "chat_b_lora", scope: "chat", session_id: "session_b", workspace_id: "workspace_a", visibility: "private", created_by: "alice", enabled: true, mounted: true }
+      ],
+      documents: [
+        { document_id: "knowledge_doc", scope: "knowledge", workspace_id: "workspace_a", visibility: "private", created_by: "alice", enabled: true },
+        { document_id: "chat_a_doc", scope: "chat", session_id: "session_a", workspace_id: "workspace_a", visibility: "private", created_by: "alice", enabled: true },
+        { document_id: "chat_b_doc", scope: "chat", session_id: "session_b", workspace_id: "workspace_a", visibility: "private", created_by: "alice", enabled: true }
+      ]
+    });
+
+    expect(context.allowedAdapters).toEqual(["knowledge_lora", "legacy_knowledge_lora", "chat_a_lora"]);
+    expect(context.documents.map((document) => document.document_id)).toEqual(["knowledge_doc", "chat_a_doc"]);
+  });
+
   it("enriches explicit Runtime selections with the overridden agent's RealityRank", () => {
     const revision = `sha256:${"a".repeat(64)}`;
     const plan = enrichRuntimeRoutingTrace({
@@ -2653,6 +2674,87 @@ describe("documents and sources", () => {
       expect.objectContaining({ artifact: "cited_passages", content_type: "application/json" })
     ]));
     expect(run.final_answer).toContain("rank is 5");
+  });
+
+  it("separates reusable Knowledge uploads from chat-only uploads", async () => {
+    const sessionA = await createSession("Scoped files A");
+    const sessionB = await createSession("Scoped files B");
+    const knowledge = await request(app)
+      .post("/api/documents")
+      .field("title", "Reusable README")
+      .field("scope", "knowledge")
+      .attach("file", Buffer.from("Reusable setup guidance for every chat."), "README.md")
+      .expect(201);
+    const chatOnly = await request(app)
+      .post("/api/documents")
+      .field("title", "Chat A Notes")
+      .field("scope", "chat")
+      .field("session_id", sessionA.session_id)
+      .attach("file", Buffer.from("Only chat A may route this private note."), "chat-a.md")
+      .expect(201);
+
+    expect(knowledge.body).toMatchObject({ scope: "knowledge", session_id: null });
+    expect(chatOnly.body).toMatchObject({ scope: "chat", session_id: sessionA.session_id });
+
+    const knowledgeList = await request(app).get("/api/documents").expect(200);
+    expect(knowledgeList.body.documents.map((document) => document.document_id)).toContain(knowledge.body.document_id);
+    expect(knowledgeList.body.documents.map((document) => document.document_id)).not.toContain(chatOnly.body.document_id);
+
+    await request(app).get("/api/documents?scope=chat").expect(400);
+    const chatAList = await request(app)
+      .get(`/api/documents?scope=chat&session_id=${encodeURIComponent(sessionA.session_id)}`)
+      .expect(200);
+    const chatBList = await request(app)
+      .get(`/api/documents?scope=chat&session_id=${encodeURIComponent(sessionB.session_id)}`)
+      .expect(200);
+    expect(chatAList.body.documents.map((document) => document.document_id)).toEqual([chatOnly.body.document_id]);
+    expect(chatBList.body.documents).toEqual([]);
+
+    const sessionADetail = await request(app).get(`/api/chat/sessions/${sessionA.session_id}`).expect(200);
+    const sessionBDetail = await request(app).get(`/api/chat/sessions/${sessionB.session_id}`).expect(200);
+    expect(sessionADetail.body.chat_documents.map((document) => document.document_id)).toEqual([chatOnly.body.document_id]);
+    expect(sessionBDetail.body.chat_documents).toEqual([]);
+
+    const globalAgents = await request(app).get("/api/agents").expect(200);
+    const chatAAgents = await request(app)
+      .get(`/api/agents?session_id=${encodeURIComponent(sessionA.session_id)}`)
+      .expect(200);
+    const chatBAgents = await request(app)
+      .get(`/api/agents?session_id=${encodeURIComponent(sessionB.session_id)}`)
+      .expect(200);
+    expect(globalAgents.body.agents.map((agent) => agent.id)).toContain(knowledge.body.agent_id);
+    expect(globalAgents.body.agents.map((agent) => agent.id)).not.toContain(chatOnly.body.agent_id);
+    expect(chatAAgents.body.agents.map((agent) => agent.id)).toContain(chatOnly.body.agent_id);
+    expect(chatBAgents.body.agents.map((agent) => agent.id)).not.toContain(chatOnly.body.agent_id);
+
+    const chatAQueued = await request(app)
+      .post(`/api/chat/sessions/${sessionA.session_id}/messages`)
+      .send({ content: '@"Chat A Notes source agent" use this chat file.' })
+      .expect(202);
+    const chatBQueued = await request(app)
+      .post(`/api/chat/sessions/${sessionB.session_id}/messages`)
+      .send({ content: '@"Chat A Notes source agent" must not be available here.' })
+      .expect(202);
+    const knowledgeQueued = await request(app)
+      .post(`/api/chat/sessions/${sessionB.session_id}/messages`)
+      .send({ content: '@“Reusable README source agent” use the reusable file.' })
+      .expect(202);
+
+    const [chatARun, chatBRun, knowledgeRun] = await Promise.all([
+      waitForRun(chatAQueued.body.run_id),
+      waitForRun(chatBQueued.body.run_id),
+      waitForRun(knowledgeQueued.body.run_id)
+    ]);
+    expect(chatARun.plan.steps.map((step) => step.adapter)).toContain(chatOnly.body.agent_id);
+    expect(chatBRun.plan.steps.map((step) => step.adapter)).not.toContain(chatOnly.body.agent_id);
+    expect(knowledgeRun.plan.steps.map((step) => step.adapter)).toContain(knowledge.body.agent_id);
+
+    await request(app)
+      .post("/api/documents")
+      .field("title", "Missing chat")
+      .field("scope", "chat")
+      .attach("file", Buffer.from("invalid"), "invalid.txt")
+      .expect(400);
   });
 
   it("keeps a deleted document agent inspectable as an owner-scoped tombstone after Runtime purge", async () => {

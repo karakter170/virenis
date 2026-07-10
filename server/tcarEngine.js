@@ -209,9 +209,10 @@ function resolveExplicitAgentMentions(query, agents) {
   }
   const selected = [];
   const seen = new Set();
-  const mentionPattern = /@(?:["']([^"']+)["']|([a-z0-9][a-z0-9_-]*))/gi;
+  const mentionPattern = /@(?:"([^"\r\n]+)"|'([^'\r\n]+)'|“([^”\r\n]+)”|‘([^’\r\n]+)’|([a-z0-9][a-z0-9_-]*))/gi;
   for (const match of String(query || "").matchAll(mentionPattern)) {
-    const agent = aliases.get(slugify(match[1] || match[2]));
+    const reference = match.slice(1).find((value) => value !== undefined);
+    const agent = aliases.get(slugify(reference));
     if (agent && !seen.has(agent.id)) {
       selected.push(agent);
       seen.add(agent.id);
@@ -255,6 +256,10 @@ export function scopedRoutingContext({ session, agents = [], documents = [] }) {
 }
 
 function resourceVisibleToSession(resource = {}, session = {}) {
+  const scope = resource.scope === "chat" ? "chat" : "knowledge";
+  if (scope === "chat" && String(resource.session_id || "") !== String(session?.session_id || "")) {
+    return false;
+  }
   if (!resource.workspace_id) {
     return true;
   }
@@ -262,6 +267,9 @@ function resourceVisibleToSession(resource = {}, session = {}) {
     return false;
   }
   const visibility = resource.visibility || "team";
+  if (scope === "chat") {
+    return true;
+  }
   if (visibility === "private") {
     return !resource.created_by || resource.created_by === session?.created_by;
   }

@@ -426,6 +426,14 @@ export async function createApp({
       res.json({
         ...session,
         messages: data.messages.filter((message) => message.session_id === session.session_id),
+        chat_documents: data.documents
+          .filter((document) =>
+            storedDocumentScope(document) === "chat"
+            && document.session_id === session.session_id
+            && document.enabled !== false
+            && documentAccessibleToRequest(data, document, req)
+          )
+          .map((document) => documentSummaryForRequest(document, req)),
         shared_memory: normalizeSharedMemory(session.shared_memory || [])
       });
     } catch (error) {
@@ -885,6 +893,10 @@ export async function createApp({
   app.get("/api/agents", async (req, res, next) => {
     try {
       const data = store.read();
+      const requestedSessionId = String(req.query.session_id || "").trim();
+      const requestedSession = requestedSessionId
+        ? findAccessibleSession(data, requestedSessionId, req)
+        : null;
       const runtimeAgents = realRuntimeEnabled() ? (await fetchRuntimeAgents()).agents || [] : data.agents;
       const localById = new Map(data.agents.map((agent) => [agent.id, agent]));
       const q = String(req.query.q || "").toLowerCase();
@@ -907,6 +919,7 @@ export async function createApp({
       const visibleAgents = runtimeAgents
       .map((agent) => mergeRuntimeAgentMetadata(agent, localById))
       .filter((agent) => agentVisibleToRequest(agent, req))
+      .filter((agent) => agentAvailableForSession(agent, requestedSession?.session_id || null))
       .filter((agent) => !q || `${agent.id} ${agent.title} ${agent.capability}`.toLowerCase().includes(q))
       .filter((agent) => !tool || (agent.tools || []).includes(tool))
       .filter((agent) => mountedValue === null || mountedValue === (agent.mounted !== false))
@@ -1563,8 +1576,10 @@ export async function createApp({
   app.post("/api/documents", documentUpload.single("file"), async (req, res, next) => {
     let runtimeRegistrationCleanup = null;
     try {
-      const workspaceId = requestWorkspaceId(req, req.body.workspace_id);
-      assertDocumentQuota(store.read(), req, workspaceId);
+      const snapshot = store.read();
+      const documentScope = resolveDocumentUploadScope(snapshot, req, req.body);
+      const workspaceId = documentScope.workspace_id;
+      assertDocumentQuota(snapshot, req, workspaceId);
       const { text, pages } = await extractDocumentFromUpload(req.file);
       const uploadDigest = sha256ContentDigest(req.file.buffer);
       const extractedTextDigest = sha256ContentDigest(text);
@@ -1642,6 +1657,8 @@ export async function createApp({
         const document = {
           document_id: makeId("doc"),
           workspace_id: workspaceId,
+          scope: documentScope.scope,
+          session_id: documentScope.session_id,
           agent_id: agentId,
           title,
           source_path: req.file.originalname,
@@ -1656,6 +1673,7 @@ export async function createApp({
           max_excerpt_chars: documentOptions.max_excerpt_chars,
           enabled: true,
           created_by: req.auth.user_id,
+          uploaded_by: req.auth.user_id,
           created_at: now,
           source_digest: runtimeDoc.source_digest,
           upload_digest: uploadDigest,
@@ -1720,6 +1738,8 @@ export async function createApp({
             index_digest: document.index_digest
           },
           workspace_id: document.workspace_id,
+          scope: document.scope,
+          session_id: document.session_id,
           visibility: document.visibility,
           created_by: document.created_by,
           enabled: runtimeAgent.enabled ?? true,
@@ -1742,6 +1762,8 @@ export async function createApp({
             actor: req.auth,
             details: {
               document_id: document.document_id,
+              scope: document.scope,
+              session_id: document.session_id,
               chunks: runtimeChunks.length,
               mounted,
               source_digest: document.source_digest,
@@ -1759,6 +1781,11 @@ export async function createApp({
           ...redactDocumentRegistrationForRequest({
             document_id: document.document_id,
             agent_id: agent.id,
+            title: document.title,
+            scope: document.scope,
+            session_id: document.session_id,
+            visibility: document.visibility,
+            created_at: document.created_at,
             status: "indexed",
             chunks: runtimeChunks.length,
             source_digest: document.source_digest,
@@ -1784,6 +1811,8 @@ export async function createApp({
       const document = {
         document_id: makeId("doc"),
         workspace_id: workspaceId,
+        scope: documentScope.scope,
+        session_id: documentScope.session_id,
         agent_id: agentId,
         title,
         source_path: req.file.originalname,
@@ -1798,6 +1827,7 @@ export async function createApp({
         max_excerpt_chars: documentOptions.max_excerpt_chars,
         enabled: true,
         created_by: req.auth.user_id,
+        uploaded_by: req.auth.user_id,
         created_at: now,
         source_digest: extractedTextDigest,
         upload_digest: uploadDigest,
@@ -1840,6 +1870,8 @@ export async function createApp({
         },
         document: { slug, title, corpus_revision: document.corpus_revision, index_digest: document.index_digest },
         workspace_id: document.workspace_id,
+        scope: document.scope,
+        session_id: document.session_id,
         visibility: document.visibility,
         created_by: document.created_by,
         stage: 13,
@@ -1866,6 +1898,8 @@ export async function createApp({
           actor: req.auth,
           details: {
             document_id: document.document_id,
+            scope: document.scope,
+            session_id: document.session_id,
             chunks: chunks.length,
             mounted: true,
             corpus_revision: document.corpus_revision,
@@ -1878,6 +1912,11 @@ export async function createApp({
         ...redactDocumentRegistrationForRequest({
           document_id: document.document_id,
           agent_id: agent.id,
+          title: document.title,
+          scope: document.scope,
+          session_id: document.session_id,
+          visibility: document.visibility,
+          created_at: document.created_at,
           status: "indexed",
           chunks: chunks.length,
           source_digest: document.source_digest,
@@ -1933,6 +1972,17 @@ export async function createApp({
   app.get("/api/documents", (req, res) => {
     const data = store.read();
     const workspaceId = requestWorkspaceId(req, req.query?.workspace_id);
+    const scope = normalizeDocumentListScope(req.query?.scope);
+    const requestedSessionId = String(req.query?.session_id || "").trim();
+    if (scope === "chat" && !requestedSessionId) {
+      throwStatus(400, "Chat document listings require session_id.");
+    }
+    if (scope === "knowledge" && requestedSessionId) {
+      throwStatus(400, "Knowledge document listings cannot include session_id.");
+    }
+    const requestedSession = scope === "chat"
+      ? findAccessibleSession(data, requestedSessionId, req)
+      : null;
     const limit = normalizeListLimit(req.query?.limit, {
       defaultValue: Number(process.env.WEB_LIST_DEFAULT_LIMIT || 100),
       maxValue: Number(process.env.WEB_LIST_MAX_LIMIT || 500)
@@ -1941,30 +1991,15 @@ export async function createApp({
     const includeArchived = isAdmin(req) && String(req.query?.include_archived || "") === "true";
     const visibleDocuments = data.documents.filter((doc) =>
       doc.workspace_id === workspaceId
-      && canAccessResource(req, doc)
+      && storedDocumentScope(doc) === scope
+      && (scope !== "chat" || doc.session_id === requestedSession.session_id)
+      && documentAccessibleToRequest(data, doc, req)
       && (includeArchived || doc.enabled !== false)
     );
     res.json({
       documents: visibleDocuments
         .slice(offset, offset + limit)
-        .map((doc) => redactDocumentSummaryForRequest({
-          document_id: doc.document_id,
-          agent_id: doc.agent_id,
-          title: doc.title,
-          chunks: doc.chunks.length,
-          visibility: doc.visibility,
-          created_at: doc.created_at,
-          enabled: doc.enabled !== false,
-          archived_at: doc.archived_at || null,
-          source_digest: doc.source_digest || null,
-          upload_digest: doc.upload_digest || null,
-          extracted_text_digest: doc.extracted_text_digest || null,
-          corpus_revision: doc.corpus_revision || null,
-          index_digest: doc.index_digest || null,
-          index_path: doc.index_path,
-          source_path: doc.source_path || null,
-          page_count: doc.page_count || null
-        }, req)),
+        .map((doc) => documentSummaryForRequest(doc, req)),
       total: visibleDocuments.length,
       limit,
       offset
@@ -3246,6 +3281,8 @@ function mergeRuntimeAgentMetadata(agent, localById) {
     ...local,
     ...agent,
     workspace_id: local.workspace_id,
+    scope: storedDocumentScope(local),
+    session_id: storedDocumentScope(local) === "chat" ? local.session_id : null,
     visibility: local.visibility,
     created_by: local.created_by,
     enabled: agent.mount_pending ? local.enabled !== false : agent.enabled ?? local.enabled,
@@ -3263,6 +3300,13 @@ function agentVisibleToRequest(agent, req) {
     return true;
   }
   return canAccessResource(req, agent);
+}
+
+function agentAvailableForSession(agent, sessionId) {
+  if (storedDocumentScope(agent) !== "chat") {
+    return true;
+  }
+  return Boolean(sessionId) && String(agent.session_id || "") === String(sessionId);
 }
 
 function assertAgentAccess(agent, req) {
@@ -3430,10 +3474,9 @@ function findAccessibleRun(data, runId, req) {
 
 function findAccessibleDocument(data, documentId, req) {
   const doc = data.documents.find((item) => item.document_id === documentId);
-  if (!doc) {
+  if (!doc || !documentAccessibleToRequest(data, doc, req)) {
     throwStatus(404, "Document not found.");
   }
-  assertResourceAccess(req, doc);
   return doc;
 }
 
@@ -3700,6 +3743,29 @@ function redactDocumentSummaryForRequest(document = {}, req) {
     ...safeDocument
   } = document;
   return safeDocument;
+}
+
+function documentSummaryForRequest(document, req) {
+  return redactDocumentSummaryForRequest({
+    document_id: document.document_id,
+    agent_id: document.agent_id,
+    title: document.title,
+    scope: storedDocumentScope(document),
+    session_id: storedDocumentScope(document) === "chat" ? document.session_id : null,
+    chunks: Array.isArray(document.chunks) ? document.chunks.length : 0,
+    visibility: document.visibility,
+    created_at: document.created_at,
+    enabled: document.enabled !== false,
+    archived_at: document.archived_at || null,
+    source_digest: document.source_digest || null,
+    upload_digest: document.upload_digest || null,
+    extracted_text_digest: document.extracted_text_digest || null,
+    corpus_revision: document.corpus_revision || null,
+    index_digest: document.index_digest || null,
+    index_path: document.index_path,
+    source_path: document.source_path || null,
+    page_count: document.page_count || null
+  }, req);
 }
 
 function redactChunkForRequest(chunk = {}, req) {
@@ -4274,6 +4340,57 @@ function assertDocumentQuota(data, req, workspaceId) {
   if (userLimit > 0 && userDocuments.length >= userLimit) {
     throwStatus(429, `User document quota exceeded. Limit is ${userLimit} documents.`);
   }
+}
+
+function storedDocumentScope(resource = {}) {
+  return resource.scope === "chat" ? "chat" : "knowledge";
+}
+
+function normalizeDocumentListScope(value) {
+  const scope = String(value || "knowledge").trim().toLowerCase();
+  if (!new Set(["knowledge", "chat"]).has(scope)) {
+    throwStatus(400, "document scope must be 'knowledge' or 'chat'.");
+  }
+  return scope;
+}
+
+function resolveDocumentUploadScope(data, req, body = {}) {
+  const suppliedSessionId = String(body?.session_id || "").trim();
+  const scope = String(body?.scope || (suppliedSessionId ? "chat" : "knowledge")).trim().toLowerCase();
+  if (!new Set(["knowledge", "chat"]).has(scope)) {
+    throwStatus(400, "document scope must be 'knowledge' or 'chat'.");
+  }
+  if (scope === "knowledge") {
+    if (suppliedSessionId) {
+      throwStatus(400, "Knowledge uploads cannot include session_id.");
+    }
+    return {
+      scope,
+      session_id: null,
+      workspace_id: requestWorkspaceId(req, body?.workspace_id)
+    };
+  }
+  if (!suppliedSessionId) {
+    throwStatus(400, "Chat uploads require session_id.");
+  }
+  const session = findAccessibleSession(data, suppliedSessionId, req);
+  return {
+    scope,
+    session_id: session.session_id,
+    workspace_id: session.workspace_id
+  };
+}
+
+function documentAccessibleToRequest(data, document, req) {
+  if (storedDocumentScope(document) !== "chat") {
+    return canAccessResource(req, document);
+  }
+  const session = data.sessions.find((item) => item.session_id === document.session_id);
+  return Boolean(
+    session
+    && String(session.workspace_id || "") === String(document.workspace_id || "")
+    && canAccessResource(req, session)
+  );
 }
 
 function assertDocumentChunkQuota(chunks) {
