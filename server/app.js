@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import express from "express";
 import multer from "multer";
-import { parseConfiguredApiTokens } from "./authConfig.js";
+import { basicAuthPassword, parseConfiguredApiTokens } from "./authConfig.js";
 import { seedAgents, BASE_MODEL } from "./catalog.js";
 import { createStore, makeId, nowIso } from "./store.js";
 import {
@@ -2710,9 +2710,10 @@ function securityHeaders(_req, res, next) {
 
 function optionalBasicAuth(req, res, next) {
   const user = process.env.APP_BASIC_AUTH_USER;
-  const password = process.env.APP_BASIC_AUTH_PASSWORD;
+  let password;
   let configuredTokens;
   try {
+    password = basicAuthPassword();
     configuredTokens = parseConfiguredApiTokens();
   } catch (error) {
     next(error);

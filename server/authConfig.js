@@ -1,3 +1,5 @@
+import { readConfiguredSecret } from "./secretConfig.js";
+
 const RESOLVER_TYPES = new Set(["human", "api", "document"]);
 const MAX_RESOLVER_BINDINGS = 32;
 const MAX_RESOLVER_AUTHORITY_CHARS = 240;
@@ -10,7 +12,15 @@ export function secretConfigured(value) {
 }
 
 export function basicAuthConfigured(env = process.env) {
-  return Boolean(env.APP_BASIC_AUTH_USER && secretConfigured(env.APP_BASIC_AUTH_PASSWORD));
+  return Boolean(env.APP_BASIC_AUTH_USER && secretConfigured(basicAuthPassword(env)));
+}
+
+export function basicAuthPassword(env = process.env) {
+  return readConfiguredSecret(
+    env,
+    "APP_BASIC_AUTH_PASSWORD",
+    "APP_BASIC_AUTH_PASSWORD_FILE"
+  );
 }
 
 export function parseConfiguredApiTokens(env = process.env, { requireStrongSecrets = false } = {}) {

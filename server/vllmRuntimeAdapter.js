@@ -9,15 +9,24 @@ import {
   planRoutes,
   sanitizeToolCalls
 } from "./tcarEngine.js";
+import { readConfiguredSecret } from "./secretConfig.js";
 
 const DEFAULT_TIMEOUT_MS = 900000;
 
 export function createVllmRuntimeAdapter(options = {}) {
   const config = {
     vllmBaseUrl: String(options.vllmBaseUrl || process.env.VLLM_BASE_URL || DEFAULT_VLLM_BASE_URL).replace(/\/+$/, ""),
-    vllmApiKey: options.vllmApiKey ?? process.env.VLLM_API_KEY,
+    vllmApiKey: options.vllmApiKey ?? readConfiguredSecret(
+      process.env,
+      "VLLM_API_KEY",
+      "VLLM_API_KEY_FILE"
+    ),
     baseModel: options.baseModel || process.env.VLLM_MODEL || process.env.VLLM_BASE_MODEL || BASE_MODEL,
-    runtimeApiKey: options.runtimeApiKey ?? process.env.TCAR_RUNTIME_API_KEY,
+    runtimeApiKey: options.runtimeApiKey ?? readConfiguredSecret(
+      process.env,
+      "TCAR_RUNTIME_API_KEY",
+      "TCAR_RUNTIME_API_KEY_FILE"
+    ),
     fetchImpl: options.fetchImpl || globalThis.fetch
   };
   if (!config.vllmApiKey) {

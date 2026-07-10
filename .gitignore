@@ -3,6 +3,7 @@ dist/
 coverage/
 .vite/
 .env.local
+.env.gpu.local
 data/app-db.json
 uploads/
 *.log

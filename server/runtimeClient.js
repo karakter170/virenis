@@ -1,6 +1,7 @@
 import http from "node:http";
 import https from "node:https";
 import { appAuthConfigured, secretConfigured } from "./authConfig.js";
+import { readConfiguredSecret } from "./secretConfig.js";
 
 const DEFAULT_TIMEOUT_MS = 900000;
 const DEFAULT_CONNECT_TIMEOUT_MS = 10000;
@@ -37,11 +38,12 @@ export function realRuntimeEnabled() {
 
 export function requireRuntimeConfigured() {
   const isProduction = process.env.NODE_ENV === "production";
+  const configuredRuntimeApiKey = realRuntimeEnabled() ? runtimeApiKey() : "";
   if (realRuntimeEnabled() && !process.env.TCAR_RUNTIME_API_URL) {
     throw new Error("TCAR_ENGINE_MODE=real requires TCAR_RUNTIME_API_URL.");
   }
-  if (realRuntimeEnabled() && isProduction && !secretConfigured(process.env.TCAR_RUNTIME_API_KEY)) {
-    throw new Error("Production real runtime requires TCAR_RUNTIME_API_KEY.");
+  if (realRuntimeEnabled() && isProduction && !secretConfigured(configuredRuntimeApiKey)) {
+    throw new Error("Production real runtime requires TCAR_RUNTIME_API_KEY or TCAR_RUNTIME_API_KEY_FILE.");
   }
   if (realRuntimeEnabled()) validateRuntimeTransportConfiguration(process.env);
   if (isProduction && process.env.APP_ALLOW_UNAUTHENTICATED !== "1") {
@@ -63,6 +65,14 @@ export function requireRuntimeConfigured() {
   if (isProduction && isAllInterfaceHost(process.env.HOST) && process.env.APP_ALLOW_PUBLIC_BIND !== "1") {
     throw new Error("Production web server must bind to 127.0.0.1 or a protected private interface. Set APP_ALLOW_PUBLIC_BIND=1 only when firewall/proxy controls explicitly protect the Node process.");
   }
+}
+
+export function runtimeApiKey(env = process.env) {
+  return readConfiguredSecret(
+    env,
+    "TCAR_RUNTIME_API_KEY",
+    "TCAR_RUNTIME_API_KEY_FILE"
+  );
 }
 
 function validateRuntimeTransportConfiguration(env) {
@@ -214,8 +224,9 @@ export async function runtimeRequest(path, { method = "GET", body, timeoutMs = D
     encodedBody = Buffer.from(JSON.stringify(body), "utf8");
     headers["Content-Length"] = String(encodedBody.length);
   }
-  if (process.env.TCAR_RUNTIME_API_KEY) {
-    headers["X-TCAR-API-Key"] = process.env.TCAR_RUNTIME_API_KEY;
+  const configuredRuntimeApiKey = runtimeApiKey();
+  if (configuredRuntimeApiKey) {
+    headers["X-TCAR-API-Key"] = configuredRuntimeApiKey;
   }
 
   const requestOptions = {
