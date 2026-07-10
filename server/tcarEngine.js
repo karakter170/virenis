@@ -1,7 +1,8 @@
 import { approvedSourceSnippets, BASE_MODEL, DEFAULT_VLLM_BASE_URL } from "./catalog.js";
 import { makeId, nowIso } from "./store.js";
-import { scoreChunks, slugify } from "./documents.js";
+import { assertStoredDocumentIntegrity, scoreChunks, slugify } from "./documents.js";
 import { executeRuntimeChat, realRuntimeEnabled } from "./runtimeClient.js";
+import { agentRevision, digestValue, normalizeSha256Digest, realityRankMap, recordExecution } from "./outcomes.js";
 
 const MAX_MESSAGE_CHARS = 12000;
 const DEFAULT_MEMORY_ENTRIES = 40;
@@ -21,15 +22,17 @@ export function validateUserMessage(content) {
   }
 }
 
-export function planRoutes({ query, agents, documents = [] }) {
-  const enabled = agents.filter((agent) => agent.enabled !== false);
+export function planRoutes({ query, agents, documents = [], agentRankings = {}, maxRoutingAdapters = 12 }) {
+  const enabled = agents.filter((agent) => agent.enabled !== false && agent.runtime_sync_pending !== true);
   const hasAgent = (id) => enabled.some((agent) => agent.id === id);
   const lower = query.toLowerCase();
   const steps = [];
   const idByAdapter = new Map();
+  const selections = new Map();
+  const specialistLimit = Math.max(1, Number(maxRoutingAdapters) || 12);
 
   const contains = (...terms) => terms.some((term) => lower.includes(term));
-  const add = (adapter, task, dependencyAdapters = []) => {
+  const add = (adapter, task, dependencyAdapters = [], selection = null) => {
     if (!hasAgent(adapter)) {
       return undefined;
     }
@@ -39,16 +42,28 @@ export function planRoutes({ query, agents, documents = [] }) {
       existing.depends_on = [...new Set([...(existing.depends_on || []), ...dependencies])].filter((id) => id !== existing.id);
       return idByAdapter.get(adapter);
     }
+    if (adapter !== "writing_synthesis_lora" && steps.filter((step) => step.adapter !== "writing_synthesis_lora").length >= specialistLimit) {
+      return undefined;
+    }
     const id = `s${steps.length + 1}`;
     const depends_on = dependencyAdapters.map((dep) => idByAdapter.get(dep)).filter(Boolean);
     steps.push({ id, adapter, task, depends_on });
     idByAdapter.set(adapter, id);
+    if (selection) {
+      selections.set(adapter, selection);
+    }
     return id;
   };
 
   for (const agent of resolveExplicitAgentMentions(query, enabled)) {
     if (agent.id === "writing_synthesis_lora") continue;
-    add(agent.id, `Execute the explicitly requested @${agent.id} agent within its declared capability and boundary.`);
+    add(agent.id, `Execute the explicitly requested @${agent.id} agent within its declared capability and boundary.`, [], {
+      adapter: agent.id,
+      source: "explicit",
+      confidence: 1,
+      reality_rank: rankingScore(agentRankings[agent.id]),
+      reason: "Explicit authorized agent reference."
+    });
   }
 
   const matchingDocuments = documents.filter((doc) => {
@@ -98,14 +113,29 @@ export function planRoutes({ query, agents, documents = [] }) {
     add("project_planning_lora", "Sequence the work into milestones, owners, and checklist items.");
   }
 
-  const metadataMatches = enabled
+  const metadataCandidates = enabled
     .filter((agent) => agent.id !== "writing_synthesis_lora" && !idByAdapter.has(agent.id))
     .map((agent) => ({ agent, score: agentMetadataScore(agent, lower) }))
     .filter((match) => match.score > 0)
-    .sort((left, right) => right.score - left.score || left.agent.id.localeCompare(right.agent.id))
-    .slice(0, 2);
-  for (const { agent } of metadataMatches) {
-    add(agent.id, `Apply ${agent.title || agent.id} to the request using only its declared tools and approved sources.`);
+    .sort((left, right) =>
+      right.score - left.score
+      || routingRankingScore(agentRankings[right.agent.id]) - routingRankingScore(agentRankings[left.agent.id])
+      || left.agent.id.localeCompare(right.agent.id)
+    );
+  const metadataMatches = metadataCandidates.slice(0, Math.min(2, specialistLimit));
+  for (const { agent, score } of metadataMatches) {
+    const rank = rankingScore(agentRankings[agent.id]);
+    const rankApplied = agentRankings[agent.id]?.routing_eligible === true
+      && metadataCandidates.some((candidate) => candidate.agent.id !== agent.id && candidate.score === score);
+    add(agent.id, `Apply ${agent.title || agent.id} to the request using only its declared tools and approved sources.`, [], {
+      adapter: agent.id,
+      source: rankApplied ? "cue+reality_rank" : "cue",
+      confidence: Number((score / (score + 4)).toFixed(4)),
+      reality_rank: rank,
+      reason: rankApplied
+        ? "Capability cues matched; settled outcomes broke an equally relevant tie."
+        : "Agent metadata matched the request."
+    });
   }
 
   const currentAdapters = steps.map((step) => step.adapter);
@@ -125,7 +155,43 @@ export function planRoutes({ query, agents, documents = [] }) {
 
   add("writing_synthesis_lora", "Synthesize one concise final answer while preserving source and safety boundaries.", steps.map((step) => step.adapter));
 
-  return { steps };
+  return {
+    steps,
+    routing: {
+      mode: "simulator",
+      candidate_trace: metadataCandidates.slice(0, 256).map(({ agent, score }) => ({
+        adapter: agent.id,
+        cue_score: score,
+        reality_rank: rankingScore(agentRankings[agent.id]),
+        rank_sample_size: Math.max(0, Number(agentRankings[agent.id]?.sample_size) || 0),
+        rank_supplied: agentRankings[agent.id]?.routing_eligible === true,
+        agent_revision: agentRankings[agent.id]?.agent_revision || agentRevision(agent)
+      })),
+      explicit_adapters: [...selections.values()]
+        .filter((selection) => selection.source === "explicit")
+        .map((selection) => selection.adapter),
+      selected: steps
+        .filter((step) => step.adapter !== "writing_synthesis_lora")
+        .map((step) => selections.get(step.adapter) || {
+          adapter: step.adapter,
+          source: "cue",
+          confidence: null,
+          reality_rank: rankingScore(agentRankings[step.adapter]),
+          reason: "Deterministic capability rule matched the request."
+        })
+    }
+  };
+}
+
+function rankingScore(value) {
+  const score = Number(value?.score ?? value);
+  return Number.isFinite(score) && score >= 0 && score <= 1 ? score : 0.5;
+}
+
+function routingRankingScore(value) {
+  if (value?.routing_eligible !== true) return 0.5;
+  const score = Number(value.routing_score ?? value.score);
+  return Number.isFinite(score) && score >= 0 && score <= 1 ? score : 0.5;
 }
 
 function resolveExplicitAgentMentions(query, agents) {
@@ -172,9 +238,14 @@ export function scopedRoutingContext({ session, agents = [], documents = [] }) {
   const visibleAgents = agents.filter((agent) =>
     agent.enabled !== false &&
     agent.mounted !== false &&
+    agent.runtime_sync_pending !== true &&
     resourceVisibleToSession(agent, session)
   );
-  const visibleDocuments = documents.filter((document) => resourceVisibleToSession(document, session));
+  const visibleDocuments = documents.filter((document) =>
+    document.enabled !== false &&
+    document.runtime_sync_pending !== true &&
+    resourceVisibleToSession(document, session)
+  );
   const allowedAdapters = [...new Set(visibleAgents.map((agent) => agent.id).filter(Boolean))];
   return {
     agents: visibleAgents,
@@ -343,7 +414,9 @@ async function processLocalChatRun({ store, bus, run_id, options = {} }) {
       session: data.sessions.find((item) => item.session_id === data.runs.find((run) => run.run_id === run_id)?.session_id),
       agents: data.agents,
       documents: data.documents,
-      messages: data.messages
+      messages: data.messages,
+      outcomeContracts: data.outcomeContracts || [],
+      executionRecords: data.executionRecords || []
     }));
     if (!snapshot.run) {
       throw new Error("Run not found.");
@@ -355,22 +428,44 @@ async function processLocalChatRun({ store, bus, run_id, options = {} }) {
       agents: snapshot.agents,
       documents: snapshot.documents
     });
-    await updateRun(store, bus, run_id, { status: "planning", started_at: nowIso() }, { type: "run.started", run_id });
-    await appendEvent(store, bus, run_id, { type: "planner.started" });
-    const plan = planRoutes({ query, agents: scoped.agents, documents: scoped.documents });
+    const agentRankings = realityRankMap(snapshot, {
+      agents: scoped.agents,
+      workspaceId: snapshot.session?.workspace_id,
+      query
+    });
+    const plan = planRoutes({
+      query,
+      agents: scoped.agents,
+      documents: scoped.documents,
+      agentRankings,
+      maxRoutingAdapters: Number(options.max_routing_adapters) || 12
+    });
     const parallel = buildParallelBatches(plan.steps, Number(options.parallel_workers) || 2);
-    await updateRun(store, bus, run_id, { plan, parallel }, { type: "planner.completed", steps: plan.steps });
+    await persistRunTransition({
+      store,
+      bus,
+      runId: run_id,
+      patch: { status: "running", started_at: nowIso(), plan, parallel },
+      events: [
+        { type: "run.started", run_id },
+        { type: "planner.started" },
+        { type: "planner.completed", steps: plan.steps }
+      ]
+    });
 
     const routeOutputs = [];
     for (const batch of parallel.batches) {
       const batchSteps = plan.steps.filter((step) => batch.steps.includes(step.id));
       await Promise.all(batchSteps.map(async (step) => {
-        await appendEvent(store, bus, run_id, {
+        const routeStartedEvent = {
           type: "route.started",
           step_id: step.id,
           adapter: step.adapter,
+          agent_revision: agentRevision(scoped.agents.find((agent) => agent.id === step.adapter) || { id: step.adapter }),
+          adapter_digest: null,
+          model_id: BASE_MODEL,
           batch: batch.batch
-        });
+        };
         const routeStarted = Date.now();
         const result = buildRouteOutput({
           step,
@@ -381,38 +476,45 @@ async function processLocalChatRun({ store, bus, run_id, options = {} }) {
         });
         const elapsed = Number(((Date.now() - routeStarted) / 1000 + 0.015).toFixed(3));
         routeOutputs.push({ ...result, elapsed_sec: elapsed, parallel_batch: batch.batch, parallel_width: batch.width });
-        await upsertRunStep(store, run_id, {
-          run_step_id: makeId("run_step"),
-          run_id,
-          step_id: step.id,
-          adapter: step.adapter,
-          task: step.task,
-          depends_on: step.depends_on || [],
-          used_upstream: step.depends_on || [],
-          parallel_batch: batch.batch,
-          parallel_width: batch.width,
-          status: "completed",
-          agent_reasoning: result.agent_reasoning,
-          domain_answer: result.domain_answer,
-          handoffs: result.handoffs,
-          handoff_artifacts: result.handoff_artifacts,
-          boundary_check: result.boundary_check,
-          allowed_tools: result.allowed_tools,
-          approved_sources: result.approved_sources,
-          policy_violations: result.policy_violations,
-          retrieved_context: result.retrieved_context,
-          citations: result.citations,
-          raw_text_admin_only: result.raw_text,
-          prompt_preview_admin_only: `Adapter ${step.adapter} received task: ${step.task}`,
-          started_at: new Date(routeStarted).toISOString(),
-          completed_at: nowIso(),
-          elapsed_sec: elapsed
-        });
-        await appendEvent(store, bus, run_id, {
+        const routeCompletedEvent = {
           type: "route.completed",
           step_id: step.id,
           adapter: step.adapter,
           elapsed_sec: elapsed
+        };
+        await persistCompletedRunRoute({
+          store,
+          bus,
+          runId: run_id,
+          startedEvent: routeStartedEvent,
+          completedEvent: routeCompletedEvent,
+          runStep: {
+            run_step_id: makeId("run_step"),
+            run_id,
+            step_id: step.id,
+            adapter: step.adapter,
+            task: step.task,
+            depends_on: step.depends_on || [],
+            used_upstream: step.depends_on || [],
+            parallel_batch: batch.batch,
+            parallel_width: batch.width,
+            status: "completed",
+            agent_reasoning: result.agent_reasoning,
+            domain_answer: result.domain_answer,
+            handoffs: result.handoffs,
+            handoff_artifacts: result.handoff_artifacts,
+            boundary_check: result.boundary_check,
+            allowed_tools: result.allowed_tools,
+            approved_sources: result.approved_sources,
+            policy_violations: result.policy_violations,
+            retrieved_context: result.retrieved_context,
+            citations: result.citations,
+            raw_text_admin_only: result.raw_text,
+            prompt_preview_admin_only: `Adapter ${step.adapter} received task: ${step.task}`,
+            started_at: new Date(routeStarted).toISOString(),
+            completed_at: nowIso(),
+            elapsed_sec: elapsed
+          }
         });
       }));
     }
@@ -438,6 +540,7 @@ async function processLocalChatRun({ store, bus, run_id, options = {} }) {
       run.assistant_message_id = assistantMessageId;
       run.completed_at = completedAt;
       run.elapsed_sec = elapsedSec;
+      run.reality_rank_snapshot = agentRankings;
       data.messages.push({
         message_id: assistantMessageId,
         session_id: run.session_id,
@@ -461,6 +564,13 @@ async function processLocalChatRun({ store, bus, run_id, options = {} }) {
         ]);
       }
       run.events.push({ type: "final.completed", message_id: assistantMessageId, elapsed_sec: elapsedSec, at: completedAt });
+      recordExecution(data, {
+        run,
+        session,
+        agents: snapshot.agents,
+        baseModel: BASE_MODEL,
+        recordedAt: completedAt
+      });
       return run;
     });
     bus.publish(run_id, { type: "final.completed", message_id: assistantMessageId, elapsed_sec: elapsedSec });
@@ -474,6 +584,14 @@ async function processLocalChatRun({ store, bus, run_id, options = {} }) {
         run.error_admin_only = failure.admin;
         run.completed_at = nowIso();
         run.events.push({ type: "run.failed", message: failure.public.message, at: nowIso() });
+        const session = data.sessions.find((item) => item.session_id === run.session_id);
+        recordExecution(data, {
+          run,
+          session,
+          agents: data.agents,
+          baseModel: BASE_MODEL,
+          recordedAt: run.completed_at
+        });
       }
       return run;
     });
@@ -488,7 +606,9 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
       run: data.runs.find((item) => item.run_id === run_id),
       session: data.sessions.find((item) => item.session_id === data.runs.find((run) => run.run_id === run_id)?.session_id),
       agents: data.agents,
-      documents: data.documents
+      documents: data.documents,
+      outcomeContracts: data.outcomeContracts || [],
+      executionRecords: data.executionRecords || []
     }));
     if (!snapshot.run) {
       throw new Error("Run not found.");
@@ -500,11 +620,31 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
       agents: snapshot.agents,
       documents: snapshot.documents
     });
-    await updateRun(store, bus, run_id, { status: "planning", started_at: nowIso() }, { type: "run.started", run_id });
-    await appendEvent(store, bus, run_id, { type: "runtime.requested" });
+    const agentRankings = realityRankMap(snapshot, {
+      agents: scoped.agents,
+      workspaceId: snapshot.session?.workspace_id,
+      query
+    });
+    await persistRunTransition({
+      store,
+      bus,
+      runId: run_id,
+      patch: { status: "planning", started_at: nowIso() },
+      events: [
+        { type: "run.started", run_id },
+        { type: "runtime.requested" }
+      ]
+    });
     const result = await executeRuntimeChat({
       query,
       sharedMemory: normalizeSharedMemory(snapshot.session?.shared_memory || []),
+      executionContext: {
+        run_id,
+        workspace_id: snapshot.session?.workspace_id || null,
+        session_id: snapshot.session?.session_id || null,
+        user_id: snapshot.run.created_by || snapshot.session?.created_by || null,
+        role: snapshot.run.actor_role || null
+      },
       options: {
         planner_mode: options.planner_mode || process.env.TCAR_PLANNER_MODE || "cue",
         max_routing_adapters: Number(options.max_routing_adapters) || Number(process.env.TCAR_MAX_ROUTING_ADAPTERS || 12),
@@ -512,31 +652,47 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
         max_tokens: Number(options.max_tokens) || Number(process.env.TCAR_MAX_TOKENS || 512),
         refiner_max_tokens: Number(options.refiner_max_tokens) || Number(process.env.TCAR_REFINER_MAX_TOKENS || 768),
         temperature: Number(options.temperature ?? process.env.TCAR_TEMPERATURE ?? 0),
-        allowed_adapters: scoped.allowedAdapters
+        allowed_adapters: scoped.allowedAdapters,
+        agent_rankings: Object.fromEntries(
+          Object.entries(agentRankings)
+            .filter(([, ranking]) => ranking.routing_eligible === true)
+            .map(([agentId, ranking]) => [agentId, ranking.routing_score])
+        )
       }
     });
     if (result.ok === false) {
       throw new Error(result.error || "TCAR runtime returned an unsuccessful response.");
     }
 
-    const plan = normalizeRuntimePlan(result.plan);
+    const plan = enrichRuntimeRoutingTrace(
+      normalizeRuntimePlan(result.plan),
+      agentRankings,
+      scoped.agents
+    );
     const parallel = result.parallel || { workers: Number(options.parallel_workers) || 2, batches: [], maxBatchWidth: 0, parallelizable: false };
     await updateRun(store, bus, run_id, { plan, parallel, status: "running" }, { type: "planner.completed", steps: plan.steps });
 
     const outputs = Array.isArray(result.expertOutputs) ? result.expertOutputs : [];
     for (const output of outputs) {
-      await appendEvent(store, bus, run_id, {
+      const routeStartedEvent = {
         type: "route.started",
         step_id: output.id,
         adapter: output.adapter,
         batch: output.parallel_batch || null
-      });
-      await upsertRunStep(store, run_id, runtimeOutputToRunStep({ run_id, output, parallel }));
-      await appendEvent(store, bus, run_id, {
+      };
+      const routeCompletedEvent = {
         type: "route.completed",
         step_id: output.id,
         adapter: output.adapter,
         elapsed_sec: output.elapsed_sec || null
+      };
+      await persistCompletedRunRoute({
+        store,
+        bus,
+        runId: run_id,
+        startedEvent: routeStartedEvent,
+        completedEvent: routeCompletedEvent,
+        runStep: runtimeOutputToRunStep({ run_id, output, parallel })
       });
     }
 
@@ -561,13 +717,16 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
       run.assistant_message_id = assistantMessageId;
       run.completed_at = completedAt;
       run.elapsed_sec = elapsedSec;
+      run.manifest_revision = result.manifestRevision || null;
+      run.reality_rank_snapshot = agentRankings;
       run.runtime_result_admin_only = {
         mode: result.mode,
         plannerMode: result.plannerMode,
         vllmBaseUrl: result.vllmBaseUrl,
         baseModel: result.baseModel,
         apiElapsedSec: result.apiElapsedSec,
-        executorElapsedSec: result.elapsedSec
+        executorElapsedSec: result.elapsedSec,
+        componentProvenance: result.componentProvenance || null
       };
       data.messages.push({
         message_id: assistantMessageId,
@@ -592,6 +751,16 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
         ]);
       }
       run.events.push({ type: "final.completed", message_id: assistantMessageId, elapsed_sec: elapsedSec, at: completedAt });
+      recordExecution(data, {
+        run,
+        session,
+        agents: snapshot.agents,
+        manifestRevision: result.manifestRevision || null,
+        runtimeExecution: result.executionProvenance || null,
+        baseModel: result.baseModel || BASE_MODEL,
+        componentProvenance: result.componentProvenance || null,
+        recordedAt: completedAt
+      });
       return run;
     });
     bus.publish(run_id, { type: "final.completed", message_id: assistantMessageId, elapsed_sec: elapsedSec });
@@ -605,6 +774,14 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
         run.error_admin_only = failure.admin;
         run.completed_at = nowIso();
         run.events.push({ type: "run.failed", message: failure.public.message, at: nowIso() });
+        const session = data.sessions.find((item) => item.session_id === run.session_id);
+        recordExecution(data, {
+          run,
+          session,
+          agents: data.agents,
+          baseModel: BASE_MODEL,
+          recordedAt: run.completed_at
+        });
       }
       return run;
     });
@@ -654,6 +831,7 @@ function normalizeRuntimeRouting(routing) {
         adapter: boundedText(selection.adapter, 240),
         source: boundedText(selection.source, 120),
         confidence: finiteProbabilityOrNull(selection.confidence),
+        reality_rank: finiteProbabilityOrNull(selection.reality_rank),
         reason: boundedText(selection.reason, 1000)
       }];
     }).filter((selection) => selection.adapter)
@@ -662,6 +840,19 @@ function normalizeRuntimeRouting(routing) {
     mode: boundedText(routing.mode, 80),
     candidate_count: Math.max(0, Math.min(Number(routing.candidate_count) || 0, 100000)),
     candidate_adapters: boundedStringList(routing.candidate_adapters, 256, 240),
+    candidate_trace: Array.isArray(routing.candidate_trace)
+      ? routing.candidate_trace.slice(0, 256).flatMap((candidate) => {
+        if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return [];
+        const adapter = boundedText(candidate.adapter, 240);
+        if (!adapter) return [];
+        return [{
+          adapter,
+          cue_score: finiteNonNegativeOrNull(candidate.cue_score),
+          reality_rank: finiteProbabilityOrNull(candidate.reality_rank),
+          rank_supplied: candidate.rank_supplied === true
+        }];
+      })
+      : [],
     selected,
     explicit_adapters: boundedStringList(routing.explicit_adapters, 64, 240),
     unresolved_mentions: boundedStringList(routing.unresolved_mentions, 64, 500),
@@ -671,10 +862,38 @@ function normalizeRuntimeRouting(routing) {
   };
 }
 
+export function enrichRuntimeRoutingTrace(plan, agentRankings, agents) {
+  if (!plan?.routing) return plan;
+  const agentsById = new Map(agents.map((agent) => [agent.id, agent]));
+  const enrich = (candidate) => {
+    const ranking = agentRankings[candidate.adapter];
+    const agent = agentsById.get(candidate.adapter);
+    return {
+      ...candidate,
+      reality_rank: ranking ? ranking.score : candidate.reality_rank ?? 0.5,
+      rank_sample_size: Math.max(0, Number(ranking?.sample_size) || 0),
+      rank_supplied: ranking ? ranking.routing_eligible === true : candidate.rank_supplied === true,
+      agent_revision: ranking?.agent_revision || (agent ? agentRevision(agent) : null)
+    };
+  };
+  const traceById = new Map((plan.routing.candidate_trace || []).map((candidate) => [candidate.adapter, candidate]));
+  for (const adapter of plan.routing.candidate_adapters || []) {
+    if (!traceById.has(adapter)) traceById.set(adapter, { adapter });
+  }
+  plan.routing.candidate_trace = [...traceById.values()].slice(0, 256).map(enrich);
+  plan.routing.selected = (plan.routing.selected || []).slice(0, 256).map(enrich);
+  return plan;
+}
+
 function boundedStringList(value, maxItems, maxChars) {
   return Array.isArray(value)
     ? value.slice(0, maxItems).map((item) => boundedText(item, maxChars)).filter(Boolean)
     : [];
+}
+
+function finiteNonNegativeOrNull(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? number : null;
 }
 
 function runtimeOutputToRunStep({ run_id, output, parallel }) {
@@ -686,6 +905,10 @@ function runtimeOutputToRunStep({ run_id, output, parallel }) {
     run_id,
     step_id: output.id,
     adapter: output.adapter,
+    agent_revision: normalizeSha256Digest(output.agent_revision),
+    adapter_digest: normalizeSha256Digest(output.adapter_content_digest || output.adapter_digest),
+    model_id: output.model_id || null,
+    model_calls_admin_only: normalizeArtifactValue(output.model_calls || []),
     task: output.task || "",
     depends_on: output.depends_on || [],
     used_upstream: output.used_upstream || [],
@@ -729,7 +952,12 @@ function runtimeCitations(outputs) {
     return context.split(/\n+/).filter(Boolean).slice(0, 8).map((line, index) => {
       const [label, ...rest] = line.split(" - ");
       return {
-        citation_id: makeId("cit"),
+        citation_id: stableCitationId({
+          step_id: output.id,
+          agent_id: output.adapter,
+          chunk_id: label?.split(":")[0] || `${output.id}_${index + 1}`,
+          excerpt: rest.join(" - ") || line
+        }),
         step_id: output.id,
         agent_id: output.adapter,
         path: "",
@@ -765,8 +993,25 @@ function normalizeRuntimeCitation(citation, output) {
   const requestedEnd = positiveIntegerOrNull(citation.page_end ?? citation.page);
   const pageEnd = pageStart && requestedEnd && requestedEnd >= pageStart ? requestedEnd : pageStart;
   const numericScore = Number(citation.score);
+  const contentDigest = normalizeSha256Digest(citation.content_digest);
+  const corpusRevision = normalizeSha256Digest(citation.corpus_revision);
+  const indexDigest = normalizeSha256Digest(citation.index_digest);
+  const documentChunk = requestedPath.includes("/chunks/")
+    && (output.approved_sources || []).some((source) => String(source || "").replaceAll("\\", "/").endsWith("/index.jsonl"));
+  const integrityBound = !documentChunk || Boolean(contentDigest && corpusRevision && indexDigest);
   return {
-    citation_id: makeId("cit"),
+    citation_id: stableCitationId({
+      step_id: output.id,
+      agent_id: output.adapter,
+      path: requestedPath,
+      chunk_id: chunkId,
+      page_start: pageStart,
+      page_end: pageEnd,
+      content_digest: contentDigest,
+      corpus_revision: corpusRevision,
+      index_digest: indexDigest,
+      excerpt
+    }),
     step_id: output.id,
     agent_id: output.adapter,
     path: requestedPath,
@@ -774,11 +1019,17 @@ function normalizeRuntimeCitation(citation, output) {
     title: title || output.adapter,
     page_start: pageStart,
     page_end: pageEnd,
+    content_digest: contentDigest,
+    corpus_revision: corpusRevision,
+    index_digest: indexDigest,
     score: Number.isFinite(numericScore) ? numericScore : null,
     excerpt,
     injected: citation.injected !== false,
     claim: boundedText(citation.claim, 2000),
-    verified: citation.verified === true && Boolean(chunkId) && (!requestedPath || isApprovedCitationPath(requestedPath, output.approved_sources || []))
+    verified: citation.verified === true
+      && Boolean(chunkId)
+      && integrityBound
+      && (!requestedPath || isApprovedCitationPath(requestedPath, output.approved_sources || []))
   };
 }
 
@@ -809,6 +1060,10 @@ function positiveIntegerOrNull(value) {
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
 }
 
+function stableCitationId(value) {
+  return `cit_${digestValue(value).slice("sha256:".length, "sha256:".length + 24)}`;
+}
+
 function boundedText(value, maxChars) {
   return String(value || "").replaceAll("\0", "").trim().slice(0, maxChars);
 }
@@ -827,6 +1082,12 @@ function normalizeHandoffArtifacts(value, output) {
       return [];
     }
     return [{
+      artifact_id: item.artifact_id || `artifact_${digestValue({
+        step_id: output.id || output.step_id || null,
+        name: artifact,
+        value: artifactValue
+      }).slice("sha256:".length, "sha256:".length + 24)}`,
+      schema_version: boundedText(item.schema_version || "tcar-handoff-artifact-v1", 120),
       name: artifact,
       artifact,
       producer_step_id: output.id || output.step_id || null,
@@ -834,6 +1095,7 @@ function normalizeHandoffArtifacts(value, output) {
       producer: output.adapter || null,
       content_type: boundedText(item.content_type || "application/json", 120),
       value: normalizeArtifactValue(artifactValue),
+      content_digest: normalizeSha256Digest(item.content_digest) || digestValue(normalizeArtifactValue(artifactValue)),
       evidence: boundedStringList(item.evidence || item.citations, 50, 240),
       confidence: finiteProbabilityOrNull(item.confidence),
       status: boundedText(item.status || "runtime_structured", 120),
@@ -875,27 +1137,41 @@ async function updateRun(store, bus, run_id, patch, event) {
   }
 }
 
-async function appendEvent(store, bus, run_id, event) {
+async function persistRunTransition({ store, bus, runId, patch, events = [] }) {
   await store.mutate((data) => {
-    const run = data.runs.find((item) => item.run_id === run_id);
-    if (run) {
+    const run = data.runs.find((item) => item.run_id === runId);
+    if (!run) {
+      throw new Error("Run not found.");
+    }
+    Object.assign(run, patch);
+    for (const event of events) {
       run.events.push({ ...event, at: nowIso() });
     }
     return run;
   });
-  bus.publish(run_id, event);
+  for (const event of events) {
+    bus.publish(runId, event);
+  }
 }
 
-async function upsertRunStep(store, run_id, step) {
+async function persistCompletedRunRoute({ store, bus, runId, startedEvent, completedEvent, runStep }) {
   await store.mutate((data) => {
-    const index = data.runSteps.findIndex((item) => item.run_id === run_id && item.step_id === step.step_id);
-    if (index >= 0) {
-      data.runSteps[index] = step;
-    } else {
-      data.runSteps.push(step);
+    const run = data.runs.find((item) => item.run_id === runId);
+    if (!run) {
+      throw new Error("Run not found.");
     }
-    return step;
+    run.events.push({ ...startedEvent, at: nowIso() });
+    const index = data.runSteps.findIndex((item) => item.run_id === runId && item.step_id === runStep.step_id);
+    if (index >= 0) {
+      data.runSteps[index] = runStep;
+    } else {
+      data.runSteps.push(runStep);
+    }
+    run.events.push({ ...completedEvent, at: nowIso() });
+    return runStep;
   });
+  bus.publish(runId, startedEvent);
+  bus.publish(runId, completedEvent);
 }
 
 function buildRouteOutput({ step, query, agents, documents }) {
@@ -954,6 +1230,7 @@ function gatherCitations({ step, agent, query, documents }) {
   if (agent?.document || agent?.retrieval?.type === "document_markdown") {
     const document = documents.find((doc) => doc.agent_id === step.adapter || doc.agent_id === agent.id);
     if (document) {
+      assertStoredDocumentIntegrity(document);
       const documentChunks = new Map((document.chunks || []).map((chunk) => [chunk.chunk_id, chunk]));
       citations.push(
         ...scoreChunks(document.chunks || [], query, document.top_k || 4).flatMap((chunk) => {
@@ -962,7 +1239,16 @@ function gatherCitations({ step, agent, query, documents }) {
             return [];
           }
           return [{
-          citation_id: makeId("cit"),
+          citation_id: stableCitationId({
+            step_id: step.id,
+            agent_id: step.adapter,
+            path: chunk.path,
+            chunk_id: chunk.chunk_id,
+            content_digest: chunk.content_digest || null,
+            corpus_revision: document.corpus_revision || null,
+            index_digest: document.index_digest || null,
+            excerpt: chunk.excerpt
+          }),
           step_id: step.id,
           agent_id: step.adapter,
           path: chunk.path,
@@ -972,6 +1258,9 @@ function gatherCitations({ step, agent, query, documents }) {
           page_end: chunk.page_end,
           score: chunk.score,
           excerpt: chunk.excerpt,
+          content_digest: chunk.content_digest || null,
+          corpus_revision: document.corpus_revision || null,
+          index_digest: document.index_digest || null,
           injected: chunk.injected,
           claim: "",
           verified: true
@@ -985,7 +1274,13 @@ function gatherCitations({ step, agent, query, documents }) {
     const source = approvedSourceSnippets[sourcePath];
     if (source) {
       citations.push({
-        citation_id: makeId("cit"),
+        citation_id: stableCitationId({
+          step_id: step.id,
+          agent_id: step.adapter,
+          path: sourcePath,
+          chunk_id: sourcePath.split("/").pop(),
+          excerpt: source.excerpt
+        }),
         step_id: step.id,
         agent_id: step.adapter,
         path: sourcePath,
@@ -1001,7 +1296,13 @@ function gatherCitations({ step, agent, query, documents }) {
       });
     } else if (agent?.source_text_internal && sourcePath === agent.sources[0] && isApprovedCitationPath(sourcePath, agent.sources)) {
       citations.push({
-        citation_id: makeId("cit"),
+        citation_id: stableCitationId({
+          step_id: step.id,
+          agent_id: step.adapter,
+          path: sourcePath,
+          chunk_id: `${step.adapter}_source_0001`,
+          excerpt: selectSourceExcerpt(agent.source_text_internal, query)
+        }),
         step_id: step.id,
         agent_id: step.adapter,
         path: sourcePath,
@@ -1037,7 +1338,10 @@ function buildLocalHandoffArtifacts({ step, agent, domainAnswer, citations, retr
     if (value === "" || value === null || value === undefined || (Array.isArray(value) && value.length === 0)) {
       return [];
     }
+    const contentDigest = digestValue(value);
     return [{
+      artifact_id: `artifact_${digestValue({ step_id: step.id, name: artifact, value }).slice("sha256:".length, "sha256:".length + 24)}`,
+      schema_version: "tcar-handoff-artifact-v1",
       name: artifact,
       artifact,
       producer_step_id: step.id,
@@ -1045,6 +1349,7 @@ function buildLocalHandoffArtifacts({ step, agent, domainAnswer, citations, retr
       producer: step.adapter,
       content_type: contentType,
       value,
+      content_digest: contentDigest,
       evidence: citations.map((citation) => citation.chunk_id).filter(Boolean),
       confidence: citations.length > 0 ? 1 : null,
       status: "local_executor_derived",

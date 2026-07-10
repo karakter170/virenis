@@ -36,6 +36,7 @@ describe("vLLM runtime adapter", () => {
     const app = createVllmRuntimeAdapter({
       vllmBaseUrl: "https://gpu.example.test/v1",
       vllmApiKey: "vllm-secret",
+      runtimeApiKey: "runtime-secret",
       fetchImpl: async (url, options = {}) => {
         if (new URL(url).pathname.endsWith("/models")) {
           return jsonResponse({ data: servedModels.map((id) => ({ id })) });
@@ -60,6 +61,7 @@ describe("vLLM runtime adapter", () => {
 
     const response = await request(app)
       .post("/chat/execute")
+      .set("X-TCAR-API-Key", "runtime-secret")
       .send({
         query: "Plan a security-reviewed software API rollout.",
         shared_memory: [],

@@ -1,16 +1,20 @@
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import request from "supertest";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createApp } from "../server/app.js";
-import { requireRuntimeConfigured } from "../server/runtimeClient.js";
-import { buildParallelBatches, normalizeSharedMemory, sanitizeToolCalls, scopedRoutingContext } from "../server/tcarEngine.js";
-import { chunkDocument } from "../server/documents.js";
+import { requireRuntimeConfigured, setRuntimeFetchForTests } from "../server/runtimeClient.js";
+import { buildParallelBatches, enrichRuntimeRoutingTrace, normalizeSharedMemory, sanitizeToolCalls, scopedRoutingContext } from "../server/tcarEngine.js";
+import { chunkDocument, runtimeDocumentRevision } from "../server/documents.js";
 
 let tmpDir;
 let app;
 let previousStoreDriver;
+const resetRuntimeFetchTransport = setRuntimeFetchForTests((...args) => globalThis.fetch(...args));
+
+afterAll(() => resetRuntimeFetchTransport());
 
 beforeEach(async () => {
   previousStoreDriver = process.env.WEB_STORE_DRIVER;
@@ -94,6 +98,35 @@ describe("runtime and catalog", () => {
 
     expect(context.allowedAdapters).toEqual(["active_lora", "legacy_active_lora"]);
     expect(context.agents.map((agent) => agent.id)).toEqual(["active_lora", "legacy_active_lora"]);
+  });
+
+  it("enriches explicit Runtime selections with the overridden agent's RealityRank", () => {
+    const revision = `sha256:${"a".repeat(64)}`;
+    const plan = enrichRuntimeRoutingTrace({
+      routing: {
+        mode: "explicit",
+        candidate_adapters: ["lower_ranked_lora"],
+        candidate_trace: [{ adapter: "lower_ranked_lora", reality_rank: null }],
+        selected: [{ adapter: "lower_ranked_lora", source: "explicit", reality_rank: null }]
+      }
+    }, {
+      lower_ranked_lora: {
+        score: 0.2,
+        sample_size: 4,
+        routing_eligible: true,
+        agent_revision: revision
+      }
+    }, [{ id: "lower_ranked_lora" }]);
+
+    expect(plan.routing.selected[0]).toMatchObject({
+      adapter: "lower_ranked_lora",
+      source: "explicit",
+      reality_rank: 0.2,
+      rank_sample_size: 4,
+      rank_supplied: true,
+      agent_revision: revision
+    });
+    expect(plan.routing.candidate_trace[0].reality_rank).toBe(0.2);
   });
 
   it("fails closed for production real-mode runtime and auth configuration", () => {
@@ -1145,6 +1178,13 @@ describe("runtime and catalog", () => {
         "PATCH /agents/legal_privacy_lora",
         "DELETE /agents/legal_privacy_lora"
       ]);
+      for (const call of [calls[0], calls[2], calls[3]]) {
+        expect(JSON.parse(call.body).audit_context).toEqual({
+          user_id: "user_local",
+          workspace_id: "workspace_default",
+          role: "admin"
+        });
+      }
     } finally {
       process.env.TCAR_ENGINE_MODE = previousMode;
       process.env.TCAR_RUNTIME_API_URL = previousUrl;
@@ -2214,6 +2254,30 @@ describe("chat execution", () => {
             ok: true,
             mode: "real",
             baseModel: "qwen36-awq",
+            manifestRevision: "1".repeat(64),
+            componentProvenance: {
+              revision_authority: "runtime",
+              manifest_revision: "1".repeat(64),
+              base_model_id: "qwen36-awq",
+              base_model_content_digest: "2".repeat(64),
+              router_model_content_digest: "3".repeat(64),
+              router_chat_template_digest: "4".repeat(64),
+              executor_code_digest: "5".repeat(64),
+              agents: [{
+                adapter: "writing_synthesis_lora",
+                agent_revision: "6".repeat(64),
+                revision_authority: "runtime",
+                manifest_contract_digest: "7".repeat(64),
+                adapter_content_digest: "8".repeat(64)
+              }]
+            },
+            executionProvenance: {
+              execution_id: "runtime-proof-execution",
+              receipt_id: "runtime-proof-receipt",
+              record_hash: "9".repeat(64),
+              schema_version: 1,
+              created_at: "2026-07-09T00:00:00.000Z"
+            },
             plan: {
               steps: [
                 {
@@ -2246,6 +2310,11 @@ describe("chat execution", () => {
             expertOutputs: [{
               id: "s1",
               adapter: "writing_synthesis_lora",
+              agent_revision: "6".repeat(64),
+              revision_authority: "runtime",
+              manifest_contract_digest: "7".repeat(64),
+              adapter_content_digest: "8".repeat(64),
+              model_id: "qwen36-awq",
               task: "Synthesize.",
               domain_answer: "Structured runtime answer.",
               approved_sources: ["sources/tcar_dummy_loras/writing_synthesis/source.md"],
@@ -2365,6 +2434,24 @@ describe("chat execution", () => {
         out_of_scope: false,
         reason: "One authorized route selected."
       });
+      const execution = await request(realApp)
+        .get(`/api/executions/${completedRun.execution.execution_id}`)
+        .set("Authorization", `Bearer ${tokenBob}`)
+        .expect(200);
+      expect(execution.body).toMatchObject({
+        runtime_execution_id: "runtime-proof-execution",
+        base_model_digest: `sha256:${"2".repeat(64)}`,
+        router_model_digest: `sha256:${"3".repeat(64)}`,
+        router_chat_template_digest: `sha256:${"4".repeat(64)}`,
+        executor_code_digest: `sha256:${"5".repeat(64)}`,
+        participants: [expect.objectContaining({
+          agent_id: "writing_synthesis_lora",
+          agent_revision: `sha256:${"6".repeat(64)}`,
+          adapter_digest: `sha256:${"8".repeat(64)}`,
+          model_id: "qwen36-awq"
+        })]
+      });
+      expect(execution.body.record_hash_valid).toBe(true);
     } finally {
       await realApp?.locals?.drainBackgroundTasks?.({ timeoutMs: 5000 });
       await realApp?.locals?.store?.close?.();
@@ -2559,6 +2646,41 @@ describe("documents and sources", () => {
     expect(run.final_answer).toContain("rank is 5");
   });
 
+  it("keeps a deleted document agent inspectable as an owner-scoped tombstone after Runtime purge", async () => {
+    const upload = await request(app)
+      .post("/api/documents")
+      .field("title", "Runtime purge tombstone")
+      .attach("file", Buffer.from("Retained document tombstone proof."), "tombstone.txt")
+      .expect(201);
+    await request(app).delete(`/api/documents/${upload.body.document_id}`).expect(200);
+
+    const previous = {
+      TCAR_ENGINE_MODE: process.env.TCAR_ENGINE_MODE,
+      TCAR_RUNTIME_API_URL: process.env.TCAR_RUNTIME_API_URL,
+      TCAR_RUNTIME_API_KEY: process.env.TCAR_RUNTIME_API_KEY
+    };
+    const previousFetch = globalThis.fetch;
+    try {
+      process.env.TCAR_ENGINE_MODE = "real";
+      process.env.TCAR_RUNTIME_API_URL = "http://gpu-runtime.internal:9000";
+      process.env.TCAR_RUNTIME_API_KEY = "runtime-tombstone-test-key";
+      globalThis.fetch = async () => Response.json({ detail: "not found" }, { status: 404 });
+      const detail = await request(app).get(`/api/agents/${upload.body.agent_id}`).expect(200);
+      expect(detail.body).toMatchObject({
+        id: upload.body.agent_id,
+        enabled: false,
+        mounted: false,
+        runtime_purged: true
+      });
+    } finally {
+      globalThis.fetch = previousFetch;
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
   it("preserves PDF pages in chunks and in the GPU registration payload", async () => {
     const previous = {
       TCAR_ENGINE_MODE: process.env.TCAR_ENGINE_MODE,
@@ -2567,57 +2689,171 @@ describe("documents and sources", () => {
     };
     const previousFetch = globalThis.fetch;
     let runtimeBody;
-    vi.doMock("pdf-parse", () => ({
-      default: async (_buffer, options) => {
-        const page = (pageNumber, text) => ({
-          pageNumber,
-          getTextContent: async () => ({
-            items: [{ str: text, transform: [1, 0, 0, 1, 0, 700] }]
-          })
-        });
-        const rendered = [
-          await options.pagerender(page(1, "Revenue is 100 million.")),
-          await options.pagerender(page(2, "Expenses are 40 million."))
-        ];
-        return { text: rendered.join("\n\n"), numpages: 2 };
-      }
-    }));
+    let runtimeReceiptChunk;
     try {
       process.env.TCAR_ENGINE_MODE = "real";
       process.env.TCAR_RUNTIME_API_URL = "http://gpu-runtime.internal:9000";
       process.env.TCAR_RUNTIME_API_KEY = "runtime-secret-for-pdf-test";
       globalThis.fetch = async (_url, options = {}) => {
+        if (options.method === "DELETE") {
+          return new Response(JSON.stringify({ ok: true, status: "deleted", purged: true }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
         runtimeBody = JSON.parse(options.body);
-        return new Response(JSON.stringify({
-          ok: true,
-          status: "added",
-          result: { status: "added", chunks: 2, mounted: true }
-        }), { status: 200, headers: { "Content-Type": "application/json" } });
+        const runtimeResponse = authoritativeRuntimeDocumentResponse(runtimeBody, {
+          body: "runtime-authoritative-marker Shipment CT-204 must be rejected after 45 cumulative minutes.",
+          pageStart: 1,
+          pageEnd: 1
+        });
+        runtimeReceiptChunk = runtimeResponse.result.chunk_records[0];
+        return new Response(JSON.stringify(runtimeResponse), {
+          status: 200,
+          headers: { "Content-Type": "application/json" }
+        });
       };
 
       const upload = await request(app)
         .post("/api/documents")
-        .field("title", "2026 Financial Data")
-        .attach("file", Buffer.from("mock-pdf"), "financial.pdf")
+        .field("title", "Cold Chain Stability Guide")
+        .attach("file", await fs.readFile(new URL("../fixtures/cold_chain_stability_guide.pdf", import.meta.url)), "stability.pdf")
         .expect(201);
-      expect(upload.body.chunks).toBe(2);
-      expect(runtimeBody.text).toBe("Revenue is 100 million.\n\nExpenses are 40 million.");
-      expect(runtimeBody.pages).toEqual([
-        { page: 1, text: "Revenue is 100 million." },
-        { page: 2, text: "Expenses are 40 million." }
-      ]);
+      expect(upload.body.chunks).toBe(1);
+      expect(upload.body.runtime.result.chunk_records).toBeUndefined();
+      expect(upload.body.runtime.result.source_digest).toMatch(/^sha256:[a-f0-9]{64}$/);
+      expect(upload.body.source_digest).toBe(upload.body.runtime.result.source_digest);
+      expect(upload.body.corpus_revision).toBe(upload.body.runtime.result.corpus_revision);
+      expect(runtimeBody.text).toContain("Shipment CT-204 disposition rule");
+      expect(runtimeBody.pages).toHaveLength(1);
+      expect(runtimeBody.pages[0]).toEqual(expect.objectContaining({
+        page: 1,
+        text: expect.stringContaining("Reject CT-204")
+      }));
       const storedDocument = app.locals.store.read().documents.find((document) => document.document_id === upload.body.document_id);
-      expect(storedDocument.page_count).toBe(2);
-      expect(storedDocument.chunks.map((chunk) => [chunk.page_start, chunk.page_end])).toEqual([[1, 1], [2, 2]]);
+      expect(storedDocument.page_count).toBe(1);
+      expect(storedDocument.chunks.map((chunk) => [chunk.page_start, chunk.page_end])).toEqual([[1, 1]]);
+      expect(storedDocument.chunks[0].body).toBe("runtime-authoritative-marker Shipment CT-204 must be rejected after 45 cumulative minutes.");
+      expect(storedDocument.chunks[0].content_digest).toMatch(/^sha256:[a-f0-9]{64}$/);
+      expect(storedDocument.source_digest).toBe(upload.body.runtime.result.source_digest);
+      expect(storedDocument.corpus_revision).toMatch(/^sha256:[a-f0-9]{64}$/);
+
+      const listed = await request(app)
+        .get("/api/documents")
+        .expect(200);
+      expect(listed.body.documents).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          document_id: upload.body.document_id,
+          source_digest: storedDocument.source_digest,
+          corpus_revision: storedDocument.corpus_revision
+        })
+      ]));
+
+      const search = await request(app)
+        .post(`/api/documents/${upload.body.document_id}/search`)
+        .send({ query: "runtime-authoritative-marker" })
+        .expect(200);
+      expect(search.body.results[0]).toEqual(expect.objectContaining({
+        chunk_id: runtimeReceiptChunk.chunk_id,
+        page_start: runtimeReceiptChunk.page_start,
+        page_end: runtimeReceiptChunk.page_end,
+        content_digest: `sha256:${runtimeReceiptChunk.content_digest}`,
+        excerpt: runtimeReceiptChunk.body
+      }));
 
       const directChunks = chunkDocument({
         slug: "financial",
         text: runtimeBody.text,
         pages: runtimeBody.pages
       });
-      expect(directChunks.map((chunk) => chunk.page_start)).toEqual([1, 2]);
+      expect(directChunks.map((chunk) => chunk.page_start)).toEqual([1]);
+
+      const deleted = await request(app)
+        .delete(`/api/documents/${upload.body.document_id}`)
+        .expect(200);
+      expect(deleted.body).toEqual(expect.objectContaining({
+        source_digest: storedDocument.source_digest,
+        corpus_revision: storedDocument.corpus_revision
+      }));
+      expect(app.locals.store.read().documents.find((document) => document.document_id === upload.body.document_id))
+        .toEqual(expect.objectContaining({
+          enabled: false,
+          source_digest: storedDocument.source_digest,
+          corpus_revision: storedDocument.corpus_revision
+        }));
     } finally {
-      vi.doUnmock("pdf-parse");
+      globalThis.fetch = previousFetch;
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) {
+          delete process.env[key];
+        } else {
+          process.env[key] = value;
+        }
+      }
+    }
+  });
+
+  it("rejects a tampered Runtime chunk receipt and compensates the remote registration", async () => {
+    const previous = {
+      TCAR_ENGINE_MODE: process.env.TCAR_ENGINE_MODE,
+      TCAR_RUNTIME_API_URL: process.env.TCAR_RUNTIME_API_URL,
+      TCAR_RUNTIME_API_KEY: process.env.TCAR_RUNTIME_API_KEY
+    };
+    const previousFetch = globalThis.fetch;
+    const calls = [];
+    try {
+      process.env.TCAR_ENGINE_MODE = "real";
+      process.env.TCAR_RUNTIME_API_URL = "http://gpu-runtime.internal:9000";
+      process.env.TCAR_RUNTIME_API_KEY = "runtime-secret-for-tamper-test";
+      globalThis.fetch = async (url, options = {}) => {
+        const pathName = new URL(url).pathname;
+        calls.push({ method: options.method || "GET", pathName });
+        if (pathName === "/documents" && options.method === "POST") {
+          const runtimeRequestBody = JSON.parse(options.body);
+          const response = authoritativeRuntimeDocumentResponse(runtimeRequestBody, {
+            body: "Runtime committed source text that must pass an exact digest check."
+          });
+          response.result.source_digest = "0".repeat(64);
+          return new Response(JSON.stringify(response), {
+            status: 200,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
+        if (pathName === "/documents/tampered_receipt_lora" && options.method === "DELETE") {
+          return new Response(JSON.stringify({
+            ok: true,
+            status: "purged",
+            purged: true,
+            enabled: false,
+            mounted: false,
+            requires_vllm_reload: false,
+            agent: { id: "tampered_receipt_lora", enabled: false, mounted: false }
+          }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
+        return new Response(JSON.stringify({ detail: "not found" }), {
+          status: 404,
+          headers: { "Content-Type": "application/json" }
+        });
+      };
+
+      const upload = await request(app)
+        .post("/api/documents")
+        .field("title", "Tampered Receipt")
+        .field("agent_id", "tampered_receipt_lora")
+        .attach("file", Buffer.from("Original source text with enough material for a local preflight chunk."), "tampered.txt")
+        .expect(502);
+
+      expect(upload.body.error).toBe("runtime_document_contract_invalid");
+      expect(calls).toEqual([
+        { method: "POST", pathName: "/documents" },
+        { method: "DELETE", pathName: "/documents/tampered_receipt_lora" }
+      ]);
+      expect(app.locals.store.read().documents).toHaveLength(0);
+      expect(app.locals.store.read().agents.some((agent) => agent.id === "tampered_receipt_lora")).toBe(false);
+    } finally {
       globalThis.fetch = previousFetch;
       for (const [key, value] of Object.entries(previous)) {
         if (value === undefined) {
@@ -2945,6 +3181,784 @@ describe("documents and sources", () => {
           process.env[key] = value;
         }
       }
+    }
+  });
+});
+
+describe("runtime registration atomicity", () => {
+  const runtimeEnvNames = ["TCAR_ENGINE_MODE", "TCAR_RUNTIME_API_URL", "TCAR_RUNTIME_API_KEY"];
+
+  function ownedPurgeResponse(agentId) {
+    return {
+      ok: true,
+      status: "purged",
+      id: agentId,
+      agent: { id: agentId, enabled: false, mounted: false, lifecycle_status: "purged" },
+      enabled: false,
+      mounted: false,
+      purged: true,
+      requires_vllm_reload: false
+    };
+  }
+
+  function enableRealRuntime() {
+    const previous = Object.fromEntries(runtimeEnvNames.map((name) => [name, process.env[name]]));
+    process.env.TCAR_ENGINE_MODE = "real";
+    process.env.TCAR_RUNTIME_API_URL = "http://gpu-runtime.internal:9000";
+    process.env.TCAR_RUNTIME_API_KEY = "atomicity-test-runtime-key";
+    return () => {
+      for (const [name, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    };
+  }
+
+  it("compensates a committed agent when durable save fails and permits a clean same-id retry", async () => {
+    const restoreEnv = enableRealRuntime();
+    const previousFetch = globalThis.fetch;
+    const calls = [];
+    const registrationIds = [];
+    const store = app.locals.store;
+    const originalSaveNow = store.saveNow.bind(store);
+    let forceSaveFailure = true;
+    store.saveNow = async () => {
+      if (!forceSaveFailure) return originalSaveNow();
+      forceSaveFailure = false;
+      await fs.writeFile(`${store.dbPath}.tmp`, `${JSON.stringify(store.data)}\n`, "utf8");
+      throw new Error("forced durable agent save failure");
+    };
+    globalThis.fetch = async (url, options = {}) => {
+      const pathName = new URL(url).pathname;
+      const body = options.body ? JSON.parse(options.body) : {};
+      calls.push({ method: options.method || "GET", pathName, body });
+      if (pathName === "/agents" && options.method === "POST") {
+        registrationIds.push(body.registration_id);
+        return Response.json({
+          ok: true,
+          status: "added",
+          id: body.id,
+          registration_id: body.registration_id,
+          result: { status: "added", id: body.id },
+          agent: {
+            id: body.id,
+            title: body.title,
+            capability: body.capability,
+            boundary: body.boundary,
+            consumes: body.consumes,
+            produces: body.produces,
+            routing_cues: body.routing_cues,
+            resources: [],
+            tools: [],
+            sources: [],
+            enabled: true,
+            mounted: true,
+            registration_id: body.registration_id,
+            registration_kind: "agent",
+            registration_cleanup_allowed: true,
+            registration_source_root: `sources/tcar_dummy_loras/${body.id}`
+          },
+          mounted: true,
+          requires_vllm_reload: false
+        });
+      }
+      if (pathName === "/agents/atomic_store_failure_lora" && options.method === "DELETE") {
+        return Response.json(ownedPurgeResponse("atomic_store_failure_lora"));
+      }
+      return Response.json({ detail: "not found" }, { status: 404 });
+    };
+
+    const payload = {
+      id: "atomic_store_failure_lora",
+      title: "Atomic store failure",
+      capability: "Tests durable registration compensation.",
+      boundary: "Use only this test."
+    };
+    try {
+      await request(app).post("/api/agents").send(payload).expect(500);
+      expect(app.locals.store.read().agents.some((agent) => agent.id === payload.id)).toBe(false);
+      const durableAfterFailure = JSON.parse(await fs.readFile(store.dbPath, "utf8"));
+      expect(durableAfterFailure.agents.some((agent) => agent.id === payload.id)).toBe(false);
+      expect(calls.map((call) => `${call.method} ${call.pathName}`)).toEqual([
+        "POST /agents",
+        "DELETE /agents/atomic_store_failure_lora"
+      ]);
+      expect(calls[1].body).toEqual({
+        audit_context: calls[0].body.audit_context,
+        registration_id: registrationIds[0],
+        purge_registration: true
+      });
+
+      store.saveNow = originalSaveNow;
+      const retried = await request(app).post("/api/agents").send(payload).expect(201);
+      expect(registrationIds[1]).not.toBe(registrationIds[0]);
+      expect(retried.body.runtime?.registration_id).toBeUndefined();
+      expect(retried.body.runtime?.agent?.registration_id).toBeUndefined();
+      const stored = app.locals.store.read().agents.find((agent) => agent.id === payload.id);
+      expect(stored).toBeTruthy();
+      expect(stored.registration_id).toBeUndefined();
+      expect(stored.registration_cleanup_allowed).toBeUndefined();
+      expect(stored.registration_source_root).toBeUndefined();
+    } finally {
+      store.saveNow = originalSaveNow;
+      globalThis.fetch = previousFetch;
+      restoreEnv();
+    }
+  });
+
+  it("cleans a token-owned agent after the Runtime commits but the POST response is lost", async () => {
+    const restoreEnv = enableRealRuntime();
+    const previousFetch = globalThis.fetch;
+    const calls = [];
+    let committedRegistrationId;
+    globalThis.fetch = async (url, options = {}) => {
+      const pathName = new URL(url).pathname;
+      const body = options.body ? JSON.parse(options.body) : {};
+      calls.push({ method: options.method || "GET", pathName, body });
+      if (pathName === "/agents" && options.method === "POST") {
+        committedRegistrationId = body.registration_id;
+        throw new Error("response lost after Runtime commit");
+      }
+      if (pathName === "/agents/commit_timeout_lora" && options.method === "DELETE") {
+        return Response.json(ownedPurgeResponse("commit_timeout_lora"));
+      }
+      return Response.json({ detail: "not found" }, { status: 404 });
+    };
+    try {
+      await request(app)
+        .post("/api/agents")
+        .send({
+          id: "commit_timeout_lora",
+          title: "Commit timeout",
+          capability: "Tests an ambiguous registration response.",
+          boundary: "Use only this test."
+        })
+        .expect(500);
+      expect(calls.map((call) => `${call.method} ${call.pathName}`)).toEqual([
+        "POST /agents",
+        "DELETE /agents/commit_timeout_lora"
+      ]);
+      expect(calls[1].body.registration_id).toBe(committedRegistrationId);
+      expect(app.locals.store.read().agents.some((agent) => agent.id === "commit_timeout_lora")).toBe(false);
+    } finally {
+      globalThis.fetch = previousFetch;
+      restoreEnv();
+    }
+  });
+
+  it("rolls back in-memory and durable document state when save fails", async () => {
+    const restoreEnv = enableRealRuntime();
+    const previousFetch = globalThis.fetch;
+    const calls = [];
+    const store = app.locals.store;
+    const originalSaveNow = store.saveNow.bind(store);
+    store.saveNow = async () => {
+      await fs.writeFile(`${store.dbPath}.tmp`, `${JSON.stringify(store.data)}\n`, "utf8");
+      throw new Error("forced durable document save failure");
+    };
+    globalThis.fetch = async (url, options = {}) => {
+      const pathName = new URL(url).pathname;
+      const body = options.body ? JSON.parse(options.body) : {};
+      calls.push({ method: options.method || "GET", pathName, body });
+      if (pathName === "/documents" && options.method === "POST") {
+        const response = authoritativeRuntimeDocumentResponse(body, {
+          body: "Runtime-owned document body."
+        });
+        response.agent.registration_id = body.registration_id;
+        response.agent.registration_cleanup_allowed = true;
+        return Response.json(response);
+      }
+      if (pathName === "/documents/atomic_document_save_lora" && options.method === "DELETE") {
+        return Response.json(ownedPurgeResponse("atomic_document_save_lora"));
+      }
+      return Response.json({ detail: "not found" }, { status: 404 });
+    };
+    try {
+      await request(app)
+        .post("/api/documents")
+        .field("title", "Atomic document save")
+        .field("agent_id", "atomic_document_save_lora")
+        .attach("file", Buffer.from("Uploaded document text for atomic rollback."), "atomic.txt")
+        .expect(500);
+      expect(app.locals.store.read().documents.some((document) => document.agent_id === "atomic_document_save_lora")).toBe(false);
+      expect(app.locals.store.read().agents.some((agent) => agent.id === "atomic_document_save_lora")).toBe(false);
+      const durable = JSON.parse(await fs.readFile(store.dbPath, "utf8"));
+      expect(durable.documents.some((document) => document.agent_id === "atomic_document_save_lora")).toBe(false);
+      expect(calls.map((call) => `${call.method} ${call.pathName}`)).toEqual([
+        "POST /documents",
+        "DELETE /documents/atomic_document_save_lora"
+      ]);
+      expect(calls[1].body.registration_id).toBe(calls[0].body.registration_id);
+    } finally {
+      store.saveNow = originalSaveNow;
+      globalThis.fetch = previousFetch;
+      restoreEnv();
+    }
+  });
+
+  it("cleans a token-owned document after a lost commit response and permits same-id retry", async () => {
+    const restoreEnv = enableRealRuntime();
+    const previousFetch = globalThis.fetch;
+    const calls = [];
+    const registrationIds = [];
+    let firstAttempt = true;
+    globalThis.fetch = async (url, options = {}) => {
+      const pathName = new URL(url).pathname;
+      const body = options.body ? JSON.parse(options.body) : {};
+      calls.push({ method: options.method || "GET", pathName, body });
+      if (pathName === "/documents" && options.method === "POST") {
+        registrationIds.push(body.registration_id);
+        if (firstAttempt) {
+          firstAttempt = false;
+          throw new Error("document response lost after Runtime commit");
+        }
+        return Response.json(authoritativeRuntimeDocumentResponse(body, {
+          body: "Runtime-owned retry body."
+        }));
+      }
+      if (pathName === "/documents/document_commit_timeout_lora" && options.method === "DELETE") {
+        return Response.json(ownedPurgeResponse("document_commit_timeout_lora"));
+      }
+      return Response.json({ detail: "not found" }, { status: 404 });
+    };
+    const upload = () => request(app)
+      .post("/api/documents")
+      .field("title", "Document commit timeout")
+      .field("agent_id", "document_commit_timeout_lora")
+      .attach("file", Buffer.from("Document text for ambiguous commit cleanup."), "commit.txt");
+    try {
+      await upload().expect(500);
+      expect(app.locals.store.read().documents.some((document) => document.agent_id === "document_commit_timeout_lora")).toBe(false);
+      expect(calls.map((call) => `${call.method} ${call.pathName}`)).toEqual([
+        "POST /documents",
+        "DELETE /documents/document_commit_timeout_lora"
+      ]);
+      expect(calls[1].body.registration_id).toBe(registrationIds[0]);
+
+      await upload().expect(201);
+      expect(registrationIds[1]).not.toBe(registrationIds[0]);
+      expect(app.locals.store.read().documents.some((document) => document.agent_id === "document_commit_timeout_lora")).toBe(true);
+    } finally {
+      globalThis.fetch = previousFetch;
+      restoreEnv();
+    }
+  });
+
+  function failTwoLifecycleCompletionSaves(store) {
+    const originalSaveNow = store.saveNow.bind(store);
+    let calls = 0;
+    store.saveNow = async () => {
+      calls += 1;
+      if (calls === 2 || calls === 3) {
+        throw new Error("forced lifecycle completion persistence failure");
+      }
+      return originalSaveNow();
+    };
+    return () => {
+      store.saveNow = originalSaveNow;
+    };
+  }
+
+  it("journals a Runtime PATCH, fails closed, and idempotently reconciles after local persistence failure", async () => {
+    const restoreEnv = enableRealRuntime();
+    const previousFetch = globalThis.fetch;
+    const store = app.locals.store;
+    const restoreSave = failTwoLifecycleCompletionSaves(store);
+    const runtimeAgent = {
+      id: "legal_privacy_lora",
+      title: "Runtime committed privacy agent",
+      enabled: true,
+      mounted: true
+    };
+    globalThis.fetch = async (url, options = {}) => {
+      const pathName = new URL(url).pathname;
+      if (pathName === "/agents/legal_privacy_lora" && options.method === "PATCH") {
+        return Response.json({ ok: true, status: "updated", agent: runtimeAgent });
+      }
+      if (pathName === "/agents/legal_privacy_lora" && (!options.method || options.method === "GET")) {
+        return Response.json({ ok: true, agent: runtimeAgent });
+      }
+      return Response.json({ detail: "not found" }, { status: 404 });
+    };
+    try {
+      await request(app)
+        .patch("/api/agents/legal_privacy_lora")
+        .send({ title: runtimeAgent.title })
+        .expect(500);
+      const pending = store.read();
+      expect(pending.runtimeLifecycleIntents).toHaveLength(1);
+      expect(pending.runtimeLifecycleIntents[0].operation).toBe("agent.update");
+      expect(pending.agents.find((agent) => agent.id === runtimeAgent.id)).toMatchObject({
+        runtime_sync_pending: true
+      });
+      expect(scopedRoutingContext({
+        session: { workspace_id: null, created_by: "admin" },
+        agents: pending.agents,
+        documents: pending.documents
+      }).allowedAdapters).not.toContain(runtimeAgent.id);
+
+      restoreSave();
+      const reconciled = await request(app)
+        .post("/api/admin/runtime-lifecycle/reconcile")
+        .send({ intent_id: pending.runtimeLifecycleIntents[0].intent_id })
+        .expect(200);
+      expect(reconciled.body).toMatchObject({ attempted: 1, reconciled: 1, pending: 0 });
+      expect(store.read().runtimeLifecycleIntents).toEqual([]);
+      const reconciledAgent = store.read().agents.find((agent) => agent.id === runtimeAgent.id);
+      expect(reconciledAgent.title).toBe(runtimeAgent.title);
+      expect(reconciledAgent).not.toHaveProperty("runtime_sync_pending");
+      const replay = await request(app)
+        .post("/api/admin/runtime-lifecycle/reconcile")
+        .send({})
+        .expect(200);
+      expect(replay.body).toMatchObject({ attempted: 0, reconciled: 0, pending: 0 });
+    } finally {
+      restoreSave();
+      globalThis.fetch = previousFetch;
+      restoreEnv();
+    }
+  });
+
+  it("releases a lifecycle intent after an unambiguous Runtime PATCH rejection", async () => {
+    const restoreEnv = enableRealRuntime();
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = async (url, options = {}) => {
+      const pathName = new URL(url).pathname;
+      if (pathName === "/agents/legal_privacy_lora" && options.method === "PATCH") {
+        return Response.json({ detail: "boundary rejected by Runtime policy" }, { status: 409 });
+      }
+      return Response.json({ detail: "not found" }, { status: 404 });
+    };
+    try {
+      await request(app)
+        .patch("/api/agents/legal_privacy_lora")
+        .send({ boundary: "A rejected boundary must not leave a permanent intent." })
+        .expect(409);
+      const data = app.locals.store.read();
+      expect(data.runtimeLifecycleIntents).toEqual([]);
+      expect(data.agents.find((agent) => agent.id === "legal_privacy_lora"))
+        .not.toHaveProperty("runtime_sync_pending");
+    } finally {
+      globalThis.fetch = previousFetch;
+      restoreEnv();
+    }
+  });
+
+  it.each([
+    {
+      name: "mount",
+      method: "post",
+      route: "/api/agents/legal_privacy_lora/mount",
+      runtimePath: "/agents/legal_privacy_lora/mount",
+      runtimeMethod: "POST",
+      operation: "agent.mount",
+      runtime: { ok: true, status: "mounted", mounted: true, requires_vllm_reload: false }
+    },
+    {
+      name: "archive",
+      method: "delete",
+      route: "/api/agents/legal_privacy_lora",
+      runtimePath: "/agents/legal_privacy_lora",
+      runtimeMethod: "DELETE",
+      operation: "agent.archive",
+      runtime: { ok: true, status: "archived", mounted: false, requires_vllm_reload: false }
+    }
+  ])("leaves $name fail-closed and recoverable when the local lifecycle commit fails", async ({ method, route, runtimePath, runtimeMethod, operation, runtime }) => {
+    const restoreEnv = enableRealRuntime();
+    const previousFetch = globalThis.fetch;
+    const store = app.locals.store;
+    const restoreSave = failTwoLifecycleCompletionSaves(store);
+    const runtimeAgent = {
+      id: "legal_privacy_lora",
+      title: "Legal & Privacy",
+      enabled: operation !== "agent.archive",
+      mounted: runtime.mounted
+    };
+    globalThis.fetch = async (url, options = {}) => {
+      const pathName = new URL(url).pathname;
+      if (pathName === runtimePath && options.method === runtimeMethod) {
+        return Response.json({ ...runtime, agent: runtimeAgent });
+      }
+      if (pathName === "/agents/legal_privacy_lora" && (!options.method || options.method === "GET")) {
+        return Response.json({ ok: true, agent: runtimeAgent });
+      }
+      return Response.json({ detail: "not found" }, { status: 404 });
+    };
+    try {
+      await request(app)[method](route).send({}).expect(500);
+      const pending = store.read();
+      expect(pending.runtimeLifecycleIntents).toHaveLength(1);
+      expect(pending.runtimeLifecycleIntents[0].operation).toBe(operation);
+      expect(pending.agents.find((agent) => agent.id === runtimeAgent.id).runtime_sync_pending).toBe(true);
+      restoreSave();
+      await request(app).post("/api/admin/runtime-lifecycle/reconcile").send({}).expect(200);
+      expect(store.read().runtimeLifecycleIntents).toEqual([]);
+      expect(store.read().agents.find((agent) => agent.id === runtimeAgent.id)).toMatchObject({
+        enabled: runtimeAgent.enabled,
+        mounted: runtimeAgent.mounted
+      });
+    } finally {
+      restoreSave();
+      globalThis.fetch = previousFetch;
+      restoreEnv();
+    }
+  });
+
+  it("recovers a Runtime-purged document from a durable delete intent after local persistence failure", async () => {
+    const created = await request(app)
+      .post("/api/documents")
+      .field("title", "Lifecycle delete recovery")
+      .attach("file", Buffer.from("Durable delete intent source content."), "delete.txt")
+      .expect(201);
+    const restoreEnv = enableRealRuntime();
+    const previousFetch = globalThis.fetch;
+    const store = app.locals.store;
+    const restoreSave = failTwoLifecycleCompletionSaves(store);
+    globalThis.fetch = async (url, options = {}) => {
+      const pathName = new URL(url).pathname;
+      if (pathName === `/documents/${created.body.agent_id}` && options.method === "DELETE") {
+        return Response.json(ownedPurgeResponse(created.body.agent_id));
+      }
+      if (pathName === `/agents/${created.body.agent_id}` && (!options.method || options.method === "GET")) {
+        return Response.json({ detail: "not found" }, { status: 404 });
+      }
+      return Response.json({ detail: "not found" }, { status: 404 });
+    };
+    try {
+      await request(app).delete(`/api/documents/${created.body.document_id}`).expect(500);
+      const pending = store.read();
+      expect(pending.runtimeLifecycleIntents).toHaveLength(1);
+      expect(pending.runtimeLifecycleIntents[0].operation).toBe("document.delete");
+      expect(pending.documents.find((document) => document.document_id === created.body.document_id)).toMatchObject({
+        enabled: true,
+        runtime_sync_pending: true
+      });
+      restoreSave();
+      await request(app).post("/api/admin/runtime-lifecycle/reconcile").send({}).expect(200);
+      const deleted = store.read().documents.find((document) => document.document_id === created.body.document_id);
+      expect(deleted).toMatchObject({ enabled: false, chunks: [] });
+      expect(deleted).not.toHaveProperty("runtime_sync_pending");
+      expect(store.read().runtimeLifecycleIntents).toEqual([]);
+    } finally {
+      restoreSave();
+      globalThis.fetch = previousFetch;
+      restoreEnv();
+    }
+  });
+});
+
+function authoritativeRuntimeDocumentResponse(requestBody, {
+  body,
+  pageStart = null,
+  pageEnd = null
+}) {
+  const slug = requestBody.id.replace(/_lora$/, "");
+  const chunkId = `${slug}_0001`;
+  const record = {
+    chunk_id: chunkId,
+    title: "Authoritative Runtime chunk",
+    page_start: pageStart,
+    page_end: pageEnd,
+    tags: ["authoritative", "runtime"],
+    path: `sources/tcar_documents/${slug}/chunks/${chunkId}.md`,
+    summary: body,
+    token_count_approx: body.split(/\s+/).length,
+    content_digest: runtimeSha256(body),
+    body
+  };
+  return {
+    ok: true,
+    status: "added",
+    id: requestBody.id,
+    result: {
+      status: "added",
+      id: requestBody.id,
+      document_root: `sources/tcar_documents/${slug}`,
+      index_path: `sources/tcar_documents/${slug}/index.jsonl`,
+      chunks: 1,
+      chunk_records: [record],
+      source_digest: runtimeSha256(requestBody.text),
+      corpus_revision: runtimeDocumentRevision([record]).replace(/^sha256:/, ""),
+      index_digest: runtimeSha256(JSON.stringify(record)),
+      mounted: true
+    },
+    agent: { id: requestBody.id, enabled: true, mounted: true },
+    mounted: true,
+    requires_vllm_reload: false
+  };
+}
+
+function runtimeSha256(value) {
+  return crypto.createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function runtimeAuditDigest(value) {
+  const canonical = (candidate) => {
+    if (Array.isArray(candidate)) return candidate.map(canonical);
+    if (!candidate || typeof candidate !== "object") return candidate;
+    return Object.fromEntries(Object.keys(candidate).sort().map((key) => [key, canonical(candidate[key])]));
+  };
+  return crypto.createHash("sha256")
+    .update("json\0", "utf8")
+    .update(JSON.stringify(canonical(value)), "utf8")
+    .digest("hex");
+}
+
+function runtimeAuditReceipt({
+  receiptId,
+  subjectType,
+  subjectId,
+  eventType,
+  executionId = null,
+  eventId = null,
+  subjectSequence = 1,
+  previousHash = "0".repeat(64),
+  payload
+}) {
+  const payloadSha256 = runtimeAuditDigest(payload);
+  const material = {
+    created_at: "2026-07-10T12:00:00.000000Z",
+    event_id: eventId,
+    event_type: eventType,
+    execution_id: executionId,
+    payload_sha256: payloadSha256,
+    previous_hash: previousHash,
+    receipt_id: receiptId,
+    schema_version: 1,
+    subject_id: subjectId,
+    subject_sequence: subjectSequence,
+    subject_type: subjectType
+  };
+  return {
+    receipt_id: receiptId,
+    schema_version: 1,
+    subject_type: subjectType,
+    subject_id: subjectId,
+    event_type: eventType,
+    event_id: eventId,
+    execution_id: executionId,
+    subject_sequence: subjectSequence,
+    created_at: material.created_at,
+    previous_hash: previousHash,
+    payload_sha256: payloadSha256,
+    receipt_hash: runtimeAuditDigest(material),
+    payload
+  };
+}
+
+describe("Runtime audit proof proxy", () => {
+  it("allows a same-workspace admin to verify locally bound execution and user-agent receipts", async () => {
+    const previous = {
+      APP_API_TOKENS_JSON: process.env.APP_API_TOKENS_JSON,
+      TCAR_ENGINE_MODE: process.env.TCAR_ENGINE_MODE,
+      TCAR_RUNTIME_API_URL: process.env.TCAR_RUNTIME_API_URL
+    };
+    const previousFetch = globalThis.fetch;
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "virenis-runtime-proof-"));
+    const creatorToken = "runtime_proof_creator_token_0123456789";
+    const adminToken = "runtime_proof_admin_token_012345678901";
+    let proofApp;
+    try {
+      process.env.APP_API_TOKENS_JSON = JSON.stringify({
+        [creatorToken]: { user_id: "creator", workspace_id: "workspace_proof", role: "user" },
+        [adminToken]: { user_id: "resolver", workspace_id: "workspace_proof", role: "admin" }
+      });
+      process.env.TCAR_ENGINE_MODE = "real";
+      process.env.TCAR_RUNTIME_API_URL = "http://gpu-runtime.internal:9000";
+      const requestFingerprint = "a".repeat(64);
+      const executionActor = runtimeAuditDigest(JSON.stringify({
+        role: "user",
+        user_id: "creator",
+        workspace_id: "workspace_proof"
+      }));
+      const executionReceipt = runtimeAuditReceipt({
+        receiptId: "ar_execution_proof",
+        subjectType: "execution",
+        subjectId: "workspace_proof",
+        eventType: "execution.completed",
+        executionId: "runtime_run_proof",
+        payload: {
+          actor_sha256: executionActor,
+          request_sha256: requestFingerprint,
+          status: "completed"
+        }
+      });
+      const agentSpec = { id: "creator_agent_lora", capability: "Creator-owned proof", mounted: true };
+      const agentPayload = {
+        actor_sha256: "b".repeat(64),
+        source_text_sha256: "c".repeat(64),
+        agent_spec_sha256: runtimeAuditDigest(agentSpec),
+        agent_revision: "d".repeat(64),
+        adapter_content_digest: "e".repeat(64),
+        manifest_contract_digest: "f".repeat(64),
+        enabled: true,
+        mounted: true,
+        lifecycle_status: "active"
+      };
+      const currentRuntimeAgent = {
+        id: "creator_agent_lora",
+        revision_authority: "runtime",
+        agent_revision: agentPayload.agent_revision,
+        adapter_content_digest: agentPayload.adapter_content_digest,
+        manifest_contract_digest: agentPayload.manifest_contract_digest,
+        enabled: true,
+        mounted: true,
+        mount_pending: false,
+        lifecycle_status: "active"
+      };
+      const agentReceipts = [];
+      let previousAgentHash = "0".repeat(64);
+      for (let index = 0; index < 1005; index += 1) {
+        const receipt = runtimeAuditReceipt({
+          receiptId: `ar_agent_proof_${index + 1}`,
+          subjectType: "agent",
+          subjectId: "creator_agent_lora",
+          eventType: index === 0 ? "agent.registered" : "agent.reconciled",
+          eventId: `agent-proof-event-${index + 1}`,
+          subjectSequence: index + 1,
+          previousHash: previousAgentHash,
+          payload: index === 0
+            ? agentPayload
+            : {
+              agent_revision: agentPayload.agent_revision,
+              adapter_content_digest: agentPayload.adapter_content_digest,
+              enabled: true,
+              lifecycle_status: "active",
+              manifest_contract_digest: agentPayload.manifest_contract_digest,
+              manifest_revision: runtimeAuditDigest({ revision: index + 1 }),
+              mounted: true
+            }
+        });
+        agentReceipts.push(receipt);
+        previousAgentHash = receipt.receipt_hash;
+      }
+      const agentReceipt = agentReceipts[0];
+      const agentHead = agentReceipts.at(-1);
+      const receiptPageRequests = [];
+      globalThis.fetch = async (url) => {
+        const parsed = new URL(url);
+        if (parsed.pathname === "/audit/executions/runtime_run_proof") {
+          return new Response(JSON.stringify({ ok: true, receipt: executionReceipt }), { status: 200 });
+        }
+        if (parsed.pathname === "/agents/creator_agent_lora") {
+          return new Response(JSON.stringify({ ok: true, agent: currentRuntimeAgent }), { status: 200 });
+        }
+        if (parsed.pathname === "/audit/subjects/agent/creator_agent_lora/receipts") {
+          const afterSequence = Number(parsed.searchParams.get("after_sequence"));
+          const throughSequence = parsed.searchParams.has("through_sequence")
+            ? Number(parsed.searchParams.get("through_sequence"))
+            : agentReceipts.length;
+          const limit = Number(parsed.searchParams.get("limit"));
+          const receipts = agentReceipts
+            .filter((receipt) => receipt.subject_sequence > afterSequence && receipt.subject_sequence <= throughSequence)
+            .slice(0, limit);
+          const lastSequence = receipts.at(-1)?.subject_sequence ?? afterSequence;
+          const hasMore = receipts.length > 0 && lastSequence < throughSequence;
+          receiptPageRequests.push({ afterSequence, throughSequence, limit });
+          return new Response(JSON.stringify({
+            ok: true,
+            schema_version: 1,
+            subject_type: "agent",
+            subject_id: "creator_agent_lora",
+            after_sequence: afterSequence,
+            snapshot_sequence: throughSequence,
+            snapshot_head_hash: agentReceipts[throughSequence - 1]?.receipt_hash ?? "0".repeat(64),
+            has_more: hasMore,
+            next_after_sequence: hasMore ? lastSequence : null,
+            receipts
+          }), { status: 200 });
+        }
+        if (parsed.pathname === "/audit/subjects/execution/workspace_proof/verify") {
+          return new Response(JSON.stringify({
+            ok: true,
+            subject_type: "execution",
+            subject_id: "workspace_proof",
+            receipts: 1,
+            head_hash: executionReceipt.receipt_hash
+          }), { status: 200 });
+        }
+        if (parsed.pathname === "/audit/subjects/agent/creator_agent_lora/verify") {
+          const throughSequence = Number(parsed.searchParams.get("through_sequence"));
+          return new Response(JSON.stringify({
+            ok: true,
+            subject_type: "agent",
+            subject_id: "creator_agent_lora",
+            receipts: throughSequence,
+            through_sequence: throughSequence,
+            head_hash: agentReceipts[throughSequence - 1]?.receipt_hash ?? "0".repeat(64)
+          }), { status: 200 });
+        }
+        return new Response(JSON.stringify({ detail: "not found" }), { status: 404 });
+      };
+      proofApp = await createApp({ dbPath: path.join(tmp, "db.json"), uploadRoot: tmp });
+      await proofApp.locals.store.mutate((data) => {
+        data.executionRecords.push({
+          execution_id: "local_execution_proof",
+          run_id: "runtime_run_proof",
+          runtime_execution_id: "runtime_run_proof",
+          runtime_record_hash: `sha256:${executionReceipt.receipt_hash}`,
+          runtime_request_fingerprint: `sha256:${requestFingerprint}`,
+          workspace_id: "workspace_proof",
+          created_by: "creator",
+          actor_role: "user",
+          visibility: "private",
+          participants: []
+        });
+        data.agents.push({
+          id: "creator_agent_lora",
+          workspace_id: "workspace_proof",
+          created_by: "creator",
+          visibility: "private",
+          runtime_registration_audit_binding: {
+            receipt_id: agentReceipt.receipt_id,
+            receipt_hash: agentReceipt.receipt_hash,
+            payload_sha256: agentReceipt.payload_sha256,
+            actor_sha256: agentPayload.actor_sha256,
+            source_text_sha256: agentPayload.source_text_sha256,
+            agent_spec_sha256: agentPayload.agent_spec_sha256,
+            agent_revision: agentPayload.agent_revision,
+            adapter_content_digest: agentPayload.adapter_content_digest,
+            manifest_contract_digest: agentPayload.manifest_contract_digest,
+            event_type: agentReceipt.event_type,
+            subject_sequence: 1
+          },
+          runtime_registration_agent_spec: agentSpec
+        });
+        return true;
+      });
+
+      await request(proofApp)
+        .get("/api/admin/executions/local_execution_proof/runtime-proof")
+        .set("Authorization", `Bearer ${creatorToken}`)
+        .expect(403);
+      const executionProof = await request(proofApp)
+        .get("/api/admin/executions/local_execution_proof/runtime-proof")
+        .set("Authorization", `Bearer ${adminToken}`)
+        .expect(200);
+      expect(executionProof.body.binding_valid).toBe(true);
+      expect(executionProof.body.receipt.receipt_hash).toBe(executionReceipt.receipt_hash);
+
+      const agentProof = await request(proofApp)
+        .get("/api/admin/agents/creator_agent_lora/runtime-audit")
+        .set("Authorization", `Bearer ${adminToken}`)
+        .expect(200);
+      expect(agentProof.body.binding_valid).toBe(true);
+      expect(agentProof.body.registration_receipt.receipt_hash).toBe(agentReceipt.receipt_hash);
+      expect(agentProof.body.receipts).toHaveLength(1005);
+      expect(agentProof.body.subject_chain.head_hash).toBe(agentHead.receipt_hash);
+      expect(receiptPageRequests).toEqual([
+        { afterSequence: 0, throughSequence: 1005, limit: 1000 },
+        { afterSequence: 1000, throughSequence: 1005, limit: 1000 }
+      ]);
+      expect(JSON.stringify(agentProof.body)).not.toContain("registration_id");
+    } finally {
+      await proofApp?.locals?.store?.close?.();
+      globalThis.fetch = previousFetch;
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      await fs.rm(tmp, { recursive: true, force: true });
     }
   });
 });

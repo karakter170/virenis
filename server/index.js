@@ -3,7 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import express from "express";
 import { createServer as createViteServer } from "vite";
-import { createApp } from "./app.js";
+import { createApp, resolveLifecycleTimeouts } from "./app.js";
 import { requireRuntimeConfigured } from "./runtimeClient.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -12,7 +12,7 @@ const distRoot = process.env.WEB_DIST_DIR ? path.resolve(process.env.WEB_DIST_DI
 const port = Number(process.env.PORT || 5173);
 const isProduction = process.env.NODE_ENV === "production";
 const host = process.env.HOST || (isProduction ? "127.0.0.1" : "0.0.0.0");
-const shutdownTimeoutMs = Number(process.env.APP_SHUTDOWN_TIMEOUT_MS || 30000);
+const { shutdownTimeoutMs, backgroundDrainTimeoutMs } = resolveLifecycleTimeouts();
 
 requireRuntimeConfigured();
 
@@ -50,7 +50,7 @@ if (isProduction) {
 }
 
 const server = app.listen(port, host, () => {
-  console.log(`TCAR Agent Router Chat listening on http://${host}:${port}`);
+  console.log(`virenis listening on http://${host}:${port}`);
 });
 
 let shuttingDown = false;
@@ -59,9 +59,9 @@ async function shutdown(signal) {
     return;
   }
   shuttingDown = true;
-  console.log(`TCAR Agent Router Chat received ${signal}; shutting down.`);
+  console.log(`virenis received ${signal}; shutting down.`);
   const forceExit = setTimeout(() => {
-    console.error(`TCAR Agent Router Chat shutdown exceeded ${shutdownTimeoutMs}ms.`);
+    console.error(`virenis shutdown exceeded ${shutdownTimeoutMs}ms.`);
     process.exit(1);
   }, shutdownTimeoutMs);
   forceExit.unref();
@@ -79,7 +79,7 @@ async function shutdown(signal) {
     app.locals.closeEventStreams?.({ reason: signal });
     await serverClosed;
     const drainResult = await app.locals.drainBackgroundTasks?.({
-      timeoutMs: Number(process.env.APP_BACKGROUND_DRAIN_TIMEOUT_MS || shutdownTimeoutMs)
+      timeoutMs: backgroundDrainTimeoutMs
     });
     if (drainResult && !drainResult.ok) {
       throw new Error(`Timed out waiting for ${drainResult.pending} background task(s) to finish.`);
@@ -90,7 +90,7 @@ async function shutdown(signal) {
     process.exit(0);
   } catch (error) {
     clearTimeout(forceExit);
-    console.error("TCAR Agent Router Chat shutdown failed.", error);
+    console.error("virenis shutdown failed.", error);
     process.exit(1);
   }
 }

@@ -1,6 +1,31 @@
+import http from "node:http";
+import https from "node:https";
 import { appAuthConfigured, secretConfigured } from "./authConfig.js";
 
 const DEFAULT_TIMEOUT_MS = 900000;
+const DEFAULT_CONNECT_TIMEOUT_MS = 10000;
+const DEFAULT_BODY_IDLE_TIMEOUT_MS = 60000;
+const DEFAULT_MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
+const MAX_REQUEST_TIMEOUT_MS = 1800000;
+const MAX_CONNECT_TIMEOUT_MS = 120000;
+const MAX_BODY_IDLE_TIMEOUT_MS = 300000;
+const MAX_RESPONSE_BYTES = 64 * 1024 * 1024;
+const MAX_AUDIT_RECEIPT_PAGE_SIZE = 1000;
+let testFetchTransport = null;
+
+export function setRuntimeFetchForTests(fetchImpl) {
+  if (process.env.NODE_ENV !== "test") {
+    throw new Error("Runtime fetch injection is available only when NODE_ENV=test.");
+  }
+  if (typeof fetchImpl !== "function") {
+    throw new TypeError("Runtime test fetch transport must be a function.");
+  }
+  const previous = testFetchTransport;
+  testFetchTransport = fetchImpl;
+  return () => {
+    if (testFetchTransport === fetchImpl) testFetchTransport = previous;
+  };
+}
 
 export function runtimeMode() {
   return String(process.env.TCAR_ENGINE_MODE || "simulator").toLowerCase();
@@ -18,6 +43,7 @@ export function requireRuntimeConfigured() {
   if (realRuntimeEnabled() && isProduction && !secretConfigured(process.env.TCAR_RUNTIME_API_KEY)) {
     throw new Error("Production real runtime requires TCAR_RUNTIME_API_KEY.");
   }
+  if (realRuntimeEnabled()) validateRuntimeTransportConfiguration(process.env);
   if (isProduction && process.env.APP_ALLOW_UNAUTHENTICATED !== "1") {
     if (!appAuthConfigured(process.env, { requireStrongSecrets: true })) {
       throw new Error("Production web server requires strong Basic Auth credentials or strong APP_API_TOKENS/APP_API_TOKENS_JSON, or APP_ALLOW_UNAUTHENTICATED=1 with an explicit unauthenticated identity.");
@@ -37,6 +63,24 @@ export function requireRuntimeConfigured() {
   if (isProduction && isAllInterfaceHost(process.env.HOST) && process.env.APP_ALLOW_PUBLIC_BIND !== "1") {
     throw new Error("Production web server must bind to 127.0.0.1 or a protected private interface. Set APP_ALLOW_PUBLIC_BIND=1 only when firewall/proxy controls explicitly protect the Node process.");
   }
+}
+
+function validateRuntimeTransportConfiguration(env) {
+  for (const [name, maximum] of [
+    ["TCAR_RUNTIME_CHAT_TIMEOUT_MS", MAX_REQUEST_TIMEOUT_MS],
+    ["TCAR_RUNTIME_HEALTH_TIMEOUT_MS", MAX_REQUEST_TIMEOUT_MS],
+    ["TCAR_RUNTIME_ADMIN_TIMEOUT_MS", MAX_REQUEST_TIMEOUT_MS],
+    ["TCAR_RUNTIME_CONNECT_TIMEOUT_MS", MAX_CONNECT_TIMEOUT_MS],
+    ["TCAR_RUNTIME_HEADER_TIMEOUT_MS", MAX_REQUEST_TIMEOUT_MS],
+    ["TCAR_RUNTIME_BODY_IDLE_TIMEOUT_MS", MAX_BODY_IDLE_TIMEOUT_MS]
+  ]) {
+    const value = String(env[name] ?? "").trim();
+    if (value) boundedInteger(value, name, 1, maximum);
+  }
+  const maxResponseBytes = String(env.TCAR_RUNTIME_MAX_RESPONSE_BYTES ?? "").trim();
+  if (maxResponseBytes) boundedInteger(maxResponseBytes, "TCAR_RUNTIME_MAX_RESPONSE_BYTES", 1024, MAX_RESPONSE_BYTES);
+  const validationSeconds = String(env.TCAR_RUNTIME_VALIDATION_TIMEOUT_SEC ?? "").trim();
+  if (validationSeconds) boundedInteger(validationSeconds, "TCAR_RUNTIME_VALIDATION_TIMEOUT_SEC", 1, MAX_REQUEST_TIMEOUT_MS / 1000);
 }
 
 function validatePublicOrigin(value) {
@@ -129,50 +173,256 @@ function runtimeBaseUrl() {
 }
 
 export async function runtimeRequest(path, { method = "GET", body, timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const requestTimeoutMs = boundedInteger(timeoutMs, "runtime request timeout", 1, MAX_REQUEST_TIMEOUT_MS);
+  const connectTimeoutMs = Math.min(
+    requestTimeoutMs,
+    optionalBoundedEnvironmentInteger(
+      "TCAR_RUNTIME_CONNECT_TIMEOUT_MS",
+      DEFAULT_CONNECT_TIMEOUT_MS,
+      1,
+      MAX_CONNECT_TIMEOUT_MS
+    )
+  );
+  const headerTimeoutMs = Math.min(
+    requestTimeoutMs,
+    optionalBoundedEnvironmentInteger(
+      "TCAR_RUNTIME_HEADER_TIMEOUT_MS",
+      requestTimeoutMs,
+      1,
+      MAX_REQUEST_TIMEOUT_MS
+    )
+  );
+  const bodyIdleTimeoutMs = Math.min(
+    requestTimeoutMs,
+    optionalBoundedEnvironmentInteger(
+      "TCAR_RUNTIME_BODY_IDLE_TIMEOUT_MS",
+      DEFAULT_BODY_IDLE_TIMEOUT_MS,
+      1,
+      MAX_BODY_IDLE_TIMEOUT_MS
+    )
+  );
+  const maxResponseBytes = optionalBoundedEnvironmentInteger(
+    "TCAR_RUNTIME_MAX_RESPONSE_BYTES",
+    DEFAULT_MAX_RESPONSE_BYTES,
+    1024,
+    MAX_RESPONSE_BYTES
+  );
   const headers = {};
+  let encodedBody;
   if (body !== undefined) {
     headers["Content-Type"] = "application/json";
+    encodedBody = Buffer.from(JSON.stringify(body), "utf8");
+    headers["Content-Length"] = String(encodedBody.length);
   }
   if (process.env.TCAR_RUNTIME_API_KEY) {
     headers["X-TCAR-API-Key"] = process.env.TCAR_RUNTIME_API_KEY;
   }
 
+  const requestOptions = {
+    method,
+    headers,
+    body: encodedBody,
+    requestTimeoutMs,
+    connectTimeoutMs,
+    headerTimeoutMs,
+    bodyIdleTimeoutMs,
+    maxResponseBytes
+  };
+  const requestUrl = `${runtimeBaseUrl()}${path}`;
+  const response = testFetchTransport
+    ? await boundedTestFetch(requestUrl, requestOptions, testFetchTransport)
+    : await boundedHttpRequest(requestUrl, requestOptions);
+  const text = response.body.toString("utf8");
+  let payload = {};
+  if (text) {
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      payload = { raw: text };
+    }
+  }
+  if (response.status < 200 || response.status >= 300) {
+    const detail = payload.detail || payload.message || payload.error || response.statusMessage;
+    const error = new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+    error.status = response.status;
+    error.payload = payload;
+    throw error;
+  }
+  return payload;
+}
+
+async function boundedTestFetch(url, { method, headers, body, requestTimeoutMs, maxResponseBytes }, fetchImpl) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), requestTimeoutMs);
   try {
-    const response = await fetch(`${runtimeBaseUrl()}${path}`, {
+    const response = await fetchImpl(url, {
       method,
       headers,
-      body: body === undefined ? undefined : JSON.stringify(body),
+      body: body?.toString("utf8"),
       signal: controller.signal
     });
     const text = await response.text();
-    let payload = {};
-    if (text) {
-      try {
-        payload = JSON.parse(text);
-      } catch {
-        payload = { raw: text };
-      }
-    }
-    if (!response.ok) {
-      const detail = payload.detail || payload.message || payload.error || response.statusText;
-      const error = new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
-      error.status = response.status;
-      error.payload = payload;
+    const responseBody = Buffer.from(text, "utf8");
+    if (responseBody.length > maxResponseBytes) {
+      const error = new Error("TCAR runtime response exceeded the configured size limit.");
+      error.status = 502;
       throw error;
     }
-    return payload;
+    return {
+      status: response.status,
+      statusMessage: response.statusText || "",
+      headers: Object.fromEntries(response.headers?.entries?.() || []),
+      body: responseBody
+    };
   } catch (error) {
-    if (error.name === "AbortError") {
-      const timeout = new Error(`TCAR runtime request timed out after ${timeoutMs}ms.`);
-      timeout.status = 504;
-      throw timeout;
-    }
+    if (error.name === "AbortError") throw runtimeTimeoutError(requestTimeoutMs);
     throw error;
   } finally {
     clearTimeout(timer);
   }
+}
+
+function boundedHttpRequest(urlValue, {
+  method,
+  headers,
+  body,
+  requestTimeoutMs,
+  connectTimeoutMs,
+  headerTimeoutMs,
+  bodyIdleTimeoutMs,
+  maxResponseBytes
+}) {
+  const url = new URL(urlValue);
+  const transport = url.protocol === "https:" ? https : url.protocol === "http:" ? http : null;
+  if (!transport) throw new Error("TCAR runtime URL must use http or https.");
+
+  return new Promise((resolve, reject) => {
+    let response;
+    let settled = false;
+    let receivedBytes = 0;
+    const chunks = [];
+    const timers = new Set();
+
+    const clearTimer = (timer) => {
+      if (!timer) return;
+      clearTimeout(timer);
+      timers.delete(timer);
+    };
+    const schedule = (callback, milliseconds) => {
+      const timer = setTimeout(callback, milliseconds);
+      timers.add(timer);
+      return timer;
+    };
+    const cleanup = () => {
+      for (const timer of timers) clearTimeout(timer);
+      timers.clear();
+    };
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (error) {
+        response?.destroy();
+        request.socket?.destroy();
+        request.destroy();
+        reject(error);
+      } else {
+        resolve(value);
+      }
+    };
+    const totalTimer = schedule(() => finish(runtimeTimeoutError(requestTimeoutMs)), requestTimeoutMs);
+    const headerTimer = schedule(() => finish(runtimeTimeoutError(headerTimeoutMs)), headerTimeoutMs);
+    let connectTimer = schedule(() => finish(runtimeTimeoutError(connectTimeoutMs)), connectTimeoutMs);
+    let bodyTimer;
+    const resetBodyTimer = () => {
+      clearTimer(bodyTimer);
+      bodyTimer = schedule(() => finish(runtimeTimeoutError(bodyIdleTimeoutMs)), bodyIdleTimeoutMs);
+    };
+
+    let request;
+    try {
+      request = transport.request(url, {
+        method,
+        headers,
+        agent: false
+      });
+    } catch (error) {
+      cleanup();
+      reject(error);
+      return;
+    }
+    request.once("socket", (socket) => {
+      const readyEvent = socket.encrypted ? "secureConnect" : "connect";
+      if (!socket.connecting && (!socket.encrypted || socket.authorized !== undefined)) {
+        clearTimer(connectTimer);
+        connectTimer = undefined;
+        return;
+      }
+      socket.once(readyEvent, () => {
+        clearTimer(connectTimer);
+        connectTimer = undefined;
+      });
+    });
+    request.once("response", (incoming) => {
+      response = incoming;
+      clearTimer(headerTimer);
+      resetBodyTimer();
+      incoming.on("data", (chunk) => {
+        receivedBytes += chunk.length;
+        if (receivedBytes > maxResponseBytes) {
+          const error = new Error("TCAR runtime response exceeded the configured size limit.");
+          error.status = 502;
+          finish(error);
+          return;
+        }
+        chunks.push(chunk);
+        resetBodyTimer();
+      });
+      incoming.once("aborted", () => {
+        const error = new Error("TCAR runtime closed the response before it completed.");
+        error.status = 502;
+        finish(error);
+      });
+      incoming.once("error", (error) => finish(error));
+      incoming.once("end", () => {
+        clearTimer(totalTimer);
+        clearTimer(bodyTimer);
+        finish(null, {
+          status: incoming.statusCode || 0,
+          statusMessage: incoming.statusMessage || "",
+          headers: incoming.headers,
+          body: Buffer.concat(chunks, receivedBytes)
+        });
+      });
+    });
+    request.once("error", (error) => finish(error));
+    if (body) request.write(body);
+    request.end();
+  });
+}
+
+function runtimeTimeoutError(timeoutMs) {
+  const error = new Error(`TCAR runtime request timed out after ${timeoutMs}ms.`);
+  error.status = 504;
+  return error;
+}
+
+function optionalBoundedEnvironmentInteger(name, fallback, minimum, maximum) {
+  const raw = String(process.env[name] ?? "").trim();
+  if (!raw) return fallback;
+  return boundedInteger(raw, name, minimum, maximum);
+}
+
+function boundedInteger(value, label, minimum, maximum) {
+  const text = String(value ?? "").trim();
+  if (!/^\d+$/.test(text)) {
+    throw new Error(`${label} must be an integer from ${minimum} to ${maximum}.`);
+  }
+  const number = Number(text);
+  if (!Number.isSafeInteger(number) || number < minimum || number > maximum) {
+    throw new Error(`${label} must be an integer from ${minimum} to ${maximum}.`);
+  }
+  return number;
 }
 
 export function fetchRuntimeHealth() {
@@ -184,7 +434,12 @@ export function fetchRuntimeModels() {
 }
 
 export function fetchRuntimeAgents() {
-  return runtimeRequest("/agents", { timeoutMs: Number(process.env.TCAR_RUNTIME_HEALTH_TIMEOUT_MS || 5000) });
+  return runtimeRequest("/agents", {
+    // Listing routes may need to validate byte provenance for every mounted and
+    // archived adapter after a lifecycle mutation. It is not a lightweight
+    // health probe and must not inherit the five-second health budget.
+    timeoutMs: Number(process.env.TCAR_RUNTIME_AGENT_LIST_TIMEOUT_MS || 120000)
+  });
 }
 
 export function fetchRuntimeAgent(agentId) {
@@ -193,12 +448,145 @@ export function fetchRuntimeAgent(agentId) {
   });
 }
 
-export function executeRuntimeChat({ query, sharedMemory = [], options = {} }) {
+export function fetchRuntimeExecutionReceipt(executionId) {
+  return runtimeRequest(`/audit/executions/${encodeURIComponent(executionId)}`, {
+    timeoutMs: Number(process.env.TCAR_RUNTIME_ADMIN_TIMEOUT_MS || 180000)
+  });
+}
+
+export function verifyRuntimeExecutionSubject(subjectId) {
+  return runtimeRequest(`/audit/subjects/execution/${encodeURIComponent(subjectId)}/verify`, {
+    timeoutMs: Number(process.env.TCAR_RUNTIME_ADMIN_TIMEOUT_MS || 180000)
+  });
+}
+
+export async function fetchRuntimeSubjectReceipts(subjectType, subjectId, { limit = MAX_AUDIT_RECEIPT_PAGE_SIZE } = {}) {
+  const pageLimit = boundedInteger(
+    limit,
+    "Runtime audit receipt page limit",
+    1,
+    MAX_AUDIT_RECEIPT_PAGE_SIZE
+  );
+  const expectedSubjectType = String(subjectType);
+  const expectedSubjectId = String(subjectId);
+  const receipts = [];
+  let afterSequence = 0;
+  let snapshotSequence = null;
+  let snapshotHeadHash = null;
+
+  while (true) {
+    const query = new URLSearchParams({
+      limit: String(pageLimit),
+      after_sequence: String(afterSequence)
+    });
+    if (snapshotSequence !== null) query.set("through_sequence", String(snapshotSequence));
+    const page = await runtimeRequest(
+      `/audit/subjects/${encodeURIComponent(expectedSubjectType)}/${encodeURIComponent(expectedSubjectId)}/receipts?${query.toString()}`,
+      { timeoutMs: Number(process.env.TCAR_RUNTIME_ADMIN_TIMEOUT_MS || 180000) }
+    );
+    const pageReceipts = Array.isArray(page?.receipts) ? page.receipts : null;
+    const pageSnapshotSequence = Number(page?.snapshot_sequence);
+    const pageAfterSequence = Number(page?.after_sequence);
+    const pageHeadHash = String(page?.snapshot_head_hash || "");
+    if (
+      page?.ok !== true
+      || Number(page?.schema_version) !== 1
+      || page?.subject_type !== expectedSubjectType
+      || page?.subject_id !== expectedSubjectId
+      || !Number.isSafeInteger(pageSnapshotSequence)
+      || pageSnapshotSequence < 0
+      || pageAfterSequence !== afterSequence
+      || !/^[a-f0-9]{64}$/.test(pageHeadHash)
+      || pageReceipts === null
+      || pageReceipts.length > pageLimit
+      || typeof page?.has_more !== "boolean"
+    ) {
+      throw invalidRuntimeAuditPage("metadata did not match the requested subject and cursor");
+    }
+    if (snapshotSequence === null) {
+      snapshotSequence = pageSnapshotSequence;
+      snapshotHeadHash = pageHeadHash;
+    } else if (pageSnapshotSequence !== snapshotSequence || pageHeadHash !== snapshotHeadHash) {
+      throw invalidRuntimeAuditPage("the pinned subject snapshot changed between pages");
+    }
+
+    let previousPageSequence = afterSequence;
+    for (const receipt of pageReceipts) {
+      const sequence = Number(receipt?.subject_sequence);
+      if (
+        !Number.isSafeInteger(sequence)
+        || sequence <= previousPageSequence
+        || sequence > snapshotSequence
+      ) {
+        throw invalidRuntimeAuditPage("receipt sequences were not strictly ascending within the snapshot");
+      }
+      previousPageSequence = sequence;
+    }
+    receipts.push(...pageReceipts);
+
+    if (!page.has_more) {
+      if (
+        page?.next_after_sequence !== null
+        || previousPageSequence !== snapshotSequence
+        || receipts.length !== snapshotSequence
+      ) {
+        throw invalidRuntimeAuditPage("the final page did not complete the pinned subject snapshot");
+      }
+      return {
+        ok: true,
+        schema_version: 1,
+        subject_type: expectedSubjectType,
+        subject_id: expectedSubjectId,
+        snapshot_sequence: snapshotSequence,
+        snapshot_head_hash: snapshotHeadHash,
+        receipts
+      };
+    }
+
+    const nextAfterSequence = Number(page?.next_after_sequence);
+    if (
+      pageReceipts.length === 0
+      || !Number.isSafeInteger(nextAfterSequence)
+      || nextAfterSequence !== previousPageSequence
+      || nextAfterSequence <= afterSequence
+      || nextAfterSequence >= snapshotSequence
+    ) {
+      throw invalidRuntimeAuditPage("the continuation cursor did not advance");
+    }
+    afterSequence = nextAfterSequence;
+  }
+}
+
+export function verifyRuntimeAuditSubject(subjectType, subjectId, { throughSequence } = {}) {
+  const query = new URLSearchParams();
+  if (throughSequence !== undefined) {
+    query.set("through_sequence", String(boundedInteger(
+      throughSequence,
+      "Runtime audit through sequence",
+      0,
+      Number.MAX_SAFE_INTEGER
+    )));
+  }
+  const suffix = query.size ? `?${query.toString()}` : "";
+  return runtimeRequest(`/audit/subjects/${encodeURIComponent(subjectType)}/${encodeURIComponent(subjectId)}/verify${suffix}`, {
+    timeoutMs: Number(process.env.TCAR_RUNTIME_ADMIN_TIMEOUT_MS || 180000)
+  });
+}
+
+function invalidRuntimeAuditPage(detail) {
+  const error = new Error(`TCAR runtime returned an invalid audit receipt page: ${detail}.`);
+  error.status = 502;
+  error.code = "runtime_audit_page_invalid";
+  return error;
+}
+
+export function executeRuntimeChat({ query, sharedMemory = [], options = {}, executionContext = {} }) {
   return runtimeRequest("/chat/execute", {
     method: "POST",
     body: {
       query,
       shared_memory: sharedMemory,
+      execution_context: executionContext,
       options
     },
     timeoutMs: Number(process.env.TCAR_RUNTIME_CHAT_TIMEOUT_MS || DEFAULT_TIMEOUT_MS)
@@ -221,16 +609,30 @@ export function updateRuntimeAgent(agentId, patch) {
   });
 }
 
-export function mountRuntimeAgent(agentId) {
+export function mountRuntimeAgent(agentId, auditContext = {}) {
   return runtimeRequest(`/agents/${encodeURIComponent(agentId)}/mount`, {
     method: "POST",
+    body: { audit_context: auditContext },
     timeoutMs: Number(process.env.TCAR_RUNTIME_ADMIN_TIMEOUT_MS || 180000)
   });
 }
 
-export function archiveRuntimeAgent(agentId) {
+export function archiveRuntimeAgent(agentId, auditContext = {}) {
   return runtimeRequest(`/agents/${encodeURIComponent(agentId)}`, {
     method: "DELETE",
+    body: { audit_context: auditContext },
+    timeoutMs: Number(process.env.TCAR_RUNTIME_ADMIN_TIMEOUT_MS || 180000)
+  });
+}
+
+export function purgeRuntimeAgentRegistration(agentId, registrationId, auditContext = {}) {
+  return runtimeRequest(`/agents/${encodeURIComponent(agentId)}`, {
+    method: "DELETE",
+    body: {
+      audit_context: auditContext,
+      registration_id: registrationId,
+      purge_registration: true
+    },
     timeoutMs: Number(process.env.TCAR_RUNTIME_ADMIN_TIMEOUT_MS || 180000)
   });
 }
@@ -240,6 +642,17 @@ export function registerRuntimeDocument(document) {
     method: "POST",
     body: document,
     timeoutMs: Number(process.env.TCAR_RUNTIME_ADMIN_TIMEOUT_MS || 600000)
+  });
+}
+
+export function deleteRuntimeDocument(agentId, auditContext = {}, registrationId = null) {
+  return runtimeRequest(`/documents/${encodeURIComponent(agentId)}`, {
+    method: "DELETE",
+    body: {
+      audit_context: auditContext,
+      ...(registrationId ? { registration_id: registrationId, purge_registration: true } : {})
+    },
+    timeoutMs: Number(process.env.TCAR_RUNTIME_ADMIN_TIMEOUT_MS || 180000)
   });
 }
 

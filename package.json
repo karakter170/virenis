@@ -1,5 +1,5 @@
 {
-  "name": "tcar-agent-router-chat",
+  "name": "virenis",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -12,14 +12,16 @@
     "build": "vite build",
     "test": "vitest run",
     "test:watch": "vitest",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "poc": "node scripts/realityrank_poc.mjs",
+    "poc:test": "node fixtures/realityrank_poc_simulator.mjs"
   },
   "dependencies": {
     "@vitejs/plugin-react": "^6.0.3",
     "express": "^4.19.2",
     "lucide-react": "^0.468.0",
     "multer": "^2.2.0",
-    "pdf-parse": "^1.1.1",
+    "pdfjs-dist": "5.6.205",
     "pg": "^8.22.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",

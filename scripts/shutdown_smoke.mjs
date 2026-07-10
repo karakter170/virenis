@@ -134,6 +134,7 @@ const child = spawn(process.execPath, ["server/index.js"], {
     }),
     APP_PUBLIC_ORIGIN: "https://shutdown-smoke.prod.test",
     APP_ENABLE_HSTS: "0",
+    APP_BACKGROUND_DRAIN_TIMEOUT_MS: "4000",
     APP_SHUTDOWN_TIMEOUT_MS: "5000"
   },
   stdio: ["ignore", "pipe", "pipe"]

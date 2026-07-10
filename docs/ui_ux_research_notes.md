@@ -1,51 +1,68 @@
-# TCAR Chat UI/UX Research Notes
+# virenis UI/UX notes
 
-Date: 2026-07-09
+Updated: 2026-07-10
 
-## Product Surface
+## Product surface
 
-The app should present TCAR as one familiar chat workspace with inspectable routing, not as many separate bots. The primary screen is:
+virenis presents one familiar chat workspace. Users should not have to
+understand TCAR, TCAndon, vLLM, or LoRA mechanics to ask a question. Those names
+belong in operator diagnostics and provenance, not primary interface copy.
 
-- Left rail: conversations, session history, and live system status.
-- Center: chat thread, current run status, answer actions, upload entry point, and composer.
-- Right rail: route graph, quick agent/document actions, runtime health, event trail, and operational signals.
+The current surface is intentionally restrained:
 
-## Research Inputs
+- a header with the lowercase `virenis` wordmark, history, new chat, and account
+  controls;
+- a centered conversation thread with plain-language run progress;
+- one composer with knowledge upload and `@agent` selection;
+- a chat-history sheet rather than a permanent left rail;
+- an Agents & knowledge sheet with `Agents`, `Knowledge`, and admin-only
+  `Admin` views;
+- an Answer details sheet with `Agents`, `Sources`, `Outcomes`, and `Activity`;
+- focused dialogs for agent, document, settlement, dispute, and correction
+  workflows;
+- confirmations before destructive archive or deletion actions.
 
-- NN/g chatbot guidance: users should not need to understand internal architecture to get help, and competing chatbot entry points should be consolidated into one clear assistant surface.
-  Source: https://www.nngroup.com/articles/ai-chatbots-design-guidelines/
+There is no permanent right operations rail, Obsidian-style execution graph,
+animated node/edge canvas, or collection of separate dashboard pages. Those
+were earlier concepts and do not describe the current interface.
 
-- NN/g explainable AI guidance: explanation text alone often fails; explanation should be tied to the actual output and decision context.
-  Source: https://www.nngroup.com/articles/explainable-ai/
+## Interaction principles
 
-- Obsidian Graph View: node/link graphs are effective when direction, grouping, and color encode relationships.
-  Source: https://obsidian.md/help/plugins/graph
+- Keep chat primary on desktop and mobile. Secondary state opens only when the
+  user asks for it.
+- Use familiar icons for commands and provide an accessible label and tooltip
+  for every icon-only button.
+- Explain routing beside the answer in plain language. Show selected agents,
+  their contribution, RealityRank tie-break context, verified sources, outcome
+  state, activity, and the execution record without exposing hidden reasoning.
+- Surface lifecycle state honestly: ready, preparing, archived, needs an owner,
+  tracking only, disputed, or verified for ranking.
+- Treat unavailable metrics as unavailable, never as a fabricated zero.
+- Keep destructive controls ownership-aware and confirmation-gated.
+- Preserve keyboard focus within sheets/dialogs, restore focus on close, and
+  keep controls usable without pointer input.
+- Keep source excerpts and PDF page/chunk provenance close to the answer that
+  used them.
 
-- Material motion guidance: motion should clarify relationships, available actions, and outcomes rather than act as decoration.
-  Source: https://m2.material.io/design/motion/understanding-motion.html
+## Role behavior
 
-## Design Implications
+- Ordinary users can manage their own private agents and knowledge.
+- Administrators can adopt runtime-only agents, inspect service state, and run
+  workspace checks.
+- Viewers receive a read-only surface with mutation controls disabled or absent
+  according to the action.
+- Cross-workspace resources are not discoverable through lists or direct ids.
 
-- Keep the chat entry point singular. TCAR can route internally, but the user should still feel like they are in one conversation.
-- Make routing inspectable. The graph should reveal which route identities participated, which dependencies were used, and which sources/documents were selected.
-- Use live signals instead of marketing claims. Runtime health, mounted agents, DAG links, event trail, document count, and validation state make the backend/GPU features visible.
-- Use motion only during inference. Edge pulses and route-node firing should communicate active work and dependency flow.
-- Keep mobile chat-first. The inspector is useful but should not cover the conversation by default on small screens.
-- Show gated data honestly. Non-admin metrics should read as unavailable rather than zero.
+## Responsive behavior
 
-## Current UI Features To Preserve
+The conversation remains the default viewport at every width. History,
+resources, and answer details use modal sheets that cover only the space they
+need and close predictably. Labels, status text, and actions must wrap without
+overlap; no fixed-format control may resize when dynamic status text changes.
 
-- Past conversations visible in the left rail.
-- ChatGPT/Gemini/Claude-style message thread and composer.
-- Right-side quick actions for route agent creation, document-agent registration, and validation.
-- Obsidian-like execution graph with route, agent, document, source, runtime, and chat nodes.
-- Animated graph pulses while a run is active.
-- Runtime operations panel with mounted agents, documents, run status, runtime health, latest event, and recent event trail.
-- Responsive mobile layout with history visible and inspector closed by default.
+## Evidence over promotion
 
-## Production UX Risks
-
-- If real GPU/vLLM health is degraded, the UI must say so plainly and still let the user understand whether they are seeing simulator output.
-- Admin-only controls should remain visible but disabled with clear affordance; hiding them makes the product capability harder to discover.
-- The graph can become dense with many agents. Keep labels short, show details on hover/focus, and avoid using the graph as the only way to understand the answer.
-- PDF/document uploads should surface chunk/source provenance in answers, not just in the inspector.
+The interface should show actual citations, run state, selected agents,
+outcomes, revision history, and integrity identifiers. It should not display
+unsupported claims about intelligence, accuracy, production throughput, or live
+proof status.
