@@ -149,6 +149,7 @@ describe("runtime and catalog", () => {
       APP_UNAUTHENTICATED_WORKSPACE_ID: process.env.APP_UNAUTHENTICATED_WORKSPACE_ID,
       APP_UNAUTHENTICATED_ROLE: process.env.APP_UNAUTHENTICATED_ROLE,
       TCAR_ALLOW_LOCAL_RUNTIME_URL: process.env.TCAR_ALLOW_LOCAL_RUNTIME_URL,
+      TCAR_ALLOW_LOOPBACK_RUNTIME_TUNNEL: process.env.TCAR_ALLOW_LOOPBACK_RUNTIME_TUNNEL,
       TCAR_ALLOW_SAME_ORIGIN_RUNTIME_URL: process.env.TCAR_ALLOW_SAME_ORIGIN_RUNTIME_URL,
       HOST: process.env.HOST
     };
@@ -173,6 +174,7 @@ describe("runtime and catalog", () => {
       delete process.env.APP_UNAUTHENTICATED_WORKSPACE_ID;
       delete process.env.APP_UNAUTHENTICATED_ROLE;
       delete process.env.TCAR_ALLOW_LOCAL_RUNTIME_URL;
+      delete process.env.TCAR_ALLOW_LOOPBACK_RUNTIME_TUNNEL;
       delete process.env.TCAR_ALLOW_SAME_ORIGIN_RUNTIME_URL;
       expect(() => requireRuntimeConfigured()).toThrow(/TCAR_RUNTIME_API_KEY/);
 
@@ -215,6 +217,13 @@ describe("runtime and catalog", () => {
       expect(() => requireRuntimeConfigured()).not.toThrow();
 
       delete process.env.TCAR_ALLOW_LOCAL_RUNTIME_URL;
+      process.env.TCAR_ALLOW_LOOPBACK_RUNTIME_TUNNEL = "1";
+      expect(() => requireRuntimeConfigured()).not.toThrow();
+
+      process.env.TCAR_RUNTIME_API_URL = "http://0.0.0.0:19000";
+      expect(() => requireRuntimeConfigured()).toThrow(/loopback hostname/);
+
+      delete process.env.TCAR_ALLOW_LOOPBACK_RUNTIME_TUNNEL;
       process.env.TCAR_RUNTIME_API_URL = "https://app.prod.test/runtime";
       expect(() => requireRuntimeConfigured()).toThrow(/different host/);
 

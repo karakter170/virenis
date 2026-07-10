@@ -153,8 +153,18 @@ function validateProductionRuntimeApiUrl(env) {
     throw new Error("TCAR_RUNTIME_API_URL must use http or https.");
   }
   const runtimeHost = runtimeUrl.hostname.toLowerCase();
-  if (isLocalRuntimeHost(runtimeHost) && env.TCAR_ALLOW_LOCAL_RUNTIME_URL !== "1") {
-    throw new Error("Production split deployment requires TCAR_RUNTIME_API_URL to point to the private GPU runtime host, not localhost. Set TCAR_ALLOW_LOCAL_RUNTIME_URL=1 only for an explicit same-host private-beta deployment.");
+  if (
+    env.TCAR_ALLOW_LOOPBACK_RUNTIME_TUNNEL === "1"
+    && !isLoopbackRuntimeHost(runtimeHost)
+  ) {
+    throw new Error("TCAR_ALLOW_LOOPBACK_RUNTIME_TUNNEL=1 requires TCAR_RUNTIME_API_URL to use a loopback hostname.");
+  }
+  if (
+    isLocalRuntimeHost(runtimeHost)
+    && env.TCAR_ALLOW_LOCAL_RUNTIME_URL !== "1"
+    && env.TCAR_ALLOW_LOOPBACK_RUNTIME_TUNNEL !== "1"
+  ) {
+    throw new Error("Production split deployment requires TCAR_RUNTIME_API_URL to point to the private GPU runtime host, not localhost. Set TCAR_ALLOW_LOOPBACK_RUNTIME_TUNNEL=1 for a supervised SSH/VPN loopback tunnel, or TCAR_ALLOW_LOCAL_RUNTIME_URL=1 only for an explicit same-host private-beta deployment.");
   }
   if (env.APP_PUBLIC_ORIGIN && env.TCAR_ALLOW_SAME_ORIGIN_RUNTIME_URL !== "1") {
     try {
@@ -172,6 +182,13 @@ function validateProductionRuntimeApiUrl(env) {
 
 function isLocalRuntimeHost(hostname) {
   return hostname === "localhost" || hostname === "localhost.localdomain" || hostname === "127.0.0.1" || hostname === "::1" || hostname === "0.0.0.0";
+}
+
+function isLoopbackRuntimeHost(hostname) {
+  return hostname === "localhost"
+    || hostname === "localhost.localdomain"
+    || hostname === "127.0.0.1"
+    || hostname === "::1";
 }
 
 function runtimeBaseUrl() {
