@@ -2434,6 +2434,7 @@ describe("chat execution", () => {
       }
 
       expect(chatBody.options.allowed_adapters).toContain("writing_synthesis_lora");
+      expect(chatBody.options.allowed_adapters).toContain("finance_reasoning_lora");
       expect(chatBody.options.allowed_adapters).not.toContain("alice_private_manual_lora");
       expect(chatBody.options.max_tokens).toBe(512);
       expect(chatBody.options.refiner_max_tokens).toBe(768);

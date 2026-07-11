@@ -82,6 +82,7 @@ describe("runtime-only agent adoption", () => {
   let previousEnv;
   let previousFetch;
   let runtimeAgent;
+  let baseLibraryAgent;
   let agentReceipts;
 
   beforeEach(async () => {
@@ -124,6 +125,35 @@ describe("runtime-only agent adoption", () => {
       mount_pending: false,
       lifecycle_status: "active"
     };
+    baseLibraryAgent = {
+      id: "finance_reasoning_lora",
+      title: "Finance analysis and quantitative decision support",
+      capability: "Provides globally available finance reasoning.",
+      boundary: "Educational finance analysis only.",
+      consumes: ["user_request"],
+      produces: ["financial_analysis"],
+      routing_cues: ["finance", "npv"],
+      resources: ["poc_validated_evaluation"],
+      tools: ["finance_calculator"],
+      sources: [],
+      stage: 20,
+      library_tier: "base",
+      library_origin: "tcar_base_lora_library",
+      base_lora: true,
+      system_managed: true,
+      visibility: "global",
+      workspace_id: null,
+      created_by: "tcar-system",
+      web_access: "all_users",
+      agent_revision: "1".repeat(64),
+      revision_authority: "runtime",
+      adapter_content_digest: "2".repeat(64),
+      manifest_contract_digest: "3".repeat(64),
+      enabled: true,
+      mounted: true,
+      mount_pending: false,
+      lifecycle_status: "active"
+    };
     agentReceipts = [lifecycleReceipt({
       agentId: runtimeAgent.id,
       receiptId: "receipt_external_registered",
@@ -137,10 +167,13 @@ describe("runtime-only agent adoption", () => {
       expect(options.headers["X-TCAR-API-Key"]).toBe("runtime-adoption-test-secret");
       const pathName = new URL(url).pathname;
       if (pathName === "/agents") {
-        return Response.json({ ok: true, agents: [runtimeAgent] });
+        return Response.json({ ok: true, agents: [runtimeAgent, baseLibraryAgent] });
       }
       if (pathName === "/agents/external_audit_lora") {
         return Response.json({ ok: true, agent: runtimeAgent });
+      }
+      if (pathName === "/agents/finance_reasoning_lora") {
+        return Response.json({ ok: true, agent: baseLibraryAgent });
       }
       if (pathName === "/audit/subjects/agent/external_audit_lora/receipts") {
         const last = agentReceipts.at(-1);
@@ -193,6 +226,25 @@ describe("runtime-only agent adoption", () => {
 
     const hidden = await request(app).get("/api/agents").set(alice).expect(200);
     expect(hidden.body.agents.map((agent) => agent.id)).not.toContain("external_audit_lora");
+    expect(hidden.body.agents).toContainEqual(expect.objectContaining({
+      id: "finance_reasoning_lora",
+      base_lora: true,
+      system_managed: true,
+      visibility: "global",
+      web_access: "all_users"
+    }));
+    await request(app)
+      .get("/api/agents/finance_reasoning_lora")
+      .set(alice)
+      .expect(200)
+      .expect((response) => {
+        expect(response.body).toMatchObject({
+          id: "finance_reasoning_lora",
+          base_lora: true,
+          visibility: "global",
+          mounted: true
+        });
+      });
     await request(app).get("/api/agents/external_audit_lora").set(alice).expect(404);
     await request(app)
       .patch("/api/agents/external_audit_lora")
