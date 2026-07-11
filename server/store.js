@@ -13,6 +13,28 @@ function clone(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
+function mergeSeedCatalog(agents, seedAgents) {
+  const indexes = new Map((agents || []).map((agent, index) => [agent.id, index]));
+  for (const seedAgent of seedAgents) {
+    const existingIndex = indexes.get(seedAgent.id);
+    if (existingIndex === undefined) {
+      agents.push(clone(seedAgent));
+      indexes.set(seedAgent.id, agents.length - 1);
+      continue;
+    }
+    if (
+      seedAgent.system_managed === true
+      && seedAgent.base_lora === true
+      && seedAgent.library_origin === "tcar_base_lora_library"
+    ) {
+      // Base-library definitions are runtime-controlled product configuration,
+      // not user-owned records. Refresh them on startup so policy and receipt
+      // revisions cannot remain stale in an existing JSON or PostgreSQL store.
+      agents[existingIndex] = clone(seedAgent);
+    }
+  }
+}
+
 function initialData(seedAgents) {
   const now = new Date().toISOString();
   return {
@@ -56,12 +78,7 @@ export class JsonStore {
   }
 
   mergeSeedAgents() {
-    const existing = new Set(this.data.agents.map((agent) => agent.id));
-    for (const agent of this.seedAgents) {
-      if (!existing.has(agent.id)) {
-        this.data.agents.push(clone(agent));
-      }
-    }
+    mergeSeedCatalog(this.data.agents, this.seedAgents);
   }
 
   read(selector = (data) => data) {
@@ -268,12 +285,7 @@ function normalizeData(value, seedAgents) {
     }
   }
   data.version = defaults.version;
-  const existing = new Set((data.agents || []).map((agent) => agent.id));
-  for (const agent of seedAgents) {
-    if (!existing.has(agent.id)) {
-      data.agents.push(clone(agent));
-    }
-  }
+  mergeSeedCatalog(data.agents, seedAgents);
   return data;
 }
 
