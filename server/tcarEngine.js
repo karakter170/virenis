@@ -1507,7 +1507,7 @@ export function runtimeHealth(data) {
       mode: "local deterministic TCAR simulator"
     },
     manifest: {
-      path: process.env.PHASE222_ADAPTER_MANIFEST || "configs/dummy_tcar_lora_suite.json",
+      path: process.env.PHASE222_ADAPTER_MANIFEST || "configs/tcar_lora_library.json",
       adapters: data.agents.length,
       valid: data.agents.every((agent) => agent.id.endsWith("_lora") && agent.title && agent.capability)
     }

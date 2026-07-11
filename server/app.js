@@ -1243,7 +1243,7 @@ export async function createApp({
         workspace_id: agent.workspace_id,
         visibility: agent.visibility,
         created_by: agent.created_by,
-        manifest: "configs/dummy_tcar_lora_suite.json",
+        manifest: "configs/tcar_lora_library.json",
         adapter_path: agent.adapter_path,
         skill_path: agent.skill_path,
         mounted: true,
