@@ -6,7 +6,7 @@ import request from "supertest";
 import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createApp } from "../server/app.js";
 import { requireRuntimeConfigured, setRuntimeFetchForTests } from "../server/runtimeClient.js";
-import { buildParallelBatches, enrichRuntimeRoutingTrace, normalizeSharedMemory, sanitizeToolCalls, scopedRoutingContext } from "../server/tcarEngine.js";
+import { buildParallelBatches, enrichRuntimeRoutingTrace, normalizeSharedMemory, planRoutes, sanitizeToolCalls, scopedRoutingContext } from "../server/tcarEngine.js";
 import { chunkDocument, runtimeDocumentRevision } from "../server/documents.js";
 
 let tmpDir;
@@ -82,6 +82,33 @@ async function waitForValidation(validationRunId) {
 }
 
 describe("runtime and catalog", () => {
+  it("routes an agent's attached knowledge before the parent agent", () => {
+    const plan = planRoutes({
+      query: "@launch_risk_lora assess the launch",
+      agents: [
+        {
+          id: "launch_risk_lora",
+          title: "Launch risk",
+          routing_cues: ["launch"],
+          resources: ["agent:launch_brief_lora"],
+          enabled: true
+        },
+        {
+          id: "launch_brief_lora",
+          title: "Launch brief source agent",
+          document: { title: "Launch brief" },
+          enabled: true
+        }
+      ],
+      maxRoutingAdapters: 1
+    });
+
+    const resourceStep = plan.steps.find((step) => step.adapter === "launch_brief_lora");
+    const parentStep = plan.steps.find((step) => step.adapter === "launch_risk_lora");
+    expect(resourceStep).toBeTruthy();
+    expect(parentStep.depends_on).toContain(resourceStep.id);
+  });
+
   it("excludes disabled and unmounted agents from the routing scope", () => {
     const session = { workspace_id: "workspace_a", created_by: "alice" };
     const context = scopedRoutingContext({
@@ -2635,6 +2662,44 @@ describe("chat execution", () => {
 });
 
 describe("documents and sources", () => {
+  it("attaches uploaded knowledge to one agent and removes the link when the file is deleted", async () => {
+    await request(app)
+      .post("/api/agents")
+      .send({
+        id: "launch_risk_lora",
+        title: "Launch risk analyst",
+        capability: "Reviews launch risk using attached sources.",
+        boundary: "Use approved sources and state uncertainty."
+      })
+      .expect(201);
+
+    const upload = await request(app)
+      .post("/api/documents")
+      .field("title", "Launch brief")
+      .field("scope", "knowledge")
+      .field("resource_for_agent_id", "launch_risk_lora")
+      .attach("file", Buffer.from("The launch brief identifies supplier concentration as a material risk."), "launch-brief.md")
+      .expect(201);
+
+    expect(upload.body.resource_for_agent_id).toBe("launch_risk_lora");
+    await request(app)
+      .patch("/api/agents/launch_risk_lora")
+      .send({ resources: [`agent:${upload.body.agent_id}`] })
+      .expect(200);
+
+    const documents = await request(app).get("/api/documents").expect(200);
+    expect(documents.body.documents).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        document_id: upload.body.document_id,
+        resource_for_agent_id: "launch_risk_lora"
+      })
+    ]));
+
+    await request(app).delete(`/api/documents/${upload.body.document_id}`).expect(200);
+    const parent = await request(app).get("/api/agents/launch_risk_lora").expect(200);
+    expect(parent.body.resources).not.toContain(`agent:${upload.body.agent_id}`);
+  });
+
   it("indexes text uploads, searches chunks, and routes document questions with citations", async () => {
     const upload = await request(app)
       .post("/api/documents")

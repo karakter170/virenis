@@ -14,14 +14,14 @@ describe("resource lifecycle UI helpers", () => {
       score: 72.5,
       score_label: "72.5",
       samples: 3,
-      sample_label: "3 verified outcomes",
+      sample_label: "3 verified results",
       status: "established",
       status_label: "Established"
     });
     expect(realityRankSummary({ score: null, sample_size: -4 })).toMatchObject({
       score: 50,
       samples: 0,
-      sample_label: "0 verified outcomes",
+      sample_label: "0 verified results",
       status: "provisional"
     });
   });

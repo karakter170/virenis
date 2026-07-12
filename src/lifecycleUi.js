@@ -22,7 +22,7 @@ export function realityRankSummary(rank = {}) {
     score,
     score_label: Number.isInteger(score) ? String(score) : String(Number(score.toFixed(2))),
     samples,
-    sample_label: `${samples} verified ${samples === 1 ? "outcome" : "outcomes"}`,
+    sample_label: `${samples} verified ${samples === 1 ? "result" : "results"}`,
     status: established ? "established" : "provisional",
     status_label: established ? "Established" : "Provisional"
   };

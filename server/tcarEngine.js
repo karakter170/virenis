@@ -32,7 +32,7 @@ export function planRoutes({ query, agents, documents = [], agentRankings = {}, 
   const specialistLimit = Math.max(1, Number(maxRoutingAdapters) || 12);
 
   const contains = (...terms) => terms.some((term) => lower.includes(term));
-  const add = (adapter, task, dependencyAdapters = [], selection = null) => {
+  const addStep = (adapter, task, dependencyAdapters = [], selection = null, resourceSupport = false) => {
     if (!hasAgent(adapter)) {
       return undefined;
     }
@@ -42,17 +42,35 @@ export function planRoutes({ query, agents, documents = [], agentRankings = {}, 
       existing.depends_on = [...new Set([...(existing.depends_on || []), ...dependencies])].filter((id) => id !== existing.id);
       return idByAdapter.get(adapter);
     }
-    if (adapter !== "writing_synthesis_lora" && steps.filter((step) => step.adapter !== "writing_synthesis_lora").length >= specialistLimit) {
+    if (adapter !== "writing_synthesis_lora" && !resourceSupport
+      && steps.filter((step) => step.adapter !== "writing_synthesis_lora" && step.resource_support !== true).length >= specialistLimit) {
       return undefined;
     }
     const id = `s${steps.length + 1}`;
     const depends_on = dependencyAdapters.map((dep) => idByAdapter.get(dep)).filter(Boolean);
-    steps.push({ id, adapter, task, depends_on });
+    steps.push({ id, adapter, task, depends_on, ...(resourceSupport ? { resource_support: true } : {}) });
     idByAdapter.set(adapter, id);
     if (selection) {
       selections.set(adapter, selection);
     }
     return id;
+  };
+
+  const add = (adapter, task, dependencyAdapters = [], selection = null) => {
+    const agent = enabled.find((candidate) => candidate.id === adapter);
+    const resourceAgents = (agent?.resources || [])
+      .map((value) => String(value || "").match(/^agent:([a-z0-9_]+_lora)$/)?.[1])
+      .filter((resourceAgentId) => resourceAgentId && resourceAgentId !== adapter && hasAgent(resourceAgentId));
+    for (const resourceAgentId of resourceAgents) {
+      addStep(
+        resourceAgentId,
+        `Retrieve the approved knowledge attached to ${agent?.title || adapter} and return only relevant cited evidence.`,
+        [],
+        null,
+        true
+      );
+    }
+    return addStep(adapter, task, [...new Set([...resourceAgents, ...dependencyAdapters])], selection);
   };
 
   for (const agent of resolveExplicitAgentMentions(query, enabled)) {

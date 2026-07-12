@@ -1,17 +1,27 @@
 import {
   AlertCircle,
   Archive,
+  ArrowLeft,
+  ArrowRight,
   ArrowUp,
   AtSign,
   BookOpen,
+  Bot,
+  Calculator,
   Check,
   ChevronRight,
   Clock3,
+  Code2,
   Copy,
+  Database,
   FilePlus2,
+  FileSearch,
   Flag,
+  Globe2,
+  Layers3,
   LoaderCircle,
   Menu,
+  Network,
   Paperclip,
   Pencil,
   Plus,
@@ -20,13 +30,17 @@ import {
   Scale,
   Search,
   Settings2,
+  Sparkles,
   SquarePen,
+  Table2,
   Trash2,
   Upload,
   UserPlus,
+  WandSparkles,
   X
 } from "lucide-react";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
+import LandingPage from "./LandingPage.jsx";
 import {
   evidenceQuoteIsValid,
   extractBinaryPrediction,
@@ -153,6 +167,26 @@ function initialsFor(auth) {
 }
 
 export default function App() {
+  const [surface, setSurface] = useState(() => window.location.pathname.startsWith("/app") ? "workspace" : "home");
+
+  useEffect(() => {
+    const handlePopState = () => setSurface(window.location.pathname.startsWith("/app") ? "workspace" : "home");
+    window.addEventListener("popstate", handlePopState);
+    return () => window.removeEventListener("popstate", handlePopState);
+  }, []);
+
+  function navigate(next) {
+    const path = next === "workspace" ? "/app" : "/";
+    if (window.location.pathname !== path) window.history.pushState({}, "", path);
+    setSurface(next);
+    window.scrollTo?.({ top: 0, behavior: "auto" });
+  }
+
+  if (surface === "home") return <LandingPage onEnter={() => navigate("workspace")} />;
+  return <Workspace onHome={() => navigate("home")} />;
+}
+
+function Workspace({ onHome }) {
   const [sessions, setSessions] = useState([]);
   const [session, setSession] = useState(null);
   const [messages, setMessages] = useState([]);
@@ -531,7 +565,7 @@ export default function App() {
           <IconButton label="Open chat history" onClick={() => setHistoryOpen(true)}>
             <Menu size={20} />
           </IconButton>
-          <span className="wordmark">virenis</span>
+          <button className="wordmark" type="button" onClick={onHome} aria-label="Go to Virenis homepage">Virenis</button>
         </div>
         <div className="header-side header-actions">
           <IconButton label="New chat" onClick={newChat} disabled={!canWrite}>
@@ -706,6 +740,8 @@ export default function App() {
         <AgentDialog
           auth={auth}
           agent={agentEditor || null}
+          agents={agents}
+          documents={documents}
           onClose={() => setAgentEditor(undefined)}
           onSaved={async () => {
             setAgentEditor(undefined);
@@ -1109,8 +1145,8 @@ function RunReceipt({ run, onClick }) {
   if (!["completed", "failed"].includes(run.status)) parts.push(runStatusLabel(run.status));
   if (agentCount) parts.push(`${agentCount} ${agentCount === 1 ? "agent" : "agents"}`);
   if (sourceCount) parts.push(`${sourceCount} ${sourceCount === 1 ? "source" : "sources"}`);
-  if (settled) parts.push(`${settled} settled outcome${settled === 1 ? "" : "s"}`);
-  else if (pending) parts.push(`${pending} pending outcome${pending === 1 ? "" : "s"}`);
+  if (settled) parts.push(`${settled} recorded result${settled === 1 ? "" : "s"}`);
+  else if (pending) parts.push(`${pending} claim${pending === 1 ? "" : "s"} being tracked`);
   if (run.elapsed_sec != null) parts.push(`${Number(run.elapsed_sec).toFixed(1)}s`);
   return (
     <button type="button" className={`run-receipt ${run.status || ""}`} onClick={onClick}>
@@ -1165,6 +1201,7 @@ function Composer({
     const query = mention.query.toLowerCase();
     return agents
       .filter((agent) => agent.enabled !== false && agent.mounted !== false)
+      .filter((agent) => !agent.document && !agent.resource_for_agent_id)
       .filter((agent) => agent.scope !== "chat" || agent.session_id === sessionId)
       .map((agent) => ({ agent, score: mentionMatchScore(agent, query) }))
       .filter(({ score }) => score > 0)
@@ -1291,7 +1328,7 @@ function Composer({
         <Paperclip size={19} />
       </IconButton>
       <label className="composer-input">
-        <span className="sr-only">Message virenis</span>
+        <span className="sr-only">Message Virenis</span>
         <textarea
           ref={inputRef}
           value={value}
@@ -1401,34 +1438,36 @@ function ResourcesSheet({
 function RealityRank({ rank }) {
   const summary = realityRankSummary(rank);
   const history = realityRankHistory(rank);
+  const hasResults = summary.samples > 0;
   return (
     <div className="rank-summary">
-      <div className="rank-overview" title="Used only when capability cues tie">
-        <b>RealityRank {summary.score_label}</b>
-        <i>{summary.status_label}</i>
-        <i>{summary.sample_label}</i>
+      <div className="rank-overview" title="Past verified results are used only when equally relevant agents tie">
+        <b>{hasResults ? `Result score ${summary.score_label}` : "No verified results yet"}</b>
+        <i>{hasResults ? summary.sample_label : "Starts from a neutral baseline"}</i>
       </div>
-      <details
-        className="rank-history"
-        onToggle={(event) => {
-          if (!event.currentTarget.open) return;
-          const details = event.currentTarget;
-          requestAnimationFrame(() => details.scrollIntoView({ block: "nearest" }));
-        }}
-      >
-        <summary>Sample history</summary>
-        <dl>
-          {history.map((entry) => {
-            const entrySummary = realityRankSummary({ score: entry.score, sample_size: entry.sample_size });
-            return (
-              <div key={`${entry.agent_revision}-${entry.current}`}>
-                <dt>{entry.current ? "Current" : `Revision ${shortRevision(entry.agent_revision)}`}</dt>
-                <dd>{entrySummary.score_label} · {entrySummary.sample_label}</dd>
-              </div>
-            );
-          })}
-        </dl>
-      </details>
+      {history.length > 1 && (
+        <details
+          className="rank-history"
+          onToggle={(event) => {
+            if (!event.currentTarget.open) return;
+            const details = event.currentTarget;
+            requestAnimationFrame(() => details.scrollIntoView({ block: "nearest" }));
+          }}
+        >
+          <summary>Past versions</summary>
+          <dl>
+            {history.map((entry) => {
+              const entrySummary = realityRankSummary({ score: entry.score, sample_size: entry.sample_size });
+              return (
+                <div key={`${entry.agent_revision}-${entry.current}`}>
+                  <dt>{entry.current ? "Current" : `Version ${shortRevision(entry.agent_revision)}`}</dt>
+                  <dd>{entrySummary.score_label} · {entrySummary.sample_label}</dd>
+                </div>
+              );
+            })}
+          </dl>
+        </details>
+      )}
     </div>
   );
 }
@@ -1441,6 +1480,7 @@ function AgentCatalog({ agents, auth, mountingAgentId, onCreate, onEdit, onAdopt
     && agent.created_by === auth?.user_id
     && agent.workspace_id === auth?.workspace_id);
   const filtered = agents
+    .filter((agent) => !agent.document && !agent.resource_for_agent_id)
     .filter((agent) => !query || `${agent.title || ""} ${agent.capability || ""}`.toLowerCase().includes(query.toLowerCase()))
     .sort((left, right) => Number(canManage(right)) - Number(canManage(left))
       || String(left.title || left.id).localeCompare(String(right.title || right.id)));
@@ -1519,23 +1559,26 @@ function KnowledgeList({ documents, agents, auth, canWrite, onAdd, onDelete }) {
         </IconButton>
       </div>
       <div className="flat-list knowledge-list">
-        {documents.map((document) => (
-          <div className="knowledge-row" key={document.document_id}>
-            <BookOpen size={18} aria-hidden="true" />
-            <div className="row-copy">
-              <strong>{document.title}</strong>
-              <span>{document.chunks ? `${document.chunks} indexed sections` : "Ready to search"}</span>
-              <small>{document.visibility === "private" ? "Private · All chats" : `${document.visibility || "Available"} · All chats`}</small>
-            </div>
-            {canManageDocument(document, agents, auth) && (
-              <div className="row-actions">
-                <IconButton label={`Delete ${document.title || "knowledge"}`} compact onClick={() => onDelete(document)}>
-                  <Trash2 size={16} />
-                </IconButton>
+        {documents.map((document) => {
+          const parentAgent = agents.find((item) => item.id === document.resource_for_agent_id);
+          return (
+            <div className="knowledge-row" key={document.document_id}>
+              <BookOpen size={18} aria-hidden="true" />
+              <div className="row-copy">
+                <strong>{document.title}</strong>
+                <span>{document.chunks ? `${document.chunks} indexed sections` : "Ready to search"}</span>
+                <small>{parentAgent ? `Used by ${formatAgentName(parentAgent.id, agents)}` : document.visibility === "private" ? "Private · All chats" : `${document.visibility || "Available"} · All chats`}</small>
               </div>
-            )}
-          </div>
-        ))}
+              {canManageDocument(document, agents, auth) && (
+                <div className="row-actions">
+                  <IconButton label={`Delete ${document.title || "knowledge"}`} compact onClick={() => onDelete(document)}>
+                    <Trash2 size={16} />
+                  </IconButton>
+                </div>
+              )}
+            </div>
+          );
+        })}
         {documents.length === 0 && <p className="muted-empty">No knowledge files yet.</p>}
       </div>
     </section>
@@ -1599,18 +1642,18 @@ function RankTieBreakNote({ tieBreak, adapter, agents }) {
   const selectedName = formatAgentName(adapter, agents);
   const alternatives = tieBreak.tied_candidates.slice(0, 2);
   const comparison = alternatives.length
-    ? `${selectedName}'s ${Math.round(tieBreak.reality_rank * 100)} rank was preferred over ${alternatives.map((candidate) => `${formatAgentName(candidate.adapter, agents)} at ${Math.round(candidate.reality_rank * 100)}`).join(" and ")} after equal capability matches.`
-    : `Capability cues tied, so ${selectedName}'s ${Math.round(tieBreak.reality_rank * 100)} rank was the final tie-break.`;
+    ? `${selectedName} was preferred after equally relevant agents were compared using their verified result history.`
+    : `The capability match was tied, so ${selectedName}'s verified result history was used as the final tie-break.`;
   const sampleText = tieBreak.sample_size === 1
-    ? "1 verified outcome informed this rank."
+    ? "1 verified result informed this choice."
     : tieBreak.sample_size > 1
-      ? `${tieBreak.sample_size} verified outcomes informed this rank.`
-      : "The execution did not expose a verified sample count for this rank snapshot.";
+      ? `${tieBreak.sample_size} verified results informed this choice.`
+      : "No verified sample count was available for this comparison.";
   return (
     <div className="rank-route-note">
       <Scale size={16} aria-hidden="true" />
       <div>
-        <strong>RealityRank tie-break</strong>
+        <strong>Past results broke a tie</strong>
         <span>{comparison} {sampleText}</span>
       </div>
     </div>
@@ -1641,7 +1684,7 @@ function RunDetailsSheet({
             <div className="view-switch four-up" aria-label="Answer detail view">
               <button type="button" aria-pressed={view === "agents"} onClick={() => setView("agents")}>Agents</button>
               <button type="button" aria-pressed={view === "sources"} onClick={() => setView("sources")}>Sources</button>
-              <button type="button" aria-pressed={view === "outcomes"} onClick={() => setView("outcomes")}>Outcomes</button>
+              <button type="button" aria-pressed={view === "outcomes"} onClick={() => setView("outcomes")}>Results</button>
               <button type="button" aria-pressed={view === "activity"} onClick={() => setView("activity")}>Activity</button>
             </div>
 
@@ -1663,7 +1706,7 @@ function RunDetailsSheet({
                             <small>{selection?.reason || route.task || "Completed its part of the answer"}</small>
                           </span>
                           {tieBreak
-                            ? <em>Rank {Math.round(tieBreak.reality_rank * 100)}</em>
+                            ? <em>Past results</em>
                             : selection?.confidence != null && <em>{Math.round(selection.confidence * 100)}%</em>}
                         </summary>
                         <div className="detail-row-content">
@@ -1704,9 +1747,9 @@ function RunDetailsSheet({
             {view === "outcomes" && (
               <section className="detail-section" aria-labelledby="outcomes-heading">
                 <div className="section-heading compact-heading">
-                  <div><h3 id="outcomes-heading">Outcomes</h3><p>Track whether a measurable claim proves true.</p></div>
+                  <div><h3 id="outcomes-heading">Result tracking</h3><p>Choose a claim now, then record what happened later.</p></div>
                   {canWrite && run.status === "completed" && !hasOutcome && (
-                    <IconButton label="Create outcome" onClick={onCreateOutcome}><Plus size={18} /></IconButton>
+                    <IconButton label="Track a claim" onClick={onCreateOutcome}><Plus size={18} /></IconButton>
                   )}
                 </div>
                 <div className="detail-list">
@@ -1744,7 +1787,7 @@ function RunDetailsSheet({
                           <dl className="outcome-result">
                             <div><dt>Actual result</dt><dd>{String(contract.settlement?.actual_value ?? "Recorded")}</dd></div>
                             <div><dt>Settled</dt><dd>{formatDate(contract.settled_at, { includeTime: true })}</dd></div>
-                            <div><dt>Rank status</dt><dd>{contract.settlement?.verified_for_rank === true ? "Verified for ranking" : "Tracking only"}</dd></div>
+                            <div><dt>Verification</dt><dd>{contract.settlement?.verified_for_rank === true ? "Verified result" : "Personal tracking"}</dd></div>
                           </dl>
                         )}
                         {status === "disputed" && latestDispute && (
@@ -1771,10 +1814,10 @@ function RunDetailsSheet({
                   {contracts.length === 0 && (
                     <div className="empty-detail">
                       <Clock3 size={20} />
-                      <p>No outcome is being tracked for this answer.</p>
+                      <p>No claim is being followed for this answer.</p>
                       {canWrite && run.status === "completed" && (
                         <button type="button" className="text-button secondary" onClick={onCreateOutcome}>
-                          <Plus size={16} />Track an outcome
+                          <Plus size={16} />Track a claim
                         </button>
                       )}
                     </div>
@@ -1829,6 +1872,107 @@ function eventLabel(type) {
   return labels[type] || String(type || "Update").replaceAll(".", " ");
 }
 
+const AGENT_TEMPLATES = [
+  {
+    id: "research",
+    label: "Research & explain",
+    icon: FileSearch,
+    capability: "Research a question, compare the available evidence, explain what is known, and make uncertainty clear.",
+    tools: ["web_search"],
+    consumes: ["user_request", "source_context"],
+    produces: ["evidence_summary"]
+  },
+  {
+    id: "monitor",
+    label: "Monitor a source",
+    icon: Globe2,
+    capability: "Check an approved source for relevant updates, summarize what changed, and flag anything that needs attention.",
+    tools: ["web_search"],
+    consumes: ["user_request", "shared_memory"],
+    produces: ["monitoring_update"]
+  },
+  {
+    id: "analysis",
+    label: "Analyze data",
+    icon: Table2,
+    capability: "Analyze supplied data, verify the calculations, surface patterns, and explain the practical meaning of the results.",
+    tools: ["data_table", "calculator"],
+    consumes: ["user_request", "table_context"],
+    produces: ["analysis", "calculation_trace"]
+  },
+  {
+    id: "writing",
+    label: "Write & edit",
+    icon: WandSparkles,
+    capability: "Turn source material and instructions into clear, concise writing for the intended audience.",
+    tools: [],
+    consumes: ["user_request", "upstream_route_outputs"],
+    produces: ["final_answer"]
+  },
+  {
+    id: "coordinate",
+    label: "Coordinate agents",
+    icon: Network,
+    capability: "Coordinate work from other agents, resolve overlaps, preserve important constraints, and prepare a unified handoff.",
+    tools: [],
+    consumes: ["user_request", "upstream_route_outputs"],
+    produces: ["agent_handoff"]
+  }
+];
+
+const RESPONSE_STYLES = [
+  {
+    id: "direct",
+    title: "Direct",
+    detail: "Lead with the answer and keep it concise.",
+    boundary: "Lead with the useful answer, keep it concise, stay within this agent's purpose, and state uncertainty when it matters."
+  },
+  {
+    id: "thorough",
+    title: "Thorough",
+    detail: "Explain the reasoning and important tradeoffs.",
+    boundary: "Explain the reasoning, assumptions, and important tradeoffs. Use only approved tools and knowledge, and stay within this agent's purpose."
+  },
+  {
+    id: "careful",
+    title: "Careful",
+    detail: "Prioritize evidence, limits, and uncertainty.",
+    boundary: "Prioritize verified evidence, identify important limits, state uncertainty clearly, and do not go beyond this agent's purpose."
+  }
+];
+
+const TOOL_OPTIONS = [
+  { id: "web", title: "Web research", detail: "Find current public information", icon: Globe2, values: ["web_search"] },
+  { id: "calculate", title: "Calculations", detail: "Check arithmetic and formulas", icon: Calculator, values: ["calculator"] },
+  { id: "tables", title: "Data tables", detail: "Read and analyze tabular data", icon: Table2, values: ["data_table"] },
+  { id: "documents", title: "Documents", detail: "Search attached files", icon: FileSearch, values: ["document_search", "document_read"] },
+  { id: "code", title: "Code & repositories", detail: "Inspect approved project files", icon: Code2, values: ["repo_inspector"] },
+  { id: "data", title: "Workspace data", detail: "Run approved read-only queries", icon: Database, values: ["sql_runner"] }
+];
+
+const CONTEXT_OPTIONS = [
+  { value: "upstream_route_outputs", title: "Other agents' work", detail: "Use verified handoffs from earlier steps", icon: Network },
+  { value: "shared_memory", title: "Conversation context", detail: "Use relevant context from the current work", icon: Layers3 },
+  { value: "table_context", title: "Structured data", detail: "Receive tables or structured records", icon: Table2 }
+];
+
+const OUTPUT_OPTIONS = [
+  { value: "domain_outputs", title: "Working answer" },
+  { value: "evidence_summary", title: "Research notes" },
+  { value: "recommendations", title: "Recommendations" },
+  { value: "structured_data", title: "Structured data" },
+  { value: "agent_handoff", title: "Handoff to another agent" },
+  { value: "final_answer", title: "Final response" }
+];
+
+function resourceToken(agentId) {
+  return `agent:${agentId}`;
+}
+
+function collaboratorToken(agentId) {
+  return `agent:${agentId}:output`;
+}
+
 function createAgentForm(agent) {
   if (agent) {
     return {
@@ -1836,9 +1980,12 @@ function createAgentForm(agent) {
       title: agent.title || "",
       capability: agent.capability || "",
       boundary: agent.boundary || "",
+      response_style: "thorough",
       routing_cues: (agent.routing_cues || []).join(", "),
-      produces: (agent.produces || []).join(", "),
-      tools: (agent.tools || []).join(", "),
+      consumes: agent.consumes?.length ? [...agent.consumes] : ["user_request"],
+      produces: agent.produces?.length ? [...agent.produces] : ["domain_outputs"],
+      tools: [...(agent.tools || [])],
+      resources: [...(agent.resources || [])],
       sources: (agent.sources || []).join(", "),
       source_text: ""
     };
@@ -1848,91 +1995,397 @@ function createAgentForm(agent) {
     id: `custom_${suffix}_lora`,
     title: "",
     capability: "",
-    boundary: "Use only the supplied instructions and knowledge. State uncertainty and stay within this agent's purpose.",
+    boundary: RESPONSE_STYLES[0].boundary,
+    response_style: "direct",
     routing_cues: "",
-    produces: "domain_outputs",
-    tools: "",
+    consumes: ["user_request"],
+    produces: ["domain_outputs"],
+    tools: [],
+    resources: [],
     sources: "",
     source_text: ""
   };
 }
 
-function AgentDialog({ auth, agent, onClose, onSaved }) {
+function AgentDialog({ auth, agent, agents, documents, onClose, onSaved }) {
   const editing = Boolean(agent);
   const [form, setForm] = useState(() => createAgentForm(agent));
+  const [step, setStep] = useState(0);
+  const [newFiles, setNewFiles] = useState([]);
+  const [uploadedFileKeys, setUploadedFileKeys] = useState([]);
+  const [createdAgentId, setCreatedAgentId] = useState("");
+  const [dragActive, setDragActive] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const fileInputId = useId();
+  const knowledgeDocuments = (documents || []).filter((document) => document.scope !== "chat" && document.enabled !== false);
+  const collaboratorAgents = (agents || [])
+    .filter((candidate) => candidate.id !== agent?.id && candidate.enabled !== false && !candidate.document && !candidate.resource_for_agent_id)
+    .slice(0, 24);
+  const selectedDocumentCount = knowledgeDocuments.filter((document) => form.resources.includes(resourceToken(document.agent_id))).length;
+
   function update(key, value) {
     setForm((current) => ({ ...current, [key]: value }));
   }
+
+  function toggleValue(key, value, checked) {
+    setForm((current) => {
+      const values = new Set(current[key] || []);
+      if (checked) values.add(value);
+      else values.delete(value);
+      return { ...current, [key]: [...values] };
+    });
+  }
+
+  function toggleTool(option) {
+    const selected = option.values.every((value) => form.tools.includes(value));
+    setForm((current) => {
+      const values = new Set(current.tools);
+      for (const value of option.values) {
+        if (selected) values.delete(value);
+        else values.add(value);
+      }
+      return { ...current, tools: [...values] };
+    });
+  }
+
+  function applyTemplate(template) {
+    setForm((current) => ({
+      ...current,
+      capability: template.capability,
+      tools: [...template.tools],
+      consumes: [...new Set(["user_request", ...template.consumes])],
+      produces: [...template.produces]
+    }));
+  }
+
+  function changeResponseStyle(style) {
+    setForm((current) => ({ ...current, response_style: style.id, boundary: style.boundary }));
+  }
+
+  function addFiles(fileList) {
+    const accepted = Array.from(fileList || []).filter((file) => /\.(pdf|md|markdown|txt)$/i.test(file.name));
+    if (!accepted.length && fileList?.length) {
+      setError("Add a PDF, Markdown, or text file.");
+      return;
+    }
+    setError("");
+    setNewFiles((current) => {
+      const keys = new Set(current.map((file) => `${file.name}:${file.size}:${file.lastModified}`));
+      return [...current, ...accepted.filter((file) => !keys.has(`${file.name}:${file.size}:${file.lastModified}`))].slice(0, 8);
+    });
+  }
+
+  function removeFile(target) {
+    setNewFiles((current) => current.filter((file) => file !== target));
+  }
+
+  async function uploadResource(file, parentAgentId) {
+    const body = new FormData();
+    body.append("file", file);
+    body.append("title", file.name.replace(/\.[^.]+$/, ""));
+    body.append("routing_cues", [form.title, parentAgentId, file.name].filter(Boolean).join(", "));
+    body.append("visibility", "private");
+    body.append("scope", "knowledge");
+    body.append("resource_for_agent_id", parentAgentId);
+    body.append("capability", `Provides approved source material to ${form.title}.`);
+    return api.postForm("/api/documents", body);
+  }
+
   async function submit(event) {
     event.preventDefault();
+    if (step < 2) {
+      setStep((current) => current + 1);
+      return;
+    }
     setBusy(true);
     setError("");
+    const activeAgentId = agent?.id || createdAgentId || form.id;
+    const hasDocumentResources = form.resources.some((value) => value.startsWith("agent:")) || newFiles.length > 0;
+    const payload = {
+      title: form.title.trim(),
+      capability: form.capability.trim(),
+      boundary: form.boundary.trim() || RESPONSE_STYLES.find((style) => style.id === form.response_style)?.boundary || RESPONSE_STYLES[0].boundary,
+      routing_cues: form.routing_cues || `${form.title}, ${form.capability}`,
+      consumes: [...new Set(["user_request", ...form.consumes, ...(hasDocumentResources ? ["document_context"] : [])])],
+      produces: form.produces.length ? form.produces : ["domain_outputs"],
+      tools: [...new Set([...form.tools, ...(hasDocumentResources ? ["document_search", "document_read"] : [])])],
+      resources: form.resources,
+      source_text: form.source_text,
+      ...(auth?.is_admin ? { sources: form.sources } : {})
+    };
+    let newAgentPersisted = Boolean(createdAgentId);
     try {
-      const payload = {
-        ...form,
-        routing_cues: form.routing_cues || form.title
-      };
-      if (editing) {
-        delete payload.id;
-        if (!payload.source_text || agent?.document) delete payload.source_text;
-        if (!auth?.is_admin) delete payload.sources;
-        await api.patch(`/api/agents/${encodeURIComponent(agent.id)}`, payload);
+      if (editing || createdAgentId) {
+        if (!payload.source_text) delete payload.source_text;
+        await api.patch(`/api/agents/${encodeURIComponent(activeAgentId)}`, payload);
       } else {
-        await api.post("/api/agents", payload);
+        await api.post("/api/agents", { id: form.id, ...payload });
+        setCreatedAgentId(form.id);
+        newAgentPersisted = true;
+      }
+
+      let resources = [...payload.resources];
+      const completed = new Set(uploadedFileKeys);
+      for (const file of newFiles) {
+        const fileKey = `${file.name}:${file.size}:${file.lastModified}`;
+        if (completed.has(fileKey)) continue;
+        const uploaded = await uploadResource(file, activeAgentId);
+        resources = [...new Set([...resources, resourceToken(uploaded.agent_id)])];
+        setForm((current) => ({ ...current, resources }));
+        completed.add(fileKey);
+        setUploadedFileKeys([...completed]);
+        await api.patch(`/api/agents/${encodeURIComponent(activeAgentId)}`, {
+          resources,
+          consumes: [...new Set([...payload.consumes, "document_context"])],
+          tools: [...new Set([...payload.tools, "document_search", "document_read"])]
+        });
       }
       await onSaved();
     } catch (saveError) {
-      setError(friendlyError(saveError));
+      const prefix = !editing && newAgentPersisted
+        ? "The agent was saved, but its setup is not finished. "
+        : "";
+      setError(`${prefix}${friendlyError(saveError)}`);
     } finally {
       setBusy(false);
     }
   }
+
+  const steps = [
+    { label: "Basics", detail: "Name and purpose" },
+    { label: "Tools & teamwork", detail: "Abilities and handoffs" },
+    { label: "Knowledge", detail: "Files and review" }
+  ];
+  const canContinue = step === 0 ? form.title.trim() && form.capability.trim() : step === 1 ? form.produces.length > 0 : true;
+
   return (
     <ModalSurface
-      title={editing ? "Edit agent" : "Create agent"}
-      description={editing ? "Changes apply to future answers." : "Give it a clear purpose and tell virenis when to use it."}
+      title={editing ? "Edit agent" : "Create an agent"}
+      description={editing ? "Update how this agent works in future answers." : "Describe the role. Virenis will handle the technical setup."}
       onClose={onClose}
-      className="form-dialog"
+      className="agent-builder-dialog"
     >
-      <form className="dialog-form" onSubmit={submit}>
-        {error && <div className="form-error" role="alert">{error}</div>}
-        <label>
-          <span>Name</span>
-          <input data-autofocus value={form.title} onChange={(event) => update("title", event.target.value)} required maxLength={160} placeholder="2026 Financial Data" />
-        </label>
-        <label>
-          <span>Purpose and instructions</span>
-          <textarea value={form.capability} onChange={(event) => update("capability", event.target.value)} required placeholder="What this agent should know and do" />
-        </label>
-        <label>
-          <span>When to use it</span>
-          <textarea value={form.routing_cues} onChange={(event) => update("routing_cues", event.target.value)} placeholder="financial data, 2026 report, revenue" />
-        </label>
-        {!agent?.document && (
-          <label>
-            <span>{editing ? "Replace private knowledge" : "Private knowledge"} <small>optional</small></span>
-            <textarea value={form.source_text} onChange={(event) => update("source_text", event.target.value)} placeholder="Paste facts, rules, or reference material" />
-          </label>
-        )}
-        <details className="advanced-fields">
-          <summary><Settings2 size={15} />Advanced</summary>
-          <div>
-            <label><span>Internal id</span><input value={form.id} onChange={(event) => update("id", event.target.value)} disabled={editing} required /></label>
-            <label><span>Boundary</span><textarea value={form.boundary} onChange={(event) => update("boundary", event.target.value)} required /></label>
-            <label><span>Outputs</span><input value={form.produces} onChange={(event) => update("produces", event.target.value)} /></label>
-            <label><span>Allowed tools</span><input value={form.tools} onChange={(event) => update("tools", event.target.value)} /></label>
-            {auth?.is_admin && <label><span>Approved sources</span><input value={form.sources} onChange={(event) => update("sources", event.target.value)} /></label>}
+      <form className="agent-builder" onSubmit={submit}>
+        <nav className="builder-steps" aria-label="Agent setup progress">
+          {steps.map((item, index) => (
+            <button
+              type="button"
+              key={item.label}
+              aria-current={step === index ? "step" : undefined}
+              className={step === index ? "active" : index < step ? "complete" : ""}
+              onClick={() => index <= step && setStep(index)}
+              disabled={busy || index > step}
+            >
+              <span>{index < step ? <Check size={13} /> : index + 1}</span>
+              <i><strong>{item.label}</strong><small>{item.detail}</small></i>
+            </button>
+          ))}
+        </nav>
+
+        <div className="builder-content">
+          <div className="builder-main">
+            {error && <div className="form-error" role="alert">{error}</div>}
+
+            {step === 0 && (
+              <section className="builder-panel" aria-labelledby="agent-basics-heading">
+                <div className="builder-heading">
+                  <span>STEP 1 OF 3</span>
+                  <h3 id="agent-basics-heading">Start with the job, not the settings.</h3>
+                  <p>A clear name and purpose are enough to create a useful first version.</p>
+                </div>
+                <div className="builder-field">
+                  <label htmlFor="agent-name">Agent name</label>
+                  <input id="agent-name" data-autofocus value={form.title} onChange={(event) => update("title", event.target.value)} required maxLength={160} placeholder="Launch risk analyst" />
+                  <small>Use a name people will recognize when they call it with @.</small>
+                </div>
+                <div className="builder-field">
+                  <label htmlFor="agent-purpose">What will this agent do?</label>
+                  <textarea id="agent-purpose" value={form.capability} onChange={(event) => update("capability", event.target.value)} required maxLength={2400} placeholder="Review launch plans, find operational and market risks, and turn them into practical recommendations..." />
+                  <small>Describe its expertise, how it should think, and what a good result looks like.</small>
+                </div>
+                <div className="template-picker">
+                  <span>Or start from a common role</span>
+                  <div>
+                    {AGENT_TEMPLATES.map((template) => {
+                      const Icon = template.icon;
+                      return <button type="button" key={template.id} onClick={() => applyTemplate(template)}><Icon size={15} />{template.label}</button>;
+                    })}
+                  </div>
+                </div>
+                <fieldset className="choice-fieldset response-style-fieldset">
+                  <legend>How should it respond?</legend>
+                  <div className="response-style-grid">
+                    {RESPONSE_STYLES.map((style) => (
+                      <label className={form.response_style === style.id ? "selected" : ""} key={style.id}>
+                        <input type="radio" name="response-style" checked={form.response_style === style.id} onChange={() => changeResponseStyle(style)} />
+                        <span><strong>{style.title}</strong><small>{style.detail}</small></span>
+                        <i>{form.response_style === style.id && <Check size={13} />}</i>
+                      </label>
+                    ))}
+                  </div>
+                </fieldset>
+                <details className="builder-details">
+                  <summary><Settings2 size={15} /> Add specific guardrails</summary>
+                  <div className="builder-field"><label htmlFor="agent-boundary">Instructions and limits</label><textarea id="agent-boundary" value={form.boundary} onChange={(event) => update("boundary", event.target.value)} /></div>
+                </details>
+              </section>
+            )}
+
+            {step === 1 && (
+              <section className="builder-panel" aria-labelledby="agent-tools-heading">
+                <div className="builder-heading">
+                  <span>STEP 2 OF 3</span>
+                  <h3 id="agent-tools-heading">Give it only the abilities it needs.</h3>
+                  <p>Choose tools and decide how this agent fits into work done by other agents.</p>
+                </div>
+                <fieldset className="choice-fieldset">
+                  <legend>Tools <small>optional</small></legend>
+                  <p>Virenis will allow only the tools you select here.</p>
+                  <div className="tool-choice-grid">
+                    {TOOL_OPTIONS.map((option) => {
+                      const Icon = option.icon;
+                      const selected = option.values.every((value) => form.tools.includes(value));
+                      return (
+                        <label className={selected ? "selected" : ""} key={option.id}>
+                          <input type="checkbox" checked={selected} onChange={() => toggleTool(option)} />
+                          <Icon size={18} />
+                          <span><strong>{option.title}</strong><small>{option.detail}</small></span>
+                          <i>{selected && <Check size={13} />}</i>
+                        </label>
+                      );
+                    })}
+                  </div>
+                </fieldset>
+                <fieldset className="choice-fieldset">
+                  <legend>What context can it receive?</legend>
+                  <p>The user's request is always included.</p>
+                  <div className="compact-choice-grid">
+                    {CONTEXT_OPTIONS.map((option) => {
+                      const Icon = option.icon;
+                      const selected = form.consumes.includes(option.value);
+                      return (
+                        <label className={selected ? "selected" : ""} key={option.value}>
+                          <input type="checkbox" checked={selected} onChange={(event) => toggleValue("consumes", option.value, event.target.checked)} />
+                          <Icon size={16} /><span><strong>{option.title}</strong><small>{option.detail}</small></span><i>{selected && <Check size={12} />}</i>
+                        </label>
+                      );
+                    })}
+                  </div>
+                </fieldset>
+                {collaboratorAgents.length > 0 && (
+                  <details className="builder-details collaborator-details">
+                    <summary><Network size={15} /> Connect specific agents <span>{form.consumes.filter((value) => /^agent:.+:output$/.test(value)).length || "Optional"}</span></summary>
+                    <p>Select agents whose completed work this agent may receive as a handoff.</p>
+                    <div className="collaborator-list">
+                      {collaboratorAgents.map((candidate) => {
+                        const token = collaboratorToken(candidate.id);
+                        return (
+                          <label key={candidate.id}>
+                            <input type="checkbox" checked={form.consumes.includes(token)} onChange={(event) => toggleValue("consumes", token, event.target.checked)} />
+                            <Bot size={15} /><span><strong>{formatAgentName(candidate.id, agents)}</strong><small>{candidate.capability || "Agent"}</small></span>
+                          </label>
+                        );
+                      })}
+                    </div>
+                  </details>
+                )}
+                <fieldset className="choice-fieldset output-fieldset">
+                  <legend>What should it produce?</legend>
+                  <div className="output-chips">
+                    {OUTPUT_OPTIONS.map((option) => {
+                      const selected = form.produces.includes(option.value);
+                      return <label className={selected ? "selected" : ""} key={option.value}><input type="checkbox" checked={selected} onChange={(event) => toggleValue("produces", option.value, event.target.checked)} />{selected && <Check size={12} />}{option.title}</label>;
+                    })}
+                  </div>
+                </fieldset>
+              </section>
+            )}
+
+            {step === 2 && (
+              <section className="builder-panel" aria-labelledby="agent-knowledge-heading">
+                <div className="builder-heading">
+                  <span>STEP 3 OF 3</span>
+                  <h3 id="agent-knowledge-heading">Add knowledge it can rely on.</h3>
+                  <p>Attach a PDF or Markdown file here. It will become a resource for this agent, not another agent you need to manage.</p>
+                </div>
+                <div
+                  className={`agent-dropzone ${dragActive ? "dragging" : ""}`}
+                  onDragEnter={(event) => { event.preventDefault(); setDragActive(true); }}
+                  onDragOver={(event) => event.preventDefault()}
+                  onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setDragActive(false); }}
+                  onDrop={(event) => { event.preventDefault(); setDragActive(false); addFiles(event.dataTransfer.files); }}
+                >
+                  <div className="dropzone-icon"><Upload size={19} /></div>
+                  <strong>Drop reference files here</strong>
+                  <span>PDF, Markdown, or text · up to 8 files</span>
+                  <label htmlFor={fileInputId}>Choose files</label>
+                  <input id={fileInputId} type="file" accept=".pdf,.md,.markdown,.txt" multiple onChange={(event) => addFiles(event.target.files)} />
+                </div>
+                {newFiles.length > 0 && (
+                  <div className="pending-files" aria-label="Files to add">
+                    {newFiles.map((file) => (
+                      <div key={`${file.name}:${file.size}:${file.lastModified}`}><FilePlus2 size={16} /><span><strong>{file.name}</strong><small>{Math.max(1, Math.round(file.size / 1024))} KB</small></span><button type="button" aria-label={`Remove ${file.name}`} onClick={() => removeFile(file)}><X size={14} /></button></div>
+                    ))}
+                  </div>
+                )}
+                {knowledgeDocuments.length > 0 && (
+                  <details className="builder-details existing-knowledge" open={selectedDocumentCount > 0}>
+                    <summary><BookOpen size={15} /> Use existing knowledge <span>{selectedDocumentCount ? `${selectedDocumentCount} selected` : "Optional"}</span></summary>
+                    <div className="knowledge-choice-list">
+                      {knowledgeDocuments.map((document) => {
+                        const token = resourceToken(document.agent_id);
+                        const selected = form.resources.includes(token);
+                        return (
+                          <label className={selected ? "selected" : ""} key={document.document_id}>
+                            <input type="checkbox" checked={selected} onChange={(event) => toggleValue("resources", token, event.target.checked)} />
+                            <BookOpen size={16} /><span><strong>{document.title}</strong><small>{document.chunks ? `${document.chunks} indexed sections` : "Ready to search"}</small></span><i>{selected && <Check size={12} />}</i>
+                          </label>
+                        );
+                      })}
+                    </div>
+                  </details>
+                )}
+                <details className="builder-details">
+                  <summary><Sparkles size={15} /> Paste short notes <span>Optional</span></summary>
+                  <div className="builder-field"><label htmlFor="agent-notes">Private notes and rules</label><textarea id="agent-notes" value={form.source_text} onChange={(event) => update("source_text", event.target.value)} placeholder="Paste facts, terminology, or rules this agent should use..." /></div>
+                </details>
+                <details className="builder-details">
+                  <summary><Settings2 size={15} /> Advanced setup</summary>
+                  <div className="advanced-builder-grid">
+                    <div className="builder-field"><label htmlFor="agent-cues">When should Virenis use it?</label><textarea id="agent-cues" value={form.routing_cues} onChange={(event) => update("routing_cues", event.target.value)} placeholder={`${form.title || "Agent name"}, related topics, common requests`} /></div>
+                    <div className="builder-field"><label htmlFor="agent-id">Internal ID</label><input id="agent-id" value={form.id} onChange={(event) => update("id", event.target.value)} disabled={editing || Boolean(createdAgentId)} required /></div>
+                    {auth?.is_admin && <div className="builder-field"><label htmlFor="agent-sources">Approved source paths</label><input id="agent-sources" value={form.sources} onChange={(event) => update("sources", event.target.value)} /></div>}
+                  </div>
+                </details>
+              </section>
+            )}
           </div>
-        </details>
-        <div className="dialog-actions">
-          <button type="button" className="text-button ghost" onClick={onClose} disabled={busy}>Cancel</button>
-          <button type="submit" className="text-button primary" disabled={busy}>
-            {busy ? <LoaderCircle className="spin" size={16} /> : editing ? <Check size={16} /> : <Plus size={16} />}
-            {editing ? "Save" : "Create"}
-          </button>
+
+          <aside className="builder-preview" aria-label="Agent summary">
+            <div className="preview-badge"><Bot size={18} /><span>AGENT PREVIEW</span></div>
+            <h4>{form.title || "Untitled agent"}</h4>
+            <p>{form.capability || "Describe what this agent will do to see a summary here."}</p>
+            <dl>
+              <div><dt>Style</dt><dd>{RESPONSE_STYLES.find((style) => style.id === form.response_style)?.title || "Custom"}</dd></div>
+              <div><dt>Tools</dt><dd>{form.tools.length || "None"}</dd></div>
+              <div><dt>Connections</dt><dd>{form.consumes.filter((value) => /^agent:.+:output$/.test(value)).length || "None"}</dd></div>
+              <div><dt>Knowledge</dt><dd>{selectedDocumentCount + newFiles.length || "None"}</dd></div>
+            </dl>
+            <div className="preview-status"><span /><div><strong>Private workspace</strong><small>Ready after setup completes</small></div></div>
+          </aside>
         </div>
+
+        <footer className="builder-actions">
+          <button type="button" className="text-button ghost" onClick={step === 0 ? onClose : () => setStep((current) => current - 1)} disabled={busy}>
+            {step === 0 ? "Cancel" : <><ArrowLeft size={15} /> Back</>}
+          </button>
+          <span>Step {step + 1} of 3</span>
+          <button type="submit" className="text-button primary" disabled={busy || !canContinue}>
+            {busy ? <LoaderCircle className="spin" size={16} /> : step < 2 ? <ArrowRight size={16} /> : editing ? <Check size={16} /> : <Plus size={16} />}
+            {busy ? "Saving" : step < 2 ? "Continue" : editing ? "Save changes" : "Create agent"}
+          </button>
+        </footer>
       </form>
     </ModalSurface>
   );
@@ -2172,10 +2625,10 @@ function OutcomeDialog({ run, agents, auth, onClose, onSaved }) {
   const [form, setForm] = useState(() => ({
     title: "",
     claim: "",
-    domain: "",
+    domain: "general",
     task_type: "decision",
     outcome_type: "binary",
-    metric: "",
+    metric: "Whether the claim happened",
     unit: "",
     due_at: "",
     error_scale: "1",
@@ -2199,6 +2652,7 @@ function OutcomeDialog({ run, agents, auth, onClose, onSaved }) {
     setForm((current) => ({
       ...current,
       outcome_type: outcomeType,
+      metric: outcomeType === "binary" ? "Whether the claim happened" : outcomeType === "numeric" ? "The final measured value" : "The final category",
       predictions: initialOutcomePredictions(participants, outcomeType)
     }));
   }
@@ -2267,7 +2721,7 @@ function OutcomeDialog({ run, agents, auth, onClose, onSaved }) {
         resolution.allowed_values = form.allowed_values.split(",").map((value) => value.trim()).filter(Boolean);
       }
       await api.post(`/api/chat/runs/${encodeURIComponent(run.run_id)}/outcome-contracts`, {
-        title: form.title,
+        title: form.title.trim() || form.claim.trim().slice(0, 80),
         claim: form.claim,
         domain: slugifyValue(form.domain),
         task_type: slugifyValue(form.task_type || "decision"),
@@ -2289,84 +2743,80 @@ function OutcomeDialog({ run, agents, auth, onClose, onSaved }) {
   }
 
   return (
-    <ModalSurface title="Track an outcome" description="Turn a measurable claim from this answer into a result you can settle later." onClose={onClose} className="wide-dialog">
-      <form className="dialog-form" onSubmit={submit}>
+    <ModalSurface title="Track a claim" description="Set the question now. Record what actually happened when the date arrives." onClose={onClose} className="wide-dialog simple-tracking-dialog">
+      <form className="dialog-form simple-tracking-form" onSubmit={submit}>
         {error && <div className="form-error" role="alert">{error}</div>}
-        <div className="field-grid two-column">
-          <label><span>Name</span><input data-autofocus value={form.title} onChange={(event) => update("title", event.target.value)} required placeholder="Q3 cash threshold" /></label>
-          <label><span>Type</span><select value={form.outcome_type} onChange={(event) => updateOutcomeType(event.target.value)}><option value="binary">Yes or no</option><option value="numeric">Number</option><option value="categorical">Category</option></select></label>
+        <div className="tracking-form-intro">
+          <Clock3 size={18} />
+          <p><strong>One claim, one check-in.</strong><span>Virenis will keep this with the answer and remind you when a result can be recorded.</span></p>
         </div>
-        <label><span>Measurable claim</span><textarea value={form.claim} onChange={(event) => update("claim", event.target.value)} required placeholder="Cash balance will remain above the required threshold through Q3." /></label>
-        <div className="field-grid two-column">
-          <label><span>Domain</span><input value={form.domain} onChange={(event) => update("domain", event.target.value)} required placeholder="finance" /></label>
-          <label><span>Metric</span><input value={form.metric} onChange={(event) => update("metric", event.target.value)} required placeholder="quarter-end cash balance" /></label>
-          <label><span>Due date</span><input type="date" min={minimumDueDate} value={form.due_at} onChange={(event) => update("due_at", event.target.value)} required /></label>
-          {form.outcome_type === "numeric" && <label><span>Accepted error</span><input type="number" min="0.000001" step="any" value={form.error_scale} onChange={(event) => update("error_scale", event.target.value)} required /></label>}
-          {form.outcome_type === "categorical" && <label><span>Allowed values <small>optional, comma separated</small></span><input value={form.allowed_values} onChange={(event) => update("allowed_values", event.target.value)} /></label>}
-          {form.outcome_type === "numeric" && <label><span>Unit <small>optional</small></span><input value={form.unit} onChange={(event) => update("unit", event.target.value)} placeholder="USD" /></label>}
-          <label className="span-two"><span>Result source</span><input value={form.reference} onChange={(event) => update("reference", event.target.value)} required maxLength={1000} placeholder="URL, report ID, or review record to use at settlement" /></label>
-        </div>
-        <fieldset className="prediction-fieldset">
-          <legend>Agent predictions</legend>
-          <p>Record each agent's independent prediction before the result is known.</p>
-          {participants.map((participant) => {
-            const prediction = form.predictions[participant.step_id];
-            const evidenceIsValid = predictionEvidenceIsValid(participant, prediction, form.outcome_type);
-            return (
-              <div className="prediction-row" key={participant.step_id}>
-                <strong>{formatAgentName(participant.adapter, agents)}</strong>
-                <label>
-                  <span>{form.outcome_type === "binary" ? "Chance (%)" : "Prediction"}</span>
-                  <input
-                    type={form.outcome_type === "categorical" ? "text" : "number"}
-                    min={form.outcome_type === "binary" ? "0" : undefined}
-                    max={form.outcome_type === "binary" ? "100" : undefined}
-                    step={form.outcome_type === "numeric" ? "any" : undefined}
-                    value={prediction.value}
-                    onChange={(event) => updatePredictionValue(participant, event.target.value)}
-                    disabled={prediction.abstained}
-                    required={!prediction.abstained}
-                  />
-                </label>
-                <label>
-                  <span>Confidence (%)</span>
-                  <input type="number" min="0" max="100" value={prediction.confidence} onChange={(event) => updatePrediction(participant.step_id, "confidence", event.target.value)} disabled={prediction.abstained} required={!prediction.abstained} />
-                </label>
-                <label className="check-label"><input type="checkbox" checked={prediction.abstained} onChange={(event) => updatePrediction(participant.step_id, "abstained", event.target.checked)} /><span>Abstain</span></label>
-                {!prediction.abstained && (
-                  <>
-                    <label className="prediction-evidence">
-                      <span>Evidence from recorded answer</span>
-                      <textarea
-                        value={prediction.evidence_quote}
-                        onChange={(event) => updatePrediction(participant.step_id, "evidence_quote", event.target.value)}
-                        required
-                        maxLength={500}
-                      />
-                      <small className={`evidence-status ${evidenceIsValid ? "valid" : "invalid"}`}>
-                        {evidenceIsValid ? "Exact passage verified" : "Use an exact passage containing this value"}
-                      </small>
-                    </label>
-                    <details className="recorded-answer">
-                      <summary>View recorded answer</summary>
-                      <p>{participant.domain_answer || "No recorded answer is available."}</p>
-                    </details>
-                  </>
-                )}
-              </div>
-            );
-          })}
+        <label className="claim-field">
+          <span>What do you want to check?</span>
+          <textarea data-autofocus value={form.claim} onChange={(event) => update("claim", event.target.value)} required placeholder="Trial conversion will exceed 12% by the end of September." />
+          <small>Write a statement that will clearly be true, false, or measurable later.</small>
+        </label>
+        <fieldset className="tracking-type-fieldset">
+          <legend>What kind of result will you record?</legend>
+          <div>
+            {[
+              { value: "binary", title: "Yes or no", detail: "Did it happen?" },
+              { value: "numeric", title: "A number", detail: "What was the value?" },
+              { value: "categorical", title: "A category", detail: "Which result occurred?" }
+            ].map((type) => (
+              <label className={form.outcome_type === type.value ? "selected" : ""} key={type.value}>
+                <input type="radio" name="result-type" checked={form.outcome_type === type.value} onChange={() => updateOutcomeType(type.value)} />
+                <span><strong>{type.title}</strong><small>{type.detail}</small></span>
+                <i>{form.outcome_type === type.value && <Check size={13} />}</i>
+              </label>
+            ))}
+          </div>
         </fieldset>
+        <div className="field-grid two-column tracking-essentials">
+          <label><span>When should it be checked?</span><input type="date" min={minimumDueDate} value={form.due_at} onChange={(event) => update("due_at", event.target.value)} required /></label>
+          <label><span>Where will the result come from?</span><input value={form.reference} onChange={(event) => update("reference", event.target.value)} required maxLength={1000} placeholder="Analytics report, public URL, review note..." /><small>This makes the final check easy to verify.</small></label>
+          {form.outcome_type === "numeric" && <label><span>Unit <small>optional</small></span><input value={form.unit} onChange={(event) => update("unit", event.target.value)} placeholder="%, USD, users..." /></label>}
+          {form.outcome_type === "numeric" && <label><span>Acceptable margin <small>optional</small></span><input type="number" min="0.000001" step="any" value={form.error_scale} onChange={(event) => update("error_scale", event.target.value)} /></label>}
+          {form.outcome_type === "categorical" && <label className="span-two"><span>Possible results <small>optional, comma separated</small></span><input value={form.allowed_values} onChange={(event) => update("allowed_values", event.target.value)} placeholder="Approved, delayed, cancelled" /></label>}
+        </div>
+        <details className="advanced-fields prediction-details">
+          <summary><Bot size={15} /> Agent estimates <span>{Object.values(form.predictions).filter((prediction) => !prediction.abstained).length} found in this answer</span></summary>
+          <div>
+            <p className="advanced-explainer">Virenis keeps any clear estimate already stated in the answer. Agents without a recorded estimate are skipped.</p>
+            <fieldset className="prediction-fieldset">
+              {participants.map((participant) => {
+                const prediction = form.predictions[participant.step_id];
+                const evidenceIsValid = predictionEvidenceIsValid(participant, prediction, form.outcome_type);
+                return (
+                  <div className="prediction-row" key={participant.step_id}>
+                    <strong>{formatAgentName(participant.adapter, agents)}</strong>
+                    <label>
+                      <span>{form.outcome_type === "binary" ? "Chance (%)" : "Estimate"}</span>
+                      <input type={form.outcome_type === "categorical" ? "text" : "number"} min={form.outcome_type === "binary" ? "0" : undefined} max={form.outcome_type === "binary" ? "100" : undefined} step={form.outcome_type === "numeric" ? "any" : undefined} value={prediction.value} onChange={(event) => updatePredictionValue(participant, event.target.value)} disabled={prediction.abstained} required={!prediction.abstained} />
+                    </label>
+                    <label><span>Confidence (%)</span><input type="number" min="0" max="100" value={prediction.confidence} onChange={(event) => updatePrediction(participant.step_id, "confidence", event.target.value)} disabled={prediction.abstained} required={!prediction.abstained} /></label>
+                    <label className="check-label"><input type="checkbox" checked={prediction.abstained} onChange={(event) => updatePrediction(participant.step_id, "abstained", event.target.checked)} /><span>Skip</span></label>
+                    {!prediction.abstained && (
+                      <label className="prediction-evidence"><span>Exact passage from the answer</span><textarea value={prediction.evidence_quote} onChange={(event) => updatePrediction(participant.step_id, "evidence_quote", event.target.value)} required maxLength={500} /><small className={`evidence-status ${evidenceIsValid ? "valid" : "invalid"}`}>{evidenceIsValid ? "Passage matched" : "Use a passage containing this value"}</small></label>
+                    )}
+                  </div>
+                );
+              })}
+            </fieldset>
+          </div>
+        </details>
         <details className="advanced-fields">
-          <summary><Settings2 size={15} />Resolver</summary>
+          <summary><Settings2 size={15} /> More details</summary>
           <div className="field-grid two-column">
+            <label><span>Short name <small>optional</small></span><input value={form.title} onChange={(event) => update("title", event.target.value)} placeholder="September conversion" /></label>
+            <label><span>Topic</span><input value={form.domain} onChange={(event) => update("domain", event.target.value)} required placeholder="general" /></label>
+            <label className="span-two"><span>What is being measured?</span><input value={form.metric} onChange={(event) => update("metric", event.target.value)} required /></label>
             <label><span>Source type</span><select value={form.resolver_type} onChange={(event) => update("resolver_type", event.target.value)}><option value="human">Human review</option><option value="api">API</option><option value="document">Document</option></select></label>
-            <label><span>Authority</span><input value={form.authority} onChange={(event) => update("authority", event.target.value)} required maxLength={240} /></label>
+            <label><span>Source owner</span><input value={form.authority} onChange={(event) => update("authority", event.target.value)} required maxLength={240} /></label>
           </div>
         </details>
         <div className="dialog-actions">
           <button type="button" className="text-button ghost" onClick={onClose} disabled={busy}>Cancel</button>
-          <button type="submit" className="text-button primary" disabled={busy || !form.due_at || !form.reference.trim() || !predictionsAreValid}>{busy ? <LoaderCircle className="spin" size={16} /> : <Clock3 size={16} />}Start tracking</button>
+          <button type="submit" className="text-button primary" disabled={busy || !form.claim.trim() || !form.due_at || !form.reference.trim() || !predictionsAreValid}>{busy ? <LoaderCircle className="spin" size={16} /> : <Clock3 size={16} />}Start tracking</button>
         </div>
       </form>
     </ModalSurface>
@@ -2453,7 +2903,7 @@ function SettlementDialog({ contract, onClose, onSaved }) {
     setError("");
     if (!outcomeIsDue(contract)) {
       setNow(Date.now());
-      setError("This outcome cannot be settled before its due time.");
+      setError("The result cannot be recorded before its check date.");
       return;
     }
     setBusy(true);

@@ -1577,6 +1577,14 @@ export async function createApp({
     let runtimeRegistrationCleanup = null;
     try {
       const snapshot = store.read();
+      const resourceForAgentId = String(req.body.resource_for_agent_id || "").trim() || null;
+      if (resourceForAgentId) {
+        const parentAgent = snapshot.agents.find((item) => item.id === resourceForAgentId);
+        assertAgentMutationAccess(parentAgent, req);
+        if (parentAgent?.document) {
+          throwStatus(400, "Knowledge can be attached only to a standard agent.");
+        }
+      }
       const documentScope = resolveDocumentUploadScope(snapshot, req, req.body);
       const workspaceId = documentScope.workspace_id;
       assertDocumentQuota(snapshot, req, workspaceId);
@@ -1659,6 +1667,7 @@ export async function createApp({
           workspace_id: workspaceId,
           scope: documentScope.scope,
           session_id: documentScope.session_id,
+          resource_for_agent_id: resourceForAgentId,
           agent_id: agentId,
           title,
           source_path: req.file.originalname,
@@ -1716,6 +1725,7 @@ export async function createApp({
           },
           ...runtimeAgent,
           id: agentId,
+          resource_for_agent_id: resourceForAgentId,
           sources: [document.index_path],
           retrieval: {
             type: "document_markdown",
@@ -1784,6 +1794,7 @@ export async function createApp({
             title: document.title,
             scope: document.scope,
             session_id: document.session_id,
+            resource_for_agent_id: document.resource_for_agent_id,
             visibility: document.visibility,
             created_at: document.created_at,
             status: "indexed",
@@ -1813,6 +1824,7 @@ export async function createApp({
         workspace_id: workspaceId,
         scope: documentScope.scope,
         session_id: documentScope.session_id,
+        resource_for_agent_id: resourceForAgentId,
         agent_id: agentId,
         title,
         source_path: req.file.originalname,
@@ -1852,6 +1864,7 @@ export async function createApp({
       };
       const agent = {
         id: agentId,
+        resource_for_agent_id: resourceForAgentId,
         title: `${title} source agent`,
         capability: req.body.capability || `Retrieves cited chunks from ${title}.`,
         boundary: "Use only retrieved document chunks for document-specific claims and cite chunk ids.",
@@ -1915,6 +1928,7 @@ export async function createApp({
           title: document.title,
           scope: document.scope,
           session_id: document.session_id,
+          resource_for_agent_id: document.resource_for_agent_id,
           visibility: document.visibility,
           created_at: document.created_at,
           status: "indexed",
@@ -3143,6 +3157,23 @@ function applyDocumentDeletionState(data, documentId, { actor, deletedAt }) {
       }
     });
   }
+  const resourceToken = `agent:${mutableDocument.agent_id}`;
+  for (const candidate of data.agents) {
+    if (!Array.isArray(candidate.resources) || !candidate.resources.includes(resourceToken)) continue;
+    candidate.resources = candidate.resources.filter((value) => value !== resourceToken);
+    candidate.last_edited_by = actor?.user_id || "system";
+    candidate.last_edited_at = deletedAt;
+    appendAgentEvent(data, {
+      eventType: "agent.resource_detached",
+      agent: candidate,
+      actor,
+      details: {
+        document_id: mutableDocument.document_id,
+        resource_agent_id: mutableDocument.agent_id
+      },
+      occurredAt: deletedAt
+    });
+  }
   return mutableDocument;
 }
 
@@ -3752,6 +3783,7 @@ function documentSummaryForRequest(document, req) {
     title: document.title,
     scope: storedDocumentScope(document),
     session_id: storedDocumentScope(document) === "chat" ? document.session_id : null,
+    resource_for_agent_id: document.resource_for_agent_id || null,
     chunks: Array.isArray(document.chunks) ? document.chunks.length : 0,
     visibility: document.visibility,
     created_at: document.created_at,
