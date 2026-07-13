@@ -38,7 +38,7 @@ function mergeSeedCatalog(agents, seedAgents) {
 function initialData(seedAgents) {
   const now = new Date().toISOString();
   return {
-    version: 2,
+    version: 3,
     created_at: now,
     sessions: [],
     messages: [],
@@ -286,6 +286,33 @@ function normalizeData(value, seedAgents) {
     }
   }
   data.version = defaults.version;
+  data.marketplaceRatings = (Array.isArray(data.marketplaceRatings) ? data.marketplaceRatings : [])
+    .filter((rating) => rating && typeof rating === "object")
+    .map((rating) => {
+      const safeRating = { ...rating };
+      delete safeRating.review;
+      delete safeRating.comment;
+      delete safeRating.comments;
+      return safeRating;
+    });
+  for (const agent of Array.isArray(data.agents) ? data.agents : []) {
+    if (!agent.marketplace || typeof agent.marketplace !== "object" || Array.isArray(agent.marketplace)) continue;
+    const marketplace = agent.marketplace;
+    marketplace.description = String(marketplace.description || marketplace.summary || agent.capability || "").trim().slice(0, 1200);
+    marketplace.published_by = String(marketplace.published_by || agent.created_by || "Virenis").trim() || "Virenis";
+    if (!marketplace.listing_id) {
+      const digest = crypto.createHash("sha256")
+        .update(`${agent.id || "agent"}:${marketplace.published_at || "legacy"}`, "utf8")
+        .digest("hex")
+        .slice(0, 16);
+      marketplace.listing_id = `listing_${digest}`;
+    }
+    delete marketplace.summary;
+    delete marketplace.achievements;
+    delete marketplace.proofs;
+    delete marketplace.version;
+    delete marketplace.license;
+  }
   mergeSeedCatalog(data.agents, seedAgents);
   return data;
 }

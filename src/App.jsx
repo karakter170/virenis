@@ -250,6 +250,7 @@ function Workspace({ onHome }) {
   const [correctionContract, setCorrectionContract] = useState(null);
   const [togglingAgentId, setTogglingAgentId] = useState("");
   const [publishTarget, setPublishTarget] = useState(null);
+  const [marketplaceTarget, setMarketplaceTarget] = useState(null);
   const [ratingTarget, setRatingTarget] = useState(null);
   const [focusComposer, setFocusComposer] = useState(0);
   const threadRef = useRef(null);
@@ -758,6 +759,10 @@ function Workspace({ onHome }) {
             setResourcesOpen(false);
             setPublishTarget(agent);
           }}
+          onOpenMarketplaceItem={(item) => {
+            setResourcesOpen(false);
+            setMarketplaceTarget(item);
+          }}
           onRate={(item) => {
             setResourcesOpen(false);
             setRatingTarget(item);
@@ -834,13 +839,35 @@ function Workspace({ onHome }) {
           onClose={() => {
             setPublishTarget(null);
             setResourcesOpen(true);
-            setResourceView("marketplace");
+            setResourceView("agents");
           }}
           onSaved={async () => {
             setPublishTarget(null);
             await refreshResources();
             setResourcesOpen(true);
+            setResourceView("agents");
+          }}
+        />
+      )}
+
+      {marketplaceTarget && (
+        <MarketplaceAgentDialog
+          item={marketplaceTarget}
+          auth={auth}
+          onClose={() => {
+            setMarketplaceTarget(null);
+            setResourcesOpen(true);
             setResourceView("marketplace");
+          }}
+          onRate={(item) => {
+            setMarketplaceTarget(null);
+            setRatingTarget(item);
+          }}
+          onCopied={async () => {
+            setMarketplaceTarget(null);
+            await refreshResources();
+            setResourcesOpen(true);
+            setResourceView("agents");
           }}
         />
       )}
@@ -1527,6 +1554,7 @@ function ResourcesSheet({
   onArchiveAgent,
   onToggleAgent,
   onPublish,
+  onOpenMarketplaceItem,
   onRate,
   onAddKnowledge,
   onDeleteKnowledge,
@@ -1579,9 +1607,8 @@ function ResourcesSheet({
         {view === "marketplace" && (
           <MarketplacePanel
             items={marketplace}
-            agents={agents}
             auth={auth}
-            onPublish={onPublish}
+            onOpen={onOpenMarketplaceItem}
             onRate={onRate}
           />
         )}
@@ -1724,9 +1751,17 @@ function AgentCatalog({
                   {manageable && <IconButton label={`Edit ${formatAgentName(agent.id, agents)}`} compact onClick={() => onEdit(agent)} disabled={archived}>
                     <Pencil size={16} />
                   </IconButton>}
-                  {manageable && <IconButton label={`Publish ${formatAgentName(agent.id, agents)} to marketplace`} compact onClick={() => onPublish(agent)} disabled={archived}>
-                    <Upload size={16} />
-                  </IconButton>}
+                  {manageable && (
+                    <button
+                      type="button"
+                      className="agent-publish-action"
+                      aria-label={`${agent.marketplace?.published ? "Update" : "Publish"} ${formatAgentName(agent.id, agents)} in marketplace`}
+                      onClick={() => onPublish(agent)}
+                      disabled={archived}
+                    >
+                      <Upload size={14} />{agent.marketplace?.published ? "Update listing" : "Publish"}
+                    </button>
+                  )}
                   {manageable && <IconButton label={`Archive ${formatAgentName(agent.id, agents)}`} compact onClick={() => onArchive(agent)} disabled={archived}>
                     <Archive size={16} />
                   </IconButton>}
@@ -2122,78 +2157,48 @@ export function AgentGraph({ agents, auth, storageKey, onConnect, onDisconnect }
   );
 }
 
-function MarketplacePanel({ items, agents, auth, onPublish, onRate }) {
+export function MarketplacePanel({ items, auth, onOpen = () => undefined, onRate = () => undefined }) {
   const [query, setQuery] = useState("");
-  const publishedIds = new Set(items.map((item) => item.id));
-  const owned = agents.filter((agent) =>
-    !agent.document && !agent.resource_for_agent_id && agent.enabled !== false &&
-    (auth?.is_admin || (agent.created_by === auth?.user_id && agent.workspace_id === auth?.workspace_id))
-  );
   const filtered = items.filter((item) =>
-    (!query || `${item.title} ${item.summary} ${item.creator} ${item.achievements.join(" ")}`.toLowerCase().includes(query.toLowerCase()))
+    !query || `${item.title} ${item.description} ${item.capability} ${item.published_by}`.toLowerCase().includes(query.toLowerCase())
   );
   return (
     <section className="resource-section marketplace-section" aria-labelledby="marketplace-heading">
       <div className="marketplace-hero">
         <span><Sparkles size={15} /> COMMUNITY LIBRARY</span>
-        <h3 id="marketplace-heading">Evidence-rich specialists, shared openly.</h3>
-        <p>Explore API-backed agents with creator-provided achievements, linked proof, and community ratings.</p>
+        <h3 id="marketplace-heading">Shared agents, ready to make your own.</h3>
+        <p>Inspect how an agent works, see who published it, rate it, or copy an independent version into your workspace.</p>
       </div>
-      {owned.length > 0 && (
-        <div className="publish-shelf">
-          <div><strong>Share your work</strong><span>Publish an existing creation with achievements and proof.</span></div>
-          <div>
-            {owned.map((agent) => (
-              <button type="button" key={agent.id} onClick={() => onPublish(agent)}>
-                <Upload size={13} />{publishedIds.has(agent.id) ? "Update" : "Publish"} {formatAgentName(agent.id, agents)}
-              </button>
-            ))}
-          </div>
-        </div>
-      )}
       <div className="marketplace-toolbar">
-        <label className="search-field full-width"><Search size={16} /><span className="sr-only">Search marketplace</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search skills, outcomes, creators" /></label>
+        <label className="search-field full-width"><Search size={16} /><span className="sr-only">Search marketplace</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search agents or publishers" /></label>
       </div>
       <div className="marketplace-grid">
         {filtered.map((item) => (
-          <article className="market-card" key={item.id}>
-            <header><span className="market-type agent"><Bot size={13} />agent</span><small>v{item.version}</small></header>
-            <h4>{agentFacingText(item.title, "Community agent")}</h4>
-            <p>{agentFacingText(item.summary || item.capability)}</p>
-            {item.achievements.length > 0 && <ul>{item.achievements.slice(0, 3).map((achievement) => <li key={achievement}><Check size={12} />{achievement}</li>)}</ul>}
-            {item.proofs.length > 0 && <div className="proof-links" aria-label="Creator-provided proof">{item.proofs.slice(0, 3).map((proof) => <a key={proof.url} href={proof.url} target="_blank" rel="noreferrer"><Globe2 size={12} />{proof.title}</a>)}</div>}
-            {item.reviews?.length > 0 && (
-              <div className="market-reviews" aria-label="Recent reviews">
-                {item.reviews.slice(0, 2).map((review, index) => (
-                  <blockquote key={`${review.created_at}:${index}`}><Star size={10} fill="currentColor" /><span>{review.review}</span></blockquote>
-                ))}
-              </div>
-            )}
+          <article className="market-card" key={item.listing_id || item.id}>
+            <button type="button" className="market-card-open" onClick={() => onOpen(item)} aria-label={`View ${agentFacingText(item.title, "community agent")}`}>
+              <header><span className="market-type agent"><Bot size={13} />agent</span><ChevronRight size={15} /></header>
+              <h4>{agentFacingText(item.title, "Community agent")}</h4>
+              <p>{agentFacingText(item.description || item.capability)}</p>
+              <small className="market-author">Published by {item.publisher?.user_id || item.published_by || "Virenis"}</small>
+              {item.workspace_copy && <span className="market-copy-state"><Check size={12} />Copied as {item.workspace_copy.title}</span>}
+            </button>
             <footer>
               <span className="market-rating"><Star size={14} fill="currentColor" />{item.rating_count ? item.rating_average.toFixed(1) : "New"}<small>{item.rating_count ? `(${item.rating_count})` : ""}</small></span>
-              <button type="button" onClick={() => onRate(item)}>{item.my_rating ? "Update rating" : "Rate"}</button>
+              <button type="button" onClick={() => onRate(item)} disabled={auth?.is_viewer}>{item.my_rating ? "Update rating" : "Rate"}</button>
             </footer>
-            <small className="market-author">by {item.creator} · {item.license}</small>
           </article>
         ))}
-        {filtered.length === 0 && <div className="market-empty"><Sparkles size={22} /><strong>No matches yet</strong><span>Publish a creation or try a broader search.</span></div>}
+        {filtered.length === 0 && <div className="market-empty"><Sparkles size={22} /><strong>No matches yet</strong><span>Try a broader search or publish an agent from the Agents tab.</span></div>}
       </div>
     </section>
   );
 }
 
-function PublishDialog({ agent, onClose, onSaved }) {
+export function PublishDialog({ agent, onClose, onSaved }) {
   const existing = agent.marketplace || {};
-  const [summary, setSummary] = useState(agentFacingText(existing.summary || agent.capability));
-  const [achievements, setAchievements] = useState((existing.achievements || []).join("\n"));
-  const [proofs, setProofs] = useState(existing.proofs?.length ? existing.proofs : [{ title: "", url: "" }]);
-  const [version, setVersion] = useState(existing.version || "1.0");
-  const [license, setLicense] = useState(existing.license || agent.license || "Unspecified");
+  const [description, setDescription] = useState(agentFacingText(existing.description || existing.summary || agent.capability));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  function updateProof(index, key, value) {
-    setProofs((current) => current.map((proof, cursor) => cursor === index ? { ...proof, [key]: value } : proof));
-  }
   async function submit(event) {
     event.preventDefault();
     setBusy(true);
@@ -2201,11 +2206,7 @@ function PublishDialog({ agent, onClose, onSaved }) {
     try {
       await api.post(`/api/marketplace/items/${encodeURIComponent(agent.id)}`, {
         item_type: "agent",
-        summary,
-        achievements: achievements.split("\n").map((value) => value.trim()).filter(Boolean),
-        proofs: proofs.filter((proof) => proof.title.trim() || proof.url.trim()),
-        version,
-        license
+        description
       });
       await onSaved();
     } catch (publishError) {
@@ -2215,23 +2216,20 @@ function PublishDialog({ agent, onClose, onSaved }) {
     }
   }
   return (
-    <ModalSurface title="Publish to marketplace" description="Add the outcomes and evidence people need to evaluate your work." onClose={onClose} className="form-dialog">
+    <ModalSurface title={existing.published ? "Update marketplace listing" : "Publish to marketplace"} description="Share a clear description. People can inspect the agent before copying it." onClose={onClose} className="form-dialog">
       <form className="dialog-form publish-form" onSubmit={submit}>
         {error && <div className="form-error" role="alert">{error}</div>}
         <div className="publish-subject"><span className="market-type agent"><Bot size={13} />agent</span><strong>{formatAgentName(agent.id, [agent])}</strong></div>
-        <label><span>Marketplace summary</span><textarea data-autofocus value={summary} onChange={(event) => setSummary(event.target.value)} required maxLength={500} /></label>
-        <label><span>Achievements <small>one per line</small></span><textarea value={achievements} onChange={(event) => setAchievements(event.target.value)} placeholder={"92% on internal support benchmark\nCut review time by 35%"} /></label>
-        <fieldset className="proof-editor"><legend>Proof links</legend>{proofs.map((proof, index) => <div key={index}><input aria-label={`Proof ${index + 1} title`} value={proof.title} onChange={(event) => updateProof(index, "title", event.target.value)} placeholder="Benchmark report" /><input aria-label={`Proof ${index + 1} URL`} type="url" value={proof.url} onChange={(event) => updateProof(index, "url", event.target.value)} placeholder="https://…" /></div>)}<button type="button" onClick={() => setProofs((current) => [...current, { title: "", url: "" }].slice(0, 8))}><Plus size={14} />Add proof</button></fieldset>
-        <div className="form-grid two"><label><span>Version</span><input value={version} onChange={(event) => setVersion(event.target.value)} required /></label><label><span>License</span><input value={license} onChange={(event) => setLicense(event.target.value)} required /></label></div>
-        <div className="dialog-actions"><button type="button" className="text-button ghost" onClick={onClose} disabled={busy}>Cancel</button><button type="submit" className="text-button primary" disabled={busy}>{busy ? <LoaderCircle className="spin" size={16} /> : <Upload size={16} />}Publish</button></div>
+        <label><span>Agent description</span><textarea data-autofocus value={description} onChange={(event) => setDescription(event.target.value)} required maxLength={1200} placeholder="Explain what this agent helps with and when someone should use it." /></label>
+        <div className="publish-note"><Bot size={16} /><span><strong>Safe sharing</strong><small>Private notes, uploaded knowledge, and workspace-only agent connections are not included.</small></span></div>
+        <div className="dialog-actions"><button type="button" className="text-button ghost" onClick={onClose} disabled={busy}>Cancel</button><button type="submit" className="text-button primary" disabled={busy}>{busy ? <LoaderCircle className="spin" size={16} /> : <Upload size={16} />}{existing.published ? "Update listing" : "Publish"}</button></div>
       </form>
     </ModalSurface>
   );
 }
 
-function RatingDialog({ item, onClose, onSaved }) {
+export function RatingDialog({ item, onClose, onSaved }) {
   const [score, setScore] = useState(item.my_rating?.score || 5);
-  const [review, setReview] = useState(item.my_rating?.review || "");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   async function submit(event) {
@@ -2239,7 +2237,7 @@ function RatingDialog({ item, onClose, onSaved }) {
     setBusy(true);
     setError("");
     try {
-      await api.post(`/api/marketplace/items/${encodeURIComponent(item.id)}/ratings`, { score, review });
+      await api.post(`/api/marketplace/items/${encodeURIComponent(item.id)}/ratings`, { score });
       await onSaved();
     } catch (ratingError) {
       setError(friendlyError(ratingError));
@@ -2248,13 +2246,129 @@ function RatingDialog({ item, onClose, onSaved }) {
     }
   }
   return (
-    <ModalSurface title={`Rate ${agentFacingText(item.title, "agent")}`} description="Share a concise, experience-based evaluation." onClose={onClose} className="small-dialog">
+    <ModalSurface title={`Rate ${agentFacingText(item.title, "agent")}`} description="Select a star rating from 1 to 5." onClose={onClose} className="small-dialog">
       <form className="dialog-form" onSubmit={submit}>
         {error && <div className="form-error" role="alert">{error}</div>}
         <fieldset className="star-picker"><legend>Your rating</legend>{[1, 2, 3, 4, 5].map((value) => <button type="button" key={value} aria-label={`${value} star${value === 1 ? "" : "s"}`} aria-pressed={score === value} onClick={() => setScore(value)}><Star size={25} fill={value <= score ? "currentColor" : "none"} /></button>)}</fieldset>
-        <label><span>Review <small>optional</small></span><textarea data-autofocus value={review} onChange={(event) => setReview(event.target.value)} maxLength={1000} placeholder="What worked well? What should others know?" /></label>
         <div className="dialog-actions"><button type="button" className="text-button ghost" onClick={onClose}>Cancel</button><button type="submit" className="text-button primary" disabled={busy}>{busy ? <LoaderCircle className="spin" size={16} /> : <Star size={16} />}Save rating</button></div>
       </form>
+    </ModalSurface>
+  );
+}
+
+export function MarketplaceAgentDialog({ item, auth, onClose, onRate, onCopied }) {
+  const [detail, setDetail] = useState(item);
+  const [loading, setLoading] = useState(true);
+  const [copying, setCopying] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let active = true;
+    setLoading(true);
+    api.get(`/api/marketplace/items/${encodeURIComponent(item.id)}`)
+      .then((payload) => {
+        if (active) setDetail(payload);
+      })
+      .catch((detailError) => {
+        if (active) setError(friendlyError(detailError));
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => { active = false; };
+  }, [item.id]);
+
+  async function copyToWorkspace() {
+    if (copying) return;
+    setCopying(true);
+    setError("");
+    try {
+      const result = await api.post(`/api/marketplace/items/${encodeURIComponent(item.id)}/copy`, {});
+      await onCopied(result.agent);
+    } catch (copyError) {
+      setError(friendlyError(copyError));
+    } finally {
+      setCopying(false);
+    }
+  }
+
+  const agent = detail.agent || {};
+  const publisher = detail.publisher?.user_id || detail.published_by || "Virenis";
+  const exclusions = agent.exclusions || {};
+  const tools = agent.tools || [];
+  const consumes = agent.consumes || [];
+  const produces = agent.produces || [];
+  const cues = agent.routing_cues || [];
+  return (
+    <ModalSurface
+      title={agentFacingText(detail.title, "Marketplace agent")}
+      description={`Published by ${publisher}`}
+      onClose={onClose}
+      className="agent-builder-dialog marketplace-agent-dialog"
+    >
+      <div className="marketplace-detail-body">
+        {error && <div className="form-error" role="alert">{error}</div>}
+        {loading && <div className="marketplace-detail-loading"><LoaderCircle className="spin" size={18} />Loading agent details</div>}
+        <div className="marketplace-detail-layout">
+          <main className="marketplace-detail-content">
+            <section className="builder-panel marketplace-detail-intro">
+              <div className="builder-heading">
+                <span>MARKETPLACE DESCRIPTION</span>
+                <h3>{agentFacingText(detail.description || detail.capability)}</h3>
+                <p>Published by <strong>{publisher}</strong>{detail.published_at ? ` on ${formatDate(detail.published_at)}` : ""}.</p>
+              </div>
+            </section>
+
+            <section className="builder-panel marketplace-detail-section" aria-labelledby="marketplace-purpose-heading">
+              <div className="builder-heading"><span>AGENT BASICS</span><h3 id="marketplace-purpose-heading">Purpose and instructions</h3></div>
+              <dl className="marketplace-spec-list">
+                <div><dt>What it does</dt><dd>{agentFacingText(agent.capability, "No purpose provided.")}</dd></div>
+                <div><dt>Instructions and limits</dt><dd>{agentFacingText(agent.boundary, "No additional limits provided.")}</dd></div>
+              </dl>
+            </section>
+
+            <section className="builder-panel marketplace-detail-section" aria-labelledby="marketplace-workflow-heading">
+              <div className="builder-heading"><span>TOOLS &amp; TEAMWORK</span><h3 id="marketplace-workflow-heading">How it works</h3></div>
+              <dl className="marketplace-spec-list compact">
+                <div><dt>Tools</dt><dd>{tools.length ? tools.map((value) => <span className="marketplace-spec-chip" key={value}>{value.replaceAll("_", " ")}</span>) : "No tools required"}</dd></div>
+                <div><dt>Receives</dt><dd>{consumes.length ? consumes.map((value) => <span className="marketplace-spec-chip" key={value}>{value.replaceAll("_", " ")}</span>) : "User request"}</dd></div>
+                <div><dt>Produces</dt><dd>{produces.length ? produces.map((value) => <span className="marketplace-spec-chip" key={value}>{value.replaceAll("_", " ")}</span>) : "Domain output"}</dd></div>
+                <div><dt>Router cues</dt><dd>{cues.length ? cues.join(", ") : "Uses its name and purpose"}</dd></div>
+              </dl>
+            </section>
+
+            {(exclusions.private_knowledge || exclusions.agent_connections) && (
+              <div className="marketplace-sharing-boundary">
+                <AlertCircle size={16} />
+                <span><strong>Workspace-safe copy</strong><small>{[exclusions.private_knowledge ? "Private knowledge" : null, exclusions.agent_connections ? "workspace agent connections" : null].filter(Boolean).join(" and ")} will not be copied.</small></span>
+              </div>
+            )}
+          </main>
+
+          <aside className="builder-preview marketplace-detail-preview" aria-label="Marketplace agent summary">
+            <div className="preview-badge"><Bot size={18} /><span>SHARED AGENT</span></div>
+            <h4>{agentFacingText(detail.title, "Marketplace agent")}</h4>
+            <p>{agentFacingText(detail.description || detail.capability)}</p>
+            <dl>
+              <div><dt>Publisher</dt><dd>{publisher}</dd></div>
+              <div><dt>Tools</dt><dd>{tools.length || "None"}</dd></div>
+              <div><dt>Outputs</dt><dd>{produces.length || "Default"}</dd></div>
+              <div><dt>Rating</dt><dd>{detail.rating_count ? `${detail.rating_average.toFixed(1)} / 5` : "Not rated"}</dd></div>
+            </dl>
+            <div className="marketplace-detail-rating"><Star size={17} fill="currentColor" /><strong>{detail.rating_count ? detail.rating_average.toFixed(1) : "New"}</strong><span>{detail.rating_count ? `${detail.rating_count} rating${detail.rating_count === 1 ? "" : "s"}` : "Be the first to rate"}</span></div>
+            {detail.workspace_copy && <div className="preview-status"><Check size={14} /><div><strong>Already in your workspace</strong><small>{detail.workspace_copy.title}</small></div></div>}
+          </aside>
+        </div>
+
+        <footer className="builder-actions marketplace-detail-actions">
+          <button type="button" className="text-button ghost" onClick={onClose}>Close</button>
+          <span>Published by {publisher}</span>
+          <div>
+            <button type="button" className="text-button ghost" onClick={() => onRate(detail)} disabled={auth?.is_viewer || loading}><Star size={15} />{detail.my_rating ? "Update rating" : "Rate"}</button>
+            <button type="button" className="text-button primary" onClick={copyToWorkspace} disabled={auth?.is_viewer || loading || copying}>{copying ? <LoaderCircle className="spin" size={16} /> : <Copy size={16} />}{copying ? "Copying" : detail.workspace_copy ? "Copy another" : "Copy to my workspace"}</button>
+          </div>
+        </footer>
+      </div>
     </ModalSurface>
   );
 }

@@ -4,6 +4,10 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 import {
   AgentGraph,
+  MarketplaceAgentDialog,
+  MarketplacePanel,
+  PublishDialog,
+  RatingDialog,
   availableSessionAgents,
   graphConnectionInputs,
   graphConnectionWouldCycle,
@@ -140,5 +144,65 @@ describe("Agent Studio product surfaces", () => {
     expect(storedGraphPositions("workspace-graph")).toEqual({
       finance_agent: { x: 64, y: 516 }
     });
+  });
+
+  it("keeps publishing in the Agent flow and makes Marketplace inspectable and copyable", () => {
+    const item = {
+      id: "shared_research_agent",
+      listing_id: "listing_shared",
+      title: "Research briefing agent",
+      capability: "Creates clear research briefs.",
+      description: "A shared agent for concise research briefs.",
+      publisher: { user_id: "alice" },
+      published_by: "alice",
+      rating_average: 4.5,
+      rating_count: 2,
+      my_rating: null,
+      workspace_copy: null,
+      agent: {
+        capability: "Creates clear research briefs.",
+        boundary: "Separate facts from open questions.",
+        consumes: ["user_request"],
+        produces: ["research_brief"],
+        routing_cues: ["research brief"],
+        tools: ["web_search"],
+        exclusions: { private_knowledge: true, agent_connections: false }
+      }
+    };
+    const marketplaceMarkup = renderToStaticMarkup(createElement(MarketplacePanel, {
+      items: [item],
+      auth: { user_id: "bob", workspace_id: "workspace_b" }
+    }));
+    expect(marketplaceMarkup).toContain("Published by alice");
+    expect(marketplaceMarkup).toContain("Rate");
+    expect(marketplaceMarkup).not.toContain("Share your work");
+    expect(marketplaceMarkup).not.toMatch(/Achievements|Proof links|License/);
+
+    const publishMarkup = renderToStaticMarkup(createElement(PublishDialog, {
+      agent: { id: "owned_agent", title: "Owned agent", capability: "Helps with planning." },
+      onClose: () => undefined,
+      onSaved: () => undefined
+    }));
+    expect(publishMarkup).toContain("Agent description");
+    expect(publishMarkup).not.toMatch(/Achievements|Proof links|Version|License/);
+
+    const detailMarkup = renderToStaticMarkup(createElement(MarketplaceAgentDialog, {
+      item,
+      auth: { user_id: "bob", workspace_id: "workspace_b" },
+      onClose: () => undefined,
+      onRate: () => undefined,
+      onCopied: () => undefined
+    }));
+    expect(detailMarkup).toContain("Purpose and instructions");
+    expect(detailMarkup).toContain("Copy to my workspace");
+    expect(detailMarkup).toContain("Published by alice");
+
+    const ratingMarkup = renderToStaticMarkup(createElement(RatingDialog, {
+      item,
+      onClose: () => undefined,
+      onSaved: () => undefined
+    }));
+    expect(ratingMarkup).toContain("Your rating");
+    expect(ratingMarkup).not.toContain("<textarea");
   });
 });

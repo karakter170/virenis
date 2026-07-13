@@ -1013,7 +1013,7 @@ export async function createApp({
       const items = data.agents
         .filter((agent) => agent.enabled !== false && agent.marketplace?.published === true)
         .filter((agent) => !itemType || agentItemType(agent) === itemType)
-        .filter((agent) => !q || `${agent.title || ""} ${agent.capability || ""} ${agent.created_by || "Virenis"} ${(agent.marketplace?.achievements || []).join(" ")}`.toLowerCase().includes(q))
+        .filter((agent) => !q || marketplaceSearchText(agent).includes(q))
         .map((agent) => marketplaceItemSummary(data, agent, req))
         .sort((left, right) => right.rating_average - left.rating_average
           || right.rating_count - left.rating_count
@@ -1024,12 +1024,27 @@ export async function createApp({
     }
   });
 
+  app.get("/api/marketplace/items/:agent_id", (req, res, next) => {
+    try {
+      const data = store.read();
+      const item = data.agents.find((agent) =>
+        agent.id === req.params.agent_id
+        && agent.enabled !== false
+        && agent.marketplace?.published === true
+      );
+      if (!item) throwStatus(404, "Marketplace item not found.");
+      res.json(marketplaceItemDetail(data, item, req));
+    } catch (error) {
+      next(error);
+    }
+  });
+
   app.post("/api/marketplace/items/:agent_id", async (req, res, next) => {
     try {
       const current = store.read().agents.find((agent) => agent.id === req.params.agent_id);
       assertAgentMutationAccess(current, req);
       if (!current || current.enabled === false) throwStatus(404, "Agent not found.");
-      const marketplace = normalizeMarketplacePayload(req.body, current);
+      const marketplace = normalizeMarketplacePayload(req.body, current, req);
       const updated = await store.mutate((data) => {
         const agent = data.agents.find((item) => item.id === current.id);
         agent.item_type = marketplace.item_type;
@@ -1040,7 +1055,7 @@ export async function createApp({
           eventType: "agent.marketplace_published",
           agent,
           actor: req.auth,
-          details: { item_type: marketplace.item_type, proof_count: marketplace.proofs.length }
+          details: { item_type: marketplace.item_type, listing_id: marketplace.listing_id }
         });
         return agent;
       });
@@ -1057,7 +1072,12 @@ export async function createApp({
       if (!current?.marketplace?.published) throwStatus(404, "Marketplace item not found.");
       await store.mutate((data) => {
         const agent = data.agents.find((item) => item.id === current.id);
-        agent.marketplace = { ...agent.marketplace, published: false, unpublished_at: nowIso() };
+        agent.marketplace = {
+          ...agent.marketplace,
+          published: false,
+          unpublished_at: nowIso(),
+          updated_by: req.auth.user_id
+        };
         return agent;
       });
       res.json({ ok: true, agent_id: current.id, published: false });
@@ -1068,38 +1088,76 @@ export async function createApp({
 
   app.post("/api/marketplace/items/:agent_id/ratings", async (req, res, next) => {
     try {
+      if (["review", "comment", "comments"].some((field) => field in (req.body || {}))) {
+        throwStatus(400, "Marketplace ratings do not support comments.");
+      }
       const score = Number(req.body?.score);
       if (!Number.isInteger(score) || score < 1 || score > 5) {
         throwStatus(400, "score must be an integer from 1 to 5.");
       }
-      const review = String(req.body?.review || "").replaceAll("\0", "").trim().slice(0, 1000);
       const snapshot = store.read();
       const item = snapshot.agents.find((agent) => agent.id === req.params.agent_id && agent.enabled !== false && agent.marketplace?.published === true);
       if (!item) throwStatus(404, "Marketplace item not found.");
-      await store.mutate((data) => {
+      const listingId = marketplaceListingId(item);
+      const result = await store.mutate((data) => {
         data.marketplaceRatings = Array.isArray(data.marketplaceRatings) ? data.marketplaceRatings : [];
-        const existing = data.marketplaceRatings.find((rating) => rating.agent_id === item.id && rating.created_by === req.auth.user_id);
+        const existing = data.marketplaceRatings.find((rating) =>
+          marketplaceRatingMatches(rating, item)
+          && rating.created_by === req.auth.user_id
+          && String(rating.workspace_id || "") === String(req.auth.workspace_id || "")
+        );
         const now = nowIso();
         if (existing) {
           existing.score = score;
-          existing.review = review;
+          existing.listing_id = listingId;
+          existing.agent_id = item.id;
+          delete existing.review;
+          delete existing.comment;
+          delete existing.comments;
           existing.updated_at = now;
-          return existing;
+          return { rating: existing, created: false };
         }
         const rating = {
           rating_id: makeId("rating"),
+          listing_id: listingId,
           agent_id: item.id,
           score,
-          review,
           workspace_id: req.auth.workspace_id,
           created_by: req.auth.user_id,
           created_at: now,
           updated_at: now
         };
         data.marketplaceRatings.push(rating);
-        return rating;
+        return { rating, created: true };
       });
-      res.status(201).json(marketplaceItemSummary(store.read(), item, req));
+      res.status(result.created ? 201 : 200).json(marketplaceItemSummary(store.read(), item, req));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/marketplace/items/:agent_id/copy", async (req, res, next) => {
+    try {
+      const snapshot = store.read();
+      const item = snapshot.agents.find((agent) =>
+        agent.id === req.params.agent_id
+        && agent.enabled !== false
+        && agent.marketplace?.published === true
+      );
+      if (!item) throwStatus(404, "Marketplace item not found.");
+      const copied = await copyMarketplaceAgentToWorkspace({
+        store,
+        req,
+        sourceAgent: item,
+        requestedId: req.body?.id
+      });
+      res.status(201).json({
+        ok: true,
+        status: "copied",
+        listing_id: marketplaceListingId(item),
+        source_agent_id: item.id,
+        agent: redactAgentForRequest(copied, req)
+      });
     } catch (error) {
       next(error);
     }
@@ -4627,86 +4685,326 @@ function normalizeAgentPatchPayload(body = {}) {
   return patch;
 }
 
-function normalizeOptionalWebUrl(value, fieldName = "url") {
-  const raw = String(value || "").trim();
-  if (!raw) return "";
-  if (raw.length > 500) throwStatus(400, `${fieldName} is too long.`);
-  let parsed;
-  try {
-    parsed = new URL(raw);
-  } catch {
-    throwStatus(400, `${fieldName} must be a valid HTTPS URL.`);
-  }
-  if (parsed.protocol !== "https:") throwStatus(400, `${fieldName} must be a valid HTTPS URL.`);
-  return parsed.toString();
-}
-
 function agentItemType(_agent = {}) {
   return "agent";
 }
 
-function normalizeMarketplacePayload(body = {}, agent = {}) {
+function marketplaceAgentSnapshot(agent = {}) {
+  const rawConsumes = splitList(agent.consumes);
+  const rawTools = splitList(agent.tools);
+  const omittedAgentConnections = rawConsumes.some((value) => /^agent:[a-z0-9_]+:output$/.test(value));
+  const omittedPrivateKnowledge = Boolean(
+    agent.source_text_internal
+    || agent.document
+    || agent.retrieval
+    || splitList(agent.sources).length
+    || splitList(agent.resources).length
+    || rawConsumes.includes("document_context")
+  );
+  const consumes = rawConsumes
+    .filter((value) => !/^agent:[a-z0-9_]+:output$/.test(value))
+    .filter((value) => value !== "document_context");
+  if (!consumes.includes("user_request")) consumes.unshift("user_request");
+  const tools = rawTools.filter((value) => !["document_search", "document_read"].includes(value));
+  return {
+    schema_version: "virenis-marketplace-agent-v1",
+    title: cleanTitle(agent.title) || "Community agent",
+    capability: String(agent.capability || "").replaceAll("\0", "").trim().slice(0, 2400),
+    boundary: String(agent.boundary || "").replaceAll("\0", "").trim().slice(0, 4000),
+    consumes: consumes.slice(0, 20),
+    produces: splitList(agent.produces).length ? splitList(agent.produces) : ["domain_outputs"],
+    routing_cues: splitList(agent.routing_cues).slice(0, 20),
+    tools: tools.slice(0, 20),
+    policies: agent.policies && typeof agent.policies === "object" && !Array.isArray(agent.policies)
+      ? JSON.parse(JSON.stringify(agent.policies))
+      : {},
+    stage: Number.isFinite(Number(agent.stage)) ? Number(agent.stage) : 50,
+    exclusions: {
+      private_knowledge: omittedPrivateKnowledge,
+      agent_connections: omittedAgentConnections
+    }
+  };
+}
+
+function publishedMarketplaceSnapshot(agent = {}) {
+  const fallback = marketplaceAgentSnapshot(agent);
+  const stored = agent.marketplace?.snapshot;
+  if (!stored || typeof stored !== "object" || Array.isArray(stored)) return fallback;
+  const normalized = marketplaceAgentSnapshot(stored);
+  return {
+    ...normalized,
+    exclusions: {
+      private_knowledge: Boolean(stored.exclusions?.private_knowledge ?? fallback.exclusions.private_knowledge),
+      agent_connections: Boolean(stored.exclusions?.agent_connections ?? fallback.exclusions.agent_connections)
+    }
+  };
+}
+
+function marketplaceListingId(agent = {}) {
+  const stored = String(agent.marketplace?.listing_id || "").trim();
+  if (/^listing_[a-z0-9]+$/i.test(stored)) return stored;
+  const digest = crypto.createHash("sha256")
+    .update(`${agent.id || "agent"}:${agent.marketplace?.published_at || "legacy"}`, "utf8")
+    .digest("hex")
+    .slice(0, 16);
+  return `listing_${digest}`;
+}
+
+function marketplacePublisherUserId(agent = {}) {
+  return String(agent.marketplace?.published_by || agent.created_by || "Virenis").trim() || "Virenis";
+}
+
+function marketplaceDescription(agent = {}) {
+  return String(
+    agent.marketplace?.description
+    || agent.marketplace?.summary
+    || agent.capability
+    || ""
+  ).replaceAll("\0", "").trim().slice(0, 1200);
+}
+
+function marketplaceSearchText(agent = {}) {
+  const snapshot = publishedMarketplaceSnapshot(agent);
+  return `${snapshot.title} ${snapshot.capability} ${marketplaceDescription(agent)} ${marketplacePublisherUserId(agent)} ${snapshot.routing_cues.join(" ")}`
+    .toLowerCase();
+}
+
+function normalizeMarketplacePayload(body = {}, agent = {}, req) {
   const itemType = agentItemType(agent);
   if (body.item_type && body.item_type !== itemType) {
     throwStatus(400, "Marketplace item_type must match the stored creation type.");
   }
-  const achievements = (Array.isArray(body.achievements) ? body.achievements : splitList(body.achievements))
-    .map((value) => String(value || "").replaceAll("\0", "").trim().slice(0, 180))
-    .filter(Boolean)
-    .slice(0, 8);
-  const rawProofs = Array.isArray(body.proofs) ? body.proofs : [];
-  const proofs = rawProofs.slice(0, 8).map((proof, index) => {
-    const title = String(proof?.title || "").replaceAll("\0", "").trim().slice(0, 120);
-    const url = normalizeOptionalWebUrl(proof?.url, `proofs[${index}].url`);
-    if (!title || !url) throwStatus(400, "Each proof requires a title and HTTPS URL.");
-    return { title, url };
-  });
+  const retiredFields = ["achievements", "proofs", "version", "license"]
+    .filter((field) => field in body);
+  if (retiredFields.length) {
+    throwStatus(400, "Marketplace publishing accepts only an agent description.");
+  }
+  const description = String(body.description || body.summary || agent.capability || "")
+    .replaceAll("\0", "")
+    .trim()
+    .slice(0, 1200);
+  if (!description) throwStatus(400, "Agent description is required.");
   const now = nowIso();
   return {
     published: true,
+    listing_id: agent.marketplace?.listing_id || makeId("listing"),
     item_type: itemType,
-    summary: String(body.summary || agent.capability || "").replaceAll("\0", "").trim().slice(0, 500),
-    achievements,
-    proofs,
-    version: String(body.version || agent.marketplace?.version || "1.0").trim().slice(0, 40),
-    license: String(body.license || agent.license || agent.marketplace?.license || "Unspecified").trim().slice(0, 80),
+    description,
+    snapshot: marketplaceAgentSnapshot(agent),
+    published_by: agent.marketplace?.published_by || req.auth.user_id,
+    updated_by: req.auth.user_id,
     published_at: agent.marketplace?.published_at || now,
     updated_at: now
   };
 }
 
+function marketplaceRatingMatches(rating = {}, agent = {}) {
+  const listingId = marketplaceListingId(agent);
+  return rating.listing_id
+    ? String(rating.listing_id) === listingId
+    : String(rating.agent_id || "") === String(agent.id || "");
+}
+
 function marketplaceItemSummary(data, agent, req) {
-  const ratings = (data.marketplaceRatings || []).filter((rating) => rating.agent_id === agent.id);
+  const ratings = (data.marketplaceRatings || [])
+    .filter((rating) => marketplaceRatingMatches(rating, agent))
+    .filter((rating) => Number.isInteger(Number(rating.score)) && Number(rating.score) >= 1 && Number(rating.score) <= 5);
   const score = ratings.reduce((total, rating) => total + Number(rating.score || 0), 0);
   const averageRating = ratings.length ? Number((score / ratings.length).toFixed(2)) : 0;
-  const myRating = ratings.find((rating) => rating.created_by === req.auth?.user_id) || null;
+  const myRating = ratings.find((rating) =>
+    rating.created_by === req.auth?.user_id
+    && String(rating.workspace_id || "") === String(req.auth?.workspace_id || "")
+  ) || null;
+  const listingId = marketplaceListingId(agent);
+  const snapshot = publishedMarketplaceSnapshot(agent);
+  const workspaceCopy = data.agents.find((candidate) =>
+    candidate.enabled !== false
+    && candidate.marketplace_origin?.listing_id === listingId
+    && candidate.created_by === req.auth?.user_id
+    && String(candidate.workspace_id || "") === String(req.auth?.workspace_id || "")
+  ) || null;
   return {
     id: agent.id,
-    title: agent.title,
-    capability: agent.capability,
+    listing_id: listingId,
+    source_agent_id: agent.id,
+    title: snapshot.title,
+    capability: snapshot.capability,
     item_type: agentItemType(agent),
-    creator: agent.created_by || "Virenis",
-    version: agent.marketplace?.version || "1.0",
-    license: agent.marketplace?.license || agent.license || "Unspecified",
-    summary: agent.marketplace?.summary || agent.capability || "",
-    achievements: agent.marketplace?.achievements || [],
-    proofs: agent.marketplace?.proofs || [],
+    description: marketplaceDescription(agent),
+    publisher: { user_id: marketplacePublisherUserId(agent) },
+    published_by: marketplacePublisherUserId(agent),
     published_at: agent.marketplace?.published_at || null,
     updated_at: agent.marketplace?.updated_at || null,
     rating_average: averageRating,
     rating_count: ratings.length,
-    my_rating: myRating ? { score: myRating.score, review: myRating.review } : null,
-    reviews: ratings
-      .filter((rating) => rating.review)
-      .slice(-6)
-      .reverse()
-      .map((rating) => ({ score: rating.score, review: rating.review, created_at: rating.created_at })),
+    my_rating: myRating ? { score: Number(myRating.score) } : null,
+    workspace_copy: workspaceCopy ? { agent_id: workspaceCopy.id, title: workspaceCopy.title } : null,
+    can_copy: !isViewer(req),
     is_owner: isAdmin(req) || (
       agent.visibility === "private" &&
       agent.created_by === req.auth?.user_id &&
       String(agent.workspace_id || "") === String(req.auth?.workspace_id || "")
     )
   };
+}
+
+function marketplaceItemDetail(data, agent, req) {
+  return {
+    ...marketplaceItemSummary(data, agent, req),
+    agent: publishedMarketplaceSnapshot(agent)
+  };
+}
+
+function marketplaceCopyAgentId(data, sourceAgent, requestedId) {
+  if (requestedId !== undefined && requestedId !== null && String(requestedId).trim()) {
+    const requested = String(requestedId).trim();
+    if (data.agents.some((agent) => agent.id === requested)) {
+      throwStatus(409, "Agent id already exists.");
+    }
+    return requested;
+  }
+  const base = `${slugify(publishedMarketplaceSnapshot(sourceAgent).title).slice(0, 92)}_copy`;
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const candidate = `${base}_${crypto.randomBytes(4).toString("hex")}`.slice(0, 120);
+    if (!data.agents.some((agent) => agent.id === candidate)) return candidate;
+  }
+  throwStatus(409, "A unique copied-agent id could not be allocated. Try again.");
+}
+
+async function copyMarketplaceAgentToWorkspace({ store, req, sourceAgent, requestedId }) {
+  const snapshot = publishedMarketplaceSnapshot(sourceAgent);
+  const listingId = marketplaceListingId(sourceAgent);
+  const agentId = marketplaceCopyAgentId(store.read(), sourceAgent, requestedId);
+  const copied = normalizeAgentPayload({
+    id: agentId,
+    title: snapshot.title,
+    capability: snapshot.capability,
+    boundary: snapshot.boundary || "Follow the user's request and state relevant limitations.",
+    consumes: snapshot.consumes,
+    produces: snapshot.produces,
+    routing_cues: snapshot.routing_cues,
+    tools: snapshot.tools,
+    resources: [],
+    sources: [],
+    policies: snapshot.policies,
+    stage: snapshot.stage
+  });
+  Object.assign(copied, {
+    workspace_id: requestWorkspaceId(req),
+    visibility: "private",
+    created_by: req.auth.user_id,
+    last_edited_by: req.auth.user_id,
+    last_edited_at: nowIso(),
+    marketplace_origin: {
+      listing_id: listingId,
+      source_agent_id: sourceAgent.id,
+      publisher_user_id: marketplacePublisherUserId(sourceAgent),
+      copied_at: nowIso()
+    }
+  });
+
+  let runtimeCleanup = null;
+  try {
+    if (realRuntimeEnabled()) {
+      const auditContext = runtimeAuditContext(req);
+      const registrationId = `registration_${crypto.randomBytes(24).toString("hex")}`;
+      runtimeCleanup = { agentId, registrationId, auditContext, phase: "pending" };
+      const runtimeResult = await registerRuntimeAgent({
+        ...copied,
+        registration_id: registrationId,
+        audit_context: auditContext
+      });
+      if (runtimeResult.status === "unchanged" || runtimeResult.result?.status === "unchanged") {
+        runtimeCleanup = null;
+        throwStatus(409, "Agent id already exists.");
+      }
+      if (!runtimeAgentRegistrationWasCreated(runtimeResult)) {
+        const error = new Error("Runtime returned an unknown agent registration status.");
+        error.status = 502;
+        error.code = "runtime_agent_contract_invalid";
+        throw error;
+      }
+      runtimeCleanup.phase = "committed";
+      const runtimeAgent = stripRuntimeRegistrationMetadata(runtimeResult.agent || {});
+      const runtimeRegistrationAudit = validateRuntimeAgentRegistrationAudit(runtimeResult, {
+        agentId,
+        sourceText: "",
+        auditContext
+      });
+      const created = await store.mutate((data) => {
+        if (data.agents.some((agent) => agent.id === agentId)) {
+          throwStatus(409, "Agent id already exists.");
+        }
+        const stored = {
+          ...copied,
+          ...runtimeAgent,
+          workspace_id: copied.workspace_id,
+          visibility: "private",
+          created_by: copied.created_by,
+          marketplace_origin: copied.marketplace_origin,
+          ready: runtimeResult.ready ?? runtimeResult.result?.ready ?? true,
+          ...(runtimeRegistrationAudit ? {
+            runtime_registration_audit_binding: runtimeRegistrationAudit.binding,
+            runtime_registration_agent_spec: runtimeRegistrationAudit.agentSpec
+          } : {})
+        };
+        data.agents.push(stored);
+        appendAgentEvent(data, {
+          eventType: "agent.marketplace_copied",
+          agent: stored,
+          actor: req.auth,
+          details: { listing_id: listingId, source_agent_id: sourceAgent.id }
+        });
+        return stored;
+      });
+      runtimeCleanup = null;
+      return created;
+    }
+
+    return await store.mutate((data) => {
+      if (data.agents.some((agent) => agent.id === agentId)) {
+        throwStatus(409, "Agent id already exists.");
+      }
+      copied.ready = true;
+      data.agents.push(copied);
+      appendAgentEvent(data, {
+        eventType: "agent.marketplace_copied",
+        agent: copied,
+        actor: req.auth,
+        details: { listing_id: listingId, source_agent_id: sourceAgent.id }
+      });
+      return copied;
+    });
+  } catch (error) {
+    if (runtimeCleanup) {
+      const shouldCompensate = runtimeCleanup.phase === "committed"
+        || Number(error?.status || 0) >= 500
+        || !Number(error?.status || 0);
+      if (shouldCompensate) {
+        try {
+          const cleanup = await purgeRuntimeAgentRegistration(
+            runtimeCleanup.agentId,
+            runtimeCleanup.registrationId,
+            runtimeCleanup.auditContext
+          );
+          if (!runtimeAgentRegistrationWasPurged(cleanup)) {
+            const cleanupError = new Error("Runtime did not prove copied-agent cleanup.");
+            cleanupError.status = 502;
+            throw cleanupError;
+          }
+          error.runtime_agent_compensated = true;
+        } catch (cleanupError) {
+          const safeAbsent = runtimeCleanup.phase === "pending" && [404, 409].includes(Number(cleanupError?.status));
+          if (safeAbsent) {
+            error.runtime_agent_compensated = true;
+          } else {
+            error.runtime_agent_compensation_failed = true;
+          }
+        }
+      }
+    }
+    throw error;
+  }
 }
 
 function documentUploadIdentity({ requestedAgentId, title }) {

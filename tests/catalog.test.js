@@ -10,14 +10,14 @@ import {
 } from "../server/catalog.js";
 
 describe("active API-agent catalog", () => {
-  it("matches the Runtime manifest and contains no model-module lifecycle fields", () => {
+  it("keeps every built-in API agent in the dynamic Runtime manifest without model-module lifecycle fields", () => {
     const manifest = JSON.parse(
       fs.readFileSync(path.resolve("../../configs/router_agent_library.json"), "utf8")
     );
     const manifestAgents = manifest.agents || manifest.adapters;
 
-    expect(apiSeedAgents.map((agent) => agent.id).sort()).toEqual(
-      manifestAgents.map((agent) => agent.id).sort()
+    expect(manifestAgents.map((agent) => agent.id)).toEqual(
+      expect.arrayContaining(apiSeedAgents.map((agent) => agent.id))
     );
     expect(JSON.stringify(apiSeedAgents)).not.toMatch(/lora/i);
     for (const agent of apiSeedAgents) {

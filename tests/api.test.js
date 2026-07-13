@@ -1244,7 +1244,7 @@ describe("runtime and catalog", () => {
     expect(reenabled.body.inactive_agent_ids).not.toContain("legal_privacy_lora");
   });
 
-  it("publishes API agents with proofs and upserted ratings", async () => {
+  it("publishes description-only agent listings with star-only ratings", async () => {
     await request(app)
       .post("/api/agents")
       .send({
@@ -1270,11 +1270,16 @@ describe("runtime and catalog", () => {
       .post("/api/marketplace/items/market_clinical_agent")
       .send({
         item_type: "agent",
-        summary: "A patient-safe clinical rewriting agent.",
-        achievements: ["92% terminology preservation on a held-out set"],
-        proofs: [{ title: "Evaluation report", url: "https://example.com/evaluation" }],
-        version: "1.2",
-        license: "Apache-2.0"
+        description: "A patient-safe clinical rewriting agent.",
+        achievements: ["Retired field"]
+      })
+      .expect(400);
+
+    await request(app)
+      .post("/api/marketplace/items/market_clinical_agent")
+      .send({
+        item_type: "agent",
+        description: "A patient-safe clinical rewriting agent."
       })
       .expect(201);
 
@@ -1282,43 +1287,233 @@ describe("runtime and catalog", () => {
     const item = listed.body.items.find((entry) => entry.id === "market_clinical_agent");
     expect(item).toMatchObject({
       item_type: "agent",
-      version: "1.2",
+      description: "A patient-safe clinical rewriting agent.",
+      published_by: "user_local",
+      publisher: { user_id: "user_local" },
       rating_count: 0,
       rating_average: 0
     });
-    expect(item.proofs).toEqual([{ title: "Evaluation report", url: "https://example.com/evaluation" }]);
-    expect(item.achievements).toEqual(["92% terminology preservation on a held-out set"]);
+    expect(item.listing_id).toMatch(/^listing_/);
+    for (const retiredField of ["achievements", "proofs", "version", "license", "reviews"]) {
+      expect(item).not.toHaveProperty(retiredField);
+    }
 
-    const creatorSearch = await request(app)
-      .get(`/api/marketplace?q=${encodeURIComponent(item.creator)}`)
+    const publisherSearch = await request(app)
+      .get(`/api/marketplace?q=${encodeURIComponent(item.published_by)}`)
       .expect(200);
-    expect(creatorSearch.body.items.some((entry) => entry.id === "market_clinical_agent")).toBe(true);
+    expect(publisherSearch.body.items.some((entry) => entry.id === "market_clinical_agent")).toBe(true);
+
+    const detail = await request(app)
+      .get("/api/marketplace/items/market_clinical_agent")
+      .expect(200);
+    expect(detail.body.agent).toMatchObject({
+      schema_version: "virenis-marketplace-agent-v1",
+      title: "Clinical language agent",
+      capability: "Rewrites technical clinical language for patients.",
+      boundary: "Preserve clinical meaning and state uncertainty."
+    });
+
+    await request(app)
+      .post("/api/marketplace/items/market_clinical_agent/ratings")
+      .send({ score: 4, review: "Strong terminology preservation." })
+      .expect(400);
 
     const firstRating = await request(app)
       .post("/api/marketplace/items/market_clinical_agent/ratings")
-      .send({ score: 4, review: "Strong terminology preservation." })
+      .send({ score: 4 })
       .expect(201);
     expect(firstRating.body).toMatchObject({ rating_average: 4, rating_count: 1 });
 
     const updatedRating = await request(app)
       .post("/api/marketplace/items/market_clinical_agent/ratings")
-      .send({ score: 5, review: "Excellent after broader testing." })
-      .expect(201);
+      .send({ score: 5 })
+      .expect(200);
     expect(updatedRating.body).toMatchObject({ rating_average: 5, rating_count: 1 });
-    expect(updatedRating.body.my_rating).toEqual({ score: 5, review: "Excellent after broader testing." });
-    expect(updatedRating.body.reviews).toEqual([
-      expect.objectContaining({ score: 5, review: "Excellent after broader testing." })
-    ]);
+    expect(updatedRating.body.my_rating).toEqual({ score: 5 });
+    expect(updatedRating.body).not.toHaveProperty("reviews");
 
     await request(app)
       .post("/api/marketplace/items/market_clinical_agent/ratings")
-      .send({ score: 6, review: "Invalid score." })
+      .send({ score: 6 })
       .expect(400);
+  });
 
-    await request(app)
-      .post("/api/marketplace/items/market_clinical_agent")
-      .send({ proofs: [{ title: "Unsafe link", url: "http://example.com/report" }] })
-      .expect(400);
+  it("copies a published agent into an isolated user workspace with listing provenance", async () => {
+    const previousTokens = process.env.APP_API_TOKENS_JSON;
+    process.env.APP_API_TOKENS_JSON = JSON.stringify({
+      market_alice: { user_id: "alice", workspace_id: "workspace_a", role: "user" },
+      market_bob: { user_id: "bob", workspace_id: "workspace_b", role: "user" }
+    });
+
+    try {
+      await request(app)
+        .post("/api/agents")
+        .set("Authorization", "Bearer market_alice")
+        .send({
+          id: "alice_shared_research_agent",
+          title: "Research briefing agent",
+          capability: "Turns broad questions into clear research briefs.",
+          boundary: "Separate verified facts from open questions.",
+          consumes: ["user_request", "document_context", "agent:alice_private_helper:output"],
+          produces: ["research_brief"],
+          routing_cues: ["research brief", "background summary"],
+          tools: ["web_search", "document_search", "document_read"],
+          resources: ["agent:alice_private_helper"],
+          source_text: "Alice-only terminology and private operating notes."
+        })
+        .expect(201);
+
+      const publication = await request(app)
+        .post("/api/marketplace/items/alice_shared_research_agent")
+        .set("Authorization", "Bearer market_alice")
+        .send({ description: "A reusable agent for producing clear research briefs." })
+        .expect(201);
+      expect(publication.body.publisher).toEqual({ user_id: "alice" });
+
+      const bobListing = await request(app)
+        .get("/api/marketplace/items/alice_shared_research_agent")
+        .set("Authorization", "Bearer market_bob")
+        .expect(200);
+      expect(bobListing.body).toMatchObject({
+        published_by: "alice",
+        workspace_copy: null,
+        can_copy: true
+      });
+      expect(bobListing.body.agent.exclusions).toEqual({
+        private_knowledge: true,
+        agent_connections: true
+      });
+      expect(bobListing.body.agent.consumes).toEqual(["user_request"]);
+      expect(bobListing.body.agent.tools).toEqual(["web_search"]);
+      expect(bobListing.body.agent).not.toHaveProperty("sources");
+      expect(bobListing.body.agent).not.toHaveProperty("resources");
+      expect(JSON.stringify(bobListing.body)).not.toContain("Alice-only terminology");
+
+      const copied = await request(app)
+        .post("/api/marketplace/items/alice_shared_research_agent/copy")
+        .set("Authorization", "Bearer market_bob")
+        .send({})
+        .expect(201);
+      expect(copied.body).toMatchObject({
+        ok: true,
+        status: "copied",
+        listing_id: publication.body.listing_id,
+        source_agent_id: "alice_shared_research_agent",
+        agent: {
+          workspace_id: "workspace_b",
+          visibility: "private",
+          created_by: "bob",
+          title: "Research briefing agent",
+          resources: [],
+          sources: [],
+          tools: ["web_search"],
+          marketplace_origin: {
+            listing_id: publication.body.listing_id,
+            source_agent_id: "alice_shared_research_agent",
+            publisher_user_id: "alice"
+          }
+        }
+      });
+      const copiedAgentId = copied.body.agent.id;
+      expect(copiedAgentId).not.toBe("alice_shared_research_agent");
+
+      const bobAgents = await request(app)
+        .get("/api/agents")
+        .set("Authorization", "Bearer market_bob")
+        .expect(200);
+      expect(bobAgents.body.agents.some((agent) => agent.id === copiedAgentId)).toBe(true);
+
+      const aliceAgents = await request(app)
+        .get("/api/agents")
+        .set("Authorization", "Bearer market_alice")
+        .expect(200);
+      expect(aliceAgents.body.agents.some((agent) => agent.id === copiedAgentId)).toBe(false);
+
+      await request(app)
+        .patch(`/api/agents/${copiedAgentId}`)
+        .set("Authorization", "Bearer market_alice")
+        .send({ title: "Alice cannot edit this copy" })
+        .expect(404);
+      await request(app)
+        .patch(`/api/agents/${copiedAgentId}`)
+        .set("Authorization", "Bearer market_bob")
+        .send({ title: "Bob's independent research agent" })
+        .expect(200);
+
+      const refreshed = await request(app)
+        .get("/api/marketplace")
+        .set("Authorization", "Bearer market_bob")
+        .expect(200);
+      expect(refreshed.body.items.find((item) => item.id === "alice_shared_research_agent").workspace_copy).toEqual({
+        agent_id: copiedAgentId,
+        title: "Bob's independent research agent"
+      });
+    } finally {
+      if (previousTokens === undefined) delete process.env.APP_API_TOKENS_JSON;
+      else process.env.APP_API_TOKENS_JSON = previousTokens;
+    }
+  });
+
+  it("migrates legacy marketplace fields without carrying reviews into the new listing contract", async () => {
+    await app.locals.store.mutate((data) => {
+      data.agents.push({
+        id: "legacy_marketplace_agent",
+        title: "Legacy marketplace agent",
+        capability: "Provides a useful shared workflow.",
+        boundary: "State limitations.",
+        enabled: true,
+        visibility: "global",
+        created_by: "legacy_publisher",
+        marketplace: {
+          published: true,
+          summary: "Legacy description",
+          achievements: ["Old achievement"],
+          proofs: [{ title: "Old proof", url: "https://example.com" }],
+          version: "2.0",
+          license: "Old license",
+          published_at: "2026-01-01T00:00:00.000Z"
+        }
+      });
+      data.marketplaceRatings.push({
+        rating_id: "legacy_rating",
+        agent_id: "legacy_marketplace_agent",
+        score: 4,
+        review: "This text must not survive migration.",
+        workspace_id: "workspace_default",
+        created_by: "user_local"
+      });
+    });
+    await app.locals.store.close();
+    app = await createApp({
+      dbPath: path.join(tmpDir, "db.json"),
+      uploadRoot: tmpDir
+    });
+
+    const stored = app.locals.store.read((data) => ({
+      agent: data.agents.find((agent) => agent.id === "legacy_marketplace_agent"),
+      rating: data.marketplaceRatings.find((rating) => rating.rating_id === "legacy_rating")
+    }));
+    expect(stored.agent.marketplace).toMatchObject({
+      description: "Legacy description",
+      published_by: "legacy_publisher"
+    });
+    expect(stored.agent.marketplace.listing_id).toMatch(/^listing_/);
+    for (const retiredField of ["summary", "achievements", "proofs", "version", "license"]) {
+      expect(stored.agent.marketplace).not.toHaveProperty(retiredField);
+    }
+    expect(stored.rating).not.toHaveProperty("review");
+
+    const listing = await request(app)
+      .get("/api/marketplace/items/legacy_marketplace_agent")
+      .expect(200);
+    expect(listing.body).toMatchObject({
+      description: "Legacy description",
+      published_by: "legacy_publisher",
+      rating_average: 4,
+      rating_count: 1,
+      my_rating: { score: 4 }
+    });
+    expect(JSON.stringify(listing.body)).not.toContain("This text must not survive migration.");
   });
 
   it("proxies real-mode agent detail, edits, and archive to the GPU runtime", async () => {
