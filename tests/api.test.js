@@ -109,6 +109,31 @@ describe("runtime and catalog", () => {
     expect(parentStep.depends_on).toContain(resourceStep.id);
   });
 
+  it("turns an Agent Studio handoff into an upstream execution step", () => {
+    const plan = planRoutes({
+      query: "@business_plan_agent create a textile business plan",
+      agents: [
+        {
+          id: "textile_agent",
+          title: "Textile Agent",
+          enabled: true
+        },
+        {
+          id: "business_plan_agent",
+          title: "Business Plan Agent",
+          consumes: ["agent:textile_agent:output"],
+          enabled: true
+        }
+      ],
+      maxRoutingAdapters: 2
+    });
+
+    const source = plan.steps.find((step) => step.adapter === "textile_agent");
+    const destination = plan.steps.find((step) => step.adapter === "business_plan_agent");
+    expect(source).toBeTruthy();
+    expect(destination.depends_on).toContain(source.id);
+  });
+
   it("excludes disabled and unmounted agents from the routing scope", () => {
     const session = { workspace_id: "workspace_a", created_by: "alice" };
     const context = scopedRoutingContext({

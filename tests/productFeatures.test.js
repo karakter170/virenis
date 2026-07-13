@@ -30,7 +30,7 @@ describe("Agent Studio product surfaces", () => {
   it("distinguishes agent bubbles by color without embedding icons", () => {
     const markup = renderToStaticMarkup(createElement(AgentGraph, {
       agents: [
-        { id: "research_agent", title: "Research agent", enabled: true },
+        { id: "research_agent", title: "Legacy LoRA Research", capability: "Uses an adapter model", enabled: true },
         { id: "finance_agent", title: "Finance agent", enabled: true }
       ],
       storageKey: ""
@@ -41,6 +41,7 @@ describe("Agent Studio product surfaces", () => {
     expect(new Set(graphButtons.map((match) => match[0].match(/tone-\d/)?.[0])).size).toBe(2);
     expect(graphButtons.every((match) => !match[1].includes("<svg"))).toBe(true);
     expect(markup).toContain("Connect agents");
+    expect(markup).not.toMatch(/LoRA|adapter model/i);
   });
 
   it("keeps the complete mounted agent catalog available to the session picker", () => {

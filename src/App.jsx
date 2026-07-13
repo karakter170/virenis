@@ -108,7 +108,15 @@ async function request(path, options) {
 function friendlyError(error) {
   return String(error?.message || error || "Something went wrong.")
     .replace(/TCAR/gi, "the service")
-    .replace(/vLLM/gi, "the model service");
+    .replace(/vLLM/gi, "the model service")
+    .replace(/LoRAs/gi, "agents")
+    .replace(/LoRA/gi, "agent")
+    .replace(/adapter models?/gi, "models")
+    .replace(/adapter id/gi, "agent id")
+    .replace(/adapter source/gi, "model source")
+    .replace(/adapters/gi, "agents")
+    .replace(/adapter/gi, "agent")
+    .replace(/_lora\b/gi, "");
 }
 
 export function availableSessionAgents(agents = []) {
@@ -1716,7 +1724,7 @@ function AgentCatalog({
               <div className="row-copy">
                 <strong>{formatAgentName(agent.id, agents)}</strong>
                 <span>{agentFacingText(agent.capability, "Custom agent")}</span>
-                <small>{archived ? "Archived" : runtimeOnly ? "Needs an owner" : agent.adapter_import_status === "pending_import" ? "Linked · awaiting runtime import" : pending ? "Preparing" : `${agent.session_active === false ? "Off in this chat" : "On in this chat"} · ${agent.visibility === "private" ? "Private" : agent.visibility === "team" ? "Team" : "Available"}`}</small>
+                <small>{archived ? "Archived" : runtimeOnly ? "Needs an owner" : agent.adapter_import_status === "pending_import" ? "Connected · preparing API access" : pending ? "Preparing" : `${agent.session_active === false ? "Off in this chat" : "On in this chat"} · ${agent.visibility === "private" ? "Private" : agent.visibility === "team" ? "Team" : "Available"}`}</small>
                 <RealityRank rank={agent.reality_rank} />
               </div>
               {runtimeOnly && auth?.is_admin && (
@@ -3135,7 +3143,7 @@ function AdoptionDialog({ auth, agent, onClose, onSaved }) {
         {error && <div className="form-error" role="alert">{error}</div>}
         <div className="adoption-agent">
           <UserPlus size={18} aria-hidden="true" />
-          <div><strong>{formatAgentName(agent.id, [agent])}</strong><code>{agent.id}</code></div>
+          <div><strong>{formatAgentName(agent.id, [agent])}</strong><small>Runtime agent</small></div>
         </div>
         <label>
           <span>Owner</span>

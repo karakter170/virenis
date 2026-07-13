@@ -29,16 +29,40 @@ export function planRoutes({ query, agents, documents = [], agentRankings = {}, 
   const steps = [];
   const idByAdapter = new Map();
   const selections = new Map();
+  const activeAdds = new Set();
   const specialistLimit = Math.max(1, Number(maxRoutingAdapters) || 12);
 
   const contains = (...terms) => terms.some((term) => lower.includes(term));
+  const wouldCreateCycle = (dependencyId, destinationId) => {
+    if (!dependencyId || !destinationId || dependencyId === destinationId) return true;
+    const downstream = new Map();
+    for (const step of steps) {
+      for (const dep of step.depends_on || []) {
+        if (!downstream.has(dep)) downstream.set(dep, new Set());
+        downstream.get(dep).add(step.id);
+      }
+    }
+    const pending = [destinationId];
+    const visited = new Set();
+    while (pending.length) {
+      const current = pending.pop();
+      if (current === dependencyId) return true;
+      if (visited.has(current)) continue;
+      visited.add(current);
+      pending.push(...(downstream.get(current) || []));
+    }
+    return false;
+  };
+  const safeDependencyIds = (destinationId, dependencyAdapters) => dependencyAdapters
+    .map((dep) => idByAdapter.get(dep))
+    .filter((dependencyId) => dependencyId && !wouldCreateCycle(dependencyId, destinationId));
   const addStep = (adapter, task, dependencyAdapters = [], selection = null, resourceSupport = false) => {
     if (!hasAgent(adapter)) {
       return undefined;
     }
     if (idByAdapter.has(adapter)) {
       const existing = steps.find((step) => step.adapter === adapter);
-      const dependencies = dependencyAdapters.map((dep) => idByAdapter.get(dep)).filter(Boolean);
+      const dependencies = safeDependencyIds(existing.id, dependencyAdapters);
       existing.depends_on = [...new Set([...(existing.depends_on || []), ...dependencies])].filter((id) => id !== existing.id);
       return idByAdapter.get(adapter);
     }
@@ -47,7 +71,7 @@ export function planRoutes({ query, agents, documents = [], agentRankings = {}, 
       return undefined;
     }
     const id = `s${steps.length + 1}`;
-    const depends_on = dependencyAdapters.map((dep) => idByAdapter.get(dep)).filter(Boolean);
+    const depends_on = safeDependencyIds(id, dependencyAdapters);
     steps.push({ id, adapter, task, depends_on, ...(resourceSupport ? { resource_support: true } : {}) });
     idByAdapter.set(adapter, id);
     if (selection) {
@@ -58,8 +82,10 @@ export function planRoutes({ query, agents, documents = [], agentRankings = {}, 
 
   const add = (adapter, task, dependencyAdapters = [], selection = null) => {
     const agent = enabled.find((candidate) => candidate.id === adapter);
+    if (!agent || activeAdds.has(adapter)) return idByAdapter.get(adapter);
+    activeAdds.add(adapter);
     const resourceAgents = (agent?.resources || [])
-      .map((value) => String(value || "").match(/^agent:([a-z0-9_]+_lora)$/)?.[1])
+      .map((value) => String(value || "").match(/^agent:([a-z0-9_]+)$/)?.[1])
       .filter((resourceAgentId) => resourceAgentId && resourceAgentId !== adapter && hasAgent(resourceAgentId));
     for (const resourceAgentId of resourceAgents) {
       addStep(
@@ -70,7 +96,23 @@ export function planRoutes({ query, agents, documents = [], agentRankings = {}, 
         true
       );
     }
-    return addStep(adapter, task, [...new Set([...resourceAgents, ...dependencyAdapters])], selection);
+    const handoffAgents = (agent?.consumes || [])
+      .map((value) => String(value || "").match(/^agent:([a-z0-9_]+):output$/)?.[1])
+      .filter((handoffAgentId) => handoffAgentId && handoffAgentId !== adapter && hasAgent(handoffAgentId));
+    for (const handoffAgentId of handoffAgents) {
+      add(
+        handoffAgentId,
+        `Prepare the upstream work required by ${agent?.title || adapter}.`
+      );
+    }
+    const result = addStep(
+      adapter,
+      task,
+      [...new Set([...resourceAgents, ...handoffAgents, ...dependencyAdapters])],
+      selection
+    );
+    activeAdds.delete(adapter);
+    return result;
   };
 
   for (const agent of resolveExplicitAgentMentions(query, enabled)) {
