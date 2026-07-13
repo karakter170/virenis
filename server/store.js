@@ -48,6 +48,7 @@ function initialData(seedAgents) {
     outcomeContracts: [],
     agentEvents: [],
     runtimeLifecycleIntents: [],
+    marketplaceRatings: [],
     agents: clone(seedAgents),
     documents: [],
     validationRuns: []

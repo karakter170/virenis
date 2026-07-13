@@ -283,7 +283,7 @@ async function synthesizeAnswer({ query, sharedMemory, expertOutputs, options, c
         ].filter(Boolean).join("\n\n")
       }
     ],
-    maxTokens: boundedInteger(options.refiner_max_tokens, 512, 64, 8192),
+    maxTokens: boundedInteger(options.refiner_max_tokens, 384, 64, 8192),
     temperature: boundedNumber(options.temperature, 0, 0, 2),
     vllmRequest
   });

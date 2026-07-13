@@ -386,7 +386,8 @@ export async function createApp({
         created_at: now,
         updated_at: now,
         last_message_at: now,
-        shared_memory: []
+        shared_memory: [],
+        inactive_agent_ids: []
       };
       await store.mutate((data) => {
         data.sessions.unshift(session);
@@ -417,6 +418,41 @@ export async function createApp({
         visibility: session.visibility
       }));
     res.json({ sessions, total: visibleSessions.length, limit, offset });
+  });
+
+  app.patch("/api/chat/sessions/:session_id/agents/:agent_id", async (req, res, next) => {
+    try {
+      if (typeof req.body?.active !== "boolean") {
+        throwStatus(400, "active must be a boolean.");
+      }
+      const snapshot = store.read();
+      const session = findAccessibleSession(snapshot, req.params.session_id, req);
+      assertSessionMutationAccess(session, req);
+      const agent = snapshot.agents.find((item) => item.id === req.params.agent_id);
+      if (!agent || !agentVisibleToRequest(agent, req) || !agentAvailableForSession(agent, session.session_id)) {
+        throwStatus(404, "Agent not found.");
+      }
+      if (req.body.active && (agent.enabled === false || agent.mounted === false)) {
+        throwStatus(409, "This agent is not currently available.");
+      }
+      const updated = await store.mutate((data) => {
+        const mutableSession = data.sessions.find((item) => item.session_id === session.session_id);
+        const inactive = new Set(Array.isArray(mutableSession.inactive_agent_ids) ? mutableSession.inactive_agent_ids : []);
+        if (req.body.active) inactive.delete(agent.id);
+        else inactive.add(agent.id);
+        mutableSession.inactive_agent_ids = [...inactive].sort();
+        mutableSession.updated_at = nowIso();
+        return {
+          session_id: mutableSession.session_id,
+          agent_id: agent.id,
+          active: !inactive.has(agent.id),
+          inactive_agent_ids: mutableSession.inactive_agent_ids
+        };
+      });
+      res.json(updated);
+    } catch (error) {
+      next(error);
+    }
   });
 
   app.get("/api/chat/sessions/:session_id", (req, res, next) => {
@@ -931,6 +967,10 @@ export async function createApp({
       .slice(offset, offset + limit)
       .map((agent) => ({
         ...agent,
+        item_type: agentItemType(agent),
+        session_active: requestedSession
+          ? !new Set(requestedSession.inactive_agent_ids || []).has(agent.id)
+          : agent.enabled !== false && agent.mounted !== false,
         agent_revision: agentRevision(agent),
         reality_rank: realityRankForAgent(data, {
           agent,
@@ -947,6 +987,109 @@ export async function createApp({
       }))
       .map((agent) => redactAgentForRequest(agent, req));
       res.json({ agents, total: visibleAgents.length, limit, offset });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/api/marketplace", (req, res, next) => {
+    try {
+      const data = store.read();
+      const q = String(req.query.q || "").trim().toLowerCase();
+      const itemType = String(req.query.type || "").trim().toLowerCase();
+      if (itemType && !["agent", "lora"].includes(itemType)) {
+        throwStatus(400, "type must be agent or lora.");
+      }
+      const items = data.agents
+        .filter((agent) => agent.enabled !== false && agent.marketplace?.published === true)
+        .filter((agent) => !itemType || agentItemType(agent) === itemType)
+        .filter((agent) => !q || `${agent.title || ""} ${agent.capability || ""} ${agent.created_by || "Virenis"} ${(agent.marketplace?.achievements || []).join(" ")}`.toLowerCase().includes(q))
+        .map((agent) => marketplaceItemSummary(data, agent, req))
+        .sort((left, right) => right.rating_average - left.rating_average
+          || right.rating_count - left.rating_count
+          || String(right.published_at || "").localeCompare(String(left.published_at || "")));
+      res.json({ items, total: items.length });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/marketplace/items/:agent_id", async (req, res, next) => {
+    try {
+      const current = store.read().agents.find((agent) => agent.id === req.params.agent_id);
+      assertAgentMutationAccess(current, req);
+      if (!current || current.enabled === false) throwStatus(404, "Agent not found.");
+      const marketplace = normalizeMarketplacePayload(req.body, current);
+      const updated = await store.mutate((data) => {
+        const agent = data.agents.find((item) => item.id === current.id);
+        agent.item_type = marketplace.item_type;
+        agent.marketplace = marketplace;
+        agent.last_edited_by = req.auth.user_id;
+        agent.last_edited_at = nowIso();
+        appendAgentEvent(data, {
+          eventType: "agent.marketplace_published",
+          agent,
+          actor: req.auth,
+          details: { item_type: marketplace.item_type, proof_count: marketplace.proofs.length }
+        });
+        return agent;
+      });
+      res.status(current.marketplace?.published ? 200 : 201).json(marketplaceItemSummary(store.read(), updated, req));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.delete("/api/marketplace/items/:agent_id", async (req, res, next) => {
+    try {
+      const current = store.read().agents.find((agent) => agent.id === req.params.agent_id);
+      assertAgentMutationAccess(current, req);
+      if (!current?.marketplace?.published) throwStatus(404, "Marketplace item not found.");
+      await store.mutate((data) => {
+        const agent = data.agents.find((item) => item.id === current.id);
+        agent.marketplace = { ...agent.marketplace, published: false, unpublished_at: nowIso() };
+        return agent;
+      });
+      res.json({ ok: true, agent_id: current.id, published: false });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/marketplace/items/:agent_id/ratings", async (req, res, next) => {
+    try {
+      const score = Number(req.body?.score);
+      if (!Number.isInteger(score) || score < 1 || score > 5) {
+        throwStatus(400, "score must be an integer from 1 to 5.");
+      }
+      const review = String(req.body?.review || "").replaceAll("\0", "").trim().slice(0, 1000);
+      const snapshot = store.read();
+      const item = snapshot.agents.find((agent) => agent.id === req.params.agent_id && agent.enabled !== false && agent.marketplace?.published === true);
+      if (!item) throwStatus(404, "Marketplace item not found.");
+      await store.mutate((data) => {
+        data.marketplaceRatings = Array.isArray(data.marketplaceRatings) ? data.marketplaceRatings : [];
+        const existing = data.marketplaceRatings.find((rating) => rating.agent_id === item.id && rating.created_by === req.auth.user_id);
+        const now = nowIso();
+        if (existing) {
+          existing.score = score;
+          existing.review = review;
+          existing.updated_at = now;
+          return existing;
+        }
+        const rating = {
+          rating_id: makeId("rating"),
+          agent_id: item.id,
+          score,
+          review,
+          workspace_id: req.auth.workspace_id,
+          created_by: req.auth.user_id,
+          created_at: now,
+          updated_at: now
+        };
+        data.marketplaceRatings.push(rating);
+        return rating;
+      });
+      res.status(201).json(marketplaceItemSummary(store.read(), item, req));
     } catch (error) {
       next(error);
     }
@@ -1168,8 +1311,14 @@ export async function createApp({
           throw error;
         }
         runtimeRegistrationCleanup.phase = "committed";
-        const requiresReload = Boolean(runtimeResult.requires_vllm_reload);
-        const mounted = runtimeResult.mounted ?? runtimeResult.result?.mounted ?? !requiresReload;
+        const linkedAdapterImported = agent.item_type !== "lora"
+          || runtimeResult.adapter_imported === true
+          || runtimeResult.result?.adapter_imported === true
+          || runtimeResult.agent?.adapter_import_status === "imported";
+        const runtimeRequiresReload = Boolean(runtimeResult.requires_vllm_reload);
+        const mounted = linkedAdapterImported
+          && (runtimeResult.mounted ?? runtimeResult.result?.mounted ?? !runtimeRequiresReload);
+        const requiresReload = !linkedAdapterImported || runtimeRequiresReload;
         const runtimeAgent = stripRuntimeRegistrationMetadata(runtimeResult.agent || {});
         const runtimeRegistrationAudit = validateRuntimeAgentRegistrationAudit(runtimeResult, {
           agentId: agent.id,
@@ -1189,6 +1338,9 @@ export async function createApp({
             created_by: agent.created_by,
             mounted,
             requires_vllm_reload: requiresReload,
+            ...(agent.item_type === "lora" ? {
+              adapter_import_status: linkedAdapterImported ? "imported" : "pending_import"
+            } : {}),
             ...(runtimeRegistrationAudit ? {
               runtime_registration_audit_binding: runtimeRegistrationAudit.binding,
               runtime_registration_agent_spec: runtimeRegistrationAudit.agentSpec
@@ -1226,14 +1378,15 @@ export async function createApp({
         if (sourceText) {
           agent.source_text_internal = sourceText;
         }
-        agent.mounted = true;
-        agent.requires_vllm_reload = false;
+        agent.mounted = agent.item_type !== "lora";
+        agent.requires_vllm_reload = agent.item_type === "lora";
+        if (agent.item_type === "lora") agent.adapter_import_status = "pending_import";
         data.agents.push(agent);
         appendAgentEvent(data, {
           eventType: "agent.created",
           agent,
           actor: req.auth,
-          details: { mounted: true, requires_vllm_reload: false }
+          details: { mounted: agent.mounted, requires_vllm_reload: agent.requires_vllm_reload }
         });
         return agent;
       });
@@ -1246,8 +1399,9 @@ export async function createApp({
         manifest: "configs/tcar_lora_library.json",
         adapter_path: agent.adapter_path,
         skill_path: agent.skill_path,
-        mounted: true,
-        requires_vllm_reload: false
+        mounted: agent.mounted,
+        requires_vllm_reload: agent.requires_vllm_reload,
+        ...(agent.item_type === "lora" ? { adapter_import_status: agent.adapter_import_status } : {})
       }, req));
     } catch (error) {
       if (runtimeRegistrationCleanup) {
@@ -1296,6 +1450,11 @@ export async function createApp({
         throwStatus(409, "Adopt the runtime-only agent before editing it through virenis.");
       }
       const patch = normalizeAgentPatchPayload(req.body);
+      const resultingItemType = patch.item_type || agentItemType(localAgent);
+      const resultingAdapterSource = patch.adapter_source ?? localAgent?.adapter_source;
+      if (resultingItemType === "lora" && localAgent?.base_lora !== true && !resultingAdapterSource) {
+        throwStatus(400, "LoRA items require an HTTPS adapter_source URL.");
+      }
       if (localAgent?.document && patch.source_text !== undefined) {
         throwStatus(400, "Document agent knowledge must be updated by registering a new document version.");
       }
@@ -2423,8 +2582,8 @@ function durableChatOptions(run, suppliedOptions) {
     planner_mode: run.planner_mode || process.env.TCAR_PLANNER_MODE || "cue",
     parallel_workers: Number(run.parallel_workers) || Number(process.env.TCAR_PARALLEL_WORKERS || 2),
     max_routing_adapters: Number(run.max_routing_adapters) || Number(process.env.TCAR_MAX_ROUTING_ADAPTERS || 12),
-    max_tokens: Number(process.env.TCAR_MAX_TOKENS || 512),
-    refiner_max_tokens: Number(process.env.TCAR_REFINER_MAX_TOKENS || 768),
+    max_tokens: Number(process.env.TCAR_MAX_TOKENS || 256),
+    refiner_max_tokens: Number(process.env.TCAR_REFINER_MAX_TOKENS || 384),
     temperature: Number(process.env.TCAR_TEMPERATURE || 0)
   };
 }
@@ -3023,6 +3182,17 @@ function assertAgentMutationAccess(agent, req) {
     agent.created_by !== req.auth?.user_id
   ) {
     throwStatus(404, "Agent not found.");
+  }
+}
+
+function assertSessionMutationAccess(session, req) {
+  if (isAdmin(req)) return;
+  if (
+    !session ||
+    String(session.workspace_id || "") !== String(req.auth?.workspace_id || "") ||
+    session.created_by !== req.auth?.user_id
+  ) {
+    throwStatus(404, "Chat session not found.");
   }
 }
 
@@ -4137,8 +4307,8 @@ function normalizeChatOptions(options = {}) {
     planner_max_tokens: boundedInt(options.planner_max_tokens, Number(process.env.TCAR_PLANNER_MAX_TOKENS || 384), 32, Number(process.env.TCAR_CLIENT_MAX_PLANNER_TOKENS || 512)),
     max_routing_adapters: boundedInt(options.max_routing_adapters, Number(process.env.TCAR_MAX_ROUTING_ADAPTERS || 12), 1, Number(process.env.TCAR_CLIENT_MAX_ROUTING_ADAPTERS || 24)),
     parallel_workers: boundedInt(options.parallel_workers, Number(process.env.TCAR_PARALLEL_WORKERS || 2), 1, Number(process.env.TCAR_CLIENT_MAX_PARALLEL_WORKERS || 4)),
-    max_tokens: boundedInt(options.max_tokens, Number(process.env.TCAR_MAX_TOKENS || 512), 16, Number(process.env.TCAR_CLIENT_MAX_TOKENS || 512)),
-    refiner_max_tokens: boundedInt(options.refiner_max_tokens, Number(process.env.TCAR_REFINER_MAX_TOKENS || 768), 32, Number(process.env.TCAR_CLIENT_MAX_REFINER_TOKENS || 1024)),
+    max_tokens: boundedInt(options.max_tokens, Number(process.env.TCAR_MAX_TOKENS || 256), 16, Number(process.env.TCAR_CLIENT_MAX_TOKENS || 512)),
+    refiner_max_tokens: boundedInt(options.refiner_max_tokens, Number(process.env.TCAR_REFINER_MAX_TOKENS || 384), 32, Number(process.env.TCAR_CLIENT_MAX_REFINER_TOKENS || 1024)),
     temperature: boundedFloat(options.temperature, Number(process.env.TCAR_TEMPERATURE || 0), 0, Number(process.env.TCAR_CLIENT_MAX_TEMPERATURE || 1))
   };
 }
@@ -4466,6 +4636,11 @@ function normalizeAgentPayload(body) {
     }
   }
   const now = nowIso();
+  const itemType = body.item_type === "lora" ? "lora" : "agent";
+  const adapterSource = itemType === "lora" ? normalizeOptionalWebUrl(body.adapter_source, "adapter_source") : "";
+  if (itemType === "lora" && !adapterSource) {
+    throwStatus(400, "LoRA items require an HTTPS adapter_source URL.");
+  }
   return {
     id,
     title: cleanTitle(body.title),
@@ -4484,6 +4659,13 @@ function normalizeAgentPayload(body) {
     adapter_path: `adapters/dummy_tcar_loras/${id}`,
     contract_version: "tcar-agent-v1",
     policies: body.policies && typeof body.policies === "object" ? body.policies : {},
+    item_type: itemType,
+    ...(itemType === "lora" ? {
+      base_model: String(body.base_model || BASE_MODEL).trim().slice(0, 120),
+      adapter_source: adapterSource,
+      trigger_words: splitList(body.trigger_words).slice(0, 20),
+      license: String(body.license || "Unspecified").trim().slice(0, 80)
+    } : {}),
     enabled: true,
     mounted: false,
     requires_vllm_reload: true,
@@ -4493,13 +4675,13 @@ function normalizeAgentPayload(body) {
 }
 
 function normalizeAgentPatchPayload(body = {}) {
-  const allowed = ["title", "capability", "boundary", "consumes", "produces", "routing_cues", "resources", "sources", "tools", "policies", "stage", "enabled", "source_text"];
+  const allowed = ["title", "capability", "boundary", "consumes", "produces", "routing_cues", "resources", "sources", "tools", "policies", "stage", "enabled", "source_text", "item_type", "base_model", "adapter_source", "trigger_words", "license"];
   const patch = {};
   for (const key of allowed) {
     if (!(key in body)) {
       continue;
     }
-    if (["consumes", "produces", "routing_cues", "resources", "sources", "tools"].includes(key)) {
+    if (["consumes", "produces", "routing_cues", "resources", "sources", "tools", "trigger_words"].includes(key)) {
       patch[key] = splitList(body[key]);
       if (["consumes", "produces", "routing_cues"].includes(key) && patch[key].length === 0) {
         throwStatus(400, `${key} must contain at least one value.`);
@@ -4509,6 +4691,15 @@ function normalizeAgentPatchPayload(body = {}) {
           assertSafeSourcePath(sourcePath);
         }
       }
+      continue;
+    }
+    if (key === "item_type") {
+      if (!["agent", "lora"].includes(body.item_type)) throwStatus(400, "item_type must be agent or lora.");
+      patch.item_type = body.item_type;
+      continue;
+    }
+    if (key === "adapter_source") {
+      patch.adapter_source = normalizeOptionalWebUrl(body.adapter_source, "adapter_source");
       continue;
     }
     if (["title", "capability", "boundary"].includes(key)) {
@@ -4547,6 +4738,90 @@ function normalizeAgentPatchPayload(body = {}) {
     throwStatus(400, "No editable agent fields were provided.");
   }
   return patch;
+}
+
+function normalizeOptionalWebUrl(value, fieldName = "url") {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  if (raw.length > 500) throwStatus(400, `${fieldName} is too long.`);
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throwStatus(400, `${fieldName} must be a valid HTTPS URL.`);
+  }
+  if (parsed.protocol !== "https:") throwStatus(400, `${fieldName} must be a valid HTTPS URL.`);
+  return parsed.toString();
+}
+
+function agentItemType(agent = {}) {
+  if (["agent", "lora"].includes(agent.item_type)) return agent.item_type;
+  if (["agent", "lora"].includes(agent.marketplace?.item_type)) return agent.marketplace.item_type;
+  return agent.base_lora === true ? "lora" : "agent";
+}
+
+function normalizeMarketplacePayload(body = {}, agent = {}) {
+  const itemType = agentItemType(agent);
+  if (body.item_type && body.item_type !== itemType) {
+    throwStatus(400, "Marketplace item_type must match the stored creation type.");
+  }
+  const achievements = (Array.isArray(body.achievements) ? body.achievements : splitList(body.achievements))
+    .map((value) => String(value || "").replaceAll("\0", "").trim().slice(0, 180))
+    .filter(Boolean)
+    .slice(0, 8);
+  const rawProofs = Array.isArray(body.proofs) ? body.proofs : [];
+  const proofs = rawProofs.slice(0, 8).map((proof, index) => {
+    const title = String(proof?.title || "").replaceAll("\0", "").trim().slice(0, 120);
+    const url = normalizeOptionalWebUrl(proof?.url, `proofs[${index}].url`);
+    if (!title || !url) throwStatus(400, "Each proof requires a title and HTTPS URL.");
+    return { title, url };
+  });
+  const now = nowIso();
+  return {
+    published: true,
+    item_type: itemType,
+    summary: String(body.summary || agent.capability || "").replaceAll("\0", "").trim().slice(0, 500),
+    achievements,
+    proofs,
+    version: String(body.version || agent.marketplace?.version || "1.0").trim().slice(0, 40),
+    license: String(body.license || agent.license || agent.marketplace?.license || "Unspecified").trim().slice(0, 80),
+    published_at: agent.marketplace?.published_at || now,
+    updated_at: now
+  };
+}
+
+function marketplaceItemSummary(data, agent, req) {
+  const ratings = (data.marketplaceRatings || []).filter((rating) => rating.agent_id === agent.id);
+  const score = ratings.reduce((total, rating) => total + Number(rating.score || 0), 0);
+  const averageRating = ratings.length ? Number((score / ratings.length).toFixed(2)) : 0;
+  const myRating = ratings.find((rating) => rating.created_by === req.auth?.user_id) || null;
+  return {
+    id: agent.id,
+    title: agent.title,
+    capability: agent.capability,
+    item_type: agentItemType(agent),
+    creator: agent.created_by || "Virenis",
+    version: agent.marketplace?.version || "1.0",
+    license: agent.marketplace?.license || agent.license || "Unspecified",
+    summary: agent.marketplace?.summary || agent.capability || "",
+    achievements: agent.marketplace?.achievements || [],
+    proofs: agent.marketplace?.proofs || [],
+    published_at: agent.marketplace?.published_at || null,
+    updated_at: agent.marketplace?.updated_at || null,
+    rating_average: averageRating,
+    rating_count: ratings.length,
+    my_rating: myRating ? { score: myRating.score, review: myRating.review } : null,
+    reviews: ratings
+      .filter((rating) => rating.review)
+      .slice(-6)
+      .reverse()
+      .map((rating) => ({ score: rating.score, review: rating.review, created_at: rating.created_at })),
+    is_owner: isAdmin(req) || (
+      agent.visibility === "private" &&
+      agent.created_by === req.auth?.user_id &&
+      String(agent.workspace_id || "") === String(req.auth?.workspace_id || "")
+    )
+  };
 }
 
 function documentUploadIdentity({ requestedAgentId, title }) {

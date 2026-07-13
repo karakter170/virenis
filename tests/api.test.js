@@ -127,6 +127,24 @@ describe("runtime and catalog", () => {
     expect(context.agents.map((agent) => agent.id)).toEqual(["active_lora", "legacy_active_lora"]);
   });
 
+  it("honors session-only agent deactivation in the routing scope", () => {
+    const context = scopedRoutingContext({
+      session: {
+        session_id: "session_a",
+        workspace_id: "workspace_a",
+        created_by: "alice",
+        inactive_agent_ids: ["paused_lora"]
+      },
+      agents: [
+        { id: "paused_lora", enabled: true, mounted: true },
+        { id: "ready_lora", enabled: true, mounted: true }
+      ],
+      documents: []
+    });
+
+    expect(context.allowedAdapters).toEqual(["ready_lora"]);
+  });
+
   it("keeps chat-scoped document agents in their chat while reusing Knowledge agents", () => {
     const session = { session_id: "session_a", workspace_id: "workspace_a", created_by: "alice" };
     const context = scopedRoutingContext({
@@ -1116,6 +1134,116 @@ describe("runtime and catalog", () => {
     };
     await request(app).post("/api/agents").send(payload).expect(201);
     await request(app).post("/api/agents").send(payload).expect(409);
+  });
+
+  it("persists per-session agent activation without changing the global agent", async () => {
+    const first = await createSession("Focused route");
+    const second = await createSession("Independent route");
+
+    const disabled = await request(app)
+      .patch(`/api/chat/sessions/${first.session_id}/agents/legal_privacy_lora`)
+      .send({ active: false })
+      .expect(200);
+    expect(disabled.body).toMatchObject({
+      session_id: first.session_id,
+      agent_id: "legal_privacy_lora",
+      active: false
+    });
+
+    const firstAgents = await request(app).get(`/api/agents?session_id=${first.session_id}`).expect(200);
+    const secondAgents = await request(app).get(`/api/agents?session_id=${second.session_id}`).expect(200);
+    expect(firstAgents.body.agents.find((agent) => agent.id === "legal_privacy_lora").session_active).toBe(false);
+    expect(secondAgents.body.agents.find((agent) => agent.id === "legal_privacy_lora").session_active).toBe(true);
+
+    const firstSession = await request(app).get(`/api/chat/sessions/${first.session_id}`).expect(200);
+    expect(firstSession.body.inactive_agent_ids).toContain("legal_privacy_lora");
+
+    const queued = await request(app)
+      .post(`/api/chat/sessions/${first.session_id}/messages`)
+      .send({ content: "Review this consent notice for privacy and legal compliance." })
+      .expect(202);
+    const run = await waitForRun(queued.body.run_id);
+    expect(run.status).toBe("completed");
+    expect(run.plan.steps.map((step) => step.adapter)).not.toContain("legal_privacy_lora");
+
+    const reenabled = await request(app)
+      .patch(`/api/chat/sessions/${first.session_id}/agents/legal_privacy_lora`)
+      .send({ active: true })
+      .expect(200);
+    expect(reenabled.body.active).toBe(true);
+    expect(reenabled.body.inactive_agent_ids).not.toContain("legal_privacy_lora");
+  });
+
+  it("publishes existing agents and LoRAs with proofs and upserted ratings", async () => {
+    await request(app)
+      .post("/api/agents")
+      .send({
+        id: "market_clinical_lora",
+        title: "Clinical language adapter",
+        capability: "Rewrites technical clinical language for patients.",
+        boundary: "Preserve clinical meaning and state uncertainty.",
+        item_type: "lora",
+        base_model: "qwen36-awq",
+        adapter_source: "https://huggingface.co/example/clinical-adapter",
+        trigger_words: ["patient safe", "clinical summary"],
+        license: "Apache-2.0"
+      })
+      .expect(201);
+
+    await request(app)
+      .post("/api/marketplace/items/market_clinical_lora")
+      .send({
+        item_type: "lora",
+        summary: "A patient-safe clinical rewriting LoRA.",
+        achievements: ["92% terminology preservation on a held-out set"],
+        proofs: [{ title: "Evaluation report", url: "https://example.com/evaluation" }],
+        version: "1.2",
+        license: "Apache-2.0"
+      })
+      .expect(201);
+
+    const listed = await request(app).get("/api/marketplace?type=lora").expect(200);
+    const item = listed.body.items.find((entry) => entry.id === "market_clinical_lora");
+    expect(item).toMatchObject({
+      item_type: "lora",
+      version: "1.2",
+      rating_count: 0,
+      rating_average: 0
+    });
+    expect(item.proofs).toEqual([{ title: "Evaluation report", url: "https://example.com/evaluation" }]);
+    expect(item.achievements).toEqual(["92% terminology preservation on a held-out set"]);
+    expect(item.adapter_source).toBeUndefined();
+
+    const creatorSearch = await request(app)
+      .get(`/api/marketplace?q=${encodeURIComponent(item.creator)}`)
+      .expect(200);
+    expect(creatorSearch.body.items.some((entry) => entry.id === "market_clinical_lora")).toBe(true);
+
+    const firstRating = await request(app)
+      .post("/api/marketplace/items/market_clinical_lora/ratings")
+      .send({ score: 4, review: "Strong terminology preservation." })
+      .expect(201);
+    expect(firstRating.body).toMatchObject({ rating_average: 4, rating_count: 1 });
+
+    const updatedRating = await request(app)
+      .post("/api/marketplace/items/market_clinical_lora/ratings")
+      .send({ score: 5, review: "Excellent after broader testing." })
+      .expect(201);
+    expect(updatedRating.body).toMatchObject({ rating_average: 5, rating_count: 1 });
+    expect(updatedRating.body.my_rating).toEqual({ score: 5, review: "Excellent after broader testing." });
+    expect(updatedRating.body.reviews).toEqual([
+      expect.objectContaining({ score: 5, review: "Excellent after broader testing." })
+    ]);
+
+    await request(app)
+      .post("/api/marketplace/items/market_clinical_lora/ratings")
+      .send({ score: 6, review: "Invalid score." })
+      .expect(400);
+
+    await request(app)
+      .post("/api/marketplace/items/market_clinical_lora")
+      .send({ proofs: [{ title: "Unsafe link", url: "http://example.com/report" }] })
+      .expect(400);
   });
 
   it("proxies real-mode agent detail, edits, and archive to the GPU runtime", async () => {
@@ -2463,8 +2591,8 @@ describe("chat execution", () => {
       expect(chatBody.options.allowed_adapters).toContain("writing_synthesis_lora");
       expect(chatBody.options.allowed_adapters).toContain("finance_reasoning_lora");
       expect(chatBody.options.allowed_adapters).not.toContain("alice_private_manual_lora");
-      expect(chatBody.options.max_tokens).toBe(512);
-      expect(chatBody.options.refiner_max_tokens).toBe(768);
+      expect(chatBody.options.max_tokens).toBe(256);
+      expect(chatBody.options.refiner_max_tokens).toBe(384);
       expect(chatBody.query).toBe("Use @alice_private_manual if available, then preserve this mention.");
       expect(completedRun.sources).toHaveLength(1);
       expect(completedRun.sources[0]).toMatchObject({

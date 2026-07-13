@@ -31,6 +31,7 @@ import {
   Search,
   Settings2,
   Sparkles,
+  Star,
   SquarePen,
   Table2,
   Trash2,
@@ -107,8 +108,18 @@ async function request(path, options) {
 function friendlyError(error) {
   return String(error?.message || error || "Something went wrong.")
     .replace(/TCAR/gi, "the service")
-    .replace(/vLLM/gi, "the model service")
-    .replace(/LoRA/gi, "agent");
+    .replace(/vLLM/gi, "the model service");
+}
+
+function productType(agent) {
+  if (["agent", "lora"].includes(agent?.item_type)) return agent.item_type;
+  return agent?.base_lora === true ? "lora" : "agent";
+}
+
+export function availableSessionLoRAs(agents = []) {
+  return agents
+    .filter((agent) => productType(agent) === "lora" && agent.enabled !== false && agent.mounted !== false)
+    .filter((agent) => !agent.document && !agent.resource_for_agent_id);
 }
 
 function emptyMetrics() {
@@ -195,6 +206,7 @@ function Workspace({ onHome }) {
   const [chatDocuments, setChatDocuments] = useState([]);
   const [runtime, setRuntime] = useState(null);
   const [metrics, setMetrics] = useState(null);
+  const [marketplace, setMarketplace] = useState([]);
   const [auth, setAuth] = useState(null);
   const [runsById, setRunsById] = useState({});
   const [contractsById, setContractsById] = useState({});
@@ -218,6 +230,9 @@ function Workspace({ onHome }) {
   const [disputeContract, setDisputeContract] = useState(null);
   const [correctionContract, setCorrectionContract] = useState(null);
   const [mountingAgentId, setMountingAgentId] = useState("");
+  const [togglingAgentId, setTogglingAgentId] = useState("");
+  const [publishTarget, setPublishTarget] = useState(null);
+  const [ratingTarget, setRatingTarget] = useState(null);
   const [focusComposer, setFocusComposer] = useState(0);
   const threadRef = useRef(null);
   const nearBottomRef = useRef(true);
@@ -241,18 +256,20 @@ function Workspace({ onHome }) {
     setLoading(true);
     setError("");
     try {
-      const [me, sessionList, health, agentList, docList] = await Promise.all([
+      const [me, sessionList, health, agentList, docList, marketplaceList] = await Promise.all([
         api.get("/api/auth/me"),
         api.get("/api/chat/sessions"),
         api.get("/api/runtime/health"),
         api.get("/api/agents"),
-        api.get("/api/documents")
+        api.get("/api/documents"),
+        api.get("/api/marketplace")
       ]);
       const metricData = me.is_admin ? await api.get("/api/admin/metrics") : emptyMetrics();
       setAuth(me);
       setRuntime(health);
       setAgents(agentList.agents || []);
       setDocuments(docList.documents || []);
+      setMarketplace(marketplaceList.items || []);
       setMetrics(metricData);
       let nextSession = sessionList.sessions?.[0] || null;
       if (!nextSession && !me.is_viewer) {
@@ -271,12 +288,13 @@ function Workspace({ onHome }) {
     const agentPath = session?.session_id
       ? `/api/agents?session_id=${encodeURIComponent(session.session_id)}`
       : "/api/agents";
-    const [me, sessionList, agentList, docList, health] = await Promise.all([
+    const [me, sessionList, agentList, docList, health, marketplaceList] = await Promise.all([
       api.get("/api/auth/me"),
       api.get("/api/chat/sessions"),
       api.get(agentPath),
       api.get("/api/documents"),
-      api.get("/api/runtime/health")
+      api.get("/api/runtime/health"),
+      api.get("/api/marketplace")
     ]);
     const metricData = me.is_admin ? await api.get("/api/admin/metrics") : emptyMetrics();
     setAuth(me);
@@ -284,6 +302,7 @@ function Workspace({ onHome }) {
     setAgents(agentList.agents || []);
     setDocuments(docList.documents || []);
     setRuntime(health);
+    setMarketplace(marketplaceList.items || []);
     setMetrics(metricData);
   }
 
@@ -493,9 +512,32 @@ function Workspace({ onHome }) {
     }
   }
 
-  function openAgentEditor(agent = null) {
+  async function toggleAgentForSession(agent, active) {
+    if (!session?.session_id || !canWrite) return;
+    setTogglingAgentId(agent.id);
+    setError("");
+    try {
+      const result = await api.patch(
+        `/api/chat/sessions/${encodeURIComponent(session.session_id)}/agents/${encodeURIComponent(agent.id)}`,
+        { active }
+      );
+      setAgents((items) => items.map((item) => item.id === agent.id ? { ...item, session_active: result.active } : item));
+      setSession((current) => current ? { ...current, inactive_agent_ids: result.inactive_agent_ids } : current);
+    } catch (toggleError) {
+      setError(friendlyError(toggleError));
+    } finally {
+      setTogglingAgentId("");
+    }
+  }
+
+  function openAgentEditor(agent = null, kind = productType(agent)) {
     setResourcesOpen(false);
-    setAgentEditor(agent);
+    setAgentEditor({ agent, kind });
+  }
+
+  function openLoRAManager() {
+    setResourceView("loras");
+    setResourcesOpen(true);
   }
 
   function openAgentAdoption(agent) {
@@ -654,6 +696,9 @@ function Workspace({ onHome }) {
             sessionId={session?.session_id}
             canWrite={canWrite}
             focusRequest={focusComposer}
+            onOpenLoRAs={openLoRAManager}
+            onToggleAgent={toggleAgentForSession}
+            togglingAgentId={togglingAgentId}
           />
         </div>
       </main>
@@ -676,11 +721,15 @@ function Workspace({ onHome }) {
           documents={documents}
           runtime={runtime}
           metrics={metrics}
+          marketplace={marketplace}
+          sessionId={session?.session_id}
           initialView={resourceView}
           mountingAgentId={mountingAgentId}
+          togglingAgentId={togglingAgentId}
           onViewChange={setResourceView}
           onClose={() => setResourcesOpen(false)}
           onCreateAgent={() => openAgentEditor(null)}
+          onCreateLoRA={() => openAgentEditor(null, "lora")}
           onEditAgent={openAgentEditor}
           onAdoptAgent={openAgentAdoption}
           onArchiveAgent={(agent) => {
@@ -688,6 +737,15 @@ function Workspace({ onHome }) {
             setArchiveTarget(agent);
           }}
           onMountAgent={mountAgent}
+          onToggleAgent={toggleAgentForSession}
+          onPublish={(agent) => {
+            setResourcesOpen(false);
+            setPublishTarget(agent);
+          }}
+          onRate={(item) => {
+            setResourcesOpen(false);
+            setRatingTarget(item);
+          }}
           onAddKnowledge={openKnowledgeUpload}
           onDeleteKnowledge={(document) => {
             setResourcesOpen(false);
@@ -739,7 +797,8 @@ function Workspace({ onHome }) {
       {agentEditor !== undefined && (
         <AgentDialog
           auth={auth}
-          agent={agentEditor || null}
+          agent={agentEditor.agent || null}
+          kind={agentEditor.kind}
           agents={agents}
           documents={documents}
           onClose={() => setAgentEditor(undefined)}
@@ -748,6 +807,40 @@ function Workspace({ onHome }) {
             await refreshResources();
             setResourcesOpen(true);
             setResourceView("agents");
+          }}
+        />
+      )}
+
+      {publishTarget && (
+        <PublishDialog
+          agent={publishTarget}
+          onClose={() => {
+            setPublishTarget(null);
+            setResourcesOpen(true);
+            setResourceView("marketplace");
+          }}
+          onSaved={async () => {
+            setPublishTarget(null);
+            await refreshResources();
+            setResourcesOpen(true);
+            setResourceView("marketplace");
+          }}
+        />
+      )}
+
+      {ratingTarget && (
+        <RatingDialog
+          item={ratingTarget}
+          onClose={() => {
+            setRatingTarget(null);
+            setResourcesOpen(true);
+            setResourceView("marketplace");
+          }}
+          onSaved={async () => {
+            setRatingTarget(null);
+            await refreshResources();
+            setResourcesOpen(true);
+            setResourceView("marketplace");
           }}
         />
       )}
@@ -1189,12 +1282,18 @@ function Composer({
   agents,
   sessionId,
   canWrite,
-  focusRequest
+  focusRequest,
+  onOpenLoRAs,
+  onToggleAgent,
+  togglingAgentId
 }) {
   const inputRef = useRef(null);
   const listId = useId();
   const [mention, setMention] = useState(null);
   const [activeIndex, setActiveIndex] = useState(0);
+  const [loraMenuOpen, setLoRAMenuOpen] = useState(false);
+  const quickLoRAs = availableSessionLoRAs(agents);
+  const activeLoRACount = quickLoRAs.filter((agent) => agent.session_active !== false).length;
 
   const suggestions = useMemo(() => {
     if (!mention) return [];
@@ -1327,6 +1426,38 @@ function Composer({
       <IconButton label="Attach file to this chat" className="composer-control" onClick={onAttachFile} disabled={!canWrite || !sessionId}>
         <Paperclip size={19} />
       </IconButton>
+      <IconButton
+        label="Choose LoRAs for this chat"
+        className={`composer-control lora-trigger ${loraMenuOpen ? "active" : ""}`}
+        onClick={() => setLoRAMenuOpen((open) => !open)}
+        disabled={!sessionId}
+        aria-expanded={loraMenuOpen}
+      >
+        <Layers3 size={18} />
+        {activeLoRACount > 0 && <span className="composer-count" aria-hidden="true">{activeLoRACount}</span>}
+      </IconButton>
+      {loraMenuOpen && (
+        <div className="quick-lora-menu" aria-label="LoRAs active in this chat">
+          <div className="quick-menu-heading">
+            <span><strong>LoRAs for this chat</strong><small>Changes apply only to this session.</small></span>
+            <button type="button" onClick={() => { setLoRAMenuOpen(false); onOpenLoRAs(); }}>Manage</button>
+          </div>
+          <div className="quick-lora-list">
+            {quickLoRAs.map((agent) => (
+              <label key={agent.id}>
+                <span><strong>{formatAgentName(agent.id, agents)}</strong><small>{agent.capability || "LoRA adapter"}</small></span>
+                <input
+                  type="checkbox"
+                  checked={agent.session_active !== false}
+                  disabled={!canWrite || togglingAgentId === agent.id}
+                  onChange={(event) => onToggleAgent(agent, event.target.checked)}
+                />
+              </label>
+            ))}
+            {quickLoRAs.length === 0 && <p>No LoRAs are ready yet.</p>}
+          </div>
+        </div>
+      )}
       <label className="composer-input">
         <span className="sr-only">Message Virenis</span>
         <textarea
@@ -1367,15 +1498,22 @@ function ResourcesSheet({
   documents,
   runtime,
   metrics,
+  marketplace,
+  sessionId,
   initialView,
   mountingAgentId,
+  togglingAgentId,
   onViewChange,
   onClose,
   onCreateAgent,
+  onCreateLoRA,
   onEditAgent,
   onAdoptAgent,
   onArchiveAgent,
   onMountAgent,
+  onToggleAgent,
+  onPublish,
+  onRate,
   onAddKnowledge,
   onDeleteKnowledge,
   onRefresh
@@ -1387,10 +1525,13 @@ function ResourcesSheet({
     onViewChange(next);
   }
   return (
-    <ModalSurface title="Agents & knowledge" side="right" onClose={onClose}>
+    <ModalSurface title="Agent studio" description="Build, connect, and share specialized intelligence." side="right" onClose={onClose} className="resource-hub-sheet">
       <div className="sheet-body resource-sheet-body">
-        <div className="view-switch" aria-label="Resource view">
+        <div className="view-switch resource-nav" aria-label="Resource view">
           <button type="button" aria-pressed={view === "agents"} onClick={() => changeView("agents")}>Agents</button>
+          <button type="button" aria-pressed={view === "loras"} onClick={() => changeView("loras")}>LoRAs</button>
+          <button type="button" aria-pressed={view === "graph"} onClick={() => changeView("graph")}>Graph</button>
+          <button type="button" aria-pressed={view === "marketplace"} onClick={() => changeView("marketplace")}>Marketplace</button>
           <button type="button" aria-pressed={view === "knowledge"} onClick={() => changeView("knowledge")}>Knowledge</button>
           {auth?.is_admin && <button type="button" aria-pressed={view === "admin"} onClick={() => changeView("admin")}>Admin</button>}
         </div>
@@ -1405,6 +1546,41 @@ function ResourcesSheet({
             onAdopt={onAdoptAgent}
             onArchive={onArchiveAgent}
             onMount={onMountAgent}
+            onToggle={onToggleAgent}
+            onPublish={onPublish}
+            togglingAgentId={togglingAgentId}
+            sessionId={sessionId}
+            type="agent"
+          />
+        )}
+
+        {view === "loras" && (
+          <AgentCatalog
+            agents={agents}
+            auth={auth}
+            mountingAgentId={mountingAgentId}
+            onCreate={onCreateLoRA}
+            onEdit={(agent) => onEditAgent(agent, "lora")}
+            onAdopt={onAdoptAgent}
+            onArchive={onArchiveAgent}
+            onMount={onMountAgent}
+            onToggle={onToggleAgent}
+            onPublish={onPublish}
+            togglingAgentId={togglingAgentId}
+            sessionId={sessionId}
+            type="lora"
+          />
+        )}
+
+        {view === "graph" && <AgentGraph agents={agents} storageKey={`virenis:agent-graph:${auth?.workspace_id || "workspace"}`} />}
+
+        {view === "marketplace" && (
+          <MarketplacePanel
+            items={marketplace}
+            agents={agents}
+            auth={auth}
+            onPublish={onPublish}
+            onRate={onRate}
           />
         )}
 
@@ -1472,7 +1648,21 @@ function RealityRank({ rank }) {
   );
 }
 
-function AgentCatalog({ agents, auth, mountingAgentId, onCreate, onEdit, onAdopt, onArchive, onMount }) {
+function AgentCatalog({
+  agents,
+  auth,
+  mountingAgentId,
+  togglingAgentId,
+  sessionId,
+  type = "agent",
+  onCreate,
+  onEdit,
+  onAdopt,
+  onArchive,
+  onMount,
+  onToggle,
+  onPublish
+}) {
   const [query, setQuery] = useState("");
   const canWrite = !auth?.is_viewer;
   const canManage = (agent) => auth?.is_admin || (canWrite
@@ -1481,6 +1671,7 @@ function AgentCatalog({ agents, auth, mountingAgentId, onCreate, onEdit, onAdopt
     && agent.workspace_id === auth?.workspace_id);
   const filtered = agents
     .filter((agent) => !agent.document && !agent.resource_for_agent_id)
+    .filter((agent) => productType(agent) === type)
     .filter((agent) => !query || `${agent.title || ""} ${agent.capability || ""}`.toLowerCase().includes(query.toLowerCase()))
     .sort((left, right) => Number(canManage(right)) - Number(canManage(left))
       || String(left.title || left.id).localeCompare(String(right.title || right.id)));
@@ -1488,31 +1679,32 @@ function AgentCatalog({ agents, auth, mountingAgentId, onCreate, onEdit, onAdopt
     <section className="resource-section" aria-labelledby="agents-heading">
       <div className="section-heading">
         <div>
-          <h3 id="agents-heading">Agents</h3>
-          <p>Choose one in chat by typing @.</p>
+          <h3 id="agents-heading">{type === "lora" ? "LoRAs" : "Agents"}</h3>
+          <p>{type === "lora" ? "Adapter models available to this chat." : "Choose one in chat by typing @."}</p>
         </div>
-        <IconButton label="Create agent" onClick={onCreate} disabled={!canWrite}>
+        <IconButton label={type === "lora" ? "Add LoRA" : "Create agent"} onClick={onCreate} disabled={!canWrite}>
           <Plus size={18} />
         </IconButton>
       </div>
       <label className="search-field full-width">
         <Search size={17} aria-hidden="true" />
-        <span className="sr-only">Search agents</span>
-        <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search agents" />
+        <span className="sr-only">Search {type === "lora" ? "LoRAs" : "agents"}</span>
+        <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={`Search ${type === "lora" ? "LoRAs" : "agents"}`} />
       </label>
       <div className="flat-list agent-list">
         {filtered.map((agent) => {
           const runtimeOnly = agent.runtime_only === true;
           const archived = agent.enabled === false && agent.mount_pending !== true;
-          const pending = !archived && (agent.mount_pending === true || agent.mounted === false);
+          const pending = !archived && (agent.mount_pending === true || agent.mounted === false || agent.adapter_import_status === "pending_import");
           const manageable = !runtimeOnly && canManage(agent);
+          const sessionToggleable = canWrite && !runtimeOnly && !archived && !pending && Boolean(sessionId);
           return (
             <div className="agent-row" key={agent.id}>
               <span className={`status-dot ${archived ? "muted" : pending || runtimeOnly ? "pending" : "ready"}`} aria-hidden="true" />
               <div className="row-copy">
                 <strong>{formatAgentName(agent.id, agents)}</strong>
                 <span>{agent.capability || "Custom agent"}</span>
-                <small>{archived ? "Archived" : runtimeOnly ? "Needs an owner" : pending ? "Preparing" : agent.visibility === "private" ? "Private" : agent.visibility === "team" ? "Team" : "Available"}</small>
+                <small>{archived ? "Archived" : runtimeOnly ? "Needs an owner" : agent.adapter_import_status === "pending_import" ? "Linked · awaiting runtime import" : pending ? "Preparing" : `${agent.session_active === false ? "Off in this chat" : "On in this chat"} · ${agent.visibility === "private" ? "Private" : agent.visibility === "team" ? "Team" : "Available"}`}</small>
                 <RealityRank rank={agent.reality_rank} />
               </div>
               {runtimeOnly && auth?.is_admin && (
@@ -1522,27 +1714,339 @@ function AgentCatalog({ agents, auth, mountingAgentId, onCreate, onEdit, onAdopt
                   </IconButton>
                 </div>
               )}
-              {manageable && (
+              {(sessionToggleable || manageable) && (
                 <div className="row-actions">
-                  {pending && (
+                  {sessionToggleable && (
+                    <label className="session-switch" title={`${agent.session_active === false ? "Activate" : "Deactivate"} for this chat`}>
+                      <span className="sr-only">Active in this chat</span>
+                      <input
+                        type="checkbox"
+                        checked={agent.session_active !== false}
+                        disabled={togglingAgentId === agent.id}
+                        onChange={(event) => onToggle(agent, event.target.checked)}
+                      />
+                      <i aria-hidden="true" />
+                    </label>
+                  )}
+                  {manageable && pending && (
                     <IconButton label={`Retry ${agent.title || "agent"}`} compact onClick={() => onMount(agent)} disabled={mountingAgentId === agent.id}>
                       <RefreshCw className={mountingAgentId === agent.id ? "spin" : ""} size={16} />
                     </IconButton>
                   )}
-                  <IconButton label={`Edit ${agent.title || "agent"}`} compact onClick={() => onEdit(agent)} disabled={archived}>
+                  {manageable && <IconButton label={`Edit ${agent.title || "agent"}`} compact onClick={() => onEdit(agent)} disabled={archived}>
                     <Pencil size={16} />
-                  </IconButton>
-                  <IconButton label={`Archive ${agent.title || "agent"}`} compact onClick={() => onArchive(agent)} disabled={archived}>
+                  </IconButton>}
+                  {manageable && <IconButton label={`Publish ${agent.title || "agent"} to marketplace`} compact onClick={() => onPublish(agent)} disabled={archived || pending}>
+                    <Upload size={16} />
+                  </IconButton>}
+                  {manageable && <IconButton label={`Archive ${agent.title || "agent"}`} compact onClick={() => onArchive(agent)} disabled={archived}>
                     <Archive size={16} />
-                  </IconButton>
+                  </IconButton>}
                 </div>
               )}
             </div>
           );
         })}
-        {filtered.length === 0 && <p className="muted-empty">No agents found.</p>}
+        {filtered.length === 0 && <p className="muted-empty">No {type === "lora" ? "LoRAs" : "agents"} found.</p>}
       </div>
     </section>
+  );
+}
+
+export function graphConnections(agents) {
+  const ids = new Set(agents.map((agent) => agent.id));
+  const edges = new Map();
+  function connect(from, to, kind) {
+    if (!ids.has(from) || !ids.has(to) || from === to) return;
+    const key = `${from}:${to}`;
+    if (!edges.has(key)) edges.set(key, { from, to, kind });
+  }
+  for (const agent of agents) {
+    for (const resource of agent.resources || []) {
+      const id = String(resource).match(/^agent:([a-z0-9_]+_lora)$/)?.[1];
+      if (id) connect(id, agent.id, "knowledge");
+    }
+    for (const input of agent.consumes || []) {
+      const id = String(input).match(/^agent:([a-z0-9_]+_lora):output$/)?.[1];
+      if (id) connect(id, agent.id, "handoff");
+    }
+  }
+  return [...edges.values()].slice(0, 240);
+}
+
+export function initialGraphPositions(agents) {
+  const centerX = 450;
+  const centerY = 278;
+  const positions = {};
+  const goldenAngle = Math.PI * (3 - Math.sqrt(5));
+  agents.forEach((agent, index) => {
+    const progress = agents.length <= 1 ? 0 : Math.sqrt((index + 0.5) / agents.length);
+    const angle = index * goldenAngle - Math.PI / 2;
+    positions[agent.id] = {
+      x: centerX + Math.cos(angle) * 360 * progress,
+      y: centerY + Math.sin(angle) * 220 * progress
+    };
+  });
+  return positions;
+}
+
+export function storedGraphPositions(storageKey) {
+  if (typeof window === "undefined" || !storageKey) return {};
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(storageKey) || "{}");
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    return Object.fromEntries(Object.entries(parsed).flatMap(([id, position]) => {
+      const x = Number(position?.x);
+      const y = Number(position?.y);
+      return Number.isFinite(x) && Number.isFinite(y)
+        ? [[id, { x: Math.max(64, Math.min(836, x)), y: Math.max(44, Math.min(516, y)) }]]
+        : [];
+    }));
+  } catch {
+    return {};
+  }
+}
+
+function AgentGraph({ agents, storageKey }) {
+  const eligibleGraphAgents = agents
+    .filter((agent) => !agent.document && !agent.resource_for_agent_id && agent.enabled !== false);
+  const graphAgents = eligibleGraphAgents.slice(0, 120);
+  const graphAgentIds = graphAgents.map((agent) => agent.id).join("|");
+  const [positions, setPositions] = useState(() => ({
+    ...initialGraphPositions(graphAgents),
+    ...storedGraphPositions(storageKey)
+  }));
+  const [focusedId, setFocusedId] = useState(null);
+  const canvasRef = useRef(null);
+  const edges = graphConnections(graphAgents);
+
+  useEffect(() => {
+    setPositions((current) => ({ ...initialGraphPositions(graphAgents), ...current }));
+  }, [agents.length]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !storageKey) return;
+    const visibleIds = new Set(graphAgentIds.split("|").filter(Boolean));
+    const persisted = Object.fromEntries(Object.entries(positions).filter(([id]) => visibleIds.has(id)));
+    try {
+      window.localStorage.setItem(storageKey, JSON.stringify(persisted));
+    } catch {
+      // Storage may be disabled or full; dragging remains functional in-memory.
+    }
+  }, [graphAgentIds, positions, storageKey]);
+
+  function dragNode(event, agentId) {
+    const node = event.currentTarget;
+    node.setPointerCapture(event.pointerId);
+    function move(moveEvent) {
+      const bounds = canvasRef.current?.getBoundingClientRect();
+      if (!bounds) return;
+      const x = ((moveEvent.clientX - bounds.left) / bounds.width) * 900;
+      const y = ((moveEvent.clientY - bounds.top) / bounds.height) * 560;
+      setPositions((current) => ({
+        ...current,
+        [agentId]: { x: Math.max(64, Math.min(836, x)), y: Math.max(44, Math.min(516, y)) }
+      }));
+    }
+    function stop() {
+      node.removeEventListener("pointermove", move);
+      node.removeEventListener("pointerup", stop);
+      node.removeEventListener("pointercancel", stop);
+    }
+    node.addEventListener("pointermove", move);
+    node.addEventListener("pointerup", stop);
+    node.addEventListener("pointercancel", stop);
+  }
+
+  return (
+    <section className="resource-section graph-section" aria-labelledby="graph-heading">
+      <div className="section-heading">
+        <div><h3 id="graph-heading">Agent graph</h3><p>Drag nodes to map your system. Arrows show knowledge and handoffs.</p></div>
+        <span className="graph-count">{graphAgents.length}{eligibleGraphAgents.length > graphAgents.length ? ` of ${eligibleGraphAgents.length}` : ""} nodes · {edges.length} links</span>
+      </div>
+      <div className="agent-graph" ref={canvasRef}>
+        <svg viewBox="0 0 900 560" role="img" aria-label="Connected agent graph">
+          <defs>
+            <marker id="graph-arrow" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+              <path d="M0,0 L7,3.5 L0,7 Z" />
+            </marker>
+          </defs>
+          {edges.map((edge) => {
+            const from = positions[edge.from];
+            const to = positions[edge.to];
+            if (!from || !to) return null;
+            return <line key={`${edge.from}-${edge.to}`} x1={from.x} y1={from.y} x2={to.x} y2={to.y} markerEnd="url(#graph-arrow)" />;
+          })}
+        </svg>
+        {graphAgents.map((agent) => {
+          const position = positions[agent.id] || { x: 450, y: 278 };
+          return (
+            <button
+              type="button"
+              className={`graph-node ${productType(agent)} ${focusedId === agent.id ? "focused" : ""}`}
+              style={{ left: `${(position.x / 900) * 100}%`, top: `${(position.y / 560) * 100}%` }}
+              key={agent.id}
+              onPointerDown={(event) => dragNode(event, agent.id)}
+              onClick={() => setFocusedId((current) => current === agent.id ? null : agent.id)}
+              title={agent.capability || agent.title}
+            >
+              {productType(agent) === "lora" ? <Layers3 size={14} /> : <Bot size={14} />}
+              <span>{formatAgentName(agent.id, agents)}</span>
+            </button>
+          );
+        })}
+        {graphAgents.length === 0 && <p className="graph-empty">Create an agent or LoRA to start your graph.</p>}
+        {focusedId && (
+          <aside className="graph-inspector">
+            <strong>{formatAgentName(focusedId, agents)}</strong>
+            <span>{agents.find((agent) => agent.id === focusedId)?.capability}</span>
+          </aside>
+        )}
+      </div>
+      <div className="graph-legend"><span><i className="agent" />Agent</span><span><i className="lora" />LoRA</span><span><i className="link" />Directed connection</span></div>
+    </section>
+  );
+}
+
+function MarketplacePanel({ items, agents, auth, onPublish, onRate }) {
+  const [query, setQuery] = useState("");
+  const [type, setType] = useState("all");
+  const publishedIds = new Set(items.map((item) => item.id));
+  const owned = agents.filter((agent) =>
+    !agent.document && !agent.resource_for_agent_id && agent.enabled !== false &&
+    (auth?.is_admin || (agent.created_by === auth?.user_id && agent.workspace_id === auth?.workspace_id))
+  );
+  const filtered = items.filter((item) =>
+    (type === "all" || item.item_type === type) &&
+    (!query || `${item.title} ${item.summary} ${item.creator} ${item.achievements.join(" ")}`.toLowerCase().includes(query.toLowerCase()))
+  );
+  return (
+    <section className="resource-section marketplace-section" aria-labelledby="marketplace-heading">
+      <div className="marketplace-hero">
+        <span><Sparkles size={15} /> COMMUNITY LIBRARY</span>
+        <h3 id="marketplace-heading">Evidence-rich specialists, shared openly.</h3>
+        <p>Explore agents and LoRAs with creator-provided achievements, linked proof, and community ratings.</p>
+      </div>
+      {owned.length > 0 && (
+        <div className="publish-shelf">
+          <div><strong>Share your work</strong><span>Publish an existing creation with achievements and proof.</span></div>
+          <div>
+            {owned.map((agent) => (
+              <button type="button" key={agent.id} onClick={() => onPublish(agent)}>
+                <Upload size={13} />{publishedIds.has(agent.id) ? "Update" : "Publish"} {formatAgentName(agent.id, agents)}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+      <div className="marketplace-toolbar">
+        <label className="search-field full-width"><Search size={16} /><span className="sr-only">Search marketplace</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search skills, outcomes, creators" /></label>
+        <div className="marketplace-filter" aria-label="Marketplace type">
+          {["all", "agent", "lora"].map((value) => <button type="button" key={value} aria-pressed={type === value} onClick={() => setType(value)}>{value === "all" ? "All" : value === "lora" ? "LoRAs" : "Agents"}</button>)}
+        </div>
+      </div>
+      <div className="marketplace-grid">
+        {filtered.map((item) => (
+          <article className="market-card" key={item.id}>
+            <header><span className={`market-type ${item.item_type}`}>{item.item_type === "lora" ? <Layers3 size={13} /> : <Bot size={13} />}{item.item_type}</span><small>v{item.version}</small></header>
+            <h4>{item.title}</h4>
+            <p>{item.summary || item.capability}</p>
+            {item.achievements.length > 0 && <ul>{item.achievements.slice(0, 3).map((achievement) => <li key={achievement}><Check size={12} />{achievement}</li>)}</ul>}
+            {item.proofs.length > 0 && <div className="proof-links" aria-label="Creator-provided proof">{item.proofs.slice(0, 3).map((proof) => <a key={proof.url} href={proof.url} target="_blank" rel="noreferrer"><Globe2 size={12} />{proof.title}</a>)}</div>}
+            {item.reviews?.length > 0 && (
+              <div className="market-reviews" aria-label="Recent reviews">
+                {item.reviews.slice(0, 2).map((review, index) => (
+                  <blockquote key={`${review.created_at}:${index}`}><Star size={10} fill="currentColor" /><span>{review.review}</span></blockquote>
+                ))}
+              </div>
+            )}
+            <footer>
+              <span className="market-rating"><Star size={14} fill="currentColor" />{item.rating_count ? item.rating_average.toFixed(1) : "New"}<small>{item.rating_count ? `(${item.rating_count})` : ""}</small></span>
+              <button type="button" onClick={() => onRate(item)}>{item.my_rating ? "Update rating" : "Rate"}</button>
+            </footer>
+            <small className="market-author">by {item.creator} · {item.license}</small>
+          </article>
+        ))}
+        {filtered.length === 0 && <div className="market-empty"><Sparkles size={22} /><strong>No matches yet</strong><span>Publish a creation or try a broader search.</span></div>}
+      </div>
+    </section>
+  );
+}
+
+function PublishDialog({ agent, onClose, onSaved }) {
+  const existing = agent.marketplace || {};
+  const [summary, setSummary] = useState(existing.summary || agent.capability || "");
+  const [achievements, setAchievements] = useState((existing.achievements || []).join("\n"));
+  const [proofs, setProofs] = useState(existing.proofs?.length ? existing.proofs : [{ title: "", url: "" }]);
+  const [version, setVersion] = useState(existing.version || "1.0");
+  const [license, setLicense] = useState(existing.license || agent.license || "Unspecified");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  function updateProof(index, key, value) {
+    setProofs((current) => current.map((proof, cursor) => cursor === index ? { ...proof, [key]: value } : proof));
+  }
+  async function submit(event) {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      await api.post(`/api/marketplace/items/${encodeURIComponent(agent.id)}`, {
+        item_type: productType(agent),
+        summary,
+        achievements: achievements.split("\n").map((value) => value.trim()).filter(Boolean),
+        proofs: proofs.filter((proof) => proof.title.trim() || proof.url.trim()),
+        version,
+        license
+      });
+      await onSaved();
+    } catch (publishError) {
+      setError(friendlyError(publishError));
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <ModalSurface title="Publish to marketplace" description="Add the outcomes and evidence people need to evaluate your work." onClose={onClose} className="form-dialog">
+      <form className="dialog-form publish-form" onSubmit={submit}>
+        {error && <div className="form-error" role="alert">{error}</div>}
+        <div className="publish-subject"><span className={`market-type ${productType(agent)}`}>{productType(agent) === "lora" ? <Layers3 size={13} /> : <Bot size={13} />}{productType(agent)}</span><strong>{formatAgentName(agent.id, [agent])}</strong></div>
+        <label><span>Marketplace summary</span><textarea data-autofocus value={summary} onChange={(event) => setSummary(event.target.value)} required maxLength={500} /></label>
+        <label><span>Achievements <small>one per line</small></span><textarea value={achievements} onChange={(event) => setAchievements(event.target.value)} placeholder={"92% on internal support benchmark\nCut review time by 35%"} /></label>
+        <fieldset className="proof-editor"><legend>Proof links</legend>{proofs.map((proof, index) => <div key={index}><input aria-label={`Proof ${index + 1} title`} value={proof.title} onChange={(event) => updateProof(index, "title", event.target.value)} placeholder="Benchmark report" /><input aria-label={`Proof ${index + 1} URL`} type="url" value={proof.url} onChange={(event) => updateProof(index, "url", event.target.value)} placeholder="https://…" /></div>)}<button type="button" onClick={() => setProofs((current) => [...current, { title: "", url: "" }].slice(0, 8))}><Plus size={14} />Add proof</button></fieldset>
+        <div className="form-grid two"><label><span>Version</span><input value={version} onChange={(event) => setVersion(event.target.value)} required /></label><label><span>License</span><input value={license} onChange={(event) => setLicense(event.target.value)} required /></label></div>
+        <div className="dialog-actions"><button type="button" className="text-button ghost" onClick={onClose} disabled={busy}>Cancel</button><button type="submit" className="text-button primary" disabled={busy}>{busy ? <LoaderCircle className="spin" size={16} /> : <Upload size={16} />}Publish</button></div>
+      </form>
+    </ModalSurface>
+  );
+}
+
+function RatingDialog({ item, onClose, onSaved }) {
+  const [score, setScore] = useState(item.my_rating?.score || 5);
+  const [review, setReview] = useState(item.my_rating?.review || "");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  async function submit(event) {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      await api.post(`/api/marketplace/items/${encodeURIComponent(item.id)}/ratings`, { score, review });
+      await onSaved();
+    } catch (ratingError) {
+      setError(friendlyError(ratingError));
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <ModalSurface title={`Rate ${item.title}`} description="Share a concise, experience-based evaluation." onClose={onClose} className="small-dialog">
+      <form className="dialog-form" onSubmit={submit}>
+        {error && <div className="form-error" role="alert">{error}</div>}
+        <fieldset className="star-picker"><legend>Your rating</legend>{[1, 2, 3, 4, 5].map((value) => <button type="button" key={value} aria-label={`${value} star${value === 1 ? "" : "s"}`} aria-pressed={score === value} onClick={() => setScore(value)}><Star size={25} fill={value <= score ? "currentColor" : "none"} /></button>)}</fieldset>
+        <label><span>Review <small>optional</small></span><textarea data-autofocus value={review} onChange={(event) => setReview(event.target.value)} maxLength={1000} placeholder="What worked well? What should others know?" /></label>
+        <div className="dialog-actions"><button type="button" className="text-button ghost" onClick={onClose}>Cancel</button><button type="submit" className="text-button primary" disabled={busy}>{busy ? <LoaderCircle className="spin" size={16} /> : <Star size={16} />}Save rating</button></div>
+      </form>
+    </ModalSurface>
   );
 }
 
@@ -1973,7 +2477,7 @@ function collaboratorToken(agentId) {
   return `agent:${agentId}:output`;
 }
 
-function createAgentForm(agent) {
+function createAgentForm(agent, kind = productType(agent)) {
   if (agent) {
     return {
       id: agent.id,
@@ -1987,7 +2491,12 @@ function createAgentForm(agent) {
       tools: [...(agent.tools || [])],
       resources: [...(agent.resources || [])],
       sources: (agent.sources || []).join(", "),
-      source_text: ""
+      source_text: "",
+      item_type: productType(agent),
+      base_model: agent.base_model || "qwen36-awq",
+      adapter_source: agent.adapter_source || "",
+      trigger_words: (agent.trigger_words || []).join(", "),
+      license: agent.license || "Unspecified"
     };
   }
   const suffix = Date.now().toString(36).slice(-7);
@@ -2003,13 +2512,19 @@ function createAgentForm(agent) {
     tools: [],
     resources: [],
     sources: "",
-    source_text: ""
+    source_text: "",
+    item_type: kind === "lora" ? "lora" : "agent",
+    base_model: "qwen36-awq",
+    adapter_source: "",
+    trigger_words: "",
+    license: "Unspecified"
   };
 }
 
-function AgentDialog({ auth, agent, agents, documents, onClose, onSaved }) {
+function AgentDialog({ auth, agent, kind = productType(agent), agents, documents, onClose, onSaved }) {
   const editing = Boolean(agent);
-  const [form, setForm] = useState(() => createAgentForm(agent));
+  const [form, setForm] = useState(() => createAgentForm(agent, kind));
+  const isLoRA = form.item_type === "lora";
   const [step, setStep] = useState(0);
   const [newFiles, setNewFiles] = useState([]);
   const [uploadedFileKeys, setUploadedFileKeys] = useState([]);
@@ -2103,6 +2618,7 @@ function AgentDialog({ auth, agent, agents, documents, onClose, onSaved }) {
     const activeAgentId = agent?.id || createdAgentId || form.id;
     const hasDocumentResources = form.resources.some((value) => value.startsWith("agent:")) || newFiles.length > 0;
     const payload = {
+      item_type: form.item_type,
       title: form.title.trim(),
       capability: form.capability.trim(),
       boundary: form.boundary.trim() || RESPONSE_STYLES.find((style) => style.id === form.response_style)?.boundary || RESPONSE_STYLES[0].boundary,
@@ -2112,6 +2628,12 @@ function AgentDialog({ auth, agent, agents, documents, onClose, onSaved }) {
       tools: [...new Set([...form.tools, ...(hasDocumentResources ? ["document_search", "document_read"] : [])])],
       resources: form.resources,
       source_text: form.source_text,
+      ...(isLoRA ? {
+        base_model: form.base_model.trim(),
+        adapter_source: form.adapter_source.trim(),
+        trigger_words: form.trigger_words,
+        license: form.license.trim()
+      } : {}),
       ...(auth?.is_admin ? { sources: form.sources } : {})
     };
     let newAgentPersisted = Boolean(createdAgentId);
@@ -2144,7 +2666,7 @@ function AgentDialog({ auth, agent, agents, documents, onClose, onSaved }) {
       await onSaved();
     } catch (saveError) {
       const prefix = !editing && newAgentPersisted
-        ? "The agent was saved, but its setup is not finished. "
+        ? `The ${isLoRA ? "LoRA" : "agent"} was saved, but its setup is not finished. `
         : "";
       setError(`${prefix}${friendlyError(saveError)}`);
     } finally {
@@ -2153,7 +2675,7 @@ function AgentDialog({ auth, agent, agents, documents, onClose, onSaved }) {
   }
 
   const steps = [
-    { label: "Basics", detail: "Name and purpose" },
+    { label: "Basics", detail: isLoRA ? "Model and purpose" : "Name and purpose" },
     { label: "Tools & teamwork", detail: "Abilities and handoffs" },
     { label: "Knowledge", detail: "Files and review" }
   ];
@@ -2161,13 +2683,13 @@ function AgentDialog({ auth, agent, agents, documents, onClose, onSaved }) {
 
   return (
     <ModalSurface
-      title={editing ? "Edit agent" : "Create an agent"}
-      description={editing ? "Update how this agent works in future answers." : "Describe the role. Virenis will handle the technical setup."}
+      title={editing ? `Edit ${isLoRA ? "LoRA" : "agent"}` : isLoRA ? "Add a LoRA" : "Create an agent"}
+      description={editing ? `Update how this ${isLoRA ? "LoRA" : "agent"} works in future answers.` : isLoRA ? "Register an adapter model and make it available inside the agent studio." : "Describe the role. Virenis will handle the technical setup."}
       onClose={onClose}
       className="agent-builder-dialog"
     >
       <form className="agent-builder" onSubmit={submit}>
-        <nav className="builder-steps" aria-label="Agent setup progress">
+        <nav className="builder-steps" aria-label={`${isLoRA ? "LoRA" : "Agent"} setup progress`}>
           {steps.map((item, index) => (
             <button
               type="button"
@@ -2191,20 +2713,28 @@ function AgentDialog({ auth, agent, agents, documents, onClose, onSaved }) {
               <section className="builder-panel" aria-labelledby="agent-basics-heading">
                 <div className="builder-heading">
                   <span>STEP 1 OF 3</span>
-                  <h3 id="agent-basics-heading">Start with the job, not the settings.</h3>
-                  <p>A clear name and purpose are enough to create a useful first version.</p>
+                  <h3 id="agent-basics-heading">{isLoRA ? "Connect the model to a clear job." : "Start with the job, not the settings."}</h3>
+                  <p>{isLoRA ? "Describe the adapter and the requests where it should add specialized behavior." : "A clear name and purpose are enough to create a useful first version."}</p>
                 </div>
                 <div className="builder-field">
-                  <label htmlFor="agent-name">Agent name</label>
-                  <input id="agent-name" data-autofocus value={form.title} onChange={(event) => update("title", event.target.value)} required maxLength={160} placeholder="Launch risk analyst" />
+                  <label htmlFor="agent-name">{isLoRA ? "LoRA name" : "Agent name"}</label>
+                  <input id="agent-name" data-autofocus value={form.title} onChange={(event) => update("title", event.target.value)} required maxLength={160} placeholder={isLoRA ? "Clinical language adapter" : "Launch risk analyst"} />
                   <small>Use a name people will recognize when they call it with @.</small>
                 </div>
                 <div className="builder-field">
-                  <label htmlFor="agent-purpose">What will this agent do?</label>
+                  <label htmlFor="agent-purpose">What will this {isLoRA ? "LoRA" : "agent"} do?</label>
                   <textarea id="agent-purpose" value={form.capability} onChange={(event) => update("capability", event.target.value)} required maxLength={2400} placeholder="Review launch plans, find operational and market risks, and turn them into practical recommendations..." />
                   <small>Describe its expertise, how it should think, and what a good result looks like.</small>
                 </div>
-                <div className="template-picker">
+                {isLoRA && (
+                  <div className="lora-model-grid">
+                    <div className="builder-field"><label htmlFor="lora-base-model">Base model</label><input id="lora-base-model" value={form.base_model} onChange={(event) => update("base_model", event.target.value)} required placeholder="qwen36-awq" /></div>
+                    <div className="builder-field"><label htmlFor="lora-license">License</label><input id="lora-license" value={form.license} onChange={(event) => update("license", event.target.value)} required placeholder="Apache-2.0" /></div>
+                    <div className="builder-field full"><label htmlFor="lora-adapter-source">Adapter source</label><input id="lora-adapter-source" type="url" value={form.adapter_source} onChange={(event) => update("adapter_source", event.target.value)} required placeholder="https://huggingface.co/your-name/adapter" /><small>Virenis imports the adapter from Hugging Face, verifies its Qwen ABI, and pins the exact source revision before mounting it.</small></div>
+                    <div className="builder-field full"><label htmlFor="lora-trigger-words">Trigger words <small>optional</small></label><input id="lora-trigger-words" value={form.trigger_words} onChange={(event) => update("trigger_words", event.target.value)} placeholder="clinical summary, patient-safe language" /></div>
+                  </div>
+                )}
+                {!isLoRA && <div className="template-picker">
                   <span>Or start from a common role</span>
                   <div>
                     {AGENT_TEMPLATES.map((template) => {
@@ -2212,7 +2742,7 @@ function AgentDialog({ auth, agent, agents, documents, onClose, onSaved }) {
                       return <button type="button" key={template.id} onClick={() => applyTemplate(template)}><Icon size={15} />{template.label}</button>;
                     })}
                   </div>
-                </div>
+                </div>}
                 <fieldset className="choice-fieldset response-style-fieldset">
                   <legend>How should it respond?</legend>
                   <div className="response-style-grid">
@@ -2237,7 +2767,7 @@ function AgentDialog({ auth, agent, agents, documents, onClose, onSaved }) {
                 <div className="builder-heading">
                   <span>STEP 2 OF 3</span>
                   <h3 id="agent-tools-heading">Give it only the abilities it needs.</h3>
-                  <p>Choose tools and decide how this agent fits into work done by other agents.</p>
+                  <p>Choose tools and decide how this {isLoRA ? "LoRA" : "agent"} fits into work done by other agents.</p>
                 </div>
                 <fieldset className="choice-fieldset">
                   <legend>Tools <small>optional</small></legend>
@@ -2362,15 +2892,16 @@ function AgentDialog({ auth, agent, agents, documents, onClose, onSaved }) {
             )}
           </div>
 
-          <aside className="builder-preview" aria-label="Agent summary">
-            <div className="preview-badge"><Bot size={18} /><span>AGENT PREVIEW</span></div>
-            <h4>{form.title || "Untitled agent"}</h4>
-            <p>{form.capability || "Describe what this agent will do to see a summary here."}</p>
+          <aside className="builder-preview" aria-label={`${isLoRA ? "LoRA" : "Agent"} summary`}>
+            <div className="preview-badge">{isLoRA ? <Layers3 size={18} /> : <Bot size={18} />}<span>{isLoRA ? "LORA" : "AGENT"} PREVIEW</span></div>
+            <h4>{form.title || `Untitled ${isLoRA ? "LoRA" : "agent"}`}</h4>
+            <p>{form.capability || `Describe what this ${isLoRA ? "LoRA" : "agent"} will do to see a summary here.`}</p>
             <dl>
               <div><dt>Style</dt><dd>{RESPONSE_STYLES.find((style) => style.id === form.response_style)?.title || "Custom"}</dd></div>
               <div><dt>Tools</dt><dd>{form.tools.length || "None"}</dd></div>
               <div><dt>Connections</dt><dd>{form.consumes.filter((value) => /^agent:.+:output$/.test(value)).length || "None"}</dd></div>
               <div><dt>Knowledge</dt><dd>{selectedDocumentCount + newFiles.length || "None"}</dd></div>
+              {isLoRA && <div><dt>Base model</dt><dd>{form.base_model || "Not set"}</dd></div>}
             </dl>
             <div className="preview-status"><span /><div><strong>Private workspace</strong><small>Ready after setup completes</small></div></div>
           </aside>
@@ -2383,7 +2914,7 @@ function AgentDialog({ auth, agent, agents, documents, onClose, onSaved }) {
           <span>Step {step + 1} of 3</span>
           <button type="submit" className="text-button primary" disabled={busy || !canContinue}>
             {busy ? <LoaderCircle className="spin" size={16} /> : step < 2 ? <ArrowRight size={16} /> : editing ? <Check size={16} /> : <Plus size={16} />}
-            {busy ? "Saving" : step < 2 ? "Continue" : editing ? "Save changes" : "Create agent"}
+            {busy ? "Saving" : step < 2 ? "Continue" : editing ? "Save changes" : isLoRA ? "Add LoRA" : "Create agent"}
           </button>
         </footer>
       </form>

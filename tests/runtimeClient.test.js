@@ -73,6 +73,21 @@ describe("TCAR runtime HTTP transport", () => {
     await expect(fetchRuntimeAgents()).resolves.toEqual({ ok: true, agents: [] });
   });
 
+  it("reuses a bounded keep-alive connection across runtime calls", async () => {
+    const peerPorts = new Set();
+    const runtime = await startHttpServer((request, response) => {
+      peerPorts.add(request.socket.remotePort);
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ ok: true }));
+    });
+    configureRuntime(runtime.url);
+
+    await expect(runtimeRequest("/first", { timeoutMs: 500 })).resolves.toEqual({ ok: true });
+    await expect(runtimeRequest("/second", { timeoutMs: 500 })).resolves.toEqual({ ok: true });
+
+    expect(peerPorts.size).toBe(1);
+  });
+
   it("aborts a response that exceeds the configured header timeout", async () => {
     const runtime = await startHttpServer(async (_request, response) => {
       await delay(100);

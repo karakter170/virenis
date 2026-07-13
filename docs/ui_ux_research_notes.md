@@ -1,6 +1,6 @@
 # virenis UI/UX notes
 
-Updated: 2026-07-10
+Updated: 2026-07-12
 
 ## Product surface
 
@@ -13,18 +13,20 @@ The current surface is intentionally restrained:
 - a header with the lowercase `virenis` wordmark, history, new chat, and account
   controls;
 - a centered conversation thread with plain-language run progress;
-- one composer with knowledge upload and `@agent` selection;
+- one composer with knowledge upload, `@agent` selection, and a LoRA session
+  picker beside the attachment control;
 - a chat-history sheet rather than a permanent left rail;
-- an Agents & knowledge sheet with `Agents`, `Knowledge`, and admin-only
-  `Admin` views;
+- an Agent Studio sheet with `Agents`, `LoRAs`, `Graph`, `Marketplace`,
+  `Knowledge`, and admin-only `Admin` views;
 - an Answer details sheet with `Agents`, `Sources`, `Outcomes`, and `Activity`;
 - focused dialogs for agent, document, settlement, dispute, and correction
   workflows;
 - confirmations before destructive archive or deletion actions.
 
-There is no permanent right operations rail, Obsidian-style execution graph,
-animated node/edge canvas, or collection of separate dashboard pages. Those
-were earlier concepts and do not describe the current interface.
+There is no permanent right operations rail or collection of separate dashboard
+pages. The Obsidian-inspired relationship graph is deliberately on demand inside
+Agent Studio: nodes are draggable, positions persist per workspace, and arrows
+represent configured handoffs or knowledge relationships.
 
 ## Interaction principles
 

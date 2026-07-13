@@ -12,6 +12,24 @@ const MAX_CONNECT_TIMEOUT_MS = 120000;
 const MAX_BODY_IDLE_TIMEOUT_MS = 300000;
 const MAX_RESPONSE_BYTES = 64 * 1024 * 1024;
 const MAX_AUDIT_RECEIPT_PAGE_SIZE = 1000;
+// The web and GPU runtime normally live on different hosts. Reopening a TCP
+// (and commonly TLS) connection for every health probe, lifecycle call, and
+// chat adds a full network handshake to each request. Keep a small bounded
+// pool per protocol; Node automatically discards sockets closed by the peer.
+const HTTP_AGENT = new http.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 1000,
+  maxSockets: 64,
+  maxFreeSockets: 16,
+  scheduling: "lifo"
+});
+const HTTPS_AGENT = new https.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 1000,
+  maxSockets: 64,
+  maxFreeSockets: 16,
+  scheduling: "lifo"
+});
 let testFetchTransport = null;
 
 export function setRuntimeFetchForTests(fetchImpl) {
@@ -372,7 +390,7 @@ function boundedHttpRequest(urlValue, {
       request = transport.request(url, {
         method,
         headers,
-        agent: false
+        agent: url.protocol === "https:" ? HTTPS_AGENT : HTTP_AGENT
       });
     } catch (error) {
       cleanup();

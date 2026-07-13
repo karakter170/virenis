@@ -254,10 +254,12 @@ function agentMetadataScore(agent, lowerQuery) {
 }
 
 export function scopedRoutingContext({ session, agents = [], documents = [] }) {
+  const inactiveAgentIds = new Set(Array.isArray(session?.inactive_agent_ids) ? session.inactive_agent_ids : []);
   const visibleAgents = agents.filter((agent) =>
     agent.enabled !== false &&
     agent.mounted !== false &&
     agent.runtime_sync_pending !== true &&
+    !inactiveAgentIds.has(agent.id) &&
     resourceVisibleToSession(agent, session)
   );
   const visibleDocuments = documents.filter((document) =>
@@ -675,8 +677,8 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
         planner_mode: options.planner_mode || process.env.TCAR_PLANNER_MODE || "cue",
         max_routing_adapters: Number(options.max_routing_adapters) || Number(process.env.TCAR_MAX_ROUTING_ADAPTERS || 12),
         parallel_workers: Number(options.parallel_workers) || Number(process.env.TCAR_PARALLEL_WORKERS || 2),
-        max_tokens: Number(options.max_tokens) || Number(process.env.TCAR_MAX_TOKENS || 512),
-        refiner_max_tokens: Number(options.refiner_max_tokens) || Number(process.env.TCAR_REFINER_MAX_TOKENS || 768),
+        max_tokens: Number(options.max_tokens) || Number(process.env.TCAR_MAX_TOKENS || 256),
+        refiner_max_tokens: Number(options.refiner_max_tokens) || Number(process.env.TCAR_REFINER_MAX_TOKENS || 384),
         temperature: Number(options.temperature ?? process.env.TCAR_TEMPERATURE ?? 0),
         allowed_adapters: scoped.allowedAdapters,
         agent_rankings: Object.fromEntries(
