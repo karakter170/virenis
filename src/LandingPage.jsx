@@ -170,15 +170,15 @@ export default function LandingPage({ onEnter }) {
             </article>
             <article className="feature-card">
               <div className="feature-icon"><Upload size={21} strokeWidth={1.6} /></div>
-              <span>EXTERNAL LoRA</span>
-              <h3>Bring specialized knowledge with you.</h3>
-              <p>Add a LoRA from an approved external source to update the knowledge or working behavior available to your agents. Keep specialist updates modular instead of rebuilding everything around them.</p>
+              <span>MODEL APIS</span>
+              <h3>Bring the model you trust.</h3>
+              <p>Connect an approved model API to an agent and give it the role, tools, and knowledge the work requires. Providers stay replaceable while the agent contract remains stable.</p>
             </article>
             <article className="feature-card">
               <div className="feature-icon"><RefreshCw size={21} strokeWidth={1.6} /></div>
-              <span>IMMEDIATE REPLACEMENT</span>
-              <h3>Replace the specialist, not the workflow.</h3>
-              <p>Swap an agent to a new LoRA while preserving its role, resources, permissions, and connections. After validation, the updated specialist can take over immediately.</p>
+              <span>PORTABLE WORKFLOWS</span>
+              <h3>Switch providers, not the workflow.</h3>
+              <p>Move an agent to another API model while preserving its role, resources, permissions, and connections. The team keeps working without being rebuilt around one provider.</p>
             </article>
           </div>
         </section>

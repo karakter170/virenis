@@ -111,15 +111,17 @@ function friendlyError(error) {
     .replace(/vLLM/gi, "the model service");
 }
 
-function productType(agent) {
-  if (["agent", "lora"].includes(agent?.item_type)) return agent.item_type;
-  return agent?.base_lora === true ? "lora" : "agent";
+export function availableSessionAgents(agents = []) {
+  return agents
+    .filter((agent) => agent.enabled !== false && agent.mounted !== false)
+    .filter((agent) => !agent.document && !agent.resource_for_agent_id);
 }
 
-export function availableSessionLoRAs(agents = []) {
-  return agents
-    .filter((agent) => productType(agent) === "lora" && agent.enabled !== false && agent.mounted !== false)
-    .filter((agent) => !agent.document && !agent.resource_for_agent_id);
+function canManageAgent(agent, auth) {
+  return Boolean(auth?.is_admin || (!auth?.is_viewer
+    && agent?.visibility === "private"
+    && agent?.created_by === auth?.user_id
+    && agent?.workspace_id === auth?.workspace_id));
 }
 
 function emptyMetrics() {
@@ -142,9 +144,22 @@ function runStatusLabel(status) {
   return "Working";
 }
 
+function agentFacingText(value, fallback = "") {
+  const cleaned = String(value || "")
+    .replace(/\bLoRAs\b/gi, "agents")
+    .replace(/\bLoRA\b/gi, "agent")
+    .replace(/\badapter models?\b/gi, "models")
+    .replace(/\badapters?\b/gi, "models")
+    .replace(/_lora\b/gi, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return cleaned || fallback;
+}
+
 function formatAgentName(agentId, agents) {
   const agent = agents.find((item) => item.id === agentId);
-  if (agent?.title && agent.title.length <= 58) return agent.title;
+  const title = agentFacingText(agent?.title);
+  if (title && title.length <= 58) return title;
   return String(agentId || "Agent")
     .replace(/_lora$/i, "")
     .replace(/^custom_[a-z0-9]+_/i, "")
@@ -530,14 +545,25 @@ function Workspace({ onHome }) {
     }
   }
 
-  function openAgentEditor(agent = null, kind = productType(agent)) {
-    setResourcesOpen(false);
-    setAgentEditor({ agent, kind });
+  async function setGraphConnection(fromId, toId, connected) {
+    if (!canWrite || !fromId || !toId || fromId === toId) return;
+    const target = agents.find((agent) => agent.id === toId);
+    if (!target) throw new Error("The destination agent is no longer available.");
+    setError("");
+    try {
+      await api.patch(`/api/agents/${encodeURIComponent(toId)}`, {
+        consumes: graphConnectionInputs(target.consumes, fromId, connected)
+      });
+      await refreshResources();
+    } catch (connectionError) {
+      setError(friendlyError(connectionError));
+      throw connectionError;
+    }
   }
 
-  function openLoRAManager() {
-    setResourceView("loras");
-    setResourcesOpen(true);
+  function openAgentEditor(agent = null) {
+    setResourcesOpen(false);
+    setAgentEditor({ agent });
   }
 
   function openAgentAdoption(agent) {
@@ -696,7 +722,10 @@ function Workspace({ onHome }) {
             sessionId={session?.session_id}
             canWrite={canWrite}
             focusRequest={focusComposer}
-            onOpenLoRAs={openLoRAManager}
+            onOpenAgents={() => {
+              setResourceView("agents");
+              setResourcesOpen(true);
+            }}
             onToggleAgent={toggleAgentForSession}
             togglingAgentId={togglingAgentId}
           />
@@ -729,7 +758,6 @@ function Workspace({ onHome }) {
           onViewChange={setResourceView}
           onClose={() => setResourcesOpen(false)}
           onCreateAgent={() => openAgentEditor(null)}
-          onCreateLoRA={() => openAgentEditor(null, "lora")}
           onEditAgent={openAgentEditor}
           onAdoptAgent={openAgentAdoption}
           onArchiveAgent={(agent) => {
@@ -751,6 +779,8 @@ function Workspace({ onHome }) {
             setResourcesOpen(false);
             setDeleteDocumentTarget(document);
           }}
+          onConnectAgents={(fromId, toId) => setGraphConnection(fromId, toId, true)}
+          onDisconnectAgents={(fromId, toId) => setGraphConnection(fromId, toId, false)}
           onRefresh={refreshResources}
         />
       )}
@@ -798,7 +828,6 @@ function Workspace({ onHome }) {
         <AgentDialog
           auth={auth}
           agent={agentEditor.agent || null}
-          kind={agentEditor.kind}
           agents={agents}
           documents={documents}
           onClose={() => setAgentEditor(undefined)}
@@ -1283,7 +1312,7 @@ function Composer({
   sessionId,
   canWrite,
   focusRequest,
-  onOpenLoRAs,
+  onOpenAgents,
   onToggleAgent,
   togglingAgentId
 }) {
@@ -1291,9 +1320,9 @@ function Composer({
   const listId = useId();
   const [mention, setMention] = useState(null);
   const [activeIndex, setActiveIndex] = useState(0);
-  const [loraMenuOpen, setLoRAMenuOpen] = useState(false);
-  const quickLoRAs = availableSessionLoRAs(agents);
-  const activeLoRACount = quickLoRAs.filter((agent) => agent.session_active !== false).length;
+  const [agentMenuOpen, setAgentMenuOpen] = useState(false);
+  const quickAgents = availableSessionAgents(agents);
+  const activeAgentCount = quickAgents.filter((agent) => agent.session_active !== false).length;
 
   const suggestions = useMemo(() => {
     if (!mention) return [];
@@ -1339,7 +1368,7 @@ function Composer({
 
   function chooseAgent(agent) {
     if (!mention) return;
-    const title = String(agent.title || "").replace(/"/g, "");
+    const title = agentFacingText(agent.title).replace(/"/g, "");
     const alias = String(agent.id || "agent").replace(/_lora$/i, "");
     const token = title && title.length <= 58 ? `@"${title}"` : `@${alias}`;
     const nextValue = `${value.slice(0, mention.start)}${token} ${value.slice(mention.end)}`;
@@ -1399,7 +1428,7 @@ function Composer({
               <AtSign size={15} aria-hidden="true" />
               <span>
                 <strong>{formatAgentName(agent.id, agents)}</strong>
-                <small>{agent.capability}</small>
+                <small>{agentFacingText(agent.capability)}</small>
               </span>
             </button>
           ))}
@@ -1427,25 +1456,25 @@ function Composer({
         <Paperclip size={19} />
       </IconButton>
       <IconButton
-        label="Choose LoRAs for this chat"
-        className={`composer-control lora-trigger ${loraMenuOpen ? "active" : ""}`}
-        onClick={() => setLoRAMenuOpen((open) => !open)}
+        label="Choose agents for this chat"
+        className={`composer-control agent-trigger ${agentMenuOpen ? "active" : ""}`}
+        onClick={() => setAgentMenuOpen((open) => !open)}
         disabled={!sessionId}
-        aria-expanded={loraMenuOpen}
+        aria-expanded={agentMenuOpen}
       >
-        <Layers3 size={18} />
-        {activeLoRACount > 0 && <span className="composer-count" aria-hidden="true">{activeLoRACount}</span>}
+        <Network size={18} />
+        {activeAgentCount > 0 && <span className="composer-count" aria-hidden="true">{activeAgentCount}</span>}
       </IconButton>
-      {loraMenuOpen && (
-        <div className="quick-lora-menu" aria-label="LoRAs active in this chat">
+      {agentMenuOpen && (
+        <div className="quick-agent-menu" aria-label="Agents active in this chat">
           <div className="quick-menu-heading">
-            <span><strong>LoRAs for this chat</strong><small>Changes apply only to this session.</small></span>
-            <button type="button" onClick={() => { setLoRAMenuOpen(false); onOpenLoRAs(); }}>Manage</button>
+            <span><strong>Agents for this chat</strong><small>Choose which specialists the Router may use.</small></span>
+            <button type="button" onClick={() => { setAgentMenuOpen(false); onOpenAgents(); }}>Manage</button>
           </div>
-          <div className="quick-lora-list">
-            {quickLoRAs.map((agent) => (
+          <div className="quick-agent-list">
+            {quickAgents.map((agent) => (
               <label key={agent.id}>
-                <span><strong>{formatAgentName(agent.id, agents)}</strong><small>{agent.capability || "LoRA adapter"}</small></span>
+                <span><strong>{formatAgentName(agent.id, agents)}</strong><small>{agentFacingText(agent.capability, "Specialist agent")}</small></span>
                 <input
                   type="checkbox"
                   checked={agent.session_active !== false}
@@ -1454,7 +1483,7 @@ function Composer({
                 />
               </label>
             ))}
-            {quickLoRAs.length === 0 && <p>No LoRAs are ready yet.</p>}
+            {quickAgents.length === 0 && <p>No agents are ready yet.</p>}
           </div>
         </div>
       )}
@@ -1506,7 +1535,6 @@ function ResourcesSheet({
   onViewChange,
   onClose,
   onCreateAgent,
-  onCreateLoRA,
   onEditAgent,
   onAdoptAgent,
   onArchiveAgent,
@@ -1516,6 +1544,8 @@ function ResourcesSheet({
   onRate,
   onAddKnowledge,
   onDeleteKnowledge,
+  onConnectAgents,
+  onDisconnectAgents,
   onRefresh
 }) {
   const [view, setView] = useState(initialView || "agents");
@@ -1529,7 +1559,6 @@ function ResourcesSheet({
       <div className="sheet-body resource-sheet-body">
         <div className="view-switch resource-nav" aria-label="Resource view">
           <button type="button" aria-pressed={view === "agents"} onClick={() => changeView("agents")}>Agents</button>
-          <button type="button" aria-pressed={view === "loras"} onClick={() => changeView("loras")}>LoRAs</button>
           <button type="button" aria-pressed={view === "graph"} onClick={() => changeView("graph")}>Graph</button>
           <button type="button" aria-pressed={view === "marketplace"} onClick={() => changeView("marketplace")}>Marketplace</button>
           <button type="button" aria-pressed={view === "knowledge"} onClick={() => changeView("knowledge")}>Knowledge</button>
@@ -1550,29 +1579,18 @@ function ResourcesSheet({
             onPublish={onPublish}
             togglingAgentId={togglingAgentId}
             sessionId={sessionId}
-            type="agent"
           />
         )}
 
-        {view === "loras" && (
-          <AgentCatalog
+        {view === "graph" && (
+          <AgentGraph
             agents={agents}
             auth={auth}
-            mountingAgentId={mountingAgentId}
-            onCreate={onCreateLoRA}
-            onEdit={(agent) => onEditAgent(agent, "lora")}
-            onAdopt={onAdoptAgent}
-            onArchive={onArchiveAgent}
-            onMount={onMountAgent}
-            onToggle={onToggleAgent}
-            onPublish={onPublish}
-            togglingAgentId={togglingAgentId}
-            sessionId={sessionId}
-            type="lora"
+            storageKey={`virenis:agent-graph:${auth?.workspace_id || "workspace"}`}
+            onConnect={onConnectAgents}
+            onDisconnect={onDisconnectAgents}
           />
         )}
-
-        {view === "graph" && <AgentGraph agents={agents} storageKey={`virenis:agent-graph:${auth?.workspace_id || "workspace"}`} />}
 
         {view === "marketplace" && (
           <MarketplacePanel
@@ -1654,7 +1672,6 @@ function AgentCatalog({
   mountingAgentId,
   togglingAgentId,
   sessionId,
-  type = "agent",
   onCreate,
   onEdit,
   onAdopt,
@@ -1665,51 +1682,46 @@ function AgentCatalog({
 }) {
   const [query, setQuery] = useState("");
   const canWrite = !auth?.is_viewer;
-  const canManage = (agent) => auth?.is_admin || (canWrite
-    && agent.visibility === "private"
-    && agent.created_by === auth?.user_id
-    && agent.workspace_id === auth?.workspace_id);
   const filtered = agents
     .filter((agent) => !agent.document && !agent.resource_for_agent_id)
-    .filter((agent) => productType(agent) === type)
     .filter((agent) => !query || `${agent.title || ""} ${agent.capability || ""}`.toLowerCase().includes(query.toLowerCase()))
-    .sort((left, right) => Number(canManage(right)) - Number(canManage(left))
+    .sort((left, right) => Number(canManageAgent(right, auth)) - Number(canManageAgent(left, auth))
       || String(left.title || left.id).localeCompare(String(right.title || right.id)));
   return (
     <section className="resource-section" aria-labelledby="agents-heading">
       <div className="section-heading">
         <div>
-          <h3 id="agents-heading">{type === "lora" ? "LoRAs" : "Agents"}</h3>
-          <p>{type === "lora" ? "Adapter models available to this chat." : "Choose one in chat by typing @."}</p>
+          <h3 id="agents-heading">Agents</h3>
+          <p>Build specialists, choose them with @, or let the Router assemble a team.</p>
         </div>
-        <IconButton label={type === "lora" ? "Add LoRA" : "Create agent"} onClick={onCreate} disabled={!canWrite}>
+        <IconButton label="Create agent" onClick={onCreate} disabled={!canWrite}>
           <Plus size={18} />
         </IconButton>
       </div>
       <label className="search-field full-width">
         <Search size={17} aria-hidden="true" />
-        <span className="sr-only">Search {type === "lora" ? "LoRAs" : "agents"}</span>
-        <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={`Search ${type === "lora" ? "LoRAs" : "agents"}`} />
+        <span className="sr-only">Search agents</span>
+        <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search agents" />
       </label>
       <div className="flat-list agent-list">
         {filtered.map((agent) => {
           const runtimeOnly = agent.runtime_only === true;
           const archived = agent.enabled === false && agent.mount_pending !== true;
           const pending = !archived && (agent.mount_pending === true || agent.mounted === false || agent.adapter_import_status === "pending_import");
-          const manageable = !runtimeOnly && canManage(agent);
+          const manageable = !runtimeOnly && canManageAgent(agent, auth);
           const sessionToggleable = canWrite && !runtimeOnly && !archived && !pending && Boolean(sessionId);
           return (
             <div className="agent-row" key={agent.id}>
               <span className={`status-dot ${archived ? "muted" : pending || runtimeOnly ? "pending" : "ready"}`} aria-hidden="true" />
               <div className="row-copy">
                 <strong>{formatAgentName(agent.id, agents)}</strong>
-                <span>{agent.capability || "Custom agent"}</span>
+                <span>{agentFacingText(agent.capability, "Custom agent")}</span>
                 <small>{archived ? "Archived" : runtimeOnly ? "Needs an owner" : agent.adapter_import_status === "pending_import" ? "Linked · awaiting runtime import" : pending ? "Preparing" : `${agent.session_active === false ? "Off in this chat" : "On in this chat"} · ${agent.visibility === "private" ? "Private" : agent.visibility === "team" ? "Team" : "Available"}`}</small>
                 <RealityRank rank={agent.reality_rank} />
               </div>
               {runtimeOnly && auth?.is_admin && (
                 <div className="row-actions">
-                  <IconButton label={`Adopt ${agent.title || "agent"}`} compact onClick={() => onAdopt(agent)}>
+                  <IconButton label={`Adopt ${formatAgentName(agent.id, agents)}`} compact onClick={() => onAdopt(agent)}>
                     <UserPlus size={16} />
                   </IconButton>
                 </div>
@@ -1729,17 +1741,17 @@ function AgentCatalog({
                     </label>
                   )}
                   {manageable && pending && (
-                    <IconButton label={`Retry ${agent.title || "agent"}`} compact onClick={() => onMount(agent)} disabled={mountingAgentId === agent.id}>
+                    <IconButton label={`Retry ${formatAgentName(agent.id, agents)}`} compact onClick={() => onMount(agent)} disabled={mountingAgentId === agent.id}>
                       <RefreshCw className={mountingAgentId === agent.id ? "spin" : ""} size={16} />
                     </IconButton>
                   )}
-                  {manageable && <IconButton label={`Edit ${agent.title || "agent"}`} compact onClick={() => onEdit(agent)} disabled={archived}>
+                  {manageable && <IconButton label={`Edit ${formatAgentName(agent.id, agents)}`} compact onClick={() => onEdit(agent)} disabled={archived}>
                     <Pencil size={16} />
                   </IconButton>}
-                  {manageable && <IconButton label={`Publish ${agent.title || "agent"} to marketplace`} compact onClick={() => onPublish(agent)} disabled={archived || pending}>
+                  {manageable && <IconButton label={`Publish ${formatAgentName(agent.id, agents)} to marketplace`} compact onClick={() => onPublish(agent)} disabled={archived || pending}>
                     <Upload size={16} />
                   </IconButton>}
-                  {manageable && <IconButton label={`Archive ${agent.title || "agent"}`} compact onClick={() => onArchive(agent)} disabled={archived}>
+                  {manageable && <IconButton label={`Archive ${formatAgentName(agent.id, agents)}`} compact onClick={() => onArchive(agent)} disabled={archived}>
                     <Archive size={16} />
                   </IconButton>}
                 </div>
@@ -1747,7 +1759,7 @@ function AgentCatalog({
             </div>
           );
         })}
-        {filtered.length === 0 && <p className="muted-empty">No {type === "lora" ? "LoRAs" : "agents"} found.</p>}
+        {filtered.length === 0 && <p className="muted-empty">No agents found.</p>}
       </div>
     </section>
   );
@@ -1758,33 +1770,57 @@ export function graphConnections(agents) {
   const edges = new Map();
   function connect(from, to, kind) {
     if (!ids.has(from) || !ids.has(to) || from === to) return;
-    const key = `${from}:${to}`;
+    const key = `${from}:${to}:${kind}`;
     if (!edges.has(key)) edges.set(key, { from, to, kind });
   }
   for (const agent of agents) {
     for (const resource of agent.resources || []) {
-      const id = String(resource).match(/^agent:([a-z0-9_]+_lora)$/)?.[1];
+      const id = String(resource).match(/^agent:([a-z0-9_]+)$/)?.[1];
       if (id) connect(id, agent.id, "knowledge");
     }
     for (const input of agent.consumes || []) {
-      const id = String(input).match(/^agent:([a-z0-9_]+_lora):output$/)?.[1];
+      const id = String(input).match(/^agent:([a-z0-9_]+):output$/)?.[1];
       if (id) connect(id, agent.id, "handoff");
     }
   }
   return [...edges.values()].slice(0, 240);
 }
 
+export function graphConnectionInputs(inputs = [], sourceId, connected = true) {
+  const token = collaboratorToken(sourceId);
+  const next = new Set(Array.isArray(inputs) ? inputs : []);
+  if (connected) next.add(token);
+  else next.delete(token);
+  return [...next];
+}
+
+function graphTone(agentId) {
+  return [...String(agentId || "agent")]
+    .reduce((value, character) => value + character.charCodeAt(0), 0) % 6;
+}
+
 export function initialGraphPositions(agents) {
   const centerX = 450;
   const centerY = 278;
   const positions = {};
+  if (!agents.length) return positions;
+  const connectionCounts = new Map(agents.map((agent) => [agent.id, 0]));
+  for (const edge of graphConnections(agents)) {
+    connectionCounts.set(edge.from, (connectionCounts.get(edge.from) || 0) + 1);
+    connectionCounts.set(edge.to, (connectionCounts.get(edge.to) || 0) + 1);
+  }
+  const ordered = [...agents].sort((left, right) =>
+    (connectionCounts.get(right.id) || 0) - (connectionCounts.get(left.id) || 0)
+      || String(left.title || left.id).localeCompare(String(right.title || right.id))
+  );
+  positions[ordered[0].id] = { x: centerX, y: centerY };
   const goldenAngle = Math.PI * (3 - Math.sqrt(5));
-  agents.forEach((agent, index) => {
-    const progress = agents.length <= 1 ? 0 : Math.sqrt((index + 0.5) / agents.length);
+  ordered.slice(1).forEach((agent, index) => {
+    const progress = Math.sqrt((index + 1) / Math.max(1, ordered.length - 1));
     const angle = index * goldenAngle - Math.PI / 2;
     positions[agent.id] = {
-      x: centerX + Math.cos(angle) * 360 * progress,
-      y: centerY + Math.sin(angle) * 220 * progress
+      x: centerX + Math.cos(angle) * (90 + 270 * progress),
+      y: centerY + Math.sin(angle) * (58 + 162 * progress)
     };
   });
   return positions;
@@ -1807,7 +1843,7 @@ export function storedGraphPositions(storageKey) {
   }
 }
 
-export function AgentGraph({ agents, storageKey }) {
+export function AgentGraph({ agents, auth, storageKey, onConnect, onDisconnect }) {
   const eligibleGraphAgents = agents
     .filter((agent) => !agent.document && !agent.resource_for_agent_id && agent.enabled !== false);
   const graphAgents = eligibleGraphAgents.slice(0, 120);
@@ -1817,8 +1853,17 @@ export function AgentGraph({ agents, storageKey }) {
     ...storedGraphPositions(storageKey)
   }));
   const [focusedId, setFocusedId] = useState(null);
+  const [connectMode, setConnectMode] = useState(false);
+  const [connectFromId, setConnectFromId] = useState(null);
+  const [connectionBusy, setConnectionBusy] = useState(false);
+  const [graphError, setGraphError] = useState("");
   const canvasRef = useRef(null);
+  const draggedRef = useRef(false);
   const edges = graphConnections(graphAgents);
+  const focusedAgent = graphAgents.find((agent) => agent.id === focusedId);
+  const focusedEdges = focusedId
+    ? edges.filter((edge) => edge.from === focusedId || edge.to === focusedId)
+    : [];
 
   useEffect(() => {
     setPositions((current) => ({ ...initialGraphPositions(graphAgents), ...current }));
@@ -1836,11 +1881,18 @@ export function AgentGraph({ agents, storageKey }) {
   }, [graphAgentIds, positions, storageKey]);
 
   function dragNode(event, agentId) {
+    if (connectMode || connectionBusy) return;
     const node = event.currentTarget;
+    const startX = event.clientX;
+    const startY = event.clientY;
+    draggedRef.current = false;
     node.setPointerCapture(event.pointerId);
     function move(moveEvent) {
       const bounds = canvasRef.current?.getBoundingClientRect();
       if (!bounds) return;
+      if (Math.hypot(moveEvent.clientX - startX, moveEvent.clientY - startY) > 4) {
+        draggedRef.current = true;
+      }
       const x = ((moveEvent.clientX - bounds.left) / bounds.width) * 900;
       const y = ((moveEvent.clientY - bounds.top) / bounds.height) * 560;
       setPositions((current) => ({
@@ -1858,65 +1910,196 @@ export function AgentGraph({ agents, storageKey }) {
     node.addEventListener("pointercancel", stop);
   }
 
+  function resetLayout() {
+    setPositions(initialGraphPositions(graphAgents));
+    setFocusedId(null);
+    setConnectFromId(null);
+    setGraphError("");
+  }
+
+  function toggleConnectMode() {
+    setConnectMode((current) => !current);
+    setConnectFromId(null);
+    setGraphError("");
+  }
+
+  async function chooseNode(agent) {
+    if (draggedRef.current) {
+      draggedRef.current = false;
+      return;
+    }
+    if (!connectMode) {
+      setFocusedId((current) => current === agent.id ? null : agent.id);
+      return;
+    }
+    if (!connectFromId) {
+      setConnectFromId(agent.id);
+      setFocusedId(agent.id);
+      return;
+    }
+    if (connectFromId === agent.id) {
+      setConnectFromId(null);
+      setGraphError("Choose a different destination agent.");
+      return;
+    }
+    if (!canManageAgent(agent, auth)) {
+      setGraphError("Choose an agent you can edit as the destination.");
+      return;
+    }
+    if (edges.some((edge) => edge.from === connectFromId && edge.to === agent.id && edge.kind === "handoff")) {
+      setGraphError("Those agents already have a handoff connection.");
+      return;
+    }
+    setConnectionBusy(true);
+    setGraphError("");
+    try {
+      await onConnect?.(connectFromId, agent.id);
+      setFocusedId(agent.id);
+      setConnectMode(false);
+      setConnectFromId(null);
+    } catch {
+      setGraphError("The connection could not be saved.");
+    } finally {
+      setConnectionBusy(false);
+    }
+  }
+
+  async function removeConnection(edge) {
+    if (edge.kind !== "handoff" || connectionBusy) return;
+    const target = graphAgents.find((agent) => agent.id === edge.to);
+    if (!canManageAgent(target, auth)) {
+      setGraphError("You can remove connections only from agents you can edit.");
+      return;
+    }
+    setConnectionBusy(true);
+    setGraphError("");
+    try {
+      await onDisconnect?.(edge.from, edge.to);
+    } catch {
+      setGraphError("The connection could not be removed.");
+    } finally {
+      setConnectionBusy(false);
+    }
+  }
+
+  function edgePath(edge) {
+    const from = positions[edge.from];
+    const to = positions[edge.to];
+    if (!from || !to) return "";
+    const direction = to.x >= from.x ? 1 : -1;
+    const bend = Math.max(42, Math.min(145, Math.abs(to.x - from.x) * 0.42));
+    const verticalOffset = Math.abs(to.x - from.x) < 40 ? 52 : 0;
+    return `M ${from.x} ${from.y} C ${from.x + direction * bend + verticalOffset} ${from.y}, ${to.x - direction * bend + verticalOffset} ${to.y}, ${to.x} ${to.y}`;
+  }
+
   return (
     <section className="resource-section graph-section" aria-labelledby="graph-heading">
-      <div className="section-heading">
-        <div><h3 id="graph-heading">Agent graph</h3><p>Drag nodes to map your system. Arrows show knowledge and handoffs.</p></div>
-        <span className="graph-count">{graphAgents.length}{eligibleGraphAgents.length > graphAgents.length ? ` of ${eligibleGraphAgents.length}` : ""} nodes · {edges.length} links</span>
+      <div className="graph-heading-row">
+        <div className="section-heading graph-title">
+          <div><span className="section-eyebrow">TEAM MAP</span><h3 id="graph-heading">Connect how agents think together.</h3><p>Arrange the map, then draw a handoff from one specialist to the next.</p></div>
+          <span className="graph-count">{graphAgents.length}{eligibleGraphAgents.length > graphAgents.length ? ` of ${eligibleGraphAgents.length}` : ""} agents · {edges.length} connections</span>
+        </div>
+        <div className="graph-toolbar" aria-label="Graph tools">
+          <button type="button" className={connectMode ? "active" : ""} onClick={toggleConnectMode} disabled={auth?.is_viewer || graphAgents.length < 2 || connectionBusy}>
+            <Network size={15} />{connectMode ? "Cancel connection" : "Connect agents"}
+          </button>
+          <button type="button" onClick={resetLayout} disabled={!graphAgents.length || connectionBusy}><RefreshCw size={15} />Reset layout</button>
+        </div>
       </div>
-      <div className="agent-graph" ref={canvasRef}>
-        <svg viewBox="0 0 900 560" role="img" aria-label="Connected agent graph">
+      <div className={`graph-guidance ${connectMode ? "active" : ""}`} role="status" aria-live="polite">
+        <span>{connectMode ? connectFromId ? "Now choose the destination agent." : "Choose the agent that will send its work." : "Drag agents to organize the map. Select an agent to inspect its connections."}</span>
+        {connectFromId && <strong>From: {formatAgentName(connectFromId, agents)}</strong>}
+        {graphError && <em>{graphError}</em>}
+      </div>
+      <div className={`agent-graph ${connectMode ? "is-connecting" : ""}`} ref={canvasRef}>
+        <svg viewBox="0 0 900 560" role="img" aria-label="Interactive agent mind map">
           <defs>
-            <marker id="graph-arrow" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+            <marker id="graph-arrow-handoff" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+              <path d="M0,0 L7,3.5 L0,7 Z" />
+            </marker>
+            <marker id="graph-arrow-knowledge" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
               <path d="M0,0 L7,3.5 L0,7 Z" />
             </marker>
           </defs>
           {edges.map((edge) => {
-            const from = positions[edge.from];
-            const to = positions[edge.to];
-            if (!from || !to) return null;
-            return <line key={`${edge.from}-${edge.to}`} x1={from.x} y1={from.y} x2={to.x} y2={to.y} markerEnd="url(#graph-arrow)" />;
+            const path = edgePath(edge);
+            if (!path) return null;
+            const related = focusedId && (edge.from === focusedId || edge.to === focusedId);
+            return (
+              <g className={`graph-edge ${edge.kind} ${related ? "related" : ""}`} key={`${edge.from}-${edge.to}-${edge.kind}`}>
+                <path className="edge-line" d={path} markerEnd={`url(#graph-arrow-${edge.kind})`} />
+                <path
+                  className="edge-hit"
+                  d={path}
+                  role="button"
+                  tabIndex="0"
+                  aria-label={`${formatAgentName(edge.from, agents)} sends work to ${formatAgentName(edge.to, agents)}`}
+                  onClick={() => setFocusedId(edge.to)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") setFocusedId(edge.to);
+                  }}
+                />
+              </g>
+            );
           })}
         </svg>
         {graphAgents.map((agent) => {
           const position = positions[agent.id] || { x: 450, y: 278 };
+          const connectionCount = edges.filter((edge) => edge.from === agent.id || edge.to === agent.id).length;
           return (
             <button
               type="button"
-              className={`graph-node ${productType(agent)} ${focusedId === agent.id ? "focused" : ""}`}
+              className={`graph-node tone-${graphTone(agent.id)} ${focusedId === agent.id ? "focused" : ""} ${connectFromId === agent.id ? "connection-source" : ""} ${agent.session_active === false ? "inactive" : ""}`}
               style={{ left: `${(position.x / 900) * 100}%`, top: `${(position.y / 560) * 100}%` }}
               key={agent.id}
               onPointerDown={(event) => dragNode(event, agent.id)}
-              onClick={() => setFocusedId((current) => current === agent.id ? null : agent.id)}
-              title={agent.capability || agent.title}
+              onClick={() => chooseNode(agent)}
+              title={agentFacingText(agent.capability || agent.title)}
             >
               <span>{formatAgentName(agent.id, agents)}</span>
+              <small>{connectionCount ? `${connectionCount} connection${connectionCount === 1 ? "" : "s"}` : "Ready to connect"}</small>
             </button>
           );
         })}
-        {graphAgents.length === 0 && <p className="graph-empty">Create an agent or LoRA to start your graph.</p>}
-        {focusedId && (
-          <aside className="graph-inspector">
+        {graphAgents.length === 0 && <p className="graph-empty">Create an agent to start mapping your team.</p>}
+        {focusedAgent && !connectMode && (
+          <aside className="graph-inspector" aria-label={`${formatAgentName(focusedId, agents)} connections`}>
+            <header><span>SELECTED AGENT</span><button type="button" aria-label="Close agent details" onClick={() => setFocusedId(null)}><X size={14} /></button></header>
             <strong>{formatAgentName(focusedId, agents)}</strong>
-            <span>{agents.find((agent) => agent.id === focusedId)?.capability}</span>
+            <p>{agentFacingText(focusedAgent.capability, "No capability description yet.")}</p>
+            <div className="graph-relations">
+              {focusedEdges.map((edge) => {
+                const incoming = edge.to === focusedId;
+                const otherId = incoming ? edge.from : edge.to;
+                const removable = edge.kind === "handoff" && canManageAgent(graphAgents.find((agent) => agent.id === edge.to), auth);
+                return (
+                  <div key={`${edge.from}-${edge.to}-${edge.kind}`}>
+                    <span><small>{incoming ? "Receives from" : "Sends to"}</small><b>{formatAgentName(otherId, agents)}</b><i>{edge.kind === "handoff" ? "Handoff" : "Knowledge"}</i></span>
+                    {removable && <button type="button" onClick={() => removeConnection(edge)} disabled={connectionBusy} aria-label={`Remove connection with ${formatAgentName(otherId, agents)}`}><X size={13} /></button>}
+                  </div>
+                );
+              })}
+              {focusedEdges.length === 0 && <span className="graph-no-relations">No connections yet. Choose “Connect agents” to add the first handoff.</span>}
+            </div>
           </aside>
         )}
       </div>
-      <div className="graph-legend"><span><i className="agent" />Agent</span><span><i className="lora" />LoRA</span><span><i className="link" />Directed connection</span></div>
+      <div className="graph-legend">
+        <span className="palette"><i /><i /><i /></span><span>Color distinguishes agents</span>
+        <span><i className="handoff" />Editable handoff</span><span><i className="knowledge" />Knowledge link</span>
+      </div>
     </section>
   );
 }
 
 function MarketplacePanel({ items, agents, auth, onPublish, onRate }) {
   const [query, setQuery] = useState("");
-  const [type, setType] = useState("all");
   const publishedIds = new Set(items.map((item) => item.id));
   const owned = agents.filter((agent) =>
     !agent.document && !agent.resource_for_agent_id && agent.enabled !== false &&
     (auth?.is_admin || (agent.created_by === auth?.user_id && agent.workspace_id === auth?.workspace_id))
   );
   const filtered = items.filter((item) =>
-    (type === "all" || item.item_type === type) &&
     (!query || `${item.title} ${item.summary} ${item.creator} ${item.achievements.join(" ")}`.toLowerCase().includes(query.toLowerCase()))
   );
   return (
@@ -1924,7 +2107,7 @@ function MarketplacePanel({ items, agents, auth, onPublish, onRate }) {
       <div className="marketplace-hero">
         <span><Sparkles size={15} /> COMMUNITY LIBRARY</span>
         <h3 id="marketplace-heading">Evidence-rich specialists, shared openly.</h3>
-        <p>Explore agents and LoRAs with creator-provided achievements, linked proof, and community ratings.</p>
+        <p>Explore API-backed agents with creator-provided achievements, linked proof, and community ratings.</p>
       </div>
       {owned.length > 0 && (
         <div className="publish-shelf">
@@ -1940,16 +2123,13 @@ function MarketplacePanel({ items, agents, auth, onPublish, onRate }) {
       )}
       <div className="marketplace-toolbar">
         <label className="search-field full-width"><Search size={16} /><span className="sr-only">Search marketplace</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search skills, outcomes, creators" /></label>
-        <div className="marketplace-filter" aria-label="Marketplace type">
-          {["all", "agent", "lora"].map((value) => <button type="button" key={value} aria-pressed={type === value} onClick={() => setType(value)}>{value === "all" ? "All" : value === "lora" ? "LoRAs" : "Agents"}</button>)}
-        </div>
       </div>
       <div className="marketplace-grid">
         {filtered.map((item) => (
           <article className="market-card" key={item.id}>
-            <header><span className={`market-type ${item.item_type}`}>{item.item_type === "lora" ? <Layers3 size={13} /> : <Bot size={13} />}{item.item_type}</span><small>v{item.version}</small></header>
-            <h4>{item.title}</h4>
-            <p>{item.summary || item.capability}</p>
+            <header><span className="market-type agent"><Bot size={13} />agent</span><small>v{item.version}</small></header>
+            <h4>{agentFacingText(item.title, "Community agent")}</h4>
+            <p>{agentFacingText(item.summary || item.capability)}</p>
             {item.achievements.length > 0 && <ul>{item.achievements.slice(0, 3).map((achievement) => <li key={achievement}><Check size={12} />{achievement}</li>)}</ul>}
             {item.proofs.length > 0 && <div className="proof-links" aria-label="Creator-provided proof">{item.proofs.slice(0, 3).map((proof) => <a key={proof.url} href={proof.url} target="_blank" rel="noreferrer"><Globe2 size={12} />{proof.title}</a>)}</div>}
             {item.reviews?.length > 0 && (
@@ -1974,7 +2154,7 @@ function MarketplacePanel({ items, agents, auth, onPublish, onRate }) {
 
 function PublishDialog({ agent, onClose, onSaved }) {
   const existing = agent.marketplace || {};
-  const [summary, setSummary] = useState(existing.summary || agent.capability || "");
+  const [summary, setSummary] = useState(agentFacingText(existing.summary || agent.capability));
   const [achievements, setAchievements] = useState((existing.achievements || []).join("\n"));
   const [proofs, setProofs] = useState(existing.proofs?.length ? existing.proofs : [{ title: "", url: "" }]);
   const [version, setVersion] = useState(existing.version || "1.0");
@@ -1990,7 +2170,7 @@ function PublishDialog({ agent, onClose, onSaved }) {
     setError("");
     try {
       await api.post(`/api/marketplace/items/${encodeURIComponent(agent.id)}`, {
-        item_type: productType(agent),
+        item_type: "agent",
         summary,
         achievements: achievements.split("\n").map((value) => value.trim()).filter(Boolean),
         proofs: proofs.filter((proof) => proof.title.trim() || proof.url.trim()),
@@ -2008,7 +2188,7 @@ function PublishDialog({ agent, onClose, onSaved }) {
     <ModalSurface title="Publish to marketplace" description="Add the outcomes and evidence people need to evaluate your work." onClose={onClose} className="form-dialog">
       <form className="dialog-form publish-form" onSubmit={submit}>
         {error && <div className="form-error" role="alert">{error}</div>}
-        <div className="publish-subject"><span className={`market-type ${productType(agent)}`}>{productType(agent) === "lora" ? <Layers3 size={13} /> : <Bot size={13} />}{productType(agent)}</span><strong>{formatAgentName(agent.id, [agent])}</strong></div>
+        <div className="publish-subject"><span className="market-type agent"><Bot size={13} />agent</span><strong>{formatAgentName(agent.id, [agent])}</strong></div>
         <label><span>Marketplace summary</span><textarea data-autofocus value={summary} onChange={(event) => setSummary(event.target.value)} required maxLength={500} /></label>
         <label><span>Achievements <small>one per line</small></span><textarea value={achievements} onChange={(event) => setAchievements(event.target.value)} placeholder={"92% on internal support benchmark\nCut review time by 35%"} /></label>
         <fieldset className="proof-editor"><legend>Proof links</legend>{proofs.map((proof, index) => <div key={index}><input aria-label={`Proof ${index + 1} title`} value={proof.title} onChange={(event) => updateProof(index, "title", event.target.value)} placeholder="Benchmark report" /><input aria-label={`Proof ${index + 1} URL`} type="url" value={proof.url} onChange={(event) => updateProof(index, "url", event.target.value)} placeholder="https://…" /></div>)}<button type="button" onClick={() => setProofs((current) => [...current, { title: "", url: "" }].slice(0, 8))}><Plus size={14} />Add proof</button></fieldset>
@@ -2038,7 +2218,7 @@ function RatingDialog({ item, onClose, onSaved }) {
     }
   }
   return (
-    <ModalSurface title={`Rate ${item.title}`} description="Share a concise, experience-based evaluation." onClose={onClose} className="small-dialog">
+    <ModalSurface title={`Rate ${agentFacingText(item.title, "agent")}`} description="Share a concise, experience-based evaluation." onClose={onClose} className="small-dialog">
       <form className="dialog-form" onSubmit={submit}>
         {error && <div className="form-error" role="alert">{error}</div>}
         <fieldset className="star-picker"><legend>Your rating</legend>{[1, 2, 3, 4, 5].map((value) => <button type="button" key={value} aria-label={`${value} star${value === 1 ? "" : "s"}`} aria-pressed={score === value} onClick={() => setScore(value)}><Star size={25} fill={value <= score ? "currentColor" : "none"} /></button>)}</fieldset>
@@ -2476,12 +2656,12 @@ function collaboratorToken(agentId) {
   return `agent:${agentId}:output`;
 }
 
-function createAgentForm(agent, kind = productType(agent)) {
+function createAgentForm(agent) {
   if (agent) {
     return {
       id: agent.id,
-      title: agent.title || "",
-      capability: agent.capability || "",
+      title: agentFacingText(agent.title),
+      capability: agentFacingText(agent.capability),
       boundary: agent.boundary || "",
       response_style: "thorough",
       routing_cues: (agent.routing_cues || []).join(", "),
@@ -2491,11 +2671,7 @@ function createAgentForm(agent, kind = productType(agent)) {
       resources: [...(agent.resources || [])],
       sources: (agent.sources || []).join(", "),
       source_text: "",
-      item_type: productType(agent),
-      base_model: agent.base_model || "qwen36-awq",
-      adapter_source: agent.adapter_source || "",
-      trigger_words: (agent.trigger_words || []).join(", "),
-      license: agent.license || "Unspecified"
+      item_type: "agent"
     };
   }
   const suffix = Date.now().toString(36).slice(-7);
@@ -2512,18 +2688,13 @@ function createAgentForm(agent, kind = productType(agent)) {
     resources: [],
     sources: "",
     source_text: "",
-    item_type: kind === "lora" ? "lora" : "agent",
-    base_model: "qwen36-awq",
-    adapter_source: "",
-    trigger_words: "",
-    license: "Unspecified"
+    item_type: "agent"
   };
 }
 
-function AgentDialog({ auth, agent, kind = productType(agent), agents, documents, onClose, onSaved }) {
+function AgentDialog({ auth, agent, agents, documents, onClose, onSaved }) {
   const editing = Boolean(agent);
-  const [form, setForm] = useState(() => createAgentForm(agent, kind));
-  const isLoRA = form.item_type === "lora";
+  const [form, setForm] = useState(() => createAgentForm(agent));
   const [step, setStep] = useState(0);
   const [newFiles, setNewFiles] = useState([]);
   const [uploadedFileKeys, setUploadedFileKeys] = useState([]);
@@ -2627,12 +2798,6 @@ function AgentDialog({ auth, agent, kind = productType(agent), agents, documents
       tools: [...new Set([...form.tools, ...(hasDocumentResources ? ["document_search", "document_read"] : [])])],
       resources: form.resources,
       source_text: form.source_text,
-      ...(isLoRA ? {
-        base_model: form.base_model.trim(),
-        adapter_source: form.adapter_source.trim(),
-        trigger_words: form.trigger_words,
-        license: form.license.trim()
-      } : {}),
       ...(auth?.is_admin ? { sources: form.sources } : {})
     };
     let newAgentPersisted = Boolean(createdAgentId);
@@ -2665,7 +2830,7 @@ function AgentDialog({ auth, agent, kind = productType(agent), agents, documents
       await onSaved();
     } catch (saveError) {
       const prefix = !editing && newAgentPersisted
-        ? `The ${isLoRA ? "LoRA" : "agent"} was saved, but its setup is not finished. `
+        ? "The agent was saved, but its setup is not finished. "
         : "";
       setError(`${prefix}${friendlyError(saveError)}`);
     } finally {
@@ -2674,7 +2839,7 @@ function AgentDialog({ auth, agent, kind = productType(agent), agents, documents
   }
 
   const steps = [
-    { label: "Basics", detail: isLoRA ? "Model and purpose" : "Name and purpose" },
+    { label: "Basics", detail: "Name and purpose" },
     { label: "Tools & teamwork", detail: "Abilities and handoffs" },
     { label: "Knowledge", detail: "Files and review" }
   ];
@@ -2682,13 +2847,13 @@ function AgentDialog({ auth, agent, kind = productType(agent), agents, documents
 
   return (
     <ModalSurface
-      title={editing ? `Edit ${isLoRA ? "LoRA" : "agent"}` : isLoRA ? "Add a LoRA" : "Create an agent"}
-      description={editing ? `Update how this ${isLoRA ? "LoRA" : "agent"} works in future answers.` : isLoRA ? "Register an adapter model and make it available inside the agent studio." : "Describe the role. Virenis will handle the technical setup."}
+      title={editing ? "Edit agent" : "Create an agent"}
+      description={editing ? "Update how this agent works in future answers." : "Describe the role. Virenis will handle the API-backed technical setup."}
       onClose={onClose}
       className="agent-builder-dialog"
     >
       <form className="agent-builder" onSubmit={submit}>
-        <nav className="builder-steps" aria-label={`${isLoRA ? "LoRA" : "Agent"} setup progress`}>
+        <nav className="builder-steps" aria-label="Agent setup progress">
           {steps.map((item, index) => (
             <button
               type="button"
@@ -2712,28 +2877,20 @@ function AgentDialog({ auth, agent, kind = productType(agent), agents, documents
               <section className="builder-panel" aria-labelledby="agent-basics-heading">
                 <div className="builder-heading">
                   <span>STEP 1 OF 3</span>
-                  <h3 id="agent-basics-heading">{isLoRA ? "Connect the model to a clear job." : "Start with the job, not the settings."}</h3>
-                  <p>{isLoRA ? "Describe the adapter and the requests where it should add specialized behavior." : "A clear name and purpose are enough to create a useful first version."}</p>
+                  <h3 id="agent-basics-heading">Start with the job, not the settings.</h3>
+                  <p>A clear name and purpose are enough to create a useful first version.</p>
                 </div>
                 <div className="builder-field">
-                  <label htmlFor="agent-name">{isLoRA ? "LoRA name" : "Agent name"}</label>
-                  <input id="agent-name" data-autofocus value={form.title} onChange={(event) => update("title", event.target.value)} required maxLength={160} placeholder={isLoRA ? "Clinical language adapter" : "Launch risk analyst"} />
+                  <label htmlFor="agent-name">Agent name</label>
+                  <input id="agent-name" data-autofocus value={form.title} onChange={(event) => update("title", event.target.value)} required maxLength={160} placeholder="Launch risk analyst" />
                   <small>Use a name people will recognize when they call it with @.</small>
                 </div>
                 <div className="builder-field">
-                  <label htmlFor="agent-purpose">What will this {isLoRA ? "LoRA" : "agent"} do?</label>
+                  <label htmlFor="agent-purpose">What will this agent do?</label>
                   <textarea id="agent-purpose" value={form.capability} onChange={(event) => update("capability", event.target.value)} required maxLength={2400} placeholder="Review launch plans, find operational and market risks, and turn them into practical recommendations..." />
                   <small>Describe its expertise, how it should think, and what a good result looks like.</small>
                 </div>
-                {isLoRA && (
-                  <div className="lora-model-grid">
-                    <div className="builder-field"><label htmlFor="lora-base-model">Base model</label><input id="lora-base-model" value={form.base_model} onChange={(event) => update("base_model", event.target.value)} required placeholder="qwen36-awq" /></div>
-                    <div className="builder-field"><label htmlFor="lora-license">License</label><input id="lora-license" value={form.license} onChange={(event) => update("license", event.target.value)} required placeholder="Apache-2.0" /></div>
-                    <div className="builder-field full"><label htmlFor="lora-adapter-source">Adapter source</label><input id="lora-adapter-source" type="url" value={form.adapter_source} onChange={(event) => update("adapter_source", event.target.value)} required placeholder="https://huggingface.co/your-name/adapter" /><small>Virenis imports the adapter from Hugging Face, verifies its Qwen ABI, and pins the exact source revision before mounting it.</small></div>
-                    <div className="builder-field full"><label htmlFor="lora-trigger-words">Trigger words <small>optional</small></label><input id="lora-trigger-words" value={form.trigger_words} onChange={(event) => update("trigger_words", event.target.value)} placeholder="clinical summary, patient-safe language" /></div>
-                  </div>
-                )}
-                {!isLoRA && <div className="template-picker">
+                <div className="template-picker">
                   <span>Or start from a common role</span>
                   <div>
                     {AGENT_TEMPLATES.map((template) => {
@@ -2741,7 +2898,7 @@ function AgentDialog({ auth, agent, kind = productType(agent), agents, documents
                       return <button type="button" key={template.id} onClick={() => applyTemplate(template)}><Icon size={15} />{template.label}</button>;
                     })}
                   </div>
-                </div>}
+                </div>
                 <fieldset className="choice-fieldset response-style-fieldset">
                   <legend>How should it respond?</legend>
                   <div className="response-style-grid">
@@ -2766,7 +2923,7 @@ function AgentDialog({ auth, agent, kind = productType(agent), agents, documents
                 <div className="builder-heading">
                   <span>STEP 2 OF 3</span>
                   <h3 id="agent-tools-heading">Give it only the abilities it needs.</h3>
-                  <p>Choose tools and decide how this {isLoRA ? "LoRA" : "agent"} fits into work done by other agents.</p>
+                  <p>Choose tools and decide how this agent fits into work done by other agents.</p>
                 </div>
                 <fieldset className="choice-fieldset">
                   <legend>Tools <small>optional</small></legend>
@@ -2883,7 +3040,6 @@ function AgentDialog({ auth, agent, kind = productType(agent), agents, documents
                   <summary><Settings2 size={15} /> Advanced setup</summary>
                   <div className="advanced-builder-grid">
                     <div className="builder-field"><label htmlFor="agent-cues">When should Virenis use it?</label><textarea id="agent-cues" value={form.routing_cues} onChange={(event) => update("routing_cues", event.target.value)} placeholder={`${form.title || "Agent name"}, related topics, common requests`} /></div>
-                    <div className="builder-field"><label htmlFor="agent-id">Internal ID</label><input id="agent-id" value={form.id} onChange={(event) => update("id", event.target.value)} disabled={editing || Boolean(createdAgentId)} required /></div>
                     {auth?.is_admin && <div className="builder-field"><label htmlFor="agent-sources">Approved source paths</label><input id="agent-sources" value={form.sources} onChange={(event) => update("sources", event.target.value)} /></div>}
                   </div>
                 </details>
@@ -2891,16 +3047,15 @@ function AgentDialog({ auth, agent, kind = productType(agent), agents, documents
             )}
           </div>
 
-          <aside className="builder-preview" aria-label={`${isLoRA ? "LoRA" : "Agent"} summary`}>
-            <div className="preview-badge">{isLoRA ? <Layers3 size={18} /> : <Bot size={18} />}<span>{isLoRA ? "LORA" : "AGENT"} PREVIEW</span></div>
-            <h4>{form.title || `Untitled ${isLoRA ? "LoRA" : "agent"}`}</h4>
-            <p>{form.capability || `Describe what this ${isLoRA ? "LoRA" : "agent"} will do to see a summary here.`}</p>
+          <aside className="builder-preview" aria-label="Agent summary">
+            <div className="preview-badge"><Bot size={18} /><span>AGENT PREVIEW</span></div>
+            <h4>{form.title || "Untitled agent"}</h4>
+            <p>{form.capability || "Describe what this agent will do to see a summary here."}</p>
             <dl>
               <div><dt>Style</dt><dd>{RESPONSE_STYLES.find((style) => style.id === form.response_style)?.title || "Custom"}</dd></div>
               <div><dt>Tools</dt><dd>{form.tools.length || "None"}</dd></div>
               <div><dt>Connections</dt><dd>{form.consumes.filter((value) => /^agent:.+:output$/.test(value)).length || "None"}</dd></div>
               <div><dt>Knowledge</dt><dd>{selectedDocumentCount + newFiles.length || "None"}</dd></div>
-              {isLoRA && <div><dt>Base model</dt><dd>{form.base_model || "Not set"}</dd></div>}
             </dl>
             <div className="preview-status"><span /><div><strong>Private workspace</strong><small>Ready after setup completes</small></div></div>
           </aside>
@@ -2913,7 +3068,7 @@ function AgentDialog({ auth, agent, kind = productType(agent), agents, documents
           <span>Step {step + 1} of 3</span>
           <button type="submit" className="text-button primary" disabled={busy || !canContinue}>
             {busy ? <LoaderCircle className="spin" size={16} /> : step < 2 ? <ArrowRight size={16} /> : editing ? <Check size={16} /> : <Plus size={16} />}
-            {busy ? "Saving" : step < 2 ? "Continue" : editing ? "Save changes" : isLoRA ? "Add LoRA" : "Create agent"}
+            {busy ? "Saving" : step < 2 ? "Continue" : editing ? "Save changes" : "Create agent"}
           </button>
         </footer>
       </form>
