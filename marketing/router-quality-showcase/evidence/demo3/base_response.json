@@ -1,0 +1,37 @@
+{
+  "id": "chatcmpl-9a037a969c694301",
+  "object": "chat.completion",
+  "created": 1783949981,
+  "model": "qwen36-awq",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "I do not have access to real-time data, so I cannot provide information on earthquakes that occurred in the past hour. For the latest seismic activity, please consult a live monitoring service such as the USGS Earthquake Hazards Program or the EMSC.",
+        "refusal": null,
+        "annotations": null,
+        "audio": null,
+        "function_call": null,
+        "reasoning": "Not published; the evidence shows only auditable routing and tool actions."
+      },
+      "logprobs": null,
+      "finish_reason": "stop",
+      "stop_reason": null,
+      "token_ids": null,
+      "routed_experts": null
+    }
+  ],
+  "service_tier": null,
+  "system_fingerprint": "vllm-0.24.0-1f1b6473",
+  "usage": {
+    "prompt_tokens": 52,
+    "total_tokens": 104,
+    "completion_tokens": 52,
+    "prompt_tokens_details": null
+  },
+  "prompt_logprobs": null,
+  "prompt_token_ids": null,
+  "prompt_text": null,
+  "kv_transfer_params": null
+}

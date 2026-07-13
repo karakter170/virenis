@@ -2579,7 +2579,7 @@ function durableChatOptions(run, suppliedOptions) {
     return { ...suppliedOptions };
   }
   return {
-    planner_mode: run.planner_mode || process.env.TCAR_PLANNER_MODE || "cue",
+    planner_mode: run.planner_mode || process.env.TCAR_PLANNER_MODE || "session",
     parallel_workers: Number(run.parallel_workers) || Number(process.env.TCAR_PARALLEL_WORKERS || 2),
     max_routing_adapters: Number(run.max_routing_adapters) || Number(process.env.TCAR_MAX_ROUTING_ADAPTERS || 12),
     max_tokens: Number(process.env.TCAR_MAX_TOKENS || 256),
@@ -4286,7 +4286,8 @@ function normalizeChatOptions(options = {}) {
     "base_model",
     "base_url",
     "enable_thinking",
-    "planner_model"
+    "planner_model",
+    "session_model"
   ]);
   const supplied = Object.keys(options);
   const forbidden = supplied.filter((key) => serverOnlyKeys.has(key));
@@ -4297,14 +4298,14 @@ function normalizeChatOptions(options = {}) {
   if (unknown.length > 0) {
     throwStatus(400, `Unknown chat option(s): ${unknown.join(", ")}.`);
   }
-  const plannerMode = String(options.planner_mode || process.env.TCAR_PLANNER_MODE || "cue").toLowerCase();
-  if (!["cue", "llm", "tcandon"].includes(plannerMode)) {
-    throwStatus(400, "planner_mode must be 'cue', 'llm', or 'tcandon'.");
+  const plannerMode = String(options.planner_mode || process.env.TCAR_PLANNER_MODE || "session").toLowerCase();
+  if (!["cue", "llm", "session", "tcandon"].includes(plannerMode)) {
+    throwStatus(400, "planner_mode must be 'cue', 'llm', 'session', or 'tcandon'.");
   }
   return {
     show_route_details: options.show_route_details !== false,
     planner_mode: plannerMode,
-    planner_max_tokens: boundedInt(options.planner_max_tokens, Number(process.env.TCAR_PLANNER_MAX_TOKENS || 384), 32, Number(process.env.TCAR_CLIENT_MAX_PLANNER_TOKENS || 512)),
+    planner_max_tokens: boundedInt(options.planner_max_tokens, Number(process.env.TCAR_PLANNER_MAX_TOKENS || 384), plannerMode === "session" ? 256 : 32, Number(process.env.TCAR_CLIENT_MAX_PLANNER_TOKENS || 512)),
     max_routing_adapters: boundedInt(options.max_routing_adapters, Number(process.env.TCAR_MAX_ROUTING_ADAPTERS || 12), 1, Number(process.env.TCAR_CLIENT_MAX_ROUTING_ADAPTERS || 24)),
     parallel_workers: boundedInt(options.parallel_workers, Number(process.env.TCAR_PARALLEL_WORKERS || 2), 1, Number(process.env.TCAR_CLIENT_MAX_PARALLEL_WORKERS || 4)),
     max_tokens: boundedInt(options.max_tokens, Number(process.env.TCAR_MAX_TOKENS || 256), 16, Number(process.env.TCAR_CLIENT_MAX_TOKENS || 512)),

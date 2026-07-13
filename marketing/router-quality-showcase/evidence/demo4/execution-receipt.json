@@ -1,0 +1,21 @@
+{
+  "status": "completed",
+  "event": "execution.completed",
+  "execution_id": "router-demo4-20260713T163455Z",
+  "receipt_id": "ar_2885929519aa43ab9692eb7dd65323f6",
+  "receipt_hash": "29e601d8716c09558d238c1cac51d33ce457dec09da82b4ac585cc6c07c474dd",
+  "selected_agents": [
+    "D01 Event Brief Source Agent",
+    "D02 Park Permit Source Agent",
+    "D03 Fire Safety Source Agent",
+    "D04 Weather Briefing Source Agent",
+    "D05 Accessibility Review Source Agent",
+    "D06 Transport Bulletin Source Agent",
+    "D07 Artist Call Sheet Source Agent",
+    "D08 Habitat and Noise Source Agent",
+    "D09 Vendor Health Source Agent",
+    "D10 Staffing and Incident Source Agent",
+    "Alder Quay Operating Plan Analysis Agent"
+  ],
+  "evidence_note": "The completed receipt binds the eleven-agent plan, outputs, citations, and evidence records."
+}

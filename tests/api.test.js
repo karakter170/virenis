@@ -6,7 +6,7 @@ import request from "supertest";
 import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createApp } from "../server/app.js";
 import { requireRuntimeConfigured, setRuntimeFetchForTests } from "../server/runtimeClient.js";
-import { buildParallelBatches, enrichRuntimeRoutingTrace, normalizeSharedMemory, planRoutes, sanitizeToolCalls, scopedRoutingContext } from "../server/tcarEngine.js";
+import { buildParallelBatches, enrichRuntimeRoutingTrace, normalizeRuntimeRouting, normalizeSharedMemory, planRoutes, sanitizeToolCalls, scopedRoutingContext } from "../server/tcarEngine.js";
 import { chunkDocument, runtimeDocumentRevision } from "../server/documents.js";
 
 let tmpDir;
@@ -193,6 +193,51 @@ describe("runtime and catalog", () => {
       agent_revision: revision
     });
     expect(plan.routing.candidate_trace[0].reality_rank).toBe(0.2);
+  });
+
+  it("preserves a bounded session-controller trace from the Runtime", () => {
+    const routing = normalizeRuntimeRouting({
+      mode: "session",
+      candidate_count: 2,
+      candidate_adapters: ["review_lora", "writer_lora"],
+      orchestrator: {
+        contract_version: "session-orchestrator-v1",
+        decision: "delegate",
+        model: "qwen36-awq",
+        intent: "Review and summarize the launch.",
+        required_capabilities: ["launch review", "clear writing"],
+        missing_capabilities: [],
+        clarification_question: "",
+        synthesis_brief: "Return one concise recommendation.",
+        discovery_method: "authorized_manifest_index",
+        authorized_agent_count: 12,
+        discovered_candidate_count: 2,
+        catalog_checked: ["review_lora", "writer_lora"],
+        rejected_adapters: ["invented_agent"],
+        fallback_used: "",
+        planning_call_performed: true,
+        final_synthesis_required: true
+      }
+    });
+
+    expect(routing.orchestrator).toEqual({
+      contract_version: "session-orchestrator-v1",
+      decision: "delegate",
+      model: "qwen36-awq",
+      intent: "Review and summarize the launch.",
+      required_capabilities: ["launch review", "clear writing"],
+      missing_capabilities: [],
+      clarification_question: "",
+      synthesis_brief: "Return one concise recommendation.",
+      discovery_method: "authorized_manifest_index",
+      authorized_agent_count: 12,
+      discovered_candidate_count: 2,
+      catalog_checked: ["review_lora", "writer_lora"],
+      rejected_adapters: ["invented_agent"],
+      fallback_used: "",
+      planning_call_performed: true,
+      final_synthesis_required: true
+    });
   });
 
   it("fails closed for production real-mode runtime and auth configuration", () => {
@@ -2282,6 +2327,17 @@ describe("chat execution", () => {
     const tcandonRun = await waitForRun(tcandonQueued.body.run_id);
     expect(tcandonRun.status).toBe("completed");
     expect(app.locals.store.read().runs.find((item) => item.run_id === tcandonQueued.body.run_id).planner_mode).toBe("tcandon");
+
+    const sessionQueued = await request(app)
+      .post(`/api/chat/sessions/${session.session_id}/messages`)
+      .send({
+        content: "Let the main session model coordinate this support workflow.",
+        options: { planner_mode: "session" }
+      })
+      .expect(202);
+    const sessionRun = await waitForRun(sessionQueued.body.run_id);
+    expect(sessionRun.status).toBe("completed");
+    expect(app.locals.store.read().runs.find((item) => item.run_id === sessionQueued.body.run_id).planner_mode).toBe("session");
   });
 
   it("redacts route raw text and prompt previews for non-admin run readers", async () => {

@@ -1,0 +1,51 @@
+{
+  "execution_id": "router-live-events-demo3-20260713T133943Z",
+  "execution_provenance": {
+    "execution_id": "router-live-events-demo3-20260713T133943Z",
+    "request_fingerprint": "d6fe383985a297d0c10c64455c53f61b12672f40a8b03dcbfdb9a12f9c072b8f",
+    "receipt_id": "ar_d6b877819a8e4cc2bed45ac5813ad455",
+    "record_hash": "95dc3467deaa369ab77d4ae27dbaecccd3c7d49459e26e9d375ab008b5fc76a9",
+    "schema_version": 1,
+    "created_at": "2026-07-13T13:41:40.962476Z"
+  },
+  "audit_receipt": {
+    "receipt_id": "ar_d6b877819a8e4cc2bed45ac5813ad455",
+    "schema_version": 1,
+    "subject_type": "execution",
+    "subject_id": "router-marketing-demo3",
+    "event_type": "execution.completed",
+    "event_id": null,
+    "execution_id": "router-live-events-demo3-20260713T133943Z",
+    "subject_sequence": 1,
+    "created_at": "2026-07-13T13:41:40.962476Z",
+    "previous_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+    "payload_sha256": "5e9e33dd0387d8576f349123deb8d25b3196f9d17d35172bcaf79802f9e6b6ce",
+    "receipt_hash": "95dc3467deaa369ab77d4ae27dbaecccd3c7d49459e26e9d375ab008b5fc76a9",
+    "payload": {
+      "actor_sha256": "46fc18fe08d02e27aa93465ce37b17b148a670f448c24038a6e41ffe83c06420",
+      "agent_revisions": {
+        "live_events_demo3_lora": "53a0038fa002038101b35ff5c6e8e6fe2943042ea293a9bcc08ba18792caeb95"
+      },
+      "artifact_count": 3,
+      "base_model_content_digest": "7706c7b95c257577cd162bd3f36c05fb1b5edee4d4d37fad366f3c661637471f",
+      "citation_count": 0,
+      "component_snapshot_sha256": "9e8f454af84c9b4f84fe327e7f312ecf7bd4453a7d89e6046139dcf0c01f8769",
+      "duration_ms": 117450,
+      "executor_code_digest": "dbe3c6af35fa6fbec8057c64acfa129a9cda40b84b58468480ac35f91c302d85",
+      "manifest_revision": "0106516ad3adf7b555783d737a34ed9058ef62fd42781051b8990fde6e955d79",
+      "output_sha256": "ed60d876e00099f77580d35edf334459082b4498b7b37db5644fa475dc684a2e",
+      "plan_sha256": "6211a1915e58acbf4d6899d7627394e1b661d020ce3bc9e3153ffa13332d83c5",
+      "query_sha256": "a520c8f0e7c33675c107b9ed301c7ebe48c45a05a458273c0b3208e1791ed1f9",
+      "request_sha256": "d6fe383985a297d0c10c64455c53f61b12672f40a8b03dcbfdb9a12f9c072b8f",
+      "router_chat_template_digest": "f5acd6f5c2e18d90077261434dca0809a457a37a3f9c333a0d0169375a765393",
+      "router_model_content_digest": "9b6076382d27a14d1ae2d1d61adf41ef70fbc02ff9fac4bf609091aea0db8f25",
+      "selected_adapters": [
+        "live_events_demo3_lora"
+      ],
+      "shared_memory_sha256": "a193f4bc3c134e94822c30476607d249b37592e2ac10f3c69cb1883387b31410",
+      "source_text_sha256": [],
+      "status": "completed"
+    }
+  },
+  "output_digest_verified": true
+}

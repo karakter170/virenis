@@ -1,0 +1,437 @@
+{
+  "ok": true,
+  "mode": "Router_dag_vllm_execute",
+  "query": "What is the latest earthquake in the past hour? Give the place and time.",
+  "vllmBaseUrl": "http://127.0.0.1:8000/v1",
+  "baseModel": "qwen36-awq",
+  "adapterMap": {},
+  "parallel": {
+    "workers": 1,
+    "batches": [
+      {
+        "batch": 1,
+        "width": 1,
+        "workers": 1,
+        "steps": [
+          {
+            "id": "s1",
+            "adapter": "live_events_demo3_lora",
+            "depends_on": []
+          }
+        ],
+        "outputStartIndex": 0
+      }
+    ],
+    "maxBatchWidth": 1,
+    "parallelizable": false
+  },
+  "plan": {
+    "steps": [
+      {
+        "id": "s1",
+        "adapter": "live_events_demo3_lora",
+        "task": "Handle live events agent for the user request.",
+        "depends_on": [],
+        "routing": {
+          "adapter": "live_events_demo3_lora",
+          "source": "Router",
+          "confidence": null,
+          "reason": "The user is asking for the latest earthquake in the past hour, including its place and time. The Live Events Agent is specifically designed to retrieve and report the most recent earthquake events from the USGS past-hour feed."
+        }
+      }
+    ],
+    "adapters": [
+      "live_events_demo3_lora"
+    ],
+    "edges": [],
+    "acyclic": true,
+    "routing": {
+      "mode": "Router",
+      "candidate_count": 2,
+      "candidate_adapters": [
+        "live_events_demo3_lora",
+        "finance_reasoning_lora"
+      ],
+      "selected": [
+        {
+          "adapter": "live_events_demo3_lora",
+          "source": "Router",
+          "confidence": null,
+          "reason": "The user is asking for the latest earthquake in the past hour, including its place and time. The Live Events Agent is specifically designed to retrieve and report the most recent earthquake events from the USGS past-hour feed."
+        }
+      ],
+      "explicit_adapters": [],
+      "unresolved_mentions": [],
+      "out_of_scope": false,
+      "reason": "The user is asking for the latest earthquake in the past hour, including its place and time. The Live Events Agent is specifically designed to retrieve and report the most recent earthquake events from the USGS past-hour feed.",
+      "fallback": "",
+      "prompt": {
+        "input_tokens": 476,
+        "input_token_limit": 3712,
+        "context_trimmed": false,
+        "query_truncated": false,
+        "removed_candidates": []
+      }
+    }
+  },
+  "sharedMemoryReceived": [],
+  "sharedMemoryUsed": [],
+  "expertOutputs": [
+    {
+      "id": "s1",
+      "step_id": "s1",
+      "adapter": "live_events_demo3_lora",
+      "vllmModel": "live_events_demo3_lora",
+      "task": "Handle live events agent for the user request.",
+      "depends_on": [],
+      "used_upstream": [],
+      "used_memory": [],
+      "raw_text": "OBSERVABLE_SUMMARY: The earthquake_feed tool successfully returned the latest event from the USGS past-hour feed, providing the necessary place and time data.\n\nDOMAIN_ANSWER: The latest earthquake was a magnitude 1.14 event located 3 km NW of The Geysers, CA, occurring at 2026-07-13T13:37:46.430Z according to USGS.",
+      "raw_turns": [
+        "<tool_call>{\"name\":\"earthquake_feed\",\"arguments\":{\"limit\":1}}</tool_call>",
+        "OBSERVABLE_SUMMARY: The earthquake_feed tool successfully returned the latest event from the USGS past-hour feed, providing the necessary place and time data.\n\nDOMAIN_ANSWER: The latest earthquake was a magnitude 1.14 event located 3 km NW of The Geysers, CA, occurring at 2026-07-13T13:37:46.430Z according to USGS."
+      ],
+      "model_calls": [
+        {
+          "response_id": "chatcmpl-b8c261d13262bf66",
+          "model": "live_events_demo3_lora",
+          "system_fingerprint": "vllm-0.24.0-1f1b6473",
+          "created": 1783950094,
+          "finish_reason": "stop",
+          "usage": {
+            "completion_tokens": 16,
+            "prompt_tokens": 1181,
+            "total_tokens": 1197,
+            "completion_tokens_details": null,
+            "prompt_tokens_details": null
+          }
+        },
+        {
+          "response_id": "chatcmpl-a83399ff4b6819c4",
+          "model": "live_events_demo3_lora",
+          "system_fingerprint": "vllm-0.24.0-1f1b6473",
+          "created": 1783950095,
+          "finish_reason": "stop",
+          "usage": {
+            "completion_tokens": 92,
+            "prompt_tokens": 1737,
+            "total_tokens": 1829,
+            "completion_tokens_details": null,
+            "prompt_tokens_details": null
+          }
+        }
+      ],
+      "policy_violations": [],
+      "knowledge_mode": "current_tool_required",
+      "missing_data_policy": "state_current_data_unavailable",
+      "constraint_mode": "strict_tool_grounding",
+      "allowed_tools": [
+        "earthquake_feed"
+      ],
+      "tool_executions": [
+        {
+          "id": "tool_call_1",
+          "name": "earthquake_feed",
+          "arguments": {
+            "limit": 1
+          },
+          "attempt_id": "tool_call_1:attempt:1",
+          "tool_implementation_digest": "ffba934cb06dcfaadc49e8a5024961a76a8fd7619614d4d055805283c2f3b358",
+          "input_digest": "156fedef9af97685d0e6f43eebe55d8ae67fcbf34b2fea23c2b1af061b4bcdf0",
+          "output_digest": "fb64fb884ac55f937dcd8e94d9e156d0da4730596bc9714f1617db0660d775c3",
+          "started_at": "2026-07-13T13:41:35.667Z",
+          "completed_at": "2026-07-13T13:41:35.926Z",
+          "duration_ms": 259.9,
+          "result": {
+            "tool": "earthquake_feed",
+            "ok": true,
+            "available": true,
+            "data": {
+              "provider": "usgs",
+              "source_url": "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_hour.geojson",
+              "feed_window": "past_hour",
+              "feed_generated_utc": "2026-07-13T13:41:24.000Z",
+              "feed_count": 9,
+              "returned_count": 1,
+              "events": [
+                {
+                  "event_id": "nc75394921",
+                  "magnitude": 1.14,
+                  "place": "3 km NW of The Geysers, CA",
+                  "event_time_utc": "2026-07-13T13:37:46.430Z",
+                  "title": "M 1.1 - 3 km NW of The Geysers, CA",
+                  "event_url": "https://earthquake.usgs.gov/earthquakes/eventpage/nc75394921",
+                  "detail_url": "https://earthquake.usgs.gov/earthquakes/feed/v1.0/detail/nc75394921.geojson",
+                  "coordinates": {
+                    "longitude": -122.77783203125,
+                    "latitude": 38.7938346862793,
+                    "depth_km": 3.08999991416931
+                  }
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "tool_round_budgets": [
+        {
+          "max_chars": 9000,
+          "max_input_tokens": 3000,
+          "original_chars": 5232,
+          "final_chars": 5232,
+          "original_estimated_tokens": 1218,
+          "final_estimated_tokens": 1218,
+          "token_estimator": "qwen_tokenizer",
+          "compacted": false,
+          "compacted_message_types": [],
+          "round": 1
+        },
+        {
+          "max_chars": 9000,
+          "max_input_tokens": 3000,
+          "original_chars": 6862,
+          "final_chars": 6862,
+          "original_estimated_tokens": 1783,
+          "final_estimated_tokens": 1783,
+          "token_estimator": "qwen_tokenizer",
+          "compacted": false,
+          "compacted_message_types": [],
+          "round": 2
+        }
+      ],
+      "approved_sources": [],
+      "retrieved_context": "",
+      "citations": [],
+      "source_validation": {
+        "required": false,
+        "valid": true,
+        "approved_source_ids": [],
+        "cited_source_ids": [],
+        "unknown_citations": [],
+        "invalid_source_integrity": [],
+        "unsupported_claims": [],
+        "uncited_claims": [],
+        "violations": []
+      },
+      "source_sanitizer": null,
+      "handoff_artifacts": [
+        {
+          "name": "live_event_summary",
+          "value": "The latest earthquake was a magnitude 1.14 event located 3 km NW of The Geysers, CA, occurring at 2026-07-13T13:37:46.430Z according to USGS.",
+          "producer": "live_events_demo3_lora",
+          "producer_step_id": "s1",
+          "evidence": [],
+          "confidence": 0.35,
+          "status": "executor_derived_from_domain_answer",
+          "verified": true,
+          "schema_version": "Router-handoff-artifact-v1",
+          "content_digest": "d02dbb058c412731613b596702c76563361f2a313da9c4679b83c508efa397c5",
+          "artifact_id": "s1:live_event_summary:d02dbb058c412731"
+        },
+        {
+          "name": "source_timestamp",
+          "value": "The latest earthquake was a magnitude 1.14 event located 3 km NW of The Geysers, CA, occurring at 2026-07-13T13:37:46.430Z according to USGS.",
+          "producer": "live_events_demo3_lora",
+          "producer_step_id": "s1",
+          "evidence": [],
+          "confidence": 0.35,
+          "status": "executor_derived_from_domain_answer",
+          "verified": true,
+          "schema_version": "Router-handoff-artifact-v1",
+          "content_digest": "d02dbb058c412731613b596702c76563361f2a313da9c4679b83c508efa397c5",
+          "artifact_id": "s1:source_timestamp:d02dbb058c412731"
+        },
+        {
+          "name": "tool_evidence",
+          "value": "The latest earthquake was a magnitude 1.14 event located 3 km NW of The Geysers, CA, occurring at 2026-07-13T13:37:46.430Z according to USGS.",
+          "producer": "live_events_demo3_lora",
+          "producer_step_id": "s1",
+          "evidence": [],
+          "confidence": 0.35,
+          "status": "executor_derived_from_domain_answer",
+          "verified": true,
+          "schema_version": "Router-handoff-artifact-v1",
+          "content_digest": "d02dbb058c412731613b596702c76563361f2a313da9c4679b83c508efa397c5",
+          "artifact_id": "s1:tool_evidence:d02dbb058c412731"
+        }
+      ],
+      "artifact_validation": {
+        "contract_version": "Router-handoff-v1",
+        "declared_produces": [
+          "live_event_summary",
+          "source_timestamp",
+          "tool_evidence"
+        ],
+        "produced": [
+          "live_event_summary",
+          "source_timestamp",
+          "tool_evidence"
+        ],
+        "missing": [],
+        "errors": [],
+        "warnings": [
+          "model_artifacts_missing:executor_wrapped_domain_answer"
+        ],
+        "valid": true
+      },
+      "consumption_validation": {
+        "contract_version": "Router-handoff-v1",
+        "consumer": "live_events_demo3_lora",
+        "declared_consumes": [
+          "user_request"
+        ],
+        "aggregate_consumes": [],
+        "resolved_contract_inputs": [],
+        "resolved_from_upstream": [],
+        "required_from_upstream": [],
+        "missing_from_upstream": [],
+        "unresolved": [
+          "user_request"
+        ],
+        "available_but_not_consumed": [],
+        "rejected": [],
+        "valid": true
+      },
+      "text": "OBSERVABLE_SUMMARY:\nThe earthquake_feed tool successfully returned the latest event from the USGS past-hour feed, providing the necessary place and time data.\nDOMAIN_ANSWER:\nThe latest earthquake was a magnitude 1.14 event located 3 km NW of The Geysers, CA, occurring at 2026-07-13T13:37:46.430Z according to USGS.\nHANDOFFS:\nProduced live_event_summary, source_timestamp, tool_evidence from the validated route result.\nBOUNDARY_CHECK:\nUse only the successful earthquake_feed result for current-event claims. If the tool is unavailable, say that current data could not be verified.",
+      "domain_answer": "The latest earthquake was a magnitude 1.14 event located 3 km NW of The Geysers, CA, occurring at 2026-07-13T13:37:46.430Z according to USGS.",
+      "boundary_check": "Use only the successful earthquake_feed result for current-event claims. If the tool is unavailable, say that current data could not be verified.",
+      "prompt_preview": "system:platform_rules | user:owner_agent_configuration | user:current_user_query | user:current_dag_task",
+      "message_types": [
+        "platform_rules",
+        "owner_agent_configuration",
+        "current_user_query",
+        "current_dag_task"
+      ],
+      "message_budget": {
+        "max_chars": 9000,
+        "max_input_tokens": 3000,
+        "original_chars": 5232,
+        "final_chars": 5232,
+        "original_estimated_tokens": 1218,
+        "final_estimated_tokens": 1218,
+        "token_estimator": "qwen_tokenizer",
+        "compacted": false,
+        "compacted_message_types": []
+      },
+      "output_contract": "terminal_domain_answer",
+      "elapsed_sec": 7.681605815887451,
+      "parallel_batch": 1,
+      "parallel_width": 1,
+      "agent_revision": "53a0038fa002038101b35ff5c6e8e6fe2943042ea293a9bcc08ba18792caeb95",
+      "revision_authority": "runtime",
+      "adapter_content_digest": "8f821c212780c7263f701f926a2db860ba51d42a19651fedabc588f24fa8e804",
+      "manifest_contract_digest": "bba33419b7aab04d337c5382db2e16b0b00c6aa615855879ac4f33ae3e0b1998",
+      "model_id": "qwen36-awq",
+      "base_model_content_digest": "7706c7b95c257577cd162bd3f36c05fb1b5edee4d4d37fad366f3c661637471f"
+    }
+  ],
+  "citations": [],
+  "handoff_artifacts": [
+    {
+      "name": "live_event_summary",
+      "value": "The latest earthquake was a magnitude 1.14 event located 3 km NW of The Geysers, CA, occurring at 2026-07-13T13:37:46.430Z according to USGS.",
+      "producer": "live_events_demo3_lora",
+      "producer_step_id": "s1",
+      "evidence": [],
+      "confidence": 0.35,
+      "status": "executor_derived_from_domain_answer",
+      "verified": true,
+      "schema_version": "Router-handoff-artifact-v1",
+      "content_digest": "d02dbb058c412731613b596702c76563361f2a313da9c4679b83c508efa397c5",
+      "artifact_id": "s1:live_event_summary:d02dbb058c412731"
+    },
+    {
+      "name": "source_timestamp",
+      "value": "The latest earthquake was a magnitude 1.14 event located 3 km NW of The Geysers, CA, occurring at 2026-07-13T13:37:46.430Z according to USGS.",
+      "producer": "live_events_demo3_lora",
+      "producer_step_id": "s1",
+      "evidence": [],
+      "confidence": 0.35,
+      "status": "executor_derived_from_domain_answer",
+      "verified": true,
+      "schema_version": "Router-handoff-artifact-v1",
+      "content_digest": "d02dbb058c412731613b596702c76563361f2a313da9c4679b83c508efa397c5",
+      "artifact_id": "s1:source_timestamp:d02dbb058c412731"
+    },
+    {
+      "name": "tool_evidence",
+      "value": "The latest earthquake was a magnitude 1.14 event located 3 km NW of The Geysers, CA, occurring at 2026-07-13T13:37:46.430Z according to USGS.",
+      "producer": "live_events_demo3_lora",
+      "producer_step_id": "s1",
+      "evidence": [],
+      "confidence": 0.35,
+      "status": "executor_derived_from_domain_answer",
+      "verified": true,
+      "schema_version": "Router-handoff-artifact-v1",
+      "content_digest": "d02dbb058c412731613b596702c76563361f2a313da9c4679b83c508efa397c5",
+      "artifact_id": "s1:tool_evidence:d02dbb058c412731"
+    }
+  ],
+  "fallbackFinalAnswer": "Live Events Demo3: The latest earthquake was a magnitude 1.14 event located 3 km NW of The Geysers, CA, occurring at 2026-07-13T13:37:46.430Z according to USGS.",
+  "refinerOutput": {
+    "id": "refining_agent",
+    "adapter": "refining_agent",
+    "vllmModel": "qwen36-awq",
+    "raw_text": "",
+    "model_call": {},
+    "bypassed": true,
+    "bypass_reason": "single_validated_route",
+    "domain_answer": "The latest earthquake was a magnitude 1.14 event located 3 km NW of The Geysers, CA, occurring at 2026-07-13T13:37:46.430Z according to USGS.",
+    "citations": [],
+    "source_validation": {
+      "required": false,
+      "valid": true,
+      "approved_source_ids": [],
+      "cited_source_ids": [],
+      "unknown_citations": [],
+      "invalid_source_integrity": [],
+      "unsupported_claims": [],
+      "uncited_claims": [],
+      "violations": []
+    },
+    "message_types": [],
+    "message_budget": {
+      "bypassed": true,
+      "reason": "single_validated_route",
+      "saved_max_tokens": 192
+    },
+    "used_memory": []
+  },
+  "finalAnswer": "The latest earthquake was a magnitude 1.14 event located 3 km NW of The Geysers, CA, occurring at 2026-07-13T13:37:46.430Z according to USGS.",
+  "elapsedSec": 7.681975841522217,
+  "apiElapsedSec": 117.4498291015625,
+  "plannerMode": "Router",
+  "manifestRevision": "0106516ad3adf7b555783d737a34ed9058ef62fd42781051b8990fde6e955d79",
+  "componentProvenance": {
+    "revision_authority": "runtime",
+    "base_model_id": "qwen36-awq",
+    "base_model_content_digest": "7706c7b95c257577cd162bd3f36c05fb1b5edee4d4d37fad366f3c661637471f",
+    "executor_code_digest": "dbe3c6af35fa6fbec8057c64acfa129a9cda40b84b58468480ac35f91c302d85",
+    "planner_mode": "Router",
+    "router_model_id": "Router-router",
+    "router_model_content_digest": "9b6076382d27a14d1ae2d1d61adf41ef70fbc02ff9fac4bf609091aea0db8f25",
+    "router_chat_template_digest": "f5acd6f5c2e18d90077261434dca0809a457a37a3f9c333a0d0169375a765393",
+    "manifest_revision": "0106516ad3adf7b555783d737a34ed9058ef62fd42781051b8990fde6e955d79",
+    "agents": [
+      {
+        "adapter": "live_events_demo3_lora",
+        "agent_revision": "53a0038fa002038101b35ff5c6e8e6fe2943042ea293a9bcc08ba18792caeb95",
+        "revision_authority": "runtime",
+        "manifest_contract_digest": "bba33419b7aab04d337c5382db2e16b0b00c6aa615855879ac4f33ae3e0b1998",
+        "adapter_content_digest": "8f821c212780c7263f701f926a2db860ba51d42a19651fedabc588f24fa8e804"
+      }
+    ]
+  },
+  "baseModelContentDigest": "7706c7b95c257577cd162bd3f36c05fb1b5edee4d4d37fad366f3c661637471f",
+  "executorCodeDigest": "dbe3c6af35fa6fbec8057c64acfa129a9cda40b84b58468480ac35f91c302d85",
+  "routerModelContentDigest": "9b6076382d27a14d1ae2d1d61adf41ef70fbc02ff9fac4bf609091aea0db8f25",
+  "routerChatTemplateDigest": "f5acd6f5c2e18d90077261434dca0809a457a37a3f9c333a0d0169375a765393",
+  "executionProvenance": {
+    "execution_id": "router-live-events-demo3-20260713T133943Z",
+    "request_fingerprint": "d6fe383985a297d0c10c64455c53f61b12672f40a8b03dcbfdb9a12f9c072b8f",
+    "receipt_id": "ar_d6b877819a8e4cc2bed45ac5813ad455",
+    "record_hash": "95dc3467deaa369ab77d4ae27dbaecccd3c7d49459e26e9d375ab008b5fc76a9",
+    "schema_version": 1,
+    "created_at": "2026-07-13T13:41:40.962476Z"
+  }
+}

@@ -1,0 +1,77 @@
+{
+  "schema_version": "router-demo4-qualitative-rubric-v1",
+  "fixture": "Alder Quay Riverlight Festival",
+  "purpose": "Compare how well two systems synthesize the same compact, synthetic document set into a safe and usable operating plan.",
+  "marketing_note": "This is an illustrative qualitative stress test, not a general performance claim or aggregate benchmark.",
+  "ratings": [
+    "meets",
+    "needs_revision",
+    "fails"
+  ],
+  "dimensions": [
+    {
+      "id": "document_integration",
+      "label": "Uses the full document set",
+      "meets": "Integrates every document where relevant and connects facts across sources.",
+      "needs_revision": "Uses most documents but misses one material connection.",
+      "fails": "Ignores multiple documents or produces a largely single-source summary."
+    },
+    {
+      "id": "conflict_resolution",
+      "label": "Resolves conflicts by authority and recency",
+      "meets": "Correctly replaces draft assumptions with later permits, signed requirements, and final updates.",
+      "needs_revision": "Finds the main conflicts but leaves one unresolved or weakly justified.",
+      "fails": "Repeats superseded plans or combines incompatible instructions."
+    },
+    {
+      "id": "operational_usefulness",
+      "label": "Produces an executable plan",
+      "meets": "Provides a coherent schedule, site arrangement, ownership, communications, and decision triggers.",
+      "needs_revision": "The plan is broadly usable but omits one important operational detail.",
+      "fails": "Provides generic advice without a workable event sequence."
+    },
+    {
+      "id": "uncertainty_handling",
+      "label": "Preserves uncertainty",
+      "meets": "Clearly keeps weather, canopy, artist, vendor, and tentative staffing outcomes conditional.",
+      "needs_revision": "Marks most uncertainties but overstates one pending outcome.",
+      "fails": "Presents pending or conditional information as confirmed."
+    },
+    {
+      "id": "safety_accessibility",
+      "label": "Protects safety and accessibility requirements",
+      "meets": "Honours capacity, curfew, fire, emergency access, habitat, step-free routing, quiet-zone, and communication requirements.",
+      "needs_revision": "Captures the core protections but misses one material requirement.",
+      "fails": "Creates a safety or accessibility conflict."
+    },
+    {
+      "id": "evidence_traceability",
+      "label": "Makes decisions traceable",
+      "meets": "Cites document IDs beside material decisions and does not use unsupported claims.",
+      "needs_revision": "Claims are mostly grounded but citations are incomplete or imprecise.",
+      "fails": "Material decisions cannot be traced to the supplied documents."
+    },
+    {
+      "id": "restraint",
+      "label": "Avoids invention",
+      "meets": "Distinguishes source facts, reasonable scheduling implications, and unknown details.",
+      "needs_revision": "Adds a minor unsupported detail that does not change the plan.",
+      "fails": "Invents material facts, approvals, resources, or policies."
+    }
+  ],
+  "non_negotiable_failures": [
+    "Treats the headline artist, suspended canopy, or Moon Bowl approval as confirmed.",
+    "Directs the public to North Gate or calls East Gate the accessible entrance.",
+    "Allows open flame, exceeds the onsite cap, or schedules amplified sound after the permit cutoff.",
+    "Claims Hearth & Grain is nut-free.",
+    "Uses tentative volunteers for critical posts.",
+    "Omits the East emergency lane or South Meadow muster point from safety arrangements."
+  ],
+  "fair_comparison_conditions": [
+    "Give both systems the same ten documents in the same order and the exact same user prompt.",
+    "Use the same context and output allowances; the complete model-facing fixture must fit before generation begins.",
+    "Do not provide the public answer key or rubric to either system during generation.",
+    "Judge grounding and operational quality, not prose style or answer length.",
+    "Present resulting examples as illustrative outputs from this fixture, not universal claims."
+  ]
+}

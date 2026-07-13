@@ -1,0 +1,60 @@
+{
+  "schema_version": "router-demo2-evidence-summary-v1",
+  "prompt": "Consult both the company cost table and the Fictionland inflation brief. Then explain what is driving the company's cost pressure and suggest one practical next step.",
+  "fixture_type": "synthetic fictional demonstration",
+  "comparison_contract": {
+    "same_question": true,
+    "same_document_text": true,
+    "base_document_delivery": "Both complete documents were included in the base-model user message.",
+    "router_document_delivery": "The same documents were registered as two source agents."
+  },
+  "router_trace_checks": {
+    "user_request_contains_no_plan_or_agent_ids": true,
+    "source_selection_generated_by_router": true,
+    "router_selected_exactly_both_source_agents": true,
+    "both_source_selection_records_are_router_generated": true,
+    "analysis_added_by_server_owned_downstream_contract": true,
+    "executed_exactly_three_expected_agents": true,
+    "both_source_to_analysis_edges_present": true,
+    "analysis_depends_on_both_sources": true,
+    "analysis_used_both_source_outputs": true,
+    "analysis_consumption_valid": true,
+    "analysis_source_validation_valid": true,
+    "analysis_policy_violations_empty": true,
+    "analysis_returned_non_refusal_synthesis": true,
+    "analysis_kept_source_ids_in_upstream_evidence": true,
+    "source_agents": {
+      "Company Cost Table Agent": {
+        "source_validation_valid": true,
+        "verified_citation_present": true,
+        "policy_violations_empty": true
+      },
+      "Inflation Brief Agent": {
+        "source_validation_valid": true,
+        "verified_citation_present": true,
+        "policy_violations_empty": true
+      }
+    },
+    "final_evidence_includes_both_sources": true,
+    "execution_receipt_present": true
+  },
+  "answer_observations": {
+    "base_answer": "The company's cost pressure is driven by increased fabric and delivery costs, which aligns with the Fictionland inflation brief’s observation that price pressure is concentrated in imported goods and transport. A practical next step is to seek alternative suppliers for fabric or negotiate new freight contracts to mitigate these rising costs.",
+    "router_answer": "Company Cost Table Agent: Fabric and delivery costs increased, while wages and rent were unchanged [demo2_company_cost_source_0001].\n\nInflation Brief Agent: Price pressure is concentrated in imported goods and transport, domestic wages are stable, and imported material costs remain uncertain [demo2_inflation_source_0001].\n\nAnalysis Agent: The company’s cost pressure is primarily driven by rising fabric and delivery expenses, while wages and rent remain stable. This aligns with broader macro conditions where price pressures are concentrated in imported goods and transport, with domestic wages stable and imported material costs uncertain. A practical next step is to renegotiate supply contracts for imported fabrics and logistics to hedge against ongoing import cost volatility.",
+    "base_mentions_core_document_concepts": {
+      "fabric": true,
+      "delivery": true,
+      "imported": true,
+      "transport": true
+    },
+    "router_mentions_core_document_concepts": {
+      "fabric": true,
+      "delivery": true,
+      "imported": true,
+      "transport": true
+    }
+  },
+  "disclosure": "All three role adapters use seeded zero-effect weights. The evidence isolates orchestration, retrieval, validation, handoffs, synthesis, and citations.",
+  "orchestration_note": "The Router selected the two document source agents. Server-owned deterministic orchestration then appended the declared downstream Analysis Agent and compiled both dependency edges. The user supplied neither a plan nor agent identifiers.",
+  "capture_status": "passed"
+}

@@ -1,0 +1,7 @@
+{
+  "schema_version": "router-live-events-prompt-v1",
+  "prompt": "What is the latest earthquake in the past hour? Give the place and time.",
+  "prompt_sha256": "c1766eee459c9c3d96e3f8edd2cd1e1364eda0b7d87c9a4eae7c91b8061e9ec7",
+  "same_prompt_used_for_both_paths": true,
+  "captured_at": "2026-07-13T13:41:40.978188+00:00"
+}

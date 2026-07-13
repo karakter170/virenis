@@ -1,0 +1,14 @@
+{
+  "schema_version": "router-public-receipts-v1",
+  "router_execution": {
+    "receipt_id": "ar_4502188c61d84b2899452f077c305ded",
+    "record_hash": "13cc128a98637f044df95ab6f88f1fff405f87d44c62b99d6583bbdde0c8b1e5",
+    "created_at": "2026-07-13T14:02:53.169746Z",
+    "audit_chain_verified": true
+  },
+  "base_capture": {
+    "request_sha256": "0122eea9fa1680804541cb395c0f04808de7de2917f8c0bc3342b6655bb04af5",
+    "response_sha256": "4388adacbc9adeacd38905f22492ea71f5e7df2d30bffb265aaa758064620cc4",
+    "receipt_type": "content-addressed local capture"
+  }
+}

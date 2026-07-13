@@ -1,0 +1,24 @@
+{
+  "schema_version": "router-public-comparison-v1",
+  "created_at": "2026-07-13T13:59:31.009339+00:00",
+  "prompt": "First identify the important textile-industry considerations, then create a simple business plan for a small company that makes durable tote bags from recycled textile offcuts.",
+  "identical_user_prompt": true,
+  "base_model": {
+    "label": "Base model",
+    "answer": "### Part 1: Important Textile-Industry Considerations\n\nBefore launching a business in the textile sector, particularly one focused on sustainability and upcycling, several critical industry factors must be addressed:\n\n1.  **Supply Chain Volatility & Sourcing:**\n    *   **Offcut Availability:** Recycled offcuts are by-products. Their availability depends on the production schedules of larger manufacturers. Securing consistent, high-quality supply is challenging.\n    *   **Quality Variance:** Offcuts vary in size, color, and fabric integrity. Standardization is difficult, requiring flexible design processes.\n    *   **Traceability:** Consumers increasingly demand proof of sustainability. Tracking the origin of materials (e.g., from which factory or brand) adds administrative complexity.\n\n2.  **Production & Manufacturing Constraints:**\n    *   **Labor-Intensive Processes:** Upcycling often requires more manual labor (sorting, cutting, piecing) than mass-producing from new rolls of fabric, increasing labor costs.\n    *   **Design Limitations:** Patterns must be adaptable to irregular shapes. This limits scalability and requires skilled pattern-makers.\n    *   **Durability Standards:** Tote bags must withstand heavy loads. Seams, handles, and fabric strength must be rigorously tested, especially when joining different fabric types.\n\n3.  **Market & Consumer Trends:**\n    *   **Greenwashing Skepticism:** Consumers are wary of false eco-claims. Transparency in sourcing and production is essential for brand trust.\n    *   **Price Sensitivity:** Sustainable products often carry a premium. The target market must be willing to pay more for ethical and durable goods.\n    *   **Aesthetic Appeal:** \"Recycled\" must not mean \"scrappy.\" Designs must be stylish and functional to compete with mainstream fashion accessories.\n\n4.  **Regulatory & Compliance Issues:**\n    *   **Safety Standards:** Textiles must meet flammability, chemical safety (e.g., REACH, CPSIA), and labeling requirements in target markets.\n    *   **Waste Disposal:** Even with upcycling, some waste will occur. Proper disposal or recycling of non-reusable scraps is necessary for true sustainability claims.\n\n5.  **Competitive Landscape:**\n    *   **Saturation:** The tote bag market is crowded. Differentiation through unique design, storytelling, or superior durability is critical.\n    *   **Fast Fashion Impact:** Low-cost, disposable bags from fast"
+  },
+  "agent_team": {
+    "label": "Business Plan Agent result after Router handoff",
+    "answer": "**Product**: Durable tote bags crafted from sorted and labeled recycled textile offcuts to ensure material consistency. **Customers**: Eco-conscious consumers seeking traceable, sustainable accessories without unsupported environmental claims. **Sourcing**: Supplier agreements defining acceptable fiber types, contamination limits, and collection frequency for incoming offcuts. **Production**: Incoming material is sorted by fiber and color, then tested for shrinkage and abrasion before batch approval. **Sales**: Marketing emphasizes traceability to supplier records and actual material usage rather than generic green assertions. **Risks**: Material variability in thickness and color requires rigorous sorting and testing to maintain quality standards."
+  },
+  "evidence_checks": {
+    "router_selected_both_agents": true,
+    "trusted_dependency_compiled": true,
+    "textile_source_verified": true,
+    "verified_handoff_created": true,
+    "business_agent_consumed_handoff": true,
+    "business_plan_passed_validation": true,
+    "business_plan_complete_and_concise": true
+  },
+  "claim_boundary": "The role adapters are zero-effect identities. Evidence supports orchestration, grounding, and handoff behavior, not a trained domain-weight uplift."
+}

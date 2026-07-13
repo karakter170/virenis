@@ -1,0 +1,22 @@
+:root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, sans-serif; background: #101411; color: #f7faf8; }
+* { box-sizing: border-box; }
+body { min-height: 100vh; margin: 0; display: grid; grid-template-rows: auto 1fr auto; background: radial-gradient(circle at 72% 10%, #214032, #101411 39%); }
+header { min-height: 78px; display: grid; grid-template-columns: 180px 1fr auto; align-items: center; gap: 28px; padding: 0 32px; border-bottom: 1px solid #304139; }
+header a { color: #fff; text-decoration: none; font-size: 22px; font-weight: 750; letter-spacing: -0.03em; }
+header div { display: flex; gap: 14px; align-items: baseline; }
+header div strong { font-size: 14px; }
+header div span, header p { color: #9fb0a8; font-size: 12px; }
+kbd { margin-left: 4px; border: 1px solid #52635b; border-radius: 5px; padding: 2px 6px; color: #d8e4de; background: #24302a; }
+main { width: min(1500px, calc(100vw - 48px)); margin: auto; padding: 28px 0; }
+figure { margin: 0; }
+figure img { width: 100%; display: block; border: 1px solid #425149; border-radius: 14px; box-shadow: 0 28px 90px #0008; background: #f7f9f7; }
+figcaption { margin-top: 12px; color: #aebdb5; font-size: 12px; font-family: ui-monospace, monospace; }
+nav { display: grid; grid-template-columns: repeat(6, 1fr); gap: 8px; margin-top: 18px; }
+nav button { min-width: 0; border: 1px solid #3c4b44; border-radius: 9px; padding: 10px 12px; color: #b8c5bf; background: #1d2722; text-align: left; cursor: pointer; }
+nav button b { float: right; color: #708078; font-family: ui-monospace, monospace; font-size: 11px; }
+nav button span { display: block; font-size: 12px; font-weight: 700; }
+nav button small { display: block; margin-top: 4px; color: #809087; font-size: 10px; }
+nav button.active { border-color: #4c9c77; color: #fff; background: #176b4b; }
+nav button.active b, nav button.active small { color: #cce6da; }
+footer { padding: 18px 32px; border-top: 1px solid #304139; color: #87978f; font-size: 12px; text-align: center; }
+@media (max-width: 900px) { header { grid-template-columns: 1fr auto; } header div { display: none; } main { width: calc(100vw - 24px); } nav { grid-template-columns: repeat(3, 1fr); } }

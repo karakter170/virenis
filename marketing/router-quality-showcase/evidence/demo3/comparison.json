@@ -1,0 +1,31 @@
+{
+  "schema_version": "router-live-events-comparison-v1",
+  "prompt": "What is the latest earthquake in the past hour? Give the place and time.",
+  "base_model": {
+    "answer": "I do not have access to real-time data, so I cannot provide information on earthquakes that occurred in the past hour. For the latest seismic activity, please consult a live monitoring service such as the USGS Earthquake Hazards Program or the EMSC.",
+    "status_against_captured_usgs_snapshot": "states_that_live_data_cannot_be_verified",
+    "live_tool_available": false,
+    "raw_response_sha256": "536985c042f27fe97f987b7c8867511a788399f59e92bf16b98d61f3f23bca04"
+  },
+  "router": {
+    "answer": "The latest earthquake was a magnitude 1.14 event located 3 km NW of The Geysers, CA, occurring at 2026-07-13T13:37:46.430Z according to USGS.",
+    "status_against_captured_usgs_snapshot": "matches_the_executor_grounded_live_snapshot",
+    "selected_agent": "Live Events Agent",
+    "tool": "earthquake_feed",
+    "source": "USGS",
+    "raw_response_sha256": "7b5614c6fb0ed41df65dc9908a0643c561889c2d18797af830a7296ffad0c087"
+  },
+  "captured_event": {
+    "event_id": "nc75394921",
+    "place": "3 km NW of The Geysers, CA",
+    "event_time_utc": "2026-07-13T13:37:46.430Z",
+    "feed_generated_utc": "2026-07-13T13:41:24.000Z",
+    "event_url": "https://earthquake.usgs.gov/earthquakes/eventpage/nc75394921"
+  },
+  "receipt_checks": {
+    "tool_output_digest_verified": true,
+    "execution_output_digest_verified": true,
+    "execution_record_hash": "95dc3467deaa369ab77d4ae27dbaecccd3c7d49459e26e9d375ab008b5fc76a9"
+  },
+  "interpretation": "This comparison demonstrates verified live retrieval and source grounding. It does not claim that a role adapter's weights improved factual knowledge."
+}

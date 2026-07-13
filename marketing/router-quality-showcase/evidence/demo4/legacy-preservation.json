@@ -1,0 +1,409 @@
+{
+  "schema_version": "router-demo4-legacy-preservation-v1",
+  "unchanged": true,
+  "file_count": 50,
+  "before": {
+    "web/virenis/marketing/router-quality-showcase/README.md": {
+      "sha256": "3ff79219549ae30cb0c3a39d6acd880fd565c5b98741957b9ae149bba3899906",
+      "bytes": 2043
+    },
+    "web/virenis/marketing/router-quality-showcase/campaign.json": {
+      "sha256": "6c9fc374a5194ea861d8b642f23eebdabac3f76b38c4503bfd1761aa107493f4",
+      "bytes": 8199
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo1/README.md": {
+      "sha256": "7d7b676a3622e47ed542a464d9d235caf0ee3e490b8ecb68478b3082d642577a",
+      "bytes": 1377
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo1/agent_team_fixture.json": {
+      "sha256": "2daf4a79dbc157add95baa0f68eb269d9a723439f43b3bc2fc9a7a705ceefe14",
+      "bytes": 1324
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo1/fixture.json": {
+      "sha256": "351f0dc3f34f0982887455c0ee32bfbfb9bff24062abecf92373f8ab6b0eb88d",
+      "bytes": 1222
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo1/public_comparison.json": {
+      "sha256": "2e2c55affde69ff1f08ebe4c7d49ddc22e54f697de0a41c1c8b700ab27e59a5a",
+      "bytes": 4219
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo1/public_receipts.json": {
+      "sha256": "0c1b83b6b452bfba100a2cb9ffc9ed38e1820b883d17a6c16bf78e70aeea2372",
+      "bytes": 567
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo1/public_route.json": {
+      "sha256": "13246cc4f0de7afe817a2c4a5c7cdb2115d8cd88b95dff8c1911bc202a135d80",
+      "bytes": 605
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo1/skills/business_plan_agent/SKILL.md": {
+      "sha256": "27f0fa3d2372d4e671913339feaef91f55e2674b463d1140cef7d0cd9a95ca1f",
+      "bytes": 1045
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo1/skills/textile_agent/SKILL.md": {
+      "sha256": "6f514594e28a0d9da8d949e4dee026118b62a969aa19360f273c6d4109742f29",
+      "bytes": 881
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo1/textile_playbook.md": {
+      "sha256": "9d05bf9c6390c7255614898e0dd393d8827d09f22fcadfc584d0d43058acf761",
+      "bytes": 1665
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo2/README.md": {
+      "sha256": "6f65b5fda2148b1789470f827d8b5f43aa9cadb1bc5e1f168eb291bd5f21d21e",
+      "bytes": 1183
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo2/base-request.json": {
+      "sha256": "2d5301135509aa6e3090f10ac60cd07b3571d706e0b9f55978fdd76cddbc96f0",
+      "bytes": 1398
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo2/base-response.json": {
+      "sha256": "aa401949ac9832a2de0b79b29a1edc185aad648b247973ad71609779720fd6d0",
+      "bytes": 399
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo2/capture-integrity.json": {
+      "sha256": "14e516ade191a226d3cbc24a5b1992d768ec8f40fc9a12210f5cce1134d9d91c",
+      "bytes": 6285
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo2/evidence-summary.json": {
+      "sha256": "ce94cfb3fb064ab35e53f15091c06702eafbb6506baac112b3a83785eec89c50",
+      "bytes": 3772
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo2/executed-dag-response.json": {
+      "sha256": "a81b06ca469894e472217a01ed257247968580147f49e9a7b1104569e6df9c3d",
+      "bytes": 7389
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo2/execution-receipt.json": {
+      "sha256": "468a619be8bf62b5a08c87bd9d651e8d835a0bba62818c5894502c56c96a66da",
+      "bytes": 482
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo2/fixtures/company-cost-table.md": {
+      "sha256": "591eaaf88dcf2911f931222b0c6cdcd199939da5ad12358d7d773132f36010eb",
+      "bytes": 467
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo2/fixtures/fictionland-inflation-brief.md": {
+      "sha256": "8b8370f91b72af3ec2fa4b78b63eb30a33cbb7f885d83aeb9cc1b82218340522",
+      "bytes": 240
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo2/fixtures/user-prompt.txt": {
+      "sha256": "a5bea01485ad09e943a967f0fe0d5686b6d83d813d50f1d78c49d901f273a460",
+      "bytes": 167
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo2/router-source-selection-request.json": {
+      "sha256": "6abe9a2fbb52e9bb9b89af4a979088bd6ac74af00a6357b55758d30042b8c56a",
+      "bytes": 378
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo2/router-source-selection-response.json": {
+      "sha256": "3df47b7a5a36b92fc9564cf7f9ba304e31f8c1b8dfa18e68fca598b68c208d40",
+      "bytes": 1467
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo2/seeded-role-adapter-disclosure.json": {
+      "sha256": "feafddd7fffdc4d1642910d386e3136286389abb141e1acc5e1ae7db3b36d7f6",
+      "bytes": 691
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo2/server-orchestration-request.json": {
+      "sha256": "d83d28b3351b4bba8c76a2b190b2e1884072fe73c1915cf58b663649e9c63988",
+      "bytes": 979
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo3/base_response.json": {
+      "sha256": "2bd9d9fa67a16b7ad71e4b953ddb45948384a2722ef6c6dcf697553c27485659",
+      "bytes": 1153
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo3/comparison.json": {
+      "sha256": "23ffe76215893269c3647f43e98e347550a42b4a3bb954cacb807e864141aece",
+      "bytes": 1782
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo3/disclosure.json": {
+      "sha256": "64f2d45b63ced86f3ad15ed17631693a30be8b7941bffc01b5d484bba9471007",
+      "bytes": 764
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo3/evidence_manifest.json": {
+      "sha256": "3659c8be08579e7ef30c7c510fc729c34f128aaf595e232690605bc69c8b6209",
+      "bytes": 1670
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo3/execution_receipt.json": {
+      "sha256": "71e4836bb3eafcfbd4b21a61b80c9ed535a1160d8cca0295b04cf1e37e5deb67",
+      "bytes": 2699
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo3/prompt.json": {
+      "sha256": "f20f7ed568bccb502825a5dfbbfc8bf1a7d53f711cb900e1b88a21251bccf62a",
+      "bytes": 326
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo3/router_response.json": {
+      "sha256": "47bc4ce60a8a6b48266ce31bf171a80e9a1b80c609db397fd3bf9ad9d3e64453",
+      "bytes": 18442
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo3/tool_execution_receipt.json": {
+      "sha256": "4c1802eacbc4c4202899a37c77de83d957d53fa08c6446188af9d3755baba11c",
+      "bytes": 1704
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo3/usgs_tool_snapshot.json": {
+      "sha256": "2a03f560747e9fcb5bacc7687547bd169f1052bbacd75f12b47f206212a42bae",
+      "bytes": 808
+    },
+    "web/virenis/marketing/router-quality-showcase/exports/01-agent-team-route.png": {
+      "sha256": "17850c2cd507423ead795e8dbf85ca3fa0d98f6ea09ab7484bd92b906ebc6215",
+      "bytes": 175719
+    },
+    "web/virenis/marketing/router-quality-showcase/exports/02-agent-team-comparison.png": {
+      "sha256": "6b6b4f3ce65d9e668dfdfca5de0f93329e3a0ecf81645948995ee980ec97f05e",
+      "bytes": 249468
+    },
+    "web/virenis/marketing/router-quality-showcase/exports/03-document-route.png": {
+      "sha256": "7d4a85cba1618a8e9b322424563d5e190b16c8e9beb6d70c6d081f0b36f65986",
+      "bytes": 205814
+    },
+    "web/virenis/marketing/router-quality-showcase/exports/04-document-comparison.png": {
+      "sha256": "cc59ffc21c4ad4cf6e7aba6cfe43de740703d5e40ecb391b726b2718dfea431b",
+      "bytes": 273571
+    },
+    "web/virenis/marketing/router-quality-showcase/exports/05-live-tool-route.png": {
+      "sha256": "b2e6875ef9f9be16329f0c2f953e2a8bd8064a57ce28c1a48d4e64a0b9bcb592",
+      "bytes": 175242
+    },
+    "web/virenis/marketing/router-quality-showcase/exports/06-live-tool-comparison.png": {
+      "sha256": "a9f8ca5a835e013ab0a9dd40a79f2016bd7e06466e045914fa34e031aa90cbc5",
+      "bytes": 200858
+    },
+    "web/virenis/marketing/router-quality-showcase/exports/router-marketing-contact-sheet.png": {
+      "sha256": "597f2fccf06baf7211294d495772ac00bac042f4687fcca57cbd40524b129548",
+      "bytes": 454622
+    },
+    "web/virenis/marketing/router-quality-showcase/frames/01-agent-team-route.svg": {
+      "sha256": "04a61c9b4d265158fcaaf335f997b070b5eb175836501153f58ed08375234353",
+      "bytes": 9152
+    },
+    "web/virenis/marketing/router-quality-showcase/frames/02-agent-team-comparison.svg": {
+      "sha256": "6bf4abd825e6517ba19c1d0098b8592ea2508f340d2124af88a15776f587380f",
+      "bytes": 6597
+    },
+    "web/virenis/marketing/router-quality-showcase/frames/03-document-route.svg": {
+      "sha256": "682cc605b94c41df229e0551fc4184f057a4a943ff4a70cc9b69a8f7c464e92d",
+      "bytes": 11043
+    },
+    "web/virenis/marketing/router-quality-showcase/frames/04-document-comparison.svg": {
+      "sha256": "aa6777c39538a35ebe79d9ae3e499d6f72746f78f587036d90d9043c3e71e5e4",
+      "bytes": 7410
+    },
+    "web/virenis/marketing/router-quality-showcase/frames/05-live-tool-route.svg": {
+      "sha256": "342beaec67b413081ae5b47b98ee9683178accecaf22c3ff33c1180a3dd03239",
+      "bytes": 9169
+    },
+    "web/virenis/marketing/router-quality-showcase/frames/06-live-tool-comparison.svg": {
+      "sha256": "7985a7f58341b80aaec2c2ac8d216d40b26a0778ecc70c87333862caeefbd8e2",
+      "bytes": 6382
+    },
+    "web/virenis/marketing/router-quality-showcase/index.html": {
+      "sha256": "d5c19d2e3a91c2c1d4c9f8b7aa713913848d80cbb1a55ab5edb537c185b9128d",
+      "bytes": 2869
+    },
+    "web/virenis/marketing/router-quality-showcase/render.mjs": {
+      "sha256": "8c416469dada3773b5f38d1affcc70f4cead2fa73a7cff8370770f54b4fa71b5",
+      "bytes": 22827
+    },
+    "web/virenis/marketing/router-quality-showcase/showcase.css": {
+      "sha256": "0f6f6bb52e60ac90f4c0c68705a22c74c71e1ba154bf786bad222528623e7ec4",
+      "bytes": 2197
+    }
+  },
+  "after": {
+    "web/virenis/marketing/router-quality-showcase/README.md": {
+      "sha256": "3ff79219549ae30cb0c3a39d6acd880fd565c5b98741957b9ae149bba3899906",
+      "bytes": 2043
+    },
+    "web/virenis/marketing/router-quality-showcase/campaign.json": {
+      "sha256": "6c9fc374a5194ea861d8b642f23eebdabac3f76b38c4503bfd1761aa107493f4",
+      "bytes": 8199
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo1/README.md": {
+      "sha256": "7d7b676a3622e47ed542a464d9d235caf0ee3e490b8ecb68478b3082d642577a",
+      "bytes": 1377
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo1/agent_team_fixture.json": {
+      "sha256": "2daf4a79dbc157add95baa0f68eb269d9a723439f43b3bc2fc9a7a705ceefe14",
+      "bytes": 1324
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo1/fixture.json": {
+      "sha256": "351f0dc3f34f0982887455c0ee32bfbfb9bff24062abecf92373f8ab6b0eb88d",
+      "bytes": 1222
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo1/public_comparison.json": {
+      "sha256": "2e2c55affde69ff1f08ebe4c7d49ddc22e54f697de0a41c1c8b700ab27e59a5a",
+      "bytes": 4219
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo1/public_receipts.json": {
+      "sha256": "0c1b83b6b452bfba100a2cb9ffc9ed38e1820b883d17a6c16bf78e70aeea2372",
+      "bytes": 567
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo1/public_route.json": {
+      "sha256": "13246cc4f0de7afe817a2c4a5c7cdb2115d8cd88b95dff8c1911bc202a135d80",
+      "bytes": 605
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo1/skills/business_plan_agent/SKILL.md": {
+      "sha256": "27f0fa3d2372d4e671913339feaef91f55e2674b463d1140cef7d0cd9a95ca1f",
+      "bytes": 1045
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo1/skills/textile_agent/SKILL.md": {
+      "sha256": "6f514594e28a0d9da8d949e4dee026118b62a969aa19360f273c6d4109742f29",
+      "bytes": 881
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo1/textile_playbook.md": {
+      "sha256": "9d05bf9c6390c7255614898e0dd393d8827d09f22fcadfc584d0d43058acf761",
+      "bytes": 1665
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo2/README.md": {
+      "sha256": "6f65b5fda2148b1789470f827d8b5f43aa9cadb1bc5e1f168eb291bd5f21d21e",
+      "bytes": 1183
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo2/base-request.json": {
+      "sha256": "2d5301135509aa6e3090f10ac60cd07b3571d706e0b9f55978fdd76cddbc96f0",
+      "bytes": 1398
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo2/base-response.json": {
+      "sha256": "aa401949ac9832a2de0b79b29a1edc185aad648b247973ad71609779720fd6d0",
+      "bytes": 399
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo2/capture-integrity.json": {
+      "sha256": "14e516ade191a226d3cbc24a5b1992d768ec8f40fc9a12210f5cce1134d9d91c",
+      "bytes": 6285
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo2/evidence-summary.json": {
+      "sha256": "ce94cfb3fb064ab35e53f15091c06702eafbb6506baac112b3a83785eec89c50",
+      "bytes": 3772
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo2/executed-dag-response.json": {
+      "sha256": "a81b06ca469894e472217a01ed257247968580147f49e9a7b1104569e6df9c3d",
+      "bytes": 7389
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo2/execution-receipt.json": {
+      "sha256": "468a619be8bf62b5a08c87bd9d651e8d835a0bba62818c5894502c56c96a66da",
+      "bytes": 482
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo2/fixtures/company-cost-table.md": {
+      "sha256": "591eaaf88dcf2911f931222b0c6cdcd199939da5ad12358d7d773132f36010eb",
+      "bytes": 467
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo2/fixtures/fictionland-inflation-brief.md": {
+      "sha256": "8b8370f91b72af3ec2fa4b78b63eb30a33cbb7f885d83aeb9cc1b82218340522",
+      "bytes": 240
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo2/fixtures/user-prompt.txt": {
+      "sha256": "a5bea01485ad09e943a967f0fe0d5686b6d83d813d50f1d78c49d901f273a460",
+      "bytes": 167
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo2/router-source-selection-request.json": {
+      "sha256": "6abe9a2fbb52e9bb9b89af4a979088bd6ac74af00a6357b55758d30042b8c56a",
+      "bytes": 378
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo2/router-source-selection-response.json": {
+      "sha256": "3df47b7a5a36b92fc9564cf7f9ba304e31f8c1b8dfa18e68fca598b68c208d40",
+      "bytes": 1467
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo2/seeded-role-adapter-disclosure.json": {
+      "sha256": "feafddd7fffdc4d1642910d386e3136286389abb141e1acc5e1ae7db3b36d7f6",
+      "bytes": 691
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo2/server-orchestration-request.json": {
+      "sha256": "d83d28b3351b4bba8c76a2b190b2e1884072fe73c1915cf58b663649e9c63988",
+      "bytes": 979
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo3/base_response.json": {
+      "sha256": "2bd9d9fa67a16b7ad71e4b953ddb45948384a2722ef6c6dcf697553c27485659",
+      "bytes": 1153
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo3/comparison.json": {
+      "sha256": "23ffe76215893269c3647f43e98e347550a42b4a3bb954cacb807e864141aece",
+      "bytes": 1782
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo3/disclosure.json": {
+      "sha256": "64f2d45b63ced86f3ad15ed17631693a30be8b7941bffc01b5d484bba9471007",
+      "bytes": 764
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo3/evidence_manifest.json": {
+      "sha256": "3659c8be08579e7ef30c7c510fc729c34f128aaf595e232690605bc69c8b6209",
+      "bytes": 1670
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo3/execution_receipt.json": {
+      "sha256": "71e4836bb3eafcfbd4b21a61b80c9ed535a1160d8cca0295b04cf1e37e5deb67",
+      "bytes": 2699
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo3/prompt.json": {
+      "sha256": "f20f7ed568bccb502825a5dfbbfc8bf1a7d53f711cb900e1b88a21251bccf62a",
+      "bytes": 326
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo3/router_response.json": {
+      "sha256": "47bc4ce60a8a6b48266ce31bf171a80e9a1b80c609db397fd3bf9ad9d3e64453",
+      "bytes": 18442
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo3/tool_execution_receipt.json": {
+      "sha256": "4c1802eacbc4c4202899a37c77de83d957d53fa08c6446188af9d3755baba11c",
+      "bytes": 1704
+    },
+    "web/virenis/marketing/router-quality-showcase/evidence/demo3/usgs_tool_snapshot.json": {
+      "sha256": "2a03f560747e9fcb5bacc7687547bd169f1052bbacd75f12b47f206212a42bae",
+      "bytes": 808
+    },
+    "web/virenis/marketing/router-quality-showcase/exports/01-agent-team-route.png": {
+      "sha256": "17850c2cd507423ead795e8dbf85ca3fa0d98f6ea09ab7484bd92b906ebc6215",
+      "bytes": 175719
+    },
+    "web/virenis/marketing/router-quality-showcase/exports/02-agent-team-comparison.png": {
+      "sha256": "6b6b4f3ce65d9e668dfdfca5de0f93329e3a0ecf81645948995ee980ec97f05e",
+      "bytes": 249468
+    },
+    "web/virenis/marketing/router-quality-showcase/exports/03-document-route.png": {
+      "sha256": "7d4a85cba1618a8e9b322424563d5e190b16c8e9beb6d70c6d081f0b36f65986",
+      "bytes": 205814
+    },
+    "web/virenis/marketing/router-quality-showcase/exports/04-document-comparison.png": {
+      "sha256": "cc59ffc21c4ad4cf6e7aba6cfe43de740703d5e40ecb391b726b2718dfea431b",
+      "bytes": 273571
+    },
+    "web/virenis/marketing/router-quality-showcase/exports/05-live-tool-route.png": {
+      "sha256": "b2e6875ef9f9be16329f0c2f953e2a8bd8064a57ce28c1a48d4e64a0b9bcb592",
+      "bytes": 175242
+    },
+    "web/virenis/marketing/router-quality-showcase/exports/06-live-tool-comparison.png": {
+      "sha256": "a9f8ca5a835e013ab0a9dd40a79f2016bd7e06466e045914fa34e031aa90cbc5",
+      "bytes": 200858
+    },
+    "web/virenis/marketing/router-quality-showcase/exports/router-marketing-contact-sheet.png": {
+      "sha256": "597f2fccf06baf7211294d495772ac00bac042f4687fcca57cbd40524b129548",
+      "bytes": 454622
+    },
+    "web/virenis/marketing/router-quality-showcase/frames/01-agent-team-route.svg": {
+      "sha256": "04a61c9b4d265158fcaaf335f997b070b5eb175836501153f58ed08375234353",
+      "bytes": 9152
+    },
+    "web/virenis/marketing/router-quality-showcase/frames/02-agent-team-comparison.svg": {
+      "sha256": "6bf4abd825e6517ba19c1d0098b8592ea2508f340d2124af88a15776f587380f",
+      "bytes": 6597
+    },
+    "web/virenis/marketing/router-quality-showcase/frames/03-document-route.svg": {
+      "sha256": "682cc605b94c41df229e0551fc4184f057a4a943ff4a70cc9b69a8f7c464e92d",
+      "bytes": 11043
+    },
+    "web/virenis/marketing/router-quality-showcase/frames/04-document-comparison.svg": {
+      "sha256": "aa6777c39538a35ebe79d9ae3e499d6f72746f78f587036d90d9043c3e71e5e4",
+      "bytes": 7410
+    },
+    "web/virenis/marketing/router-quality-showcase/frames/05-live-tool-route.svg": {
+      "sha256": "342beaec67b413081ae5b47b98ee9683178accecaf22c3ff33c1180a3dd03239",
+      "bytes": 9169
+    },
+    "web/virenis/marketing/router-quality-showcase/frames/06-live-tool-comparison.svg": {
+      "sha256": "7985a7f58341b80aaec2c2ac8d216d40b26a0778ecc70c87333862caeefbd8e2",
+      "bytes": 6382
+    },
+    "web/virenis/marketing/router-quality-showcase/index.html": {
+      "sha256": "d5c19d2e3a91c2c1d4c9f8b7aa713913848d80cbb1a55ab5edb537c185b9128d",
+      "bytes": 2869
+    },
+    "web/virenis/marketing/router-quality-showcase/render.mjs": {
+      "sha256": "8c416469dada3773b5f38d1affcc70f4cead2fa73a7cff8370770f54b4fa71b5",
+      "bytes": 22827
+    },
+    "web/virenis/marketing/router-quality-showcase/showcase.css": {
+      "sha256": "0f6f6bb52e60ac90f4c0c68705a22c74c71e1ba154bf786bad222528623e7ec4",
+      "bytes": 2197
+    }
+  }
+}

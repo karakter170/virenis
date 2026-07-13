@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Virenis · Router in action</title>
+    <link rel="stylesheet" href="showcase.css" />
+  </head>
+  <body>
+    <header>
+      <a href="../../index.html">Virenis</a>
+      <div><strong>Router in action</strong><span>Three captured demonstrations · Six visual frames</span></div>
+      <p><kbd>←</kbd><kbd>→</kbd> to navigate</p>
+    </header>
+    <main>
+      <figure>
+        <img id="active-frame" src="exports/01-agent-team-route.png" alt="Agent team route trace" />
+        <figcaption id="caption">01 · Agent team route</figcaption>
+      </figure>
+      <nav aria-label="Showcase frames">
+        <button class="active" data-index="0"><b>01</b><span>Agent team</span><small>Route trace</small></button>
+        <button data-index="1"><b>02</b><span>Agent team</span><small>Comparison</small></button>
+        <button data-index="2"><b>03</b><span>Documents</span><small>Route trace</small></button>
+        <button data-index="3"><b>04</b><span>Documents</span><small>Comparison</small></button>
+        <button data-index="4"><b>05</b><span>Live tool</span><small>Route trace</small></button>
+        <button data-index="5"><b>06</b><span>Live tool</span><small>Comparison</small></button>
+      </nav>
+    </main>
+    <footer>Captured outputs and observable execution receipts. Illustrative demonstrations, not aggregate benchmark claims.</footer>
+    <script>
+      const frames = [
+        ["exports/01-agent-team-route.png", "01 · Agent team route"],
+        ["exports/02-agent-team-comparison.png", "02 · Agent team comparison"],
+        ["exports/03-document-route.png", "03 · Two-document route"],
+        ["exports/04-document-comparison.png", "04 · Two-document comparison"],
+        ["exports/05-live-tool-route.png", "05 · Live-tool route"],
+        ["exports/06-live-tool-comparison.png", "06 · Live-tool comparison"]
+      ];
+      const image = document.querySelector("#active-frame");
+      const caption = document.querySelector("#caption");
+      const buttons = [...document.querySelectorAll("nav button")];
+      let active = 0;
+      function show(index) {
+        active = (index + frames.length) % frames.length;
+        image.src = frames[active][0];
+        image.alt = frames[active][1];
+        caption.textContent = frames[active][1];
+        buttons.forEach((button, buttonIndex) => button.classList.toggle("active", buttonIndex === active));
+      }
+      buttons.forEach((button) => button.addEventListener("click", () => show(Number(button.dataset.index))));
+      addEventListener("keydown", (event) => {
+        if (event.key === "ArrowRight") show(active + 1);
+        if (event.key === "ArrowLeft") show(active - 1);
+      });
+    </script>
+  </body>
+</html>

@@ -1,0 +1,97 @@
+{
+  "schema_version": "router-demo2-capture-integrity-v1",
+  "captures": {
+    "accounts-registration-request": {
+      "raw_capture": "outputs/router_marketing_demos/demo2/accounts-registration-request.json",
+      "raw_sha256": "6475146add2d725395a0c9615ece84a4146c829b1c9b374d394a7e18263f48ee"
+    },
+    "accounts-registration-response": {
+      "raw_capture": "outputs/router_marketing_demos/demo2/accounts-registration-response.json",
+      "raw_sha256": "1f4a9b75f7c74098df54e356f92c9e5faf6b44dfade7ebdf01b6ada163314f9a"
+    },
+    "analysis-registration-request": {
+      "raw_capture": "outputs/router_marketing_demos/demo2/analysis-registration-request.json",
+      "raw_sha256": "548d80eafe4b16715aeaa05c9129fc5b14ed2f4340f017ad6395bab2700fb09e"
+    },
+    "analysis-registration-response": {
+      "raw_capture": "outputs/router_marketing_demos/demo2/analysis-registration-response.json",
+      "raw_sha256": "831f683ebc6941ef548cbc2a96079576414e405ae3cea494ff36802a3c22d1df"
+    },
+    "base-request": {
+      "raw_capture": "outputs/router_marketing_demos/demo2/base-request.json",
+      "raw_sha256": "a0c28660bed9a2905fdd86ef64c92813b2a02e3843067bfc7d9d73813a6a907b",
+      "public_capture": "web/virenis/marketing/router-quality-showcase/evidence/demo2/base-request.json",
+      "public_sha256": "2d5301135509aa6e3090f10ac60cd07b3571d706e0b9f55978fdd76cddbc96f0",
+      "public_name_policy": "Internal architecture labels are replaced with Router in the public copy."
+    },
+    "base-response": {
+      "raw_capture": "outputs/router_marketing_demos/demo2/base-response.json",
+      "raw_sha256": "bd583c6352486727df3e3450355bb31834df92b5c57cb26d3127f50f3adbbc88",
+      "public_capture": "web/virenis/marketing/router-quality-showcase/evidence/demo2/base-response.json",
+      "public_sha256": "aa401949ac9832a2de0b79b29a1edc185aad648b247973ad71609779720fd6d0",
+      "public_name_policy": "Internal architecture labels are replaced with Router in the public copy."
+    },
+    "cleanup-results": {
+      "raw_capture": "outputs/router_marketing_demos/demo2/cleanup-results.json",
+      "raw_sha256": "b03a54967ffe9c4a834ce4e98d6e8e2ab1637d4e7ed62dac8d0b2e623d044a73"
+    },
+    "evidence-summary": {
+      "raw_capture": "outputs/router_marketing_demos/demo2/evidence-summary.json",
+      "raw_sha256": "e82d1e1ca4e300107e44130ba67d828cf6a17f4bdd74b58096302fe185d075b8",
+      "public_capture": "web/virenis/marketing/router-quality-showcase/evidence/demo2/evidence-summary.json",
+      "public_sha256": "ce94cfb3fb064ab35e53f15091c06702eafbb6506baac112b3a83785eec89c50",
+      "public_name_policy": "Internal architecture labels are replaced with Router in the public copy."
+    },
+    "executed-dag-response": {
+      "raw_capture": "outputs/router_marketing_demos/demo2/executed-dag-response.json",
+      "raw_sha256": "2376c3848c8e129d756226e854a28be54a77fffb8a851dead5025d5ef66132ec",
+      "public_capture": "web/virenis/marketing/router-quality-showcase/evidence/demo2/executed-dag-response.json",
+      "public_sha256": "a81b06ca469894e472217a01ed257247968580147f49e9a7b1104569e6df9c3d",
+      "public_name_policy": "Internal architecture labels are replaced with Router in the public copy."
+    },
+    "execution-receipt": {
+      "raw_capture": "outputs/router_marketing_demos/demo2/execution-receipt.json",
+      "raw_sha256": "ea2482ab55a76926dacb5d5555476eacd9aff11af95713e18a09c69627c37c86",
+      "public_capture": "web/virenis/marketing/router-quality-showcase/evidence/demo2/execution-receipt.json",
+      "public_sha256": "468a619be8bf62b5a08c87bd9d651e8d835a0bba62818c5894502c56c96a66da",
+      "public_name_policy": "Internal architecture labels are replaced with Router in the public copy."
+    },
+    "inflation-registration-request": {
+      "raw_capture": "outputs/router_marketing_demos/demo2/inflation-registration-request.json",
+      "raw_sha256": "2dceca5455fcdc3082aaa1a339dacd5bb938b51ac4b9090a700193dea1bada6a"
+    },
+    "inflation-registration-response": {
+      "raw_capture": "outputs/router_marketing_demos/demo2/inflation-registration-response.json",
+      "raw_sha256": "ca9e023c65387dfc4e08a190bcb85cba20f5b46c0d6c32b4326216c532aef00b"
+    },
+    "isolated-manifest-snapshot": {
+      "raw_capture": "outputs/router_marketing_demos/demo2/isolated-manifest-snapshot.json",
+      "raw_sha256": "b14ef304d40409af13de0091a771ae27f6cc08c9820ad0539be50e60873d3ac3"
+    },
+    "router-source-selection-request": {
+      "raw_capture": "outputs/router_marketing_demos/demo2/router-source-selection-request.json",
+      "raw_sha256": "8961c1a67f703c99c507accbcb35c85a52d2586d881ff4f473729d911702903a",
+      "public_capture": "web/virenis/marketing/router-quality-showcase/evidence/demo2/router-source-selection-request.json",
+      "public_sha256": "6abe9a2fbb52e9bb9b89af4a979088bd6ac74af00a6357b55758d30042b8c56a",
+      "public_name_policy": "Internal architecture labels are replaced with Router in the public copy."
+    },
+    "router-source-selection-response": {
+      "raw_capture": "outputs/router_marketing_demos/demo2/router-source-selection-response.json",
+      "raw_sha256": "a966a596ca75da7bfd980ac3f3608ee729906e884c07768ced5bec519fe98bc8",
+      "public_capture": "web/virenis/marketing/router-quality-showcase/evidence/demo2/router-source-selection-response.json",
+      "public_sha256": "3df47b7a5a36b92fc9564cf7f9ba304e31f8c1b8dfa18e68fca598b68c208d40",
+      "public_name_policy": "Internal architecture labels are replaced with Router in the public copy."
+    },
+    "runtime-health": {
+      "raw_capture": "outputs/router_marketing_demos/demo2/runtime-health.json",
+      "raw_sha256": "8b8b1ae4e6c12b82353058faade32ce10d85880b0f6ad8c66cd23bf7a5f487c2"
+    },
+    "server-orchestration-request": {
+      "raw_capture": "outputs/router_marketing_demos/demo2/server-orchestration-request.json",
+      "raw_sha256": "454f8d2dad63b417cb162d222c0f395a6144a346669481a11a3c01785c69aab9",
+      "public_capture": "web/virenis/marketing/router-quality-showcase/evidence/demo2/server-orchestration-request.json",
+      "public_sha256": "d83d28b3351b4bba8c76a2b190b2e1884072fe73c1915cf58b663649e9c63988",
+      "public_name_policy": "Internal architecture labels are replaced with Router in the public copy."
+    }
+  }
+}

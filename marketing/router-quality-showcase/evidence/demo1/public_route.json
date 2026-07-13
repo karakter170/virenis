@@ -1,0 +1,30 @@
+{
+  "schema_version": "router-public-route-v1",
+  "steps": [
+    {
+      "agent": "Textile Agent",
+      "depends_on": [],
+      "status": "completed"
+    },
+    {
+      "agent": "Business Plan Agent",
+      "depends_on": [
+        "Textile Agent"
+      ],
+      "status": "completed"
+    }
+  ],
+  "handoff": {
+    "from": "Textile Agent",
+    "to": "Business Plan Agent",
+    "artifact": "textile_industry_brief",
+    "verified": true
+  },
+  "playbook_citations": [
+    {
+      "source_id": "source_textile_playbook_f32c52a8bb56",
+      "title": "textile_playbook.md",
+      "verified": true
+    }
+  ]
+}

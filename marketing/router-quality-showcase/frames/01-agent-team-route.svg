@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1080" viewBox="0 0 1920 1080">
+    <defs>
+    <pattern id="dots" width="26" height="26" patternUnits="userSpaceOnUse"><circle cx="2" cy="2" r="1.15" fill="#d8e0db"/></pattern>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="#8ea098"/></marker>
+    <marker id="arrowGreen" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="#176b4b"/></marker>
+  </defs>
+    <rect width="1920" height="1080" fill="#f7f9f7"/>
+    <rect x="1470" y="0" width="450" height="1080" fill="url(#dots)" opacity="0.5"/>
+    <circle cx="1755" cy="55" r="250" fill="#e5f3ec" stroke="#e5f3ec" stroke-width="0"/>
+    <circle cx="1808" cy="1016" r="212" fill="#f0e9fb" stroke="#f0e9fb" stroke-width="0"/>
+    <text x="86" y="68" fill="#131815" font-family="Showcase Sans" font-size="29" font-weight="700" text-anchor="start" letter-spacing="0"><tspan x="86" dy="0">Virenis</tspan></text>
+    <text x="1834" y="66" fill="#818b84" font-family="Showcase Mono" font-size="14" font-weight="700" text-anchor="end" letter-spacing="0.8"><tspan x="1834" dy="0">DEMO 1 · AGENT TEAM · 01 / 06</tspan></text>
+    <line x1="86" y1="94" x2="1834" y2="94" stroke="#bdc9c2" stroke-width="1" />
+    <text x="86" y="170" fill="#131815" font-family="Showcase Sans" font-size="56" font-weight="700" text-anchor="start" letter-spacing="0"><tspan x="86" dy="0">One request. Two specialist roles.</tspan></text>
+    <text x="88" y="214" fill="#68716b" font-family="Showcase Sans" font-size="20" font-weight="400" text-anchor="start" letter-spacing="0"><tspan x="88" dy="0">The first agent extracts textile constraints; the second turns the verified handoff into a business plan.</tspan></text>
+    <rect x="86" y="258" width="1748" height="112" rx="18" fill="#ffffff" fill-opacity="1" stroke="#bdc9c2" stroke-width="1"/>
+    <rect x="108" y="276" width="126" height="34" rx="17" fill="#eef1ef" fill-opacity="1" stroke="#eef1ef" stroke-width="1"/><text x="171" y="299" fill="#68716b" font-family="Showcase Mono" font-size="12" font-weight="700" text-anchor="middle" letter-spacing="0.35"><tspan x="171" dy="0">USER PROMPT</tspan></text>
+    <text x="108" y="334" fill="#131815" font-family="Showcase Sans" font-size="20" font-weight="700" text-anchor="start" letter-spacing="0"><tspan x="108" dy="0">First identify the important textile-industry considerations, then create a simple business plan for a small company that makes durable tote bags from recycled</tspan><tspan x="108" dy="24">textile offcuts.</tspan></text>
+    <rect x="86" y="398" width="250" height="34" rx="17" fill="#e5f3ec" fill-opacity="1" stroke="#e5f3ec" stroke-width="1"/><text x="211" y="421" fill="#176b4b" font-family="Showcase Mono" font-size="14" font-weight="700" text-anchor="middle" letter-spacing="0.35"><tspan x="211" dy="0">OBSERVABLE DECISION TRACE</tspan></text>
+    <rect x="86" y="452" width="1748" height="466" rx="24" fill="#ffffff" fill-opacity="1" stroke="#d9e1dc" stroke-width="1"/>
+    <rect x="120" y="508" width="348" height="296" rx="20" fill="#e5f3ec" fill-opacity="1" stroke="#176b4b" stroke-width="1"/>
+    <rect x="140" y="526" width="128" height="34" rx="17" fill="#ffffff" fill-opacity="1" stroke="#ffffff" stroke-width="1"/><text x="204" y="549" fill="#176b4b" font-family="Showcase Mono" font-size="12" font-weight="700" text-anchor="middle" letter-spacing="0.35"><tspan x="204" dy="0">SELECTS</tspan></text>
+    <text x="140" y="586" fill="#176b4b" font-family="Showcase Sans" font-size="28" font-weight="700" text-anchor="start" letter-spacing="0"><tspan x="140" dy="0">Router</tspan></text>
+    <text x="140" y="624" fill="#29302c" font-family="Showcase Sans" font-size="18" font-weight="400" text-anchor="start" letter-spacing="0"><tspan x="140" dy="0">Selects both roles; the workflow</tspan><tspan x="140" dy="22.5">compiler sequences their</tspan><tspan x="140" dy="22.5">handoff.</tspan></text>
+    <line x1="140" y1="762" x2="448" y2="762" stroke="#176b4b" stroke-width="1" /><text x="140" y="790" fill="#176b4b" font-family="Showcase Mono" font-size="12" font-weight="700" text-anchor="start" letter-spacing="0"><tspan x="140" dy="0">SELECTED BOTH ROLES</tspan></text>
+    <line x1="468" y1="656" x2="540" y2="656" stroke="#176b4b" stroke-width="3" marker-end="url(#arrowGreen)"/>
+    <rect x="548" y="508" width="360" height="296" rx="20" fill="#fff0e4" fill-opacity="1" stroke="#a8581a" stroke-width="1"/>
+    <rect x="568" y="526" width="128" height="34" rx="17" fill="#ffffff" fill-opacity="1" stroke="#ffffff" stroke-width="1"/><text x="632" y="549" fill="#a8581a" font-family="Showcase Mono" font-size="12" font-weight="700" text-anchor="middle" letter-spacing="0.35"><tspan x="632" dy="0">STAGE 1</tspan></text>
+    <text x="568" y="586" fill="#a8581a" font-family="Showcase Sans" font-size="28" font-weight="700" text-anchor="start" letter-spacing="0"><tspan x="568" dy="0">Textile Agent</tspan></text>
+    <text x="568" y="624" fill="#29302c" font-family="Showcase Sans" font-size="18" font-weight="400" text-anchor="start" letter-spacing="0"><tspan x="568" dy="0">Extracts material variation,</tspan><tspan x="568" dy="22.5">supplier rules, batch tests, and</tspan><tspan x="568" dy="22.5">traceability controls.</tspan></text>
+    <line x1="568" y1="762" x2="888" y2="762" stroke="#a8581a" stroke-width="1" /><text x="568" y="790" fill="#a8581a" font-family="Showcase Mono" font-size="12" font-weight="700" text-anchor="start" letter-spacing="0"><tspan x="568" dy="0">VERIFIED: INDUSTRY BRIEF</tspan></text>
+    <line x1="908" y1="656" x2="980" y2="656" stroke="#176b4b" stroke-width="3" marker-end="url(#arrowGreen)"/>
+    <rect x="988" y="508" width="360" height="296" rx="20" fill="#e8f1fb" fill-opacity="1" stroke="#2564a7" stroke-width="1"/>
+    <rect x="1008" y="526" width="128" height="34" rx="17" fill="#ffffff" fill-opacity="1" stroke="#ffffff" stroke-width="1"/><text x="1072" y="549" fill="#2564a7" font-family="Showcase Mono" font-size="12" font-weight="700" text-anchor="middle" letter-spacing="0.35"><tspan x="1072" dy="0">STAGE 2</tspan></text>
+    <text x="1008" y="586" fill="#2564a7" font-family="Showcase Sans" font-size="28" font-weight="700" text-anchor="start" letter-spacing="0"><tspan x="1008" dy="0">Business Plan Agent</tspan></text>
+    <text x="1008" y="624" fill="#29302c" font-family="Showcase Sans" font-size="18" font-weight="400" text-anchor="start" letter-spacing="0"><tspan x="1008" dy="0">Consumes the verified brief and</tspan><tspan x="1008" dy="22.5">turns it into one complete</tspan><tspan x="1008" dy="22.5">six-part operating plan.</tspan></text>
+    <line x1="1008" y1="762" x2="1328" y2="762" stroke="#2564a7" stroke-width="1" /><text x="1008" y="790" fill="#2564a7" font-family="Showcase Mono" font-size="12" font-weight="700" text-anchor="start" letter-spacing="0"><tspan x="1008" dy="0">VERIFIED: BUSINESS PLAN</tspan></text>
+    <line x1="1348" y1="656" x2="1420" y2="656" stroke="#176b4b" stroke-width="3" marker-end="url(#arrowGreen)"/>
+    <rect x="1428" y="508" width="372" height="296" rx="20" fill="#0d5339" fill-opacity="1" stroke="#0d5339" stroke-width="1"/>
+    <rect x="1448" y="526" width="140" height="34" rx="17" fill="#ffffff" fill-opacity="1" stroke="#ffffff" stroke-width="1"/><text x="1518" y="549" fill="#0d5339" font-family="Showcase Mono" font-size="12" font-weight="700" text-anchor="middle" letter-spacing="0.35"><tspan x="1518" dy="0">FINAL ANSWER</tspan></text>
+    <text x="1448" y="592" fill="#ffffff" font-family="Showcase Sans" font-size="29" font-weight="700" text-anchor="start" letter-spacing="0"><tspan x="1448" dy="0">Textile-aware plan</tspan></text>
+    <text x="1448" y="678" fill="#d5eee2" font-family="Showcase Sans" font-size="18" font-weight="400" text-anchor="start" letter-spacing="0"><tspan x="1448" dy="0">Product · customers · sourcing ·</tspan><tspan x="1448" dy="22.5">production · sales · risks</tspan></text>
+    <rect x="120" y="834" width="1680" height="56" rx="14" fill="#eef1ef" fill-opacity="1" stroke="#eef1ef" stroke-width="1"/>
+    <path d="M142,858 l7,7 l14,-17" fill="none" stroke="#176b4b" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="180" y="870" fill="#0d5339" font-family="Showcase Sans" font-size="20" font-weight="700" text-anchor="start" letter-spacing="0"><tspan x="180" dy="0">The verified textile brief is recorded as consumed by the Business Plan Agent.</tspan></text>
+    <line x1="86" y1="1004" x2="1834" y2="1004" stroke="#bdc9c2" stroke-width="1" />
+    <text x="86" y="1039" fill="#818b84" font-family="Showcase Mono" font-size="14" font-weight="400" text-anchor="start" letter-spacing="0"><tspan x="86" dy="0">Observable route decisions and captured outputs — not private chain-of-thought</tspan></text>
+    <text x="1834" y="1039" fill="#176b4b" font-family="Showcase Mono" font-size="14" font-weight="700" text-anchor="end" letter-spacing="0"><tspan x="1834" dy="0">CAPTURED RUN · RECEIPT RECORDED</tspan></text>
+  </svg>

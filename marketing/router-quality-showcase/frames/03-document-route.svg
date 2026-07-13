@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1080" viewBox="0 0 1920 1080">
+    <defs>
+    <pattern id="dots" width="26" height="26" patternUnits="userSpaceOnUse"><circle cx="2" cy="2" r="1.15" fill="#d8e0db"/></pattern>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="#8ea098"/></marker>
+    <marker id="arrowGreen" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="#176b4b"/></marker>
+  </defs>
+    <rect width="1920" height="1080" fill="#f7f9f7"/>
+    <rect x="1470" y="0" width="450" height="1080" fill="url(#dots)" opacity="0.5"/>
+    <circle cx="1755" cy="55" r="250" fill="#e5f3ec" stroke="#e5f3ec" stroke-width="0"/>
+    <circle cx="1808" cy="1016" r="212" fill="#f0e9fb" stroke="#f0e9fb" stroke-width="0"/>
+    <text x="86" y="68" fill="#131815" font-family="Showcase Sans" font-size="29" font-weight="700" text-anchor="start" letter-spacing="0"><tspan x="86" dy="0">Virenis</tspan></text>
+    <text x="1834" y="66" fill="#818b84" font-family="Showcase Mono" font-size="14" font-weight="700" text-anchor="end" letter-spacing="0.8"><tspan x="1834" dy="0">DEMO 2 · TWO DOCUMENTS · 03 / 06</tspan></text>
+    <line x1="86" y1="94" x2="1834" y2="94" stroke="#bdc9c2" stroke-width="1" />
+    <text x="86" y="170" fill="#131815" font-family="Showcase Sans" font-size="56" font-weight="700" text-anchor="start" letter-spacing="0"><tspan x="86" dy="0">Two sources. Scoped in parallel. Joined once.</tspan></text>
+    <text x="88" y="214" fill="#68716b" font-family="Showcase Sans" font-size="20" font-weight="400" text-anchor="start" letter-spacing="0"><tspan x="88" dy="0">Each document stays with its own source agent before the Analysis Agent receives validated source handoffs from both.</tspan></text>
+    <rect x="86" y="258" width="1748" height="112" rx="18" fill="#ffffff" fill-opacity="1" stroke="#bdc9c2" stroke-width="1"/>
+    <rect x="108" y="276" width="126" height="34" rx="17" fill="#eef1ef" fill-opacity="1" stroke="#eef1ef" stroke-width="1"/><text x="171" y="299" fill="#68716b" font-family="Showcase Mono" font-size="12" font-weight="700" text-anchor="middle" letter-spacing="0.35"><tspan x="171" dy="0">USER PROMPT</tspan></text>
+    <text x="108" y="334" fill="#131815" font-family="Showcase Sans" font-size="20" font-weight="700" text-anchor="start" letter-spacing="0"><tspan x="108" dy="0">Consult both the company cost table and the Fictionland inflation brief. Then explain what is driving the company&apos;s cost pressure and suggest one practical next</tspan><tspan x="108" dy="24">step.</tspan></text>
+    <rect x="86" y="398" width="1748" height="526" rx="24" fill="#ffffff" fill-opacity="1" stroke="#d9e1dc" stroke-width="1"/>
+    <rect x="116" y="438" width="306" height="194" rx="16" fill="#e8f1fb" fill-opacity="1" stroke="#2564a7" stroke-width="1"/>
+    <rect x="134" y="454" width="116" height="34" rx="17" fill="#ffffff" fill-opacity="1" stroke="#ffffff" stroke-width="1"/><text x="192" y="477" fill="#2564a7" font-family="Showcase Mono" font-size="11" font-weight="700" text-anchor="middle" letter-spacing="0.35"><tspan x="192" dy="0">DOCUMENT A</tspan></text>
+    <text x="134" y="510" fill="#2564a7" font-family="Showcase Sans" font-size="21" font-weight="700" text-anchor="start" letter-spacing="0"><tspan x="134" dy="0">Loom &amp; Pine cost review</tspan></text>
+    <line x1="134" y1="546" x2="404" y2="546" stroke="#2564a7" stroke-width="1" />
+    <text x="134" y="578" fill="#29302c" font-family="Showcase Sans" font-size="16" font-weight="400" text-anchor="start" letter-spacing="0"><tspan x="134" dy="0">The clearest cost pressure</tspan><tspan x="134" dy="20.48">comes from fabric and delivery,</tspan><tspan x="134" dy="20.48">not wages or rent.</tspan></text>
+    <rect x="116" y="694" width="306" height="194" rx="16" fill="#fbeaea" fill-opacity="1" stroke="#9e4848" stroke-width="1"/>
+    <rect x="134" y="710" width="116" height="34" rx="17" fill="#ffffff" fill-opacity="1" stroke="#ffffff" stroke-width="1"/><text x="192" y="733" fill="#9e4848" font-family="Showcase Mono" font-size="11" font-weight="700" text-anchor="middle" letter-spacing="0.35"><tspan x="192" dy="0">DOCUMENT B</tspan></text>
+    <text x="134" y="766" fill="#9e4848" font-family="Showcase Sans" font-size="21" font-weight="700" text-anchor="start" letter-spacing="0"><tspan x="134" dy="0">Fictionland inflation</tspan><tspan x="134" dy="26.25">brief</tspan></text>
+    <line x1="134" y1="802" x2="404" y2="802" stroke="#9e4848" stroke-width="1" />
+    <text x="134" y="834" fill="#29302c" font-family="Showcase Sans" font-size="16" font-weight="400" text-anchor="start" letter-spacing="0"><tspan x="134" dy="0">Recent price pressure is</tspan><tspan x="134" dy="20.48">concentrated in imported goods</tspan><tspan x="134" dy="20.48">and transport.</tspan></text>
+    <path d="M422,535 C485,535 486,562 534,562" fill="none" stroke="#bdc9c2" stroke-width="2" marker-end="url(#arrow)"/>
+    <path d="M422,791 C485,791 486,754 534,754" fill="none" stroke="#bdc9c2" stroke-width="2" marker-end="url(#arrow)"/>
+    <rect x="542" y="502" width="282" height="290" rx="20" fill="#e5f3ec" fill-opacity="1" stroke="#176b4b" stroke-width="1"/>
+    <rect x="562" y="520" width="128" height="34" rx="17" fill="#ffffff" fill-opacity="1" stroke="#ffffff" stroke-width="1"/><text x="626" y="543" fill="#176b4b" font-family="Showcase Mono" font-size="12" font-weight="700" text-anchor="middle" letter-spacing="0.35"><tspan x="626" dy="0">SELECTS 2</tspan></text>
+    <text x="562" y="580" fill="#176b4b" font-family="Showcase Sans" font-size="28" font-weight="700" text-anchor="start" letter-spacing="0"><tspan x="562" dy="0">Router</tspan></text>
+    <text x="562" y="618" fill="#29302c" font-family="Showcase Sans" font-size="18" font-weight="400" text-anchor="start" letter-spacing="0"><tspan x="562" dy="0">Selects both document</tspan><tspan x="562" dy="22.5">sources; no user plan or</tspan><tspan x="562" dy="22.5">agent IDs.</tspan></text>
+    <line x1="562" y1="750" x2="804" y2="750" stroke="#176b4b" stroke-width="1" /><text x="562" y="778" fill="#176b4b" font-family="Showcase Mono" font-size="12" font-weight="700" text-anchor="start" letter-spacing="0"><tspan x="562" dy="0">PARALLEL SOURCE ROUTES</tspan></text>
+    <path d="M824,605 C868,605 868,512 916,512" fill="none" stroke="#2564a7" stroke-width="2" marker-end="url(#arrow)"/>
+    <path d="M824,689 C868,689 868,780 916,780" fill="none" stroke="#9e4848" stroke-width="2" marker-end="url(#arrow)"/>
+    <rect x="924" y="438" width="318" height="194" rx="20" fill="#e8f1fb" fill-opacity="1" stroke="#2564a7" stroke-width="1"/>
+    <rect x="944" y="456" width="128" height="34" rx="17" fill="#ffffff" fill-opacity="1" stroke="#ffffff" stroke-width="1"/><text x="1008" y="479" fill="#2564a7" font-family="Showcase Mono" font-size="12" font-weight="700" text-anchor="middle" letter-spacing="0.35"><tspan x="1008" dy="0">SOURCE A</tspan></text>
+    <text x="944" y="516" fill="#2564a7" font-family="Showcase Sans" font-size="21" font-weight="700" text-anchor="start" letter-spacing="0"><tspan x="944" dy="0">Company Cost Table Agent</tspan></text>
+    <text x="944" y="554" fill="#29302c" font-family="Showcase Sans" font-size="18" font-weight="400" text-anchor="start" letter-spacing="0"><tspan x="944" dy="0">Retrieves cost facts from</tspan><tspan x="944" dy="22.5">Document A.</tspan></text>
+    <line x1="944" y1="590" x2="1222" y2="590" stroke="#2564a7" stroke-width="1" /><text x="944" y="618" fill="#2564a7" font-family="Showcase Mono" font-size="12" font-weight="700" text-anchor="start" letter-spacing="0"><tspan x="944" dy="0">VERIFIED CITATION · A</tspan></text>
+    <rect x="924" y="694" width="318" height="194" rx="20" fill="#fbeaea" fill-opacity="1" stroke="#9e4848" stroke-width="1"/>
+    <rect x="944" y="712" width="128" height="34" rx="17" fill="#ffffff" fill-opacity="1" stroke="#ffffff" stroke-width="1"/><text x="1008" y="735" fill="#9e4848" font-family="Showcase Mono" font-size="12" font-weight="700" text-anchor="middle" letter-spacing="0.35"><tspan x="1008" dy="0">SOURCE B</tspan></text>
+    <text x="944" y="772" fill="#9e4848" font-family="Showcase Sans" font-size="21" font-weight="700" text-anchor="start" letter-spacing="0"><tspan x="944" dy="0">Inflation Brief Agent</tspan></text>
+    <text x="944" y="810" fill="#29302c" font-family="Showcase Sans" font-size="18" font-weight="400" text-anchor="start" letter-spacing="0"><tspan x="944" dy="0">Retrieves inflation context</tspan><tspan x="944" dy="22.5">from Document B.</tspan></text>
+    <line x1="944" y1="846" x2="1222" y2="846" stroke="#9e4848" stroke-width="1" /><text x="944" y="874" fill="#9e4848" font-family="Showcase Mono" font-size="12" font-weight="700" text-anchor="start" letter-spacing="0"><tspan x="944" dy="0">VERIFIED CITATION · B</tspan></text>
+    <path d="M1242,535 C1305,535 1305,617 1350,617" fill="none" stroke="#2564a7" stroke-width="2" marker-end="url(#arrow)"/>
+    <path d="M1242,791 C1305,791 1305,709 1350,709" fill="none" stroke="#9e4848" stroke-width="2" marker-end="url(#arrow)"/>
+    <rect x="1358" y="502" width="442" height="290" rx="20" fill="#e5f3ec" fill-opacity="1" stroke="#176b4b" stroke-width="1"/>
+    <rect x="1378" y="520" width="128" height="34" rx="17" fill="#ffffff" fill-opacity="1" stroke="#ffffff" stroke-width="1"/><text x="1442" y="543" fill="#176b4b" font-family="Showcase Mono" font-size="12" font-weight="700" text-anchor="middle" letter-spacing="0.35"><tspan x="1442" dy="0">WORKFLOW</tspan></text>
+    <text x="1378" y="580" fill="#176b4b" font-family="Showcase Sans" font-size="28" font-weight="700" text-anchor="start" letter-spacing="0"><tspan x="1378" dy="0">Analysis Agent</tspan></text>
+    <text x="1378" y="618" fill="#29302c" font-family="Showcase Sans" font-size="18" font-weight="400" text-anchor="start" letter-spacing="0"><tspan x="1378" dy="0">Server workflow passes both validated</tspan><tspan x="1378" dy="22.5">source artifacts into one downstream</tspan><tspan x="1378" dy="22.5">synthesis.</tspan></text>
+    <line x1="1378" y1="750" x2="1780" y2="750" stroke="#176b4b" stroke-width="1" /><text x="1378" y="778" fill="#176b4b" font-family="Showcase Mono" font-size="12" font-weight="700" text-anchor="start" letter-spacing="0"><tspan x="1378" dy="0">BOTH SOURCE HANDOFFS CONSUMED</tspan></text>
+    <line x1="86" y1="1004" x2="1834" y2="1004" stroke="#bdc9c2" stroke-width="1" />
+    <text x="86" y="1039" fill="#818b84" font-family="Showcase Mono" font-size="14" font-weight="400" text-anchor="start" letter-spacing="0"><tspan x="86" dy="0">Observable route decisions and captured outputs — not private chain-of-thought</tspan></text>
+    <text x="1834" y="1039" fill="#176b4b" font-family="Showcase Mono" font-size="14" font-weight="700" text-anchor="end" letter-spacing="0"><tspan x="1834" dy="0">CAPTURED RUN · RECEIPT RECORDED</tspan></text>
+  </svg>

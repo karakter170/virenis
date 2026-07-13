@@ -1,0 +1,14 @@
+{
+  "schema_version": "router-demo4-zero-effect-disclosure-v1",
+  "adapter_count": 11,
+  "adapter_effect": "zero-effect role identities",
+  "claim": "No trained adapter-weight improvement is claimed in this demonstration.",
+  "isolated_value": [
+    "routing",
+    "document retrieval",
+    "validated handoffs",
+    "fan-in",
+    "synthesis",
+    "citations"
+  ]
+}

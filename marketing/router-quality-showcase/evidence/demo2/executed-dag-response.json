@@ -1,0 +1,157 @@
+{
+  "question": "Consult both the company cost table and the Fictionland inflation brief. Then explain what is driving the company's cost pressure and suggest one practical next step.",
+  "execution_sequence": [
+    [
+      "Company Cost Table Agent",
+      "Inflation Brief Agent"
+    ],
+    [
+      "Analysis Agent"
+    ]
+  ],
+  "plan": {
+    "steps": [
+      {
+        "id": "s1",
+        "agent": "Company Cost Table Agent",
+        "depends_on": []
+      },
+      {
+        "id": "s2",
+        "agent": "Inflation Brief Agent",
+        "depends_on": []
+      },
+      {
+        "id": "s3",
+        "agent": "Analysis Agent",
+        "depends_on": [
+          "s1",
+          "s2"
+        ]
+      }
+    ],
+    "edges": [
+      {
+        "source": "Company Cost Table Agent",
+        "target": "Analysis Agent"
+      },
+      {
+        "source": "Inflation Brief Agent",
+        "target": "Analysis Agent"
+      }
+    ]
+  },
+  "source_results": [
+    {
+      "agent": "Company Cost Table Agent",
+      "answer": "Fabric and delivery costs increased, while wages and rent were unchanged [demo2_company_cost_source_0001].",
+      "source_validation_valid": true,
+      "policy_violations_empty": true,
+      "citations": [
+        {
+          "title": "Loom & Pine Company Cost Review",
+          "chunk_id": "demo2_company_cost_source_0001",
+          "claim": "Fabric and delivery costs increased, while wages and rent were unchanged .",
+          "excerpt": "# Loom & Pine Company Cost Review\n\n| Cost area | Earlier period | Latest period | Management note |\n| --- | --- | --- | --- |\n| Fabric | Steady | Higher | Supplier invoices show that fabric costs increased. |\n| Delivery | Steady | Higher | Freight and local delivery costs increased. |\n| Wages | Stable | Stable | Payroll was unchanged. |\n| Rent | Stable | Stable | Rent was unchanged. |\n\nThe clearest cost pressure comes from fabric and delivery, not wages or rent.",
+          "verified": true
+        }
+      ],
+      "handoff": {
+        "to": "Analysis Agent",
+        "artifact_names": [
+          "retrieved_context",
+          "cited_passages",
+          "document_constraints",
+          "source_confidence"
+        ],
+        "evidence": [
+          "demo2_company_cost_source_0001"
+        ]
+      }
+    },
+    {
+      "agent": "Inflation Brief Agent",
+      "answer": "Price pressure is concentrated in imported goods and transport, domestic wages are stable, and imported material costs remain uncertain [demo2_inflation_source_0001].",
+      "source_validation_valid": true,
+      "policy_violations_empty": true,
+      "citations": [
+        {
+          "title": "Fictionland Inflation Brief",
+          "chunk_id": "demo2_inflation_source_0001",
+          "claim": "Price pressure is concentrated in imported goods and transport, domestic wages are stable, and imported material costs remain uncertain .",
+          "excerpt": "# Fictionland Inflation Brief\n\nRecent price pressure is concentrated in imported goods and transport. Domestic wages are broadly stable. The outlook expects transport pressure to ease slowly, while imported material costs remain uncertain.",
+          "verified": true
+        }
+      ],
+      "handoff": {
+        "to": "Analysis Agent",
+        "artifact_names": [
+          "retrieved_context",
+          "cited_passages",
+          "document_constraints",
+          "source_confidence"
+        ],
+        "evidence": [
+          "demo2_inflation_source_0001"
+        ]
+      }
+    }
+  ],
+  "analysis_result": {
+    "agent": "Analysis Agent",
+    "answer": "The company’s cost pressure is primarily driven by rising fabric and delivery expenses, while wages and rent remain stable. This aligns with broader macro conditions where price pressures are concentrated in imported goods and transport, with domestic wages stable and imported material costs uncertain. A practical next step is to renegotiate supply contracts for imported fabrics and logistics to hedge against ongoing import cost volatility.",
+    "used_upstream": [
+      "Company Cost Table Agent",
+      "Inflation Brief Agent"
+    ],
+    "consumption_validation_valid": true,
+    "source_validation_valid": true,
+    "policy_violations_empty": true,
+    "handoff_artifacts": [
+      {
+        "name": "combined_findings",
+        "value": "Company cost increases in fabric and delivery correlate with macro price pressures in imported goods and transport; wages and rent are stable.",
+        "evidence": [
+          "demo2_company_cost_source_0001",
+          "demo2_inflation_source_0001"
+        ],
+        "verified": true
+      },
+      {
+        "name": "business_implication",
+        "value": "Cost pressure is externally driven by import and transport inflation, not labor or fixed overhead.",
+        "evidence": [
+          "demo2_company_cost_source_0001",
+          "demo2_inflation_source_0001"
+        ],
+        "verified": true
+      },
+      {
+        "name": "recommended_action",
+        "value": "Renegotiate supply contracts for imported fabrics and logistics to mitigate import cost volatility.",
+        "evidence": [
+          "demo2_company_cost_source_0001",
+          "demo2_inflation_source_0001"
+        ],
+        "verified": true
+      }
+    ]
+  },
+  "verified_citations": [
+    {
+      "title": "Loom & Pine Company Cost Review",
+      "chunk_id": "demo2_company_cost_source_0001",
+      "claim": "Fabric and delivery costs increased, while wages and rent were unchanged .",
+      "excerpt": "# Loom & Pine Company Cost Review\n\n| Cost area | Earlier period | Latest period | Management note |\n| --- | --- | --- | --- |\n| Fabric | Steady | Higher | Supplier invoices show that fabric costs increased. |\n| Delivery | Steady | Higher | Freight and local delivery costs increased. |\n| Wages | Stable | Stable | Payroll was unchanged. |\n| Rent | Stable | Stable | Rent was unchanged. |\n\nThe clearest cost pressure comes from fabric and delivery, not wages or rent.",
+      "verified": true
+    },
+    {
+      "title": "Fictionland Inflation Brief",
+      "chunk_id": "demo2_inflation_source_0001",
+      "claim": "Price pressure is concentrated in imported goods and transport, domestic wages are stable, and imported material costs remain uncertain .",
+      "excerpt": "# Fictionland Inflation Brief\n\nRecent price pressure is concentrated in imported goods and transport. Domestic wages are broadly stable. The outlook expects transport pressure to ease slowly, while imported material costs remain uncertain.",
+      "verified": true
+    }
+  ],
+  "final_answer": "Company Cost Table Agent: Fabric and delivery costs increased, while wages and rent were unchanged [demo2_company_cost_source_0001].\n\nInflation Brief Agent: Price pressure is concentrated in imported goods and transport, domestic wages are stable, and imported material costs remain uncertain [demo2_inflation_source_0001].\n\nAnalysis Agent: The company’s cost pressure is primarily driven by rising fabric and delivery expenses, while wages and rent remain stable. This aligns with broader macro conditions where price pressures are concentrated in imported goods and transport, with domestic wages stable and imported material costs uncertain. A practical next step is to renegotiate supply contracts for imported fabrics and logistics to hedge against ongoing import cost volatility."
+}

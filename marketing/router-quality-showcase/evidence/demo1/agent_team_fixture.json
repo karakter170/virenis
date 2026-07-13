@@ -1,0 +1,30 @@
+{
+  "schema_version": "router-public-agent-team-fixture-v1",
+  "demo_id": "textile-business-plan-handoff",
+  "adapter_disclosure": "Both roles use the same zero-effect identity. All adapter tensors are zeros; the tested difference comes from Router selection, scoped instructions, approved knowledge, and a verified handoff.",
+  "agents": [
+    {
+      "id": "demo1_textile_agent_lora",
+      "label": "Textile Agent",
+      "role": "Extract textile-specific sourcing, quality, production, traceability, and supply-risk considerations from the approved playbook.",
+      "consumes": ["user_request"],
+      "produces": ["textile_industry_brief"],
+      "routing_cues": ["textile", "textile offcuts", "recycled textile", "fabric", "tote bags"],
+      "stage": "first"
+    },
+    {
+      "id": "demo1_business_plan_agent_lora",
+      "label": "Business Plan Agent",
+      "role": "Turn the verified textile-industry brief into a concise, practical business plan.",
+      "consumes": ["user_request", "textile_industry_brief"],
+      "produces": ["business_plan"],
+      "routing_cues": ["business plan", "business planning", "startup plan", "company plan"],
+      "stage": "second"
+    }
+  ],
+  "compiled_handoff": {
+    "from": "Textile Agent",
+    "to": "Business Plan Agent",
+    "artifact": "textile_industry_brief"
+  }
+}

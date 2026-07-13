@@ -1,0 +1,87 @@
+{
+  "schema_version": "router-demo4-selection-passes-v1",
+  "user_prompt": "Using all ten documents, create the final operating plan for Saturday's Alder Quay Riverlight Festival. Resolve conflicts using the most authoritative and recent source, clearly mark what is still uncertain, and give a usable schedule, site plan, safety, accessibility, transport and communications arrangements, plus go/no-go triggers. Cite document IDs and do not invent missing details. Keep the complete plan under 750 words without omitting any requested section.",
+  "native_selection_limit_per_pass": 3,
+  "pass_count": 4,
+  "passes": [
+    {
+      "pass": 1,
+      "candidate_agents": [
+        "D01 Event Brief Source Agent",
+        "D02 Park Permit Source Agent",
+        "D03 Fire Safety Source Agent"
+      ],
+      "selected_agents": [
+        "D01 Event Brief Source Agent",
+        "D02 Park Permit Source Agent",
+        "D03 Fire Safety Source Agent"
+      ],
+      "selection_source": "Router",
+      "reason": "The user wants to create a final operating plan for an event, using all ten documents, and has specified that D01, D02, and D03 are the required sources. The D01 Event Brief Source Agent is appropriate for retrieving the event’s objectives, timing, and site assumptions. The D02 Park Permit Source Agent is appropriate for park-related constraints (capacity, timing, access, etc.). The D03 Fire Safety Source Agent is appropriate for safety and emergency conditions. These three agents together cover the core requirements for the operating plan.",
+      "fallback": "",
+      "out_of_scope": false
+    },
+    {
+      "pass": 2,
+      "candidate_agents": [
+        "D04 Weather Briefing Source Agent",
+        "D05 Accessibility Review Source Agent",
+        "D06 Transport Bulletin Source Agent"
+      ],
+      "selected_agents": [
+        "D04 Weather Briefing Source Agent",
+        "D05 Accessibility Review Source Agent",
+        "D06 Transport Bulletin Source Agent"
+      ],
+      "selection_source": "Router",
+      "reason": "The user wants to create a final operating plan for an event, using all ten documents, and has specified that D04, D05, and D06 are the only available Agents. The task is to route to these Agents to retrieve their specific document sources and then synthesize the plan. No other specialized Agents are needed.",
+      "fallback": "",
+      "out_of_scope": false
+    },
+    {
+      "pass": 3,
+      "candidate_agents": [
+        "D07 Artist Call Sheet Source Agent",
+        "D08 Habitat and Noise Source Agent",
+        "D09 Vendor Health Source Agent"
+      ],
+      "selected_agents": [
+        "D07 Artist Call Sheet Source Agent",
+        "D08 Habitat and Noise Source Agent",
+        "D09 Vendor Health Source Agent"
+      ],
+      "selection_source": "Router",
+      "reason": "The user wants to create a final operating plan for an event, using all ten documents, and has specified that D07, D08, and D09 are the required sources. The D07 Artist Call Sheet Source Agent is appropriate for handling artist timing, soundcheck, and set dependencies. The D08 Habitat and Noise Source Agent is appropriate for habitat, lighting, sound-location, and related requirements. The D09 Vendor Health Source Agent is appropriate for vendor siting, cooking, and related conditions. These three agents together cover the core needs of the user’s request.",
+      "fallback": "",
+      "out_of_scope": false
+    },
+    {
+      "pass": 4,
+      "candidate_agents": [
+        "D10 Staffing and Incident Source Agent"
+      ],
+      "selected_agents": [
+        "D10 Staffing and Incident Source Agent"
+      ],
+      "selection_source": "Router",
+      "reason": "The user wants to create a final operating plan for an event, using all ten documents, with specific requirements (schedule, site plan, safety, accessibility, transport, communications, go/no-go triggers, and conflict resolution). The D10 Staffing and Incident Source Agent is explicitly designed to retrieve and cite D10, and can supply confirmed and tentative staffing, first-aid and accessibility coverage, incident locations, radio channels, and decision ownership, which directly matches the user’s needs. No other listed Agent covers the full scope of the request.",
+      "fallback": "",
+      "out_of_scope": false
+    }
+  ],
+  "selected_union": [
+    "D01 Event Brief Source Agent",
+    "D02 Park Permit Source Agent",
+    "D03 Fire Safety Source Agent",
+    "D04 Weather Briefing Source Agent",
+    "D05 Accessibility Review Source Agent",
+    "D06 Transport Bulletin Source Agent",
+    "D07 Artist Call Sheet Source Agent",
+    "D08 Habitat and Noise Source Agent",
+    "D09 Vendor Health Source Agent",
+    "D10 Staffing and Incident Source Agent"
+  ],
+  "selected_unique_source_count": 10,
+  "deterministic_fill_used": false,
+  "analysis_agent_selected_by_router": false
+}

@@ -1,0 +1,140 @@
+{
+  "schema_version": "router-demo4-evidence-manifest-v1",
+  "files": [
+    {
+      "path": "base-request.json",
+      "sha256": "f33da6a3203587a7a26b928065214b5ce4832828a29afeade19af397615cd2fa",
+      "bytes": 7689
+    },
+    {
+      "path": "base-response.json",
+      "sha256": "6d3a31a38d523f9ff957d412305678f5f69cb23e7f9f51e63cb1454bb160266b",
+      "bytes": 4695
+    },
+    {
+      "path": "capture-integrity.json",
+      "sha256": "8fc75c09d24dfe22d471870caeb72ca7116597dd6e1a20afba7dc73bf358e97a",
+      "bytes": 13215
+    },
+    {
+      "path": "document-source-registry.json",
+      "sha256": "bb7d4222b3bcd4b42215145962e57ea3831f19b653ecc07e93939b1d0af12586",
+      "bytes": 4176
+    },
+    {
+      "path": "evidence-summary.json",
+      "sha256": "bdd54d757c04d2546d0de7b4ce9bc3745611568b757714a6b964d9d5f5d9269c",
+      "bytes": 8473
+    },
+    {
+      "path": "executed-dag-response.json",
+      "sha256": "744496e76a2b0e37ecb2e387de63ad6d4e2c8e27b4c8773a37a462a4ee75a59a",
+      "bytes": 35452
+    },
+    {
+      "path": "execution-receipt.json",
+      "sha256": "81560864390e039a91135dafb56ee94ca31994e13d597d5018381e5a95bba435",
+      "bytes": 849
+    },
+    {
+      "path": "fixtures/D01-event-brief.md",
+      "sha256": "03d5da80fba3c0d44c0345792b117222cbdada426e1af21c293530588501e30a",
+      "bytes": 719
+    },
+    {
+      "path": "fixtures/D02-park-permit.md",
+      "sha256": "a01ff51125c13d3b185edccd5551778f35ee0ab0b840dd16b2662a72390b9569",
+      "bytes": 613
+    },
+    {
+      "path": "fixtures/D03-fire-safety-addendum.md",
+      "sha256": "a69ab5cffce709ef45a8f21d2c160af80ddbd6f9ceece4c1f914b3c84f1d58e4",
+      "bytes": 603
+    },
+    {
+      "path": "fixtures/D04-weather-briefing.md",
+      "sha256": "79da4e5bd9fb7c7ed19a02adee85733f6bb01f716447ff36482b1d4ff89d8fa9",
+      "bytes": 600
+    },
+    {
+      "path": "fixtures/D05-accessibility-review.md",
+      "sha256": "8c18039326289e5548e902e6a0d1f64663669f5aee0a5c3d3ddce7100547372f",
+      "bytes": 657
+    },
+    {
+      "path": "fixtures/D06-transport-bulletin.md",
+      "sha256": "f166f2449dcef21816eff5369b56a57c1c802ce2908dc5ae499a9d2caf00639d",
+      "bytes": 604
+    },
+    {
+      "path": "fixtures/D07-artist-call-sheet.md",
+      "sha256": "e1a38aceed0e9dd5c39c4850984490bfacd49e37838a596e0ebdd1a7bce36217",
+      "bytes": 630
+    },
+    {
+      "path": "fixtures/D08-river-habitat-noise-agreement.md",
+      "sha256": "97e1b59c8e752d61ef9f9cdb3891c9df420a0df8e40ac108f437d50ab13648e5",
+      "bytes": 594
+    },
+    {
+      "path": "fixtures/D09-vendor-health-inspection.md",
+      "sha256": "43e3a50e8d3bf23de01593f3544fb2bce410d48be63f964cb07c2cc2dadbf876",
+      "bytes": 643
+    },
+    {
+      "path": "fixtures/D10-staffing-incident-comms.md",
+      "sha256": "ba5b3eb6bf7b762e904e2780761fb13adf46a7fb042b97cbbef9f5519c8798e9",
+      "bytes": 674
+    },
+    {
+      "path": "fixtures/public-answer-key.md",
+      "sha256": "6a91f40835d31e6bc47268280dcf4f4fc150d767c6edd2e6325a2facf6d4146f",
+      "bytes": 4025
+    },
+    {
+      "path": "fixtures/qualitative-rubric.json",
+      "sha256": "2ee24e2be4dc162664a0d15d60768774adbb4ebdd752ce22a262f3a7b627611e",
+      "bytes": 4123
+    },
+    {
+      "path": "fixtures/user-prompt.txt",
+      "sha256": "ea8620eb7f2091e627c159026c5b0736f2f03aad4d3801fa2512ece1774cf78c",
+      "bytes": 469
+    },
+    {
+      "path": "full-outputs.json",
+      "sha256": "7c3ac820734d5dc17f457a65677b9860dd616966a346122cb010c8c74c92cb70",
+      "bytes": 11534
+    },
+    {
+      "path": "full-outputs.md",
+      "sha256": "82f119375e61a4c3521e2005cd687e8a38884920aadd0aee94687d3a48f3a091",
+      "bytes": 7905
+    },
+    {
+      "path": "legacy-preservation.json",
+      "sha256": "8a67cfed73b71da94503d49942b4c00306f0237ba438f8cdc3271bbcc89ec531",
+      "bytes": 20220
+    },
+    {
+      "path": "router-selection-passes.json",
+      "sha256": "6f776797f3c26859fc072018def776a6e575667dc5f641162d67ff8e33611f02",
+      "bytes": 4887
+    },
+    {
+      "path": "seeded-role-adapter-disclosure.json",
+      "sha256": "9b1e219f107b38b559d35d68df22bab8ca46ac8bc3e5272b0ea112184eb1ea74",
+      "bytes": 366
+    },
+    {
+      "path": "server-orchestration-request.json",
+      "sha256": "73695e674ed40211bbe31f9cbb8caaada31d0aa141029d5fc9587b97190ff5dd",
+      "bytes": 4643
+    },
+    {
+      "path": "token-preflight.json",
+      "sha256": "4524d912df44da8ba13a455acb301e5dee4503630566d869fb183041c5cebb76",
+      "bytes": 229
+    }
+  ]
+}

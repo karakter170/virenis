@@ -1,0 +1,227 @@
+{
+  "schema_version": "router-demo4-evidence-summary-v1",
+  "capture_status": "failed",
+  "fixture_type": "synthetic fictional ten-document stress test",
+  "prompt": "Using all ten documents, create the final operating plan for Saturday's Alder Quay Riverlight Festival. Resolve conflicts using the most authoritative and recent source, clearly mark what is still uncertain, and give a usable schedule, site plan, safety, accessibility, transport and communications arrangements, plus go/no-go triggers. Cite document IDs and do not invent missing details. Keep the complete plan under 750 words without omitting any requested section.",
+  "comparison_contract": {
+    "same_user_prompt": true,
+    "same_document_order": [
+      "D01",
+      "D02",
+      "D03",
+      "D04",
+      "D05",
+      "D06",
+      "D07",
+      "D08",
+      "D09",
+      "D10"
+    ],
+    "same_canonical_document_sha256": {
+      "D01": "81849dbde884b371c218bb16bfc4f08ddb1690e7853891dda8bfd4559fd4f863",
+      "D02": "a3f0df4e292c1c4b9d40e5d0aba09bacae836b2cf708798738a96b61b5f693d2",
+      "D03": "06af9e0c5b1b60534bd12f6a646676ebee7f5ef2d624109f9bacd1067720d5d6",
+      "D04": "52dc039ebe068ecaf6cb96be2d3b5a0c8f4162babbd303144e208a3460f29774",
+      "D05": "a6fa816c1d2c74a72cfae22d246eb2243a9805557fd5620c18b4ddccf80b5486",
+      "D06": "60f6f92573999c829334b04691a5725309350e636317c2707da725a2a8ff5ac8",
+      "D07": "670565f605cbc7cf184597d3fad08181713aa806df0b37753da467ddeedb0288",
+      "D08": "3052b0aabe30751c753041d83ff96a86004e75eb8087911e217989bc9be20821",
+      "D09": "4cc4ac0c7030a45005e55eae0096640684201beedd1afd1db691508738768f3d",
+      "D10": "cbd7d34228976817f3e515a8bd7097ed1151cbe543fb77f05dd9457c1561985a"
+    },
+    "same_output_token_allowance": 1600,
+    "temperature": 0,
+    "judge_files_withheld_from_both_paths": true
+  },
+  "expanded_token_allowance": {
+    "base_max_output_tokens": 1600,
+    "router_agent_max_output_tokens": 1600,
+    "router_refiner_input_token_budget": 2000,
+    "context_limit": 4096,
+    "base_prompt_tokens": 1641,
+    "both_full_generations_stopped_normally": false
+  },
+  "router_trace_checks": {
+    "same_user_prompt": true,
+    "same_ten_canonical_documents": true,
+    "answer_key_and_rubric_excluded": true,
+    "base_prompt_and_allowance_fit_context": true,
+    "base_generation_stopped_normally": true,
+    "router_selected_ten_unique_sources_across_four_native_passes": true,
+    "no_deterministic_source_fill": true,
+    "analysis_not_router_selected": true,
+    "server_appended_analysis": true,
+    "executed_exactly_eleven_expected_agents": true,
+    "ten_source_to_analysis_edges": true,
+    "analysis_depends_on_all_ten_sources": true,
+    "analysis_used_all_ten_source_outputs": true,
+    "analysis_consumption_valid": true,
+    "analysis_missing_inputs_empty": true,
+    "analysis_rejected_inputs_empty": true,
+    "analysis_policy_violations_empty": false,
+    "analysis_source_validation_valid": false,
+    "analysis_cites_all_ten_upstream_chunks": false,
+    "analysis_labels_all_ten_documents": false,
+    "analysis_generation_stopped_normally": false,
+    "refiner_input_envelope_within_configured_budget": true,
+    "refiner_generation_stopped_normally": true,
+    "execution_receipt_present": true,
+    "source_agents": {
+      "D01": {
+        "executed": true,
+        "source_validation_valid": true,
+        "verified_citation_present": true,
+        "unique_handoff_present": true,
+        "policy_violations_empty": true,
+        "generation_stopped_normally": true,
+        "compact_handoff_word_count": 26,
+        "compact_handoff_within_forty_words": true
+      },
+      "D02": {
+        "executed": true,
+        "source_validation_valid": true,
+        "verified_citation_present": true,
+        "unique_handoff_present": true,
+        "policy_violations_empty": true,
+        "generation_stopped_normally": true,
+        "compact_handoff_word_count": 20,
+        "compact_handoff_within_forty_words": true
+      },
+      "D03": {
+        "executed": true,
+        "source_validation_valid": true,
+        "verified_citation_present": true,
+        "unique_handoff_present": true,
+        "policy_violations_empty": true,
+        "generation_stopped_normally": true,
+        "compact_handoff_word_count": 35,
+        "compact_handoff_within_forty_words": true
+      },
+      "D04": {
+        "executed": true,
+        "source_validation_valid": true,
+        "verified_citation_present": true,
+        "unique_handoff_present": true,
+        "policy_violations_empty": true,
+        "generation_stopped_normally": true,
+        "compact_handoff_word_count": 25,
+        "compact_handoff_within_forty_words": true
+      },
+      "D05": {
+        "executed": true,
+        "source_validation_valid": true,
+        "verified_citation_present": true,
+        "unique_handoff_present": true,
+        "policy_violations_empty": true,
+        "generation_stopped_normally": true,
+        "compact_handoff_word_count": 32,
+        "compact_handoff_within_forty_words": true
+      },
+      "D06": {
+        "executed": true,
+        "source_validation_valid": true,
+        "verified_citation_present": true,
+        "unique_handoff_present": true,
+        "policy_violations_empty": true,
+        "generation_stopped_normally": true,
+        "compact_handoff_word_count": 34,
+        "compact_handoff_within_forty_words": true
+      },
+      "D07": {
+        "executed": true,
+        "source_validation_valid": true,
+        "verified_citation_present": true,
+        "unique_handoff_present": true,
+        "policy_violations_empty": true,
+        "generation_stopped_normally": true,
+        "compact_handoff_word_count": 24,
+        "compact_handoff_within_forty_words": true
+      },
+      "D08": {
+        "executed": true,
+        "source_validation_valid": true,
+        "verified_citation_present": true,
+        "unique_handoff_present": true,
+        "policy_violations_empty": true,
+        "generation_stopped_normally": true,
+        "compact_handoff_word_count": 29,
+        "compact_handoff_within_forty_words": true
+      },
+      "D09": {
+        "executed": true,
+        "source_validation_valid": true,
+        "verified_citation_present": true,
+        "unique_handoff_present": true,
+        "policy_violations_empty": true,
+        "generation_stopped_normally": true,
+        "compact_handoff_word_count": 24,
+        "compact_handoff_within_forty_words": true
+      },
+      "D10": {
+        "executed": true,
+        "source_validation_valid": true,
+        "verified_citation_present": true,
+        "unique_handoff_present": true,
+        "policy_violations_empty": true,
+        "generation_stopped_normally": true,
+        "compact_handoff_word_count": 30,
+        "compact_handoff_within_forty_words": true
+      }
+    }
+  },
+  "document_id_coverage": {
+    "base": [
+      "D01",
+      "D02",
+      "D03",
+      "D04",
+      "D05",
+      "D06",
+      "D07",
+      "D08",
+      "D09",
+      "D10"
+    ],
+    "base_missing": [],
+    "analysis": [],
+    "analysis_missing": [
+      "D01",
+      "D02",
+      "D03",
+      "D04",
+      "D05",
+      "D06",
+      "D07",
+      "D08",
+      "D09",
+      "D10"
+    ]
+  },
+  "observable_route": {
+    "selection_passes": 4,
+    "native_max_sources_per_pass": 3,
+    "selected_source_agents": [
+      "D01 Event Brief Source Agent",
+      "D02 Park Permit Source Agent",
+      "D03 Fire Safety Source Agent",
+      "D04 Weather Briefing Source Agent",
+      "D05 Accessibility Review Source Agent",
+      "D06 Transport Bulletin Source Agent",
+      "D07 Artist Call Sheet Source Agent",
+      "D08 Habitat and Noise Source Agent",
+      "D09 Vendor Health Source Agent",
+      "D10 Staffing and Incident Source Agent"
+    ],
+    "server_appended_analysis_agent": "Alder Quay Operating Plan Analysis Agent",
+    "compiled_source_dependencies": 10,
+    "deterministic_fill_used": false
+  },
+  "full_output_sources": {
+    "base": "full-outputs.json#/base/answer",
+    "router_multi_agent": "full-outputs.json#/router/full_answer",
+    "router_analysis": "full-outputs.json#/router/analysis_answer"
+  },
+  "qualitative_rubric": "fixtures/qualitative-rubric.json",
+  "public_answer_key": "fixtures/public-answer-key.md",
+  "disclosure": "All eleven role adapters use seeded zero-effect weights. This isolates routing, scoped retrieval, validated handoffs, fan-in, synthesis, and citations rather than trained domain-weight improvement."
+}

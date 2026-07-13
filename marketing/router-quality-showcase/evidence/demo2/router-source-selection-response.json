@@ -1,0 +1,30 @@
+{
+  "selected_by": "Router",
+  "selected_agents": [
+    {
+      "agent": "Company Cost Table Agent",
+      "reason": "The user wants to consult both the company cost table and the Fictionland inflation brief to understand what is driving the company’s cost pressure and to suggest a practical next step. This is exactly the kind of request handled by the company cost table source and the fictionland inflation brief source, which together can provide the necessary data and context to explain cost pressures and recommend actions."
+    },
+    {
+      "agent": "Inflation Brief Agent",
+      "reason": "The user wants to consult both the company cost table and the Fictionland inflation brief to understand what is driving the company’s cost pressure and to suggest a practical next step. This is exactly the kind of request handled by the company cost table source and the fictionland inflation brief source, which together can provide the necessary data and context to explain cost pressures and recommend actions."
+    }
+  ],
+  "source_plan": {
+    "steps": [
+      {
+        "id": "s1",
+        "agent": "Company Cost Table Agent",
+        "task": "Handle company cost table source for the user request.",
+        "depends_on": []
+      },
+      {
+        "id": "s2",
+        "agent": "Inflation Brief Agent",
+        "task": "Handle fictionland inflation brief source for the user request.",
+        "depends_on": []
+      }
+    ],
+    "acyclic": true
+  }
+}

@@ -1,0 +1,120 @@
+{
+  "schema_version": "router-demo4-source-registry-v1",
+  "document_count": 10,
+  "documents": [
+    {
+      "document": "D01",
+      "title": "D01 Event Brief Source Agent",
+      "fixture": "fixtures/D01-event-brief.md",
+      "canonical_sha256": "81849dbde884b371c218bb16bfc4f08ddb1690e7853891dda8bfd4559fd4f863",
+      "registered_chunk_count": 1,
+      "chunk_ids": [
+        "demo4_d01_event_brief_0001"
+      ],
+      "unique_handoff": "d01_source_finding"
+    },
+    {
+      "document": "D02",
+      "title": "D02 Park Permit Source Agent",
+      "fixture": "fixtures/D02-park-permit.md",
+      "canonical_sha256": "a3f0df4e292c1c4b9d40e5d0aba09bacae836b2cf708798738a96b61b5f693d2",
+      "registered_chunk_count": 1,
+      "chunk_ids": [
+        "demo4_d02_park_permit_0001"
+      ],
+      "unique_handoff": "d02_source_finding"
+    },
+    {
+      "document": "D03",
+      "title": "D03 Fire Safety Source Agent",
+      "fixture": "fixtures/D03-fire-safety-addendum.md",
+      "canonical_sha256": "06af9e0c5b1b60534bd12f6a646676ebee7f5ef2d624109f9bacd1067720d5d6",
+      "registered_chunk_count": 1,
+      "chunk_ids": [
+        "demo4_d03_fire_safety_addendum_0001"
+      ],
+      "unique_handoff": "d03_source_finding"
+    },
+    {
+      "document": "D04",
+      "title": "D04 Weather Briefing Source Agent",
+      "fixture": "fixtures/D04-weather-briefing.md",
+      "canonical_sha256": "52dc039ebe068ecaf6cb96be2d3b5a0c8f4162babbd303144e208a3460f29774",
+      "registered_chunk_count": 1,
+      "chunk_ids": [
+        "demo4_d04_weather_briefing_0001"
+      ],
+      "unique_handoff": "d04_source_finding"
+    },
+    {
+      "document": "D05",
+      "title": "D05 Accessibility Review Source Agent",
+      "fixture": "fixtures/D05-accessibility-review.md",
+      "canonical_sha256": "a6fa816c1d2c74a72cfae22d246eb2243a9805557fd5620c18b4ddccf80b5486",
+      "registered_chunk_count": 1,
+      "chunk_ids": [
+        "demo4_d05_accessibility_review_0001"
+      ],
+      "unique_handoff": "d05_source_finding"
+    },
+    {
+      "document": "D06",
+      "title": "D06 Transport Bulletin Source Agent",
+      "fixture": "fixtures/D06-transport-bulletin.md",
+      "canonical_sha256": "60f6f92573999c829334b04691a5725309350e636317c2707da725a2a8ff5ac8",
+      "registered_chunk_count": 1,
+      "chunk_ids": [
+        "demo4_d06_transport_bulletin_0001"
+      ],
+      "unique_handoff": "d06_source_finding"
+    },
+    {
+      "document": "D07",
+      "title": "D07 Artist Call Sheet Source Agent",
+      "fixture": "fixtures/D07-artist-call-sheet.md",
+      "canonical_sha256": "670565f605cbc7cf184597d3fad08181713aa806df0b37753da467ddeedb0288",
+      "registered_chunk_count": 1,
+      "chunk_ids": [
+        "demo4_d07_artist_call_sheet_0001"
+      ],
+      "unique_handoff": "d07_source_finding"
+    },
+    {
+      "document": "D08",
+      "title": "D08 Habitat and Noise Source Agent",
+      "fixture": "fixtures/D08-river-habitat-noise-agreement.md",
+      "canonical_sha256": "3052b0aabe30751c753041d83ff96a86004e75eb8087911e217989bc9be20821",
+      "registered_chunk_count": 1,
+      "chunk_ids": [
+        "demo4_d08_river_habitat_noise_agreement_0001"
+      ],
+      "unique_handoff": "d08_source_finding"
+    },
+    {
+      "document": "D09",
+      "title": "D09 Vendor Health Source Agent",
+      "fixture": "fixtures/D09-vendor-health-inspection.md",
+      "canonical_sha256": "4cc4ac0c7030a45005e55eae0096640684201beedd1afd1db691508738768f3d",
+      "registered_chunk_count": 1,
+      "chunk_ids": [
+        "demo4_d09_vendor_health_inspection_0001"
+      ],
+      "unique_handoff": "d09_source_finding"
+    },
+    {
+      "document": "D10",
+      "title": "D10 Staffing and Incident Source Agent",
+      "fixture": "fixtures/D10-staffing-incident-comms.md",
+      "canonical_sha256": "cbd7d34228976817f3e515a8bd7097ed1151cbe543fb77f05dd9457c1561985a",
+      "registered_chunk_count": 1,
+      "chunk_ids": [
+        "demo4_d10_staffing_incident_comms_0001"
+      ],
+      "unique_handoff": "d10_source_finding"
+    }
+  ],
+  "judge_only_files_excluded_from_generation": [
+    "fixtures/public-answer-key.md",
+    "fixtures/qualitative-rubric.json"
+  ]
+}

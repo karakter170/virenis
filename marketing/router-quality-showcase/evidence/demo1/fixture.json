@@ -1,0 +1,25 @@
+{
+  "schema_version": "router-marketing-demo-fixture-v1",
+  "demo_id": "textile-business-plan-handoff",
+  "prompt": "First identify the important textile-industry considerations, then create a simple business plan for a small company that makes durable tote bags from recycled textile offcuts.",
+  "comparison_rule": "The exact prompt string is sent to both arms.",
+  "base_arm": "One direct qwen36-awq completion using general model knowledge.",
+  "router_arm": "Router selection followed by a verified Textile Agent to Business Plan Agent handoff.",
+  "expected_route": [
+    "demo1_textile_agent_lora",
+    "demo1_business_plan_agent_lora"
+  ],
+  "expected_edge": {
+    "source": "demo1_textile_agent_lora",
+    "target": "demo1_business_plan_agent_lora",
+    "artifact": "textile_industry_brief"
+  },
+  "visible_comparison_points": [
+    "material variability and sorting",
+    "batch-level textile quality checks",
+    "durability-focused construction checks",
+    "traceable product claims",
+    "an operating workflow adapted to offcuts"
+  ],
+  "claim_boundary": "The role adapters are zero-effect identities. Evidence supports orchestration, grounding, and handoff behavior, not a trained domain-weight uplift."
+}

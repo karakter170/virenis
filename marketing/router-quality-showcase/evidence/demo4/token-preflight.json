@@ -1,0 +1,9 @@
+{
+  "tokenizer": "Qwen3.6-27B-AWQ local tokenizer",
+  "context_limit": 4096,
+  "prompt_tokens": 1641,
+  "output_token_allowance": 1600,
+  "reserved_total_tokens": 3241,
+  "remaining_context_tokens": 855,
+  "fits_context": true
+}

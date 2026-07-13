@@ -1,0 +1,10 @@
+{
+  "question": "Consult both the company cost table and the Fictionland inflation brief. Then explain what is driving the company's cost pressure and suggest one practical next step.",
+  "candidate_agents": [
+    "Company Cost Table Agent",
+    "Inflation Brief Agent"
+  ],
+  "selection_authority": "Router",
+  "user_supplied_plan": false,
+  "user_supplied_agent_ids": false
+}

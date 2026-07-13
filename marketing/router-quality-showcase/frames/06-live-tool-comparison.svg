@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1080" viewBox="0 0 1920 1080">
+    <defs>
+    <pattern id="dots" width="26" height="26" patternUnits="userSpaceOnUse"><circle cx="2" cy="2" r="1.15" fill="#d8e0db"/></pattern>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="#8ea098"/></marker>
+    <marker id="arrowGreen" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="#176b4b"/></marker>
+  </defs>
+    <rect width="1920" height="1080" fill="#f7f9f7"/>
+    <rect x="1470" y="0" width="450" height="1080" fill="url(#dots)" opacity="0.5"/>
+    <circle cx="1755" cy="55" r="250" fill="#e5f3ec" stroke="#e5f3ec" stroke-width="0"/>
+    <circle cx="1808" cy="1016" r="212" fill="#f0e9fb" stroke="#f0e9fb" stroke-width="0"/>
+    <text x="86" y="68" fill="#131815" font-family="Showcase Sans" font-size="29" font-weight="700" text-anchor="start" letter-spacing="0"><tspan x="86" dy="0">Virenis</tspan></text>
+    <text x="1834" y="66" fill="#818b84" font-family="Showcase Mono" font-size="14" font-weight="700" text-anchor="end" letter-spacing="0.8"><tspan x="1834" dy="0">DEMO 3 · LIVE TOOL · 06 / 06</tspan></text>
+    <line x1="86" y1="94" x2="1834" y2="94" stroke="#bdc9c2" stroke-width="1" />
+    <text x="86" y="170" fill="#131815" font-family="Showcase Sans" font-size="56" font-weight="700" text-anchor="start" letter-spacing="0"><tspan x="86" dy="0">The quality difference is the evidence path.</tspan></text>
+    <text x="88" y="214" fill="#68716b" font-family="Showcase Sans" font-size="20" font-weight="400" text-anchor="start" letter-spacing="0"><tspan x="88" dy="0">The base answer is honest about its limit. The Router answer is current because a timestamped official source was available.</tspan></text>
+    <rect x="86" y="258" width="1748" height="112" rx="18" fill="#ffffff" fill-opacity="1" stroke="#bdc9c2" stroke-width="1"/>
+    <rect x="108" y="276" width="126" height="34" rx="17" fill="#eef1ef" fill-opacity="1" stroke="#eef1ef" stroke-width="1"/><text x="171" y="299" fill="#68716b" font-family="Showcase Mono" font-size="12" font-weight="700" text-anchor="middle" letter-spacing="0.35"><tspan x="171" dy="0">USER PROMPT</tspan></text>
+    <text x="108" y="334" fill="#131815" font-family="Showcase Sans" font-size="20" font-weight="700" text-anchor="start" letter-spacing="0"><tspan x="108" dy="0">What is the latest earthquake in the past hour? Give the place and time.</tspan></text>
+    <rect x="86" y="400" width="842" height="390" rx="22" fill="#eef1ef" fill-opacity="1" stroke="#bdc9c2" stroke-width="1"/>
+    <rect x="110" y="422" width="150" height="34" rx="17" fill="#ffffff" fill-opacity="1" stroke="#ffffff" stroke-width="1"/><text x="185" y="445" fill="#68716b" font-family="Showcase Mono" font-size="12" font-weight="700" text-anchor="middle" letter-spacing="0.35"><tspan x="185" dy="0">BASE MODEL</tspan></text>
+    <text x="110" y="484" fill="#68716b" font-family="Showcase Mono" font-size="13" font-weight="700" text-anchor="start" letter-spacing="0.25"><tspan x="110" dy="0">CAPTURED RESPONSE · NO LIVE SOURCE</tspan></text>
+    <text x="110" y="536" fill="#131815" font-family="Showcase Sans" font-size="24" font-weight="700" text-anchor="start" letter-spacing="0"><tspan x="110" dy="0">I do not have access to real-time data, so I cannot provide</tspan><tspan x="110" dy="30.72">information on earthquakes that occurred in the past hour. For</tspan><tspan x="110" dy="30.72">the latest seismic activity, please consult a live monitoring</tspan><tspan x="110" dy="30.72">service such as the USGS Earthquake Hazards Program or the</tspan><tspan x="110" dy="30.72">EMSC.</tspan></text>
+    <rect x="952" y="400" width="882" height="390" rx="22" fill="#e5f3ec" fill-opacity="1" stroke="#9cc8b3" stroke-width="1"/>
+    <rect x="976" y="422" width="136" height="34" rx="17" fill="#ffffff" fill-opacity="1" stroke="#ffffff" stroke-width="1"/><text x="1044" y="445" fill="#176b4b" font-family="Showcase Mono" font-size="12" font-weight="700" text-anchor="middle" letter-spacing="0.35"><tspan x="1044" dy="0">ROUTER</tspan></text>
+    <text x="976" y="484" fill="#176b4b" font-family="Showcase Mono" font-size="13" font-weight="700" text-anchor="start" letter-spacing="0.25"><tspan x="976" dy="0">CAPTURED RESPONSE · LIVE EVENTS AGENT → OFFICIAL USGS FEED</tspan></text>
+    <text x="976" y="536" fill="#0d5339" font-family="Showcase Sans" font-size="24" font-weight="700" text-anchor="start" letter-spacing="0"><tspan x="976" dy="0">The latest earthquake was a magnitude 1.14 event located 3 km NW</tspan><tspan x="976" dy="30.72">of The Geysers, CA, occurring at 2026-07-13T13:37:46.430Z</tspan><tspan x="976" dy="30.72">according to USGS.</tspan></text>
+    <rect x="86" y="820" width="1748" height="110" rx="18" fill="#ffffff" fill-opacity="1" stroke="#bdc9c2" stroke-width="1"/>
+    <rect x="110" y="840" width="154" height="34" rx="17" fill="#e3f5f7" fill-opacity="1" stroke="#e3f5f7" stroke-width="1"/><text x="187" y="863" fill="#087786" font-family="Showcase Mono" font-size="11" font-weight="700" text-anchor="middle" letter-spacing="0.35"><tspan x="187" dy="0">SOURCE RECEIPT</tspan></text>
+    <text x="290" y="864" fill="#68716b" font-family="Showcase Mono" font-size="18" font-weight="400" text-anchor="start" letter-spacing="0"><tspan x="290" dy="0">USGS · ALL_HOUR.GEOJSON · 2026-07-13T13:41:24.000Z</tspan></text>
+    <text x="110" y="908" fill="#131815" font-family="Showcase Sans" font-size="21" font-weight="700" text-anchor="start" letter-spacing="0"><tspan x="110" dy="0">Base correctly states its limit. Router adds a verified, timestamped live source and answers from that captured snapshot.</tspan></text>
+    <line x1="86" y1="1004" x2="1834" y2="1004" stroke="#bdc9c2" stroke-width="1" />
+    <text x="86" y="1039" fill="#818b84" font-family="Showcase Mono" font-size="14" font-weight="400" text-anchor="start" letter-spacing="0"><tspan x="86" dy="0">Observable route decisions and captured outputs — not private chain-of-thought</tspan></text>
+    <text x="1834" y="1039" fill="#176b4b" font-family="Showcase Mono" font-size="14" font-weight="700" text-anchor="end" letter-spacing="0"><tspan x="1834" dy="0">LIVE SOURCE SNAPSHOT · RECEIPT RECORDED</tspan></text>
+  </svg>

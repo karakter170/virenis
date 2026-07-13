@@ -674,7 +674,7 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
         role: snapshot.run.actor_role || null
       },
       options: {
-        planner_mode: options.planner_mode || process.env.TCAR_PLANNER_MODE || "cue",
+        planner_mode: options.planner_mode || process.env.TCAR_PLANNER_MODE || "session",
         max_routing_adapters: Number(options.max_routing_adapters) || Number(process.env.TCAR_MAX_ROUTING_ADAPTERS || 12),
         parallel_workers: Number(options.parallel_workers) || Number(process.env.TCAR_PARALLEL_WORKERS || 2),
         max_tokens: Number(options.max_tokens) || Number(process.env.TCAR_MAX_TOKENS || 256),
@@ -750,6 +750,7 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
       run.runtime_result_admin_only = {
         mode: result.mode,
         plannerMode: result.plannerMode,
+        sessionController: normalizeArtifactValue(result.sessionController || null),
         vllmBaseUrl: result.vllmBaseUrl,
         baseModel: result.baseModel,
         apiElapsedSec: result.apiElapsedSec,
@@ -848,7 +849,7 @@ function normalizeRuntimePlan(plan) {
   return { steps: [], adapters: [], edges: [], acyclic: true, routing: null };
 }
 
-function normalizeRuntimeRouting(routing) {
+export function normalizeRuntimeRouting(routing) {
   if (!routing || typeof routing !== "object" || Array.isArray(routing)) {
     return null;
   }
@@ -864,6 +865,27 @@ function normalizeRuntimeRouting(routing) {
       }];
     }).filter((selection) => selection.adapter)
     : [];
+  const rawOrchestrator = routing.orchestrator;
+  const orchestrator = rawOrchestrator && typeof rawOrchestrator === "object" && !Array.isArray(rawOrchestrator)
+    ? {
+      contract_version: boundedText(rawOrchestrator.contract_version, 120),
+      decision: boundedText(rawOrchestrator.decision, 40),
+      model: boundedText(rawOrchestrator.model, 240),
+      intent: boundedText(rawOrchestrator.intent, 600),
+      required_capabilities: boundedStringList(rawOrchestrator.required_capabilities, 24, 240),
+      missing_capabilities: boundedStringList(rawOrchestrator.missing_capabilities, 24, 240),
+      clarification_question: boundedText(rawOrchestrator.clarification_question, 600),
+      synthesis_brief: boundedText(rawOrchestrator.synthesis_brief, 1200),
+      discovery_method: boundedText(rawOrchestrator.discovery_method, 120),
+      authorized_agent_count: Math.max(0, Math.min(Number(rawOrchestrator.authorized_agent_count) || 0, 100000)),
+      discovered_candidate_count: Math.max(0, Math.min(Number(rawOrchestrator.discovered_candidate_count) || 0, 100000)),
+      catalog_checked: boundedStringList(rawOrchestrator.catalog_checked, 64, 240),
+      rejected_adapters: boundedStringList(rawOrchestrator.rejected_adapters, 24, 240),
+      fallback_used: boundedText(rawOrchestrator.fallback_used, 120),
+      planning_call_performed: rawOrchestrator.planning_call_performed === true,
+      final_synthesis_required: rawOrchestrator.final_synthesis_required === true
+    }
+    : null;
   return {
     mode: boundedText(routing.mode, 80),
     candidate_count: Math.max(0, Math.min(Number(routing.candidate_count) || 0, 100000)),
@@ -886,7 +908,8 @@ function normalizeRuntimeRouting(routing) {
     unresolved_mentions: boundedStringList(routing.unresolved_mentions, 64, 500),
     out_of_scope: routing.out_of_scope === true,
     reason: boundedText(routing.reason, 1000),
-    fallback: boundedText(routing.fallback, 240)
+    fallback: boundedText(routing.fallback, 240),
+    orchestrator
   };
 }
 

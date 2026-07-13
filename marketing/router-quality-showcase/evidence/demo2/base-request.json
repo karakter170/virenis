@@ -1,0 +1,14 @@
+{
+  "comparison_side": "Base model",
+  "messages": [
+    {
+      "role": "system",
+      "content": "Answer the question directly and briefly using only the supplied documents. Do not discuss models or routing."
+    },
+    {
+      "role": "user",
+      "content": "Use only the two documents below.\n\nDOCUMENT 1 — Company Cost Table\n# Loom & Pine Company Cost Review\n\n| Cost area | Earlier period | Latest period | Management note |\n| --- | --- | --- | --- |\n| Fabric | Steady | Higher | Supplier invoices show that fabric costs increased. |\n| Delivery | Steady | Higher | Freight and local delivery costs increased. |\n| Wages | Stable | Stable | Payroll was unchanged. |\n| Rent | Stable | Stable | Rent was unchanged. |\n\nThe clearest cost pressure comes from fabric and delivery, not wages or rent.\n\nDOCUMENT 2 — Fictionland Inflation Brief\n# Fictionland Inflation Brief\n\nRecent price pressure is concentrated in imported goods and transport. Domestic wages are broadly stable. The outlook expects transport pressure to ease slowly, while imported material costs remain uncertain.\n\nQUESTION\nConsult both the company cost table and the Fictionland inflation brief. Then explain what is driving the company's cost pressure and suggest one practical next step."
+    }
+  ],
+  "comparison_note": "The complete text of both synthetic documents is included in the user message."
+}

@@ -1,0 +1,11 @@
+{
+  "schema_version": "router-live-events-disclosure-v1",
+  "role_adapter": "Live Events Agent",
+  "adapter_effect": "zero_effect",
+  "weight_disclosure": "All role-adapter tensors are zero; the adapter provides route identity only.",
+  "demonstrated_difference": "Router selected the authorized agent, the executor called a fixed official source, and the answer was grounded in that returned snapshot.",
+  "base_comparison_boundary": "The base path received the identical user prompt but no live-data tool. Its captured answer is shown without rewriting.",
+  "hidden_reasoning": "Not used as evidence; only routing records, tool actions, outputs, and receipts are published.",
+  "isolated_runtime": true,
+  "model_environment": "Miniconda environment (qwen36)"
+}

@@ -1,0 +1,16 @@
+{
+  "schema_version": "router-seeded-role-disclosure-v1",
+  "role_adapter_type": "seeded zero-effect adapter",
+  "effect": "No weight-level behavior change; all adapter tensors are zeros.",
+  "what_this_demo_can_show": [
+    "Router selection",
+    "document retrieval",
+    "source-scoped answers",
+    "validated agent handoffs",
+    "cross-document synthesis",
+    "citation and execution receipts"
+  ],
+  "what_this_demo_does_not_show": "A quality gain caused by newly trained specialist weights.",
+  "seed_metadata_sha256": "cf06467fba35ab629324a161ae0bcfb994804a30b93ccc4d7e25770f7f2eda9f",
+  "seed_weights_sha256": "b0c0733ffe13eeb9f6808c7e175c225a2b121a3fa371e64d1535effdac97ae4f"
+}

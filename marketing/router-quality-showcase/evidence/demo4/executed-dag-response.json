@@ -1,0 +1,524 @@
+{
+  "question": "Using all ten documents, create the final operating plan for Saturday's Alder Quay Riverlight Festival. Resolve conflicts using the most authoritative and recent source, clearly mark what is still uncertain, and give a usable schedule, site plan, safety, accessibility, transport and communications arrangements, plus go/no-go triggers. Cite document IDs and do not invent missing details. Keep the complete plan under 750 words without omitting any requested section.",
+  "plan": {
+    "steps": [
+      {
+        "id": "s1",
+        "agent": "D01 Event Brief Source Agent",
+        "depends_on": []
+      },
+      {
+        "id": "s2",
+        "agent": "D10 Staffing and Incident Source Agent",
+        "depends_on": []
+      },
+      {
+        "id": "s3",
+        "agent": "D02 Park Permit Source Agent",
+        "depends_on": []
+      },
+      {
+        "id": "s4",
+        "agent": "D03 Fire Safety Source Agent",
+        "depends_on": []
+      },
+      {
+        "id": "s5",
+        "agent": "D04 Weather Briefing Source Agent",
+        "depends_on": []
+      },
+      {
+        "id": "s6",
+        "agent": "D05 Accessibility Review Source Agent",
+        "depends_on": []
+      },
+      {
+        "id": "s7",
+        "agent": "D06 Transport Bulletin Source Agent",
+        "depends_on": []
+      },
+      {
+        "id": "s8",
+        "agent": "D07 Artist Call Sheet Source Agent",
+        "depends_on": []
+      },
+      {
+        "id": "s9",
+        "agent": "D08 Habitat and Noise Source Agent",
+        "depends_on": []
+      },
+      {
+        "id": "s10",
+        "agent": "D09 Vendor Health Source Agent",
+        "depends_on": []
+      },
+      {
+        "id": "s11",
+        "agent": "Alder Quay Operating Plan Analysis Agent",
+        "depends_on": [
+          "s1",
+          "s3",
+          "s4",
+          "s5",
+          "s6",
+          "s7",
+          "s8",
+          "s9",
+          "s10",
+          "s2"
+        ]
+      }
+    ],
+    "edges": [
+      {
+        "source": "D01 Event Brief Source Agent",
+        "target": "Alder Quay Operating Plan Analysis Agent"
+      },
+      {
+        "source": "D02 Park Permit Source Agent",
+        "target": "Alder Quay Operating Plan Analysis Agent"
+      },
+      {
+        "source": "D03 Fire Safety Source Agent",
+        "target": "Alder Quay Operating Plan Analysis Agent"
+      },
+      {
+        "source": "D04 Weather Briefing Source Agent",
+        "target": "Alder Quay Operating Plan Analysis Agent"
+      },
+      {
+        "source": "D05 Accessibility Review Source Agent",
+        "target": "Alder Quay Operating Plan Analysis Agent"
+      },
+      {
+        "source": "D06 Transport Bulletin Source Agent",
+        "target": "Alder Quay Operating Plan Analysis Agent"
+      },
+      {
+        "source": "D07 Artist Call Sheet Source Agent",
+        "target": "Alder Quay Operating Plan Analysis Agent"
+      },
+      {
+        "source": "D08 Habitat and Noise Source Agent",
+        "target": "Alder Quay Operating Plan Analysis Agent"
+      },
+      {
+        "source": "D09 Vendor Health Source Agent",
+        "target": "Alder Quay Operating Plan Analysis Agent"
+      },
+      {
+        "source": "D10 Staffing and Incident Source Agent",
+        "target": "Alder Quay Operating Plan Analysis Agent"
+      }
+    ]
+  },
+  "source_results": [
+    {
+      "document": "D01",
+      "agent": "D01 Event Brief Source Agent",
+      "answer": "D01: welcoming neighbourhood arts evening; 17:00 open, 22:00 close, North Gate entrance; candle procession, lantern canopy, West Lawn quiet area, 20:40 headline [demo4_d01_event_brief_0001].",
+      "finish_reasons": [
+        "stop"
+      ],
+      "source_validation_valid": true,
+      "policy_violations_empty": true,
+      "citations": [
+        {
+          "agent": "D01 Event Brief Source Agent",
+          "title": "D01 — Event Brief and Draft Run Sheet",
+          "chunk_id": "demo4_d01_event_brief_0001",
+          "claim": "D01: welcoming neighbourhood arts evening; 17:00 open, 22:00 close, North Gate entrance; candle procession, lantern canopy, West Lawn quiet area, 20:40 headline .",
+          "excerpt": "# D01 — Event Brief and Draft Run Sheet\n\n**Issuer:** Alder Quay Riverlight Festival organizer  \n**Issued:** 1 October 2026  \n**Status:** Early planning draft; later official instructions take precedence\n\nThe festival is designed as a welcoming neighbourhood arts evening. Registration currently stands at 1,100. The draft proposes opening at 17:00, using the North Gate as the main entrance, and closing at 22:00. Planned features are a candle-lit riverside procession, a suspended lantern canopy, a quiet area on the West Lawn, and a headline performance at 20:40. These ideas are provisional and must be reconciled with permits, safety reviews, access requirements, transport notices, and later production updates.",
+          "verified": true
+        }
+      ],
+      "handoff_artifacts": [
+        {
+          "name": "d01_source_finding",
+          "evidence": [
+            "demo4_d01_event_brief_0001"
+          ],
+          "verified": true
+        }
+      ]
+    },
+    {
+      "document": "D10",
+      "agent": "D10 Staffing and Incident Source Agent",
+      "answer": "D10: two confirmed entrances; six tentative volunteers; two first aiders; two accessibility marshals; Community Hall Annex; channel 1 ops; channel 3 medical; weather lead 14:00; safety lead suspension [demo4_d10_staffing_incident_comms_0001].",
+      "finish_reasons": [
+        "stop"
+      ],
+      "source_validation_valid": true,
+      "policy_violations_empty": true,
+      "citations": [
+        {
+          "agent": "D10 Staffing and Incident Source Agent",
+          "title": "D10 — Staffing, Incident and Radio Plan",
+          "chunk_id": "demo4_d10_staffing_incident_comms_0001",
+          "claim": "D10: two confirmed entrances; six tentative volunteers; two first aiders; two accessibility marshals; Community Hall Annex; channel 1 ops; channel 3 medical; weather lead 14:00; safety lead suspension .",
+          "excerpt": "# D10 — Staffing, Incident and Radio Plan\n\n**Issuer:** Festival Operations Lead  \n**Issued:** 16 October 2026 at 18:00  \n**Status:** Latest confirmed staffing plan\n\nConfirmed staff can operate two public entrances. Six additional volunteers are tentative and must not fill critical posts. Two certified first aiders are confirmed. One accessibility marshal is available at opening and a second begins at 18:30. Incident command, lost-child response, and family reunification are based at the Community Hall Annex. Use radio channel 1 for operations and channel 3 for medical incidents. The weather lead owns the 14:00 update; the safety lead owns any suspension decision.",
+          "verified": true
+        }
+      ],
+      "handoff_artifacts": [
+        {
+          "name": "d10_source_finding",
+          "evidence": [
+            "demo4_d10_staffing_incident_comms_0001"
+          ],
+          "verified": true
+        }
+      ]
+    },
+    {
+      "document": "D02",
+      "agent": "D02 Park Permit Source Agent",
+      "answer": "D02: max 900 onsite; clicker counts; sound ends 20:45, clear 21:30; East lane unobstructed; two first aiders [demo4_d02_park_permit_0001].",
+      "finish_reasons": [
+        "stop"
+      ],
+      "source_validation_valid": true,
+      "policy_violations_empty": true,
+      "citations": [
+        {
+          "agent": "D02 Park Permit Source Agent",
+          "title": "D02 — Final Park Permit",
+          "chunk_id": "demo4_d02_park_permit_0001",
+          "claim": "D02: max 900 onsite; clicker counts; sound ends 20:45, clear 21:30; East lane unobstructed; two first aiders .",
+          "excerpt": "# D02 — Final Park Permit\n\n**Issuer:** City Parks Department  \n**Issued:** 12 October 2026  \n**Status:** Final and controlling for park operations\n\nNo more than 900 people may be onsite at once. Every open public entrance must use clicker counts, with the combined count reported to operations. Amplified sound must end by 20:45 and the site must be clear by 21:30. The East service lane is an emergency route and must remain unobstructed. At least two certified first aiders must be onsite whenever the public is admitted. These conditions replace conflicting times or capacity assumptions in planning drafts.",
+          "verified": true
+        }
+      ],
+      "handoff_artifacts": [
+        {
+          "name": "d02_source_finding",
+          "evidence": [
+            "demo4_d02_park_permit_0001"
+          ],
+          "verified": true
+        }
+      ]
+    },
+    {
+      "document": "D03",
+      "agent": "D03 Fire Safety Source Agent",
+      "answer": "D03: no open flames; LED lanterns only; canopy suspended at 30 km/h sustained or 45 km/h gusts; evacuate to South Meadow; ground-level fallback; keep East emergency lane clear; safety lead may suspend [demo4_d03_fire_safety_addendum_0001].",
+      "finish_reasons": [
+        "stop"
+      ],
+      "source_validation_valid": true,
+      "policy_violations_empty": true,
+      "citations": [
+        {
+          "agent": "D03 Fire Safety Source Agent",
+          "title": "D03 — Fire Marshal Safety Addendum",
+          "chunk_id": "demo4_d03_fire_safety_addendum_0001",
+          "claim": "D03: no open flames; LED lanterns only; canopy suspended at 30 km/h sustained or 45 km/h gusts; evacuate to South Meadow; ground-level fallback; keep East emergency lane clear; safety lead may suspend .",
+          "excerpt": "# D03 — Fire Marshal Safety Addendum\n\n**Issuer:** City Fire Marshal  \n**Issued:** 13 October 2026  \n**Status:** Final safety direction\n\nOpen flames are prohibited; lanterns and candles must use LEDs. The suspended lantern canopy must not operate when sustained winds reach 30 km/h or gusts reach 45 km/h. A ground-level lantern display is the approved fallback. The evacuation muster point is South Meadow. Access to the East emergency lane must remain clear at all times. The safety lead has authority to suspend an installation or activity when these limits are reached or conditions become unsafe.",
+          "verified": true
+        }
+      ],
+      "handoff_artifacts": [
+        {
+          "name": "d03_source_finding",
+          "evidence": [
+            "demo4_d03_fire_safety_addendum_0001"
+          ],
+          "verified": true
+        }
+      ]
+    },
+    {
+      "document": "D04",
+      "agent": "D04 Weather Briefing Source Agent",
+      "answer": "Showers likely; winds near canopy limit with 48 km/h gusts after 19:45; moderate confidence; low thunder risk; update pending Saturday 14:00 [demo4_d04_weather_briefing_0001].",
+      "finish_reasons": [
+        "stop"
+      ],
+      "source_validation_valid": true,
+      "policy_violations_empty": true,
+      "citations": [
+        {
+          "agent": "D04 Weather Briefing Source Agent",
+          "title": "D04 — Event Weather Briefing",
+          "chunk_id": "demo4_d04_weather_briefing_0001",
+          "claim": "Showers likely; winds near canopy limit with 48 km/h gusts after 19:45; moderate confidence; low thunder risk; update pending Saturday 14:00 .",
+          "excerpt": "# D04 — Event Weather Briefing\n\n**Issuer:** Municipal Weather Desk  \n**Issued:** 16 October 2026 at 15:00  \n**Status:** Latest briefing; event-day update pending\n\nShowers are likely around opening. Sustained winds may approach the lantern-canopy limit, and gusts are forecast to reach 48 km/h after 19:45. Confidence in the wind forecast is moderate. Thunder risk is low but not zero. The next bulletin will be issued at 14:00 on Saturday and may change the timing or severity. The weather lead must deliver that update to operations; this briefing does not establish that the canopy will be safe.",
+          "verified": true
+        }
+      ],
+      "handoff_artifacts": [
+        {
+          "name": "d04_source_finding",
+          "evidence": [
+            "demo4_d04_weather_briefing_0001"
+          ],
+          "verified": true
+        }
+      ]
+    },
+    {
+      "document": "D05",
+      "agent": "D05 Accessibility Review Source Agent",
+      "answer": "D05: South Gate entrance; 1.8m clear route; Community Hall Annex quiet zone; accessible toilet there; Main Stage viewing; caption all programming; interpreter 18:30-20:30; signpost route, zone, toilet, viewing [demo4_d05_accessibility_review_0001].",
+      "finish_reasons": [
+        "stop"
+      ],
+      "source_validation_valid": true,
+      "policy_violations_empty": true,
+      "citations": [
+        {
+          "agent": "D05 Accessibility Review Source Agent",
+          "title": "D05 — Accessibility Review",
+          "chunk_id": "demo4_d05_accessibility_review_0001",
+          "claim": "D05: South Gate entrance; 1.8m clear route; Community Hall Annex quiet zone; accessible toilet there; Main Stage viewing; caption all programming; interpreter 18:30-20:30; signpost route, zone, toilet, viewing .",
+          "excerpt": "# D05 — Accessibility Review\n\n**Issuer:** Alder Quay Access Panel  \n**Issued:** 8 October 2026  \n**Status:** Signed operating requirement\n\nSouth Gate is the only reliable step-free public entrance; East Gate is not suitable as an accessible entrance. Keep a continuous 1.8-metre route clear from South Gate to the main areas. Use the Community Hall Annex, not the sloped West Lawn, as the quiet zone; an accessible toilet is available there. Reserve an accessible viewing area at the Main Stage. Caption all stage programming. A sign-language interpreter is available from 18:30 to 20:30. Clearly signpost the route, quiet zone, toilet, and viewing area.",
+          "verified": true
+        }
+      ],
+      "handoff_artifacts": [
+        {
+          "name": "d05_source_finding",
+          "evidence": [
+            "demo4_d05_accessibility_review_0001"
+          ],
+          "verified": true
+        }
+      ]
+    },
+    {
+      "document": "D06",
+      "agent": "D06 Transport Bulletin Source Agent",
+      "answer": "D06: North Gate closed 16:00–23:00; shuttle at East curb; drop-off at South Gate; last bus 21:20; cycle parking at East Gate; rideshare at remote pickup; no North approach comms [demo4_d06_transport_bulletin_0001].",
+      "finish_reasons": [
+        "stop"
+      ],
+      "source_validation_valid": true,
+      "policy_violations_empty": true,
+      "citations": [
+        {
+          "agent": "D06 Transport Bulletin Source Agent",
+          "title": "D06 — Roadworks and Transport Bulletin",
+          "chunk_id": "demo4_d06_transport_bulletin_0001",
+          "claim": "D06: North Gate closed 16:00–23:00; shuttle at East curb; drop-off at South Gate; last bus 21:20; cycle parking at East Gate; rideshare at remote pickup; no North approach comms .",
+          "excerpt": "# D06 — Roadworks and Transport Bulletin\n\n**Issuer:** City Transport Control  \n**Issued:** 16 October 2026  \n**Status:** Final event update\n\nThe North approach will be closed from 16:00 to 23:00, so North Gate cannot serve arriving or departing visitors. The event shuttle will stop at the East curb. The accessible drop-off point is at South Gate. The last scheduled bus from the South stop leaves at 21:20. Cycle parking is beside East Gate. Rideshare vehicles cannot enter the quay and should use the signed remote pickup point. Public communications must not direct visitors to the North approach.",
+          "verified": true
+        }
+      ],
+      "handoff_artifacts": [
+        {
+          "name": "d06_source_finding",
+          "evidence": [
+            "demo4_d06_transport_bulletin_0001"
+          ],
+          "verified": true
+        }
+      ]
+    },
+    {
+      "document": "D07",
+      "agent": "D07 Artist Call Sheet Source Agent",
+      "answer": "D07: headline arrival 19:45-20:15; 15-min soundcheck then 25-min set; local ensemble backup ready; lantern display if canopy fails; sound cutoff applies [demo4_d07_artist_call_sheet_0001].",
+      "finish_reasons": [
+        "stop"
+      ],
+      "source_validation_valid": true,
+      "policy_violations_empty": true,
+      "citations": [
+        {
+          "agent": "D07 Artist Call Sheet Source Agent",
+          "title": "D07 — Artist and Production Call Sheet",
+          "chunk_id": "demo4_d07_artist_call_sheet_0001",
+          "claim": "D07: headline arrival 19:45-20:15; 15-min soundcheck then 25-min set; local ensemble backup ready; lantern display if canopy fails; sound cutoff applies .",
+          "excerpt": "# D07 — Artist and Production Call Sheet\n\n**Issuer:** Festival Production Manager  \n**Issued:** 16 October 2026 at 17:00  \n**Status:** Latest production update\n\nThe headline artist's arrival is uncertain and expected between 19:45 and 20:15. After arrival, the artist needs a 15-minute soundcheck and a minimum 25-minute set. Do not announce the headline performance as confirmed until the artist checks in. The local ensemble is ready as the backup closing act. The lantern artist approves the ground-level display if the suspended canopy cannot operate. All amplified performance remains subject to the permit's sound cutoff.",
+          "verified": true
+        }
+      ],
+      "handoff_artifacts": [
+        {
+          "name": "d07_source_finding",
+          "evidence": [
+            "demo4_d07_artist_call_sheet_0001"
+          ],
+          "verified": true
+        }
+      ]
+    },
+    {
+      "document": "D08",
+      "agent": "D08 Habitat and Noise Source Agent",
+      "answer": "D08: 25-metre dark buffer; no lighting across water after 20:30; amplified sound at Main Stage only; procession on inland path; steward approval before gates; applies to all [demo4_d08_river_habitat_noise_agreement_0001].",
+      "finish_reasons": [
+        "stop"
+      ],
+      "source_validation_valid": true,
+      "policy_violations_empty": true,
+      "citations": [
+        {
+          "agent": "D08 Habitat and Noise Source Agent",
+          "title": "D08 — River Habitat and Noise Agreement",
+          "chunk_id": "demo4_d08_river_habitat_noise_agreement_0001",
+          "claim": "D08: 25-metre dark buffer; no lighting across water after 20:30; amplified sound at Main Stage only; procession on inland path; steward approval before gates; applies to all .",
+          "excerpt": "# D08 — River Habitat and Noise Agreement\n\n**Issuer:** River Habitat Authority  \n**Issued:** 5 October 2026  \n**Status:** Binding event condition\n\nMaintain a 25-metre dark buffer around the reed bed. No lighting may point across the water after 20:30. Amplified sound is allowed only at the Main Stage. Any lantern procession must follow the inland path, not the river edge. Before gates open, the wildlife steward must inspect and approve the marked buffer boundary. These restrictions apply to artists, vendors, staff, and visitors and cannot be relaxed by the organizer's draft programme.",
+          "verified": true
+        }
+      ],
+      "handoff_artifacts": [
+        {
+          "name": "d08_source_finding",
+          "evidence": [
+            "demo4_d08_river_habitat_noise_agreement_0001"
+          ],
+          "verified": true
+        }
+      ]
+    },
+    {
+      "document": "D09",
+      "agent": "D09 Vendor Health Source Agent",
+      "answer": "D09: East hardstand siting; no cooking under fabric; Moon Bowl conditional on temp log; no nut-free claims; water at Annex; remove failing vendors [demo4_d09_vendor_health_inspection_0001].",
+      "finish_reasons": [
+        "stop"
+      ],
+      "source_validation_valid": true,
+      "policy_violations_empty": true,
+      "citations": [
+        {
+          "agent": "D09 Vendor Health Source Agent",
+          "title": "D09 — Vendor Health and Allergen Inspection",
+          "chunk_id": "demo4_d09_vendor_health_inspection_0001",
+          "claim": "D09: East hardstand siting; no cooking under fabric; Moon Bowl conditional on temp log; no nut-free claims; water at Annex; remove failing vendors .",
+          "excerpt": "# D09 — Vendor Health and Allergen Inspection\n\n**Issuer:** City Environmental Health Officer  \n**Issued:** 15 October 2026  \n**Status:** Conditional approval\n\nPlace the vendor row on the East hardstand. Cooking is not allowed beneath fabric structures. Moon Bowl may serve only if it submits an acceptable temperature log by noon on Saturday; approval is not yet confirmed. Hearth & Grain uses shared preparation space and must not describe its food as nut-free. Vendors must display cross-contact information. The public water-refill point is at the Community Hall Annex. Operations must remove any vendor that fails the stated conditions.",
+          "verified": true
+        }
+      ],
+      "handoff_artifacts": [
+        {
+          "name": "d09_source_finding",
+          "evidence": [
+            "demo4_d09_vendor_health_inspection_0001"
+          ],
+          "verified": true
+        }
+      ]
+    }
+  ],
+  "analysis_result": {
+    "agent": "Alder Quay Operating Plan Analysis Agent",
+    "answer": "I cannot provide a source-grounded answer from the approved excerpts because the available evidence was missing or did not support the generated claims. Please refine the question or update the source.",
+    "finish_reasons": [
+      "length"
+    ],
+    "used_upstream": [
+      "D01 Event Brief Source Agent",
+      "D09 Vendor Health Source Agent",
+      "D10 Staffing and Incident Source Agent",
+      "D02 Park Permit Source Agent",
+      "D03 Fire Safety Source Agent",
+      "D04 Weather Briefing Source Agent",
+      "D05 Accessibility Review Source Agent",
+      "D06 Transport Bulletin Source Agent",
+      "D07 Artist Call Sheet Source Agent",
+      "D08 Habitat and Noise Source Agent"
+    ],
+    "consumption_validation": {
+      "valid": true,
+      "missing": [],
+      "rejected": []
+    },
+    "policy_violations_empty": false,
+    "document_ids_cited": []
+  },
+  "verified_citations": [
+    {
+      "agent": "D01 Event Brief Source Agent",
+      "title": "D01 — Event Brief and Draft Run Sheet",
+      "chunk_id": "demo4_d01_event_brief_0001",
+      "claim": "D01: welcoming neighbourhood arts evening; 17:00 open, 22:00 close, North Gate entrance; candle procession, lantern canopy, West Lawn quiet area, 20:40 headline .",
+      "excerpt": "# D01 — Event Brief and Draft Run Sheet\n\n**Issuer:** Alder Quay Riverlight Festival organizer  \n**Issued:** 1 October 2026  \n**Status:** Early planning draft; later official instructions take precedence\n\nThe festival is designed as a welcoming neighbourhood arts evening. Registration currently stands at 1,100. The draft proposes opening at 17:00, using the North Gate as the main entrance, and closing at 22:00. Planned features are a candle-lit riverside procession, a suspended lantern canopy, a quiet area on the West Lawn, and a headline performance at 20:40. These ideas are provisional and must be reconciled with permits, safety reviews, access requirements, transport notices, and later production updates.",
+      "verified": true
+    },
+    {
+      "agent": "D10 Staffing and Incident Source Agent",
+      "title": "D10 — Staffing, Incident and Radio Plan",
+      "chunk_id": "demo4_d10_staffing_incident_comms_0001",
+      "claim": "D10: two confirmed entrances; six tentative volunteers; two first aiders; two accessibility marshals; Community Hall Annex; channel 1 ops; channel 3 medical; weather lead 14:00; safety lead suspension .",
+      "excerpt": "# D10 — Staffing, Incident and Radio Plan\n\n**Issuer:** Festival Operations Lead  \n**Issued:** 16 October 2026 at 18:00  \n**Status:** Latest confirmed staffing plan\n\nConfirmed staff can operate two public entrances. Six additional volunteers are tentative and must not fill critical posts. Two certified first aiders are confirmed. One accessibility marshal is available at opening and a second begins at 18:30. Incident command, lost-child response, and family reunification are based at the Community Hall Annex. Use radio channel 1 for operations and channel 3 for medical incidents. The weather lead owns the 14:00 update; the safety lead owns any suspension decision.",
+      "verified": true
+    },
+    {
+      "agent": "D02 Park Permit Source Agent",
+      "title": "D02 — Final Park Permit",
+      "chunk_id": "demo4_d02_park_permit_0001",
+      "claim": "D02: max 900 onsite; clicker counts; sound ends 20:45, clear 21:30; East lane unobstructed; two first aiders .",
+      "excerpt": "# D02 — Final Park Permit\n\n**Issuer:** City Parks Department  \n**Issued:** 12 October 2026  \n**Status:** Final and controlling for park operations\n\nNo more than 900 people may be onsite at once. Every open public entrance must use clicker counts, with the combined count reported to operations. Amplified sound must end by 20:45 and the site must be clear by 21:30. The East service lane is an emergency route and must remain unobstructed. At least two certified first aiders must be onsite whenever the public is admitted. These conditions replace conflicting times or capacity assumptions in planning drafts.",
+      "verified": true
+    },
+    {
+      "agent": "D03 Fire Safety Source Agent",
+      "title": "D03 — Fire Marshal Safety Addendum",
+      "chunk_id": "demo4_d03_fire_safety_addendum_0001",
+      "claim": "D03: no open flames; LED lanterns only; canopy suspended at 30 km/h sustained or 45 km/h gusts; evacuate to South Meadow; ground-level fallback; keep East emergency lane clear; safety lead may suspend .",
+      "excerpt": "# D03 — Fire Marshal Safety Addendum\n\n**Issuer:** City Fire Marshal  \n**Issued:** 13 October 2026  \n**Status:** Final safety direction\n\nOpen flames are prohibited; lanterns and candles must use LEDs. The suspended lantern canopy must not operate when sustained winds reach 30 km/h or gusts reach 45 km/h. A ground-level lantern display is the approved fallback. The evacuation muster point is South Meadow. Access to the East emergency lane must remain clear at all times. The safety lead has authority to suspend an installation or activity when these limits are reached or conditions become unsafe.",
+      "verified": true
+    },
+    {
+      "agent": "D04 Weather Briefing Source Agent",
+      "title": "D04 — Event Weather Briefing",
+      "chunk_id": "demo4_d04_weather_briefing_0001",
+      "claim": "Showers likely; winds near canopy limit with 48 km/h gusts after 19:45; moderate confidence; low thunder risk; update pending Saturday 14:00 .",
+      "excerpt": "# D04 — Event Weather Briefing\n\n**Issuer:** Municipal Weather Desk  \n**Issued:** 16 October 2026 at 15:00  \n**Status:** Latest briefing; event-day update pending\n\nShowers are likely around opening. Sustained winds may approach the lantern-canopy limit, and gusts are forecast to reach 48 km/h after 19:45. Confidence in the wind forecast is moderate. Thunder risk is low but not zero. The next bulletin will be issued at 14:00 on Saturday and may change the timing or severity. The weather lead must deliver that update to operations; this briefing does not establish that the canopy will be safe.",
+      "verified": true
+    },
+    {
+      "agent": "D05 Accessibility Review Source Agent",
+      "title": "D05 — Accessibility Review",
+      "chunk_id": "demo4_d05_accessibility_review_0001",
+      "claim": "D05: South Gate entrance; 1.8m clear route; Community Hall Annex quiet zone; accessible toilet there; Main Stage viewing; caption all programming; interpreter 18:30-20:30; signpost route, zone, toilet, viewing .",
+      "excerpt": "# D05 — Accessibility Review\n\n**Issuer:** Alder Quay Access Panel  \n**Issued:** 8 October 2026  \n**Status:** Signed operating requirement\n\nSouth Gate is the only reliable step-free public entrance; East Gate is not suitable as an accessible entrance. Keep a continuous 1.8-metre route clear from South Gate to the main areas. Use the Community Hall Annex, not the sloped West Lawn, as the quiet zone; an accessible toilet is available there. Reserve an accessible viewing area at the Main Stage. Caption all stage programming. A sign-language interpreter is available from 18:30 to 20:30. Clearly signpost the route, quiet zone, toilet, and viewing area.",
+      "verified": true
+    },
+    {
+      "agent": "D06 Transport Bulletin Source Agent",
+      "title": "D06 — Roadworks and Transport Bulletin",
+      "chunk_id": "demo4_d06_transport_bulletin_0001",
+      "claim": "D06: North Gate closed 16:00–23:00; shuttle at East curb; drop-off at South Gate; last bus 21:20; cycle parking at East Gate; rideshare at remote pickup; no North approach comms .",
+      "excerpt": "# D06 — Roadworks and Transport Bulletin\n\n**Issuer:** City Transport Control  \n**Issued:** 16 October 2026  \n**Status:** Final event update\n\nThe North approach will be closed from 16:00 to 23:00, so North Gate cannot serve arriving or departing visitors. The event shuttle will stop at the East curb. The accessible drop-off point is at South Gate. The last scheduled bus from the South stop leaves at 21:20. Cycle parking is beside East Gate. Rideshare vehicles cannot enter the quay and should use the signed remote pickup point. Public communications must not direct visitors to the North approach.",
+      "verified": true
+    },
+    {
+      "agent": "D07 Artist Call Sheet Source Agent",
+      "title": "D07 — Artist and Production Call Sheet",
+      "chunk_id": "demo4_d07_artist_call_sheet_0001",
+      "claim": "D07: headline arrival 19:45-20:15; 15-min soundcheck then 25-min set; local ensemble backup ready; lantern display if canopy fails; sound cutoff applies .",
+      "excerpt": "# D07 — Artist and Production Call Sheet\n\n**Issuer:** Festival Production Manager  \n**Issued:** 16 October 2026 at 17:00  \n**Status:** Latest production update\n\nThe headline artist's arrival is uncertain and expected between 19:45 and 20:15. After arrival, the artist needs a 15-minute soundcheck and a minimum 25-minute set. Do not announce the headline performance as confirmed until the artist checks in. The local ensemble is ready as the backup closing act. The lantern artist approves the ground-level display if the suspended canopy cannot operate. All amplified performance remains subject to the permit's sound cutoff.",
+      "verified": true
+    },
+    {
+      "agent": "D08 Habitat and Noise Source Agent",
+      "title": "D08 — River Habitat and Noise Agreement",
+      "chunk_id": "demo4_d08_river_habitat_noise_agreement_0001",
+      "claim": "D08: 25-metre dark buffer; no lighting across water after 20:30; amplified sound at Main Stage only; procession on inland path; steward approval before gates; applies to all .",
+      "excerpt": "# D08 — River Habitat and Noise Agreement\n\n**Issuer:** River Habitat Authority  \n**Issued:** 5 October 2026  \n**Status:** Binding event condition\n\nMaintain a 25-metre dark buffer around the reed bed. No lighting may point across the water after 20:30. Amplified sound is allowed only at the Main Stage. Any lantern procession must follow the inland path, not the river edge. Before gates open, the wildlife steward must inspect and approve the marked buffer boundary. These restrictions apply to artists, vendors, staff, and visitors and cannot be relaxed by the organizer's draft programme.",
+      "verified": true
+    },
+    {
+      "agent": "D09 Vendor Health Source Agent",
+      "title": "D09 — Vendor Health and Allergen Inspection",
+      "chunk_id": "demo4_d09_vendor_health_inspection_0001",
+      "claim": "D09: East hardstand siting; no cooking under fabric; Moon Bowl conditional on temp log; no nut-free claims; water at Annex; remove failing vendors .",
+      "excerpt": "# D09 — Vendor Health and Allergen Inspection\n\n**Issuer:** City Environmental Health Officer  \n**Issued:** 15 October 2026  \n**Status:** Conditional approval\n\nPlace the vendor row on the East hardstand. Cooking is not allowed beneath fabric structures. Moon Bowl may serve only if it submits an acceptable temperature log by noon on Saturday; approval is not yet confirmed. Hearth & Grain uses shared preparation space and must not describe its food as nut-free. Vendors must display cross-contact information. The public water-refill point is at the Community Hall Annex. Operations must remove any vendor that fails the stated conditions.",
+      "verified": true
+    }
+  ],
+  "full_answer": "Demo4 D01 Event Brief: D01: welcoming neighbourhood arts evening; 17:00 open, 22:00 close, North Gate entrance; candle procession, lantern canopy, West Lawn quiet area, 20:40 headline [demo4_d01_event_brief_0001].\n\nDemo4 D10 Staffing Incident Comms: D10: two confirmed entrances; six tentative volunteers; two first aiders; two accessibility marshals; Community Hall Annex; channel 1 ops; channel 3 medical; weather lead 14:00; safety lead suspension [demo4_d10_staffing_incident_comms_0001].\n\nDemo4 D02 Park Permit: D02: max 900 onsite; clicker counts; sound ends 20:45, clear 21:30; East lane unobstructed; two first aiders [demo4_d02_park_permit_0001].\n\nDemo4 D03 Fire Safety Addendum: D03: no open flames; LED lanterns only; canopy suspended at 30 km/h sustained or 45 km/h gusts; evacuate to South Meadow; ground-level fallback; keep East emergency lane clear; safety lead may suspend [demo4_d03_fire_safety_addendum_0001].\n\nDemo4 D04 Weather Briefing: Showers likely; winds near canopy limit with 48 km/h gusts after 19:45; moderate confidence; low thunder risk; update pending Saturday 14:00 [demo4_d04_weather_briefing_0001].\n\nDemo4 D05 Accessibility Review: D05: South Gate entrance; 1.8m clear route; Community Hall Annex quiet zone; accessible toilet there; Main Stage viewing; caption all programming; interpreter 18:30-20:30; signpost route, zone, toilet, viewing [demo4_d05_accessibility_review_0001].\n\nDemo4 D06 Transport Bulletin: D06: North Gate closed 16:00–23:00; shuttle at East curb; drop-off at South Gate; last bus 21:20; cycle parking at East Gate; rideshare at remote pickup; no North approach comms [demo4_d06_transport_bulletin_0001].\n\nDemo4 D07 Artist Call Sheet: D07: headline arrival 19:45-20:15; 15-min soundcheck then 25-min set; local ensemble backup ready; lantern display if canopy fails; sound cutoff applies [demo4_d07_artist_call_sheet_0001].\n\nDemo4 D08 River Habitat Noise Agreement: D08: 25-metre dark buffer; no lighting across water after 20:30; amplified sound at Main Stage only; procession on inland path; steward approval before gates; applies to all [demo4_d08_river_habitat_noise_agreement_0001].\n\nDemo4 D09 Vendor Health Inspection: D09: East hardstand siting; no cooking under fabric; Moon Bowl conditional on temp log; no nut-free claims; water at Annex; remove failing vendors [demo4_d09_vendor_health_inspection_0001].\n\nDemo4 Operating Plan Analysis: I cannot provide a source-grounded answer from the approved excerpts because the available evidence was missing or did not support the generated claims. Please refine the question or update the source.",
+  "execution_provenance": {
+    "execution_id": "router-demo4-20260713T163455Z",
+    "request_fingerprint": "b4109531f98abc02f44da2ecf5954d48ec186364669644f92e8d1a68eb40c30c",
+    "receipt_id": "ar_2885929519aa43ab9692eb7dd65323f6",
+    "record_hash": "29e601d8716c09558d238c1cac51d33ce457dec09da82b4ac585cc6c07c474dd",
+    "schema_version": 1,
+    "created_at": "2026-07-13T16:40:41.499357Z"
+  }
+}

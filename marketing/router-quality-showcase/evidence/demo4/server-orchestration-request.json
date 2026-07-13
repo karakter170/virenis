@@ -1,0 +1,59 @@
+{
+  "question": "Using all ten documents, create the final operating plan for Saturday's Alder Quay Riverlight Festival. Resolve conflicts using the most authoritative and recent source, clearly mark what is still uncertain, and give a usable schedule, site plan, safety, accessibility, transport and communications arrangements, plus go/no-go triggers. Cite document IDs and do not invent missing details. Keep the complete plan under 750 words without omitting any requested section.",
+  "source_steps": [
+    {
+      "document": "D01",
+      "agent": "D01 Event Brief Source Agent",
+      "task": "Return exactly one sentence: 'D01: fact; fact; fact [demo4_d01_event_brief_0001].' Cover organizer objectives and provisional programme, timing, entrance, and site assumptions in at most 32 words. Use semicolons only; the sole full stop must follow the citation."
+    },
+    {
+      "document": "D02",
+      "agent": "D02 Park Permit Source Agent",
+      "task": "Return exactly one sentence: 'D02: fact; fact; fact [demo4_d02_park_permit_0001].' Cover controlling park capacity, timing, counting, emergency-access, and first-aid conditions in at most 32 words. Use semicolons only; the sole full stop must follow the citation."
+    },
+    {
+      "document": "D03",
+      "agent": "D03 Fire Safety Source Agent",
+      "task": "Return exactly one sentence: 'D03: fact; fact; fact [demo4_d03_fire_safety_addendum_0001].' Cover controlling flame, canopy, wind, evacuation, fallback, emergency-access, and suspension conditions in at most 32 words. Use semicolons only; the sole full stop must follow the citation."
+    },
+    {
+      "document": "D04",
+      "agent": "D04 Weather Briefing Source Agent",
+      "task": "Return exactly one sentence: 'D04: fact; fact; fact [demo4_d04_weather_briefing_0001].' Cover forecast conditions, confidence, pending-update status, and weather uncertainty in at most 32 words. Use semicolons only; the sole full stop must follow the citation."
+    },
+    {
+      "document": "D05",
+      "agent": "D05 Accessibility Review Source Agent",
+      "task": "Return exactly one sentence: 'D05: fact; fact; fact [demo4_d05_accessibility_review_0001].' Cover binding entrance, route, quiet-zone, toilet, viewing, captioning, interpreter, and signage requirements in at most 32 words. Use semicolons only; the sole full stop must follow the citation."
+    },
+    {
+      "document": "D06",
+      "agent": "D06 Transport Bulletin Source Agent",
+      "task": "Return exactly one sentence: 'D06: fact; fact; fact [demo4_d06_transport_bulletin_0001].' Cover gate closure, shuttle, drop-off, bus, cycle, rideshare, and visitor-communications conditions in at most 32 words. Use semicolons only; the sole full stop must follow the citation."
+    },
+    {
+      "document": "D07",
+      "agent": "D07 Artist Call Sheet Source Agent",
+      "task": "Return exactly one sentence: 'D07: fact; fact; fact [demo4_d07_artist_call_sheet_0001].' Cover conditional artist timing, soundcheck and set dependencies, backup readiness, lantern fallback, and cutoff dependencies in at most 32 words. Use semicolons only; the sole full stop must follow the citation."
+    },
+    {
+      "document": "D08",
+      "agent": "D08 Habitat and Noise Source Agent",
+      "task": "Return exactly one sentence: 'D08: fact; fact; fact [demo4_d08_river_habitat_noise_agreement_0001].' Cover habitat-buffer, lighting, sound-location, procession-route, steward-approval, and scope requirements in at most 32 words. Use semicolons only; the sole full stop must follow the citation."
+    },
+    {
+      "document": "D09",
+      "agent": "D09 Vendor Health Source Agent",
+      "task": "Return exactly one sentence: 'D09: fact; fact; fact [demo4_d09_vendor_health_inspection_0001].' Cover vendor siting, cooking, conditional approval, allergen, water-refill, and enforcement conditions in at most 32 words. Use semicolons only; the sole full stop must follow the citation."
+    },
+    {
+      "document": "D10",
+      "agent": "D10 Staffing and Incident Source Agent",
+      "task": "Return exactly one sentence: 'D10: fact; fact; fact [demo4_d10_staffing_incident_comms_0001].' Cover confirmed and tentative staffing, first-aid and accessibility coverage, incident locations, radio channels, and decision ownership in at most 32 words. Use semicolons only; the sole full stop must follow the citation."
+    }
+  ],
+  "server_owned_action": "Append the downstream Analysis Agent and compile all ten source dependencies.",
+  "analysis_agent": "Alder Quay Operating Plan Analysis Agent",
+  "user_supplied_plan": false,
+  "output_token_allowance": 1600
+}

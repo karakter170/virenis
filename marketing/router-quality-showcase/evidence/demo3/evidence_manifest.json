@@ -1,0 +1,49 @@
+{
+  "schema_version": "router-live-events-public-evidence-v1",
+  "created_at": "2026-07-13T13:41:40.978188+00:00",
+  "files": [
+    {
+      "path": "prompt.json",
+      "sha256": "f20f7ed568bccb502825a5dfbbfc8bf1a7d53f711cb900e1b88a21251bccf62a",
+      "bytes": 326
+    },
+    {
+      "path": "base_response.json",
+      "sha256": "2bd9d9fa67a16b7ad71e4b953ddb45948384a2722ef6c6dcf697553c27485659",
+      "bytes": 1153
+    },
+    {
+      "path": "router_response.json",
+      "sha256": "47bc4ce60a8a6b48266ce31bf171a80e9a1b80c609db397fd3bf9ad9d3e64453",
+      "bytes": 18442
+    },
+    {
+      "path": "usgs_tool_snapshot.json",
+      "sha256": "2a03f560747e9fcb5bacc7687547bd169f1052bbacd75f12b47f206212a42bae",
+      "bytes": 808
+    },
+    {
+      "path": "tool_execution_receipt.json",
+      "sha256": "4c1802eacbc4c4202899a37c77de83d957d53fa08c6446188af9d3755baba11c",
+      "bytes": 1704
+    },
+    {
+      "path": "execution_receipt.json",
+      "sha256": "71e4836bb3eafcfbd4b21a61b80c9ed535a1160d8cca0295b04cf1e37e5deb67",
+      "bytes": 2699
+    },
+    {
+      "path": "comparison.json",
+      "sha256": "23ffe76215893269c3647f43e98e347550a42b4a3bb954cacb807e864141aece",
+      "bytes": 1782
+    },
+    {
+      "path": "disclosure.json",
+      "sha256": "64f2d45b63ced86f3ad15ed17631693a30be8b7941bffc01b5d484bba9471007",
+      "bytes": 764
+    }
+  ],
+  "native_evidence_location": "outputs/router_marketing_demos/demo3",
+  "terminology_sanitized_for_publication": true,
+  "values_preserved": "Prompt, answers, source fields, tool arguments/results, timestamps, and receipt hashes are preserved; private internal product terminology is replaced with Router."
+}

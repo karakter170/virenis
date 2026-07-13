@@ -1,0 +1,20 @@
+{
+  "question": "Consult both the company cost table and the Fictionland inflation brief. Then explain what is driving the company's cost pressure and suggest one practical next step.",
+  "input": "Router-selected source agents",
+  "server_owned_action": "Append the declared downstream Analysis Agent and compile both source dependencies.",
+  "user_supplied_plan": false,
+  "steps": [
+    {
+      "agent": "Company Cost Table Agent",
+      "task": "Retrieve the company cost-table facts needed by the user request."
+    },
+    {
+      "agent": "Inflation Brief Agent",
+      "task": "Retrieve the Fictionland inflation facts needed by the user request."
+    },
+    {
+      "agent": "Analysis Agent",
+      "task": "Synthesize only the validated values from both upstream handoffs. In DOMAIN_ANSWER, explain the combined cost pressure and give one practical next step without repeating bracketed source ids. Keep evidence ids only in ARTIFACTS_JSON evidence arrays."
+    }
+  ]
+}

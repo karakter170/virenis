@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="An evidence-backed viewer for the Virenis ten-document stress test."
+    />
+    <title>Virenis · Ten-document stress test</title>
+    <link rel="stylesheet" href="showcase.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#content">Skip to evidence viewer</a>
+
+    <header class="site-header">
+      <a class="brand" href="../index.html" aria-label="Back to the Virenis showcase">Virenis</a>
+      <div class="header-context">
+        <strong>Ten-document stress test</strong>
+        <span>Four evidence-backed views</span>
+      </div>
+      <p class="keyboard-hint" aria-hidden="true"><kbd>←</kbd><kbd>→</kbd> navigate</p>
+    </header>
+
+    <main id="content">
+      <section class="intro" aria-labelledby="page-title">
+        <div class="intro-copy">
+          <p class="eyebrow">Router evidence viewer</p>
+          <h1 id="page-title">Follow the route.<br />Inspect the complete result.</h1>
+          <p class="lede">
+            Review how ten documents move through the workflow, compare the two results, and
+            inspect both captured answers in full.
+          </p>
+        </div>
+
+        <aside class="evidence-card" aria-labelledby="evidence-title">
+          <p class="eyebrow" id="evidence-title">Evidence standard</p>
+          <p id="evidence-standard">
+            Full-output images must be unabridged and evidence-backed.
+          </p>
+          <div class="evidence-links">
+            <a href="../evidence/demo4/full-outputs.json">View full-output evidence</a>
+            <a href="../evidence/demo4/evidence-summary.json">View evidence summary</a>
+          </div>
+        </aside>
+      </section>
+
+      <section class="viewer" aria-labelledby="viewer-title">
+        <header class="viewer-header">
+          <div>
+            <p class="eyebrow">Captured visual</p>
+            <h2 id="viewer-title">Route</h2>
+          </div>
+          <p class="frame-count"><span id="active-number">07</span> / 10</p>
+        </header>
+
+        <figure
+          id="frame-panel"
+          role="tabpanel"
+          tabindex="0"
+          aria-labelledby="frame-tab-0"
+          aria-describedby="frame-caption asset-status evidence-standard"
+        >
+          <div class="media-stage">
+            <img
+              id="active-frame"
+              src="exports/07-ten-document-route.png"
+              alt="Route view for the ten-document stress test"
+              decoding="async"
+            />
+            <div class="asset-placeholder" id="asset-status" role="status" hidden>
+              <span>Visual pending</span>
+              <strong>The evidence asset has not been exported yet.</strong>
+              <code>exports/07-ten-document-route.png</code>
+            </div>
+          </div>
+          <figcaption id="frame-caption">07 · Route</figcaption>
+        </figure>
+
+        <nav class="frame-tabs" role="tablist" aria-label="Stress-test views">
+          <button
+            id="frame-tab-0"
+            type="button"
+            role="tab"
+            aria-selected="true"
+            aria-controls="frame-panel"
+            tabindex="0"
+            data-index="0"
+          >
+            <b>07</b><span>Route</span><small>Document flow</small>
+          </button>
+          <button
+            id="frame-tab-1"
+            type="button"
+            role="tab"
+            aria-selected="false"
+            aria-controls="frame-panel"
+            tabindex="-1"
+            data-index="1"
+          >
+            <b>08</b><span>Comparison</span><small>Results together</small>
+          </button>
+          <button
+            id="frame-tab-2"
+            type="button"
+            role="tab"
+            aria-selected="false"
+            aria-controls="frame-panel"
+            tabindex="-1"
+            data-index="2"
+          >
+            <b>09</b><span>Base full output</span><small>Unabridged answer</small>
+          </button>
+          <button
+            id="frame-tab-3"
+            type="button"
+            role="tab"
+            aria-selected="false"
+            aria-controls="frame-panel"
+            tabindex="-1"
+            data-index="3"
+          >
+            <b>10</b><span>Router full output</span><small>Unabridged answer</small>
+          </button>
+        </nav>
+      </section>
+    </main>
+
+    <footer>
+      Captured outputs and observable evidence. This demonstration is not an aggregate benchmark.
+    </footer>
+
+    <script>
+      const frames = [
+        {
+          number: "07",
+          label: "Route",
+          caption: "07 · Route",
+          src: "exports/07-ten-document-route.png",
+          alt: "Route view for the ten-document stress test"
+        },
+        {
+          number: "08",
+          label: "Comparison",
+          caption: "08 · Comparison",
+          src: "exports/08-ten-document-comparison.png",
+          alt: "Result comparison for the ten-document stress test"
+        },
+        {
+          number: "09",
+          label: "Base full output",
+          caption: "09 · Base full output",
+          src: "exports/09-base-full-output.png",
+          alt: "Unabridged captured base output"
+        },
+        {
+          number: "10",
+          label: "Router full output",
+          caption: "10 · Router full output",
+          src: "exports/10-router-full-output.png",
+          alt: "Unabridged captured Router output"
+        }
+      ];
+
+      const image = document.querySelector("#active-frame");
+      const stage = document.querySelector(".media-stage");
+      const panel = document.querySelector("#frame-panel");
+      const title = document.querySelector("#viewer-title");
+      const number = document.querySelector("#active-number");
+      const caption = document.querySelector("#frame-caption");
+      const placeholder = document.querySelector("#asset-status");
+      const placeholderPath = placeholder.querySelector("code");
+      const tabs = [...document.querySelectorAll('[role="tab"]')];
+      let active = 0;
+
+      function show(index, moveFocus = false) {
+        active = (index + frames.length) % frames.length;
+        const frame = frames[active];
+
+        image.hidden = false;
+        placeholder.hidden = true;
+        image.src = frame.src;
+        image.alt = frame.alt;
+        stage.classList.toggle("full-output", active === 2 || active === 3);
+        title.textContent = frame.label;
+        number.textContent = frame.number;
+        caption.textContent = frame.caption;
+        placeholderPath.textContent = frame.src;
+        panel.setAttribute("aria-labelledby", tabs[active].id);
+
+        tabs.forEach((tab, tabIndex) => {
+          const selected = tabIndex === active;
+          tab.setAttribute("aria-selected", String(selected));
+          tab.tabIndex = selected ? 0 : -1;
+        });
+
+        if (moveFocus) tabs[active].focus();
+      }
+
+      tabs.forEach((tab) => {
+        tab.addEventListener("click", () => show(Number(tab.dataset.index)));
+        tab.addEventListener("keydown", (event) => {
+          const keyTargets = {
+            ArrowRight: active + 1,
+            ArrowLeft: active - 1,
+            Home: 0,
+            End: frames.length - 1
+          };
+
+          if (keyTargets[event.key] === undefined) return;
+          event.preventDefault();
+          show(keyTargets[event.key], true);
+        });
+      });
+
+      image.addEventListener("load", () => {
+        image.hidden = false;
+        placeholder.hidden = true;
+      });
+
+      image.addEventListener("error", () => {
+        image.hidden = true;
+        placeholder.hidden = false;
+      });
+    </script>
+  </body>
+</html>

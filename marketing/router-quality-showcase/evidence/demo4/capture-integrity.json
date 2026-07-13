@@ -1,0 +1,260 @@
+{
+  "schema_version": "router-demo4-capture-integrity-v1",
+  "captures": {
+    "token-preflight": {
+      "raw_capture": "outputs/router_marketing_demos/demo4/token-preflight.json",
+      "raw_sha256": "4524d912df44da8ba13a455acb301e5dee4503630566d869fb183041c5cebb76",
+      "raw_bytes": 229,
+      "public_capture": "web/virenis/marketing/router-quality-showcase/evidence/demo4/token-preflight.json",
+      "public_sha256": "4524d912df44da8ba13a455acb301e5dee4503630566d869fb183041c5cebb76",
+      "public_bytes": 229
+    },
+    "runtime-health": {
+      "raw_capture": "outputs/router_marketing_demos/demo4/runtime-health.json",
+      "raw_sha256": "ff21eea641a7f044b3f00e130f68677e3b89cc4c94bc4e5ce94db90753d4522e",
+      "raw_bytes": 1542
+    },
+    "registration-d01-request": {
+      "raw_capture": "outputs/router_marketing_demos/demo4/registration-d01-request.json",
+      "raw_sha256": "ff63709335bd981bb40fb167b11b60b035e3e2641529eeb62dc53b88a1a1650a",
+      "raw_bytes": 1920
+    },
+    "registration-d01-response": {
+      "raw_capture": "outputs/router_marketing_demos/demo4/registration-d01-response.json",
+      "raw_sha256": "6ec320337ed519457ee1422f928589f557a4ff0392af719914b70d478e54539e",
+      "raw_bytes": 10513
+    },
+    "contract-d01-response": {
+      "raw_capture": "outputs/router_marketing_demos/demo4/contract-d01-response.json",
+      "raw_sha256": "12642c6121cd7b4bd72764e868ed36dda962c04445ee2cd3569176837c375e25",
+      "raw_bytes": 4851
+    },
+    "registration-d02-request": {
+      "raw_capture": "outputs/router_marketing_demos/demo4/registration-d02-request.json",
+      "raw_sha256": "89e8dbe575fe4597bcc844f469a457dbc994846f18abeef76dc686081f63aa82",
+      "raw_bytes": 1810
+    },
+    "registration-d02-response": {
+      "raw_capture": "outputs/router_marketing_demos/demo4/registration-d02-response.json",
+      "raw_sha256": "1586138bb1d047bdbf7e9f17086af8a1e48741da22c7b44a7848720544110c33",
+      "raw_bytes": 10393
+    },
+    "contract-d02-response": {
+      "raw_capture": "outputs/router_marketing_demos/demo4/contract-d02-response.json",
+      "raw_sha256": "da4099458c80a8efe86e9aa560b4764a9bb15294f0b5fa68a2d00ff089806ff4",
+      "raw_bytes": 4847
+    },
+    "registration-d03-request": {
+      "raw_capture": "outputs/router_marketing_demos/demo4/registration-d03-request.json",
+      "raw_sha256": "705a552e4786607547b13914d725bb642c7e7e2302443e615216b02ecfdd6026",
+      "raw_bytes": 1839
+    },
+    "registration-d03-response": {
+      "raw_capture": "outputs/router_marketing_demos/demo4/registration-d03-response.json",
+      "raw_sha256": "395a4feb24b9717f4822368380e76b891a0d986303469a1b017a0b210c3110b8",
+      "raw_bytes": 10751
+    },
+    "contract-d03-response": {
+      "raw_capture": "outputs/router_marketing_demos/demo4/contract-d03-response.json",
+      "raw_sha256": "e515371957293874c470896e4c8ea716064d8181ccad03ac74241781e3c550f7",
+      "raw_bytes": 4994
+    },
+    "registration-d04-request": {
+      "raw_capture": "outputs/router_marketing_demos/demo4/registration-d04-request.json",
+      "raw_sha256": "b7e0876f3b22624c0260ab1c3ac33b42507f800b4692a3003382caf24353dfcd",
+      "raw_bytes": 1790
+    },
+    "registration-d04-response": {
+      "raw_capture": "outputs/router_marketing_demos/demo4/registration-d04-response.json",
+      "raw_sha256": "e03d7c63a7399eacb903cbf386e712f6c35f68a794994b5dd45fb57518e03c52",
+      "raw_bytes": 10549
+    },
+    "contract-d04-response": {
+      "raw_capture": "outputs/router_marketing_demos/demo4/contract-d04-response.json",
+      "raw_sha256": "6fdffe2d24544508fc47ed7235875b29cd960c8e89577ca39384bd007ba41d3f",
+      "raw_bytes": 4910
+    },
+    "registration-d05-request": {
+      "raw_capture": "outputs/router_marketing_demos/demo4/registration-d05-request.json",
+      "raw_sha256": "7e1f25ed21b0b855a28c07ea223d83bece75d2f4c44fed4728699ba831bf8686",
+      "raw_bytes": 1933
+    },
+    "registration-d05-response": {
+      "raw_capture": "outputs/router_marketing_demos/demo4/registration-d05-response.json",
+      "raw_sha256": "64f47ad516e9f9300902738c81507e562ccb3cc05397ba575cd836c010efbe35",
+      "raw_bytes": 10932
+    },
+    "contract-d05-response": {
+      "raw_capture": "outputs/router_marketing_demos/demo4/contract-d05-response.json",
+      "raw_sha256": "93cd839b2652ed3db3a71f47ffa1c203fefbcbc339941c0ae72899641655b83c",
+      "raw_bytes": 5052
+    },
+    "registration-d06-request": {
+      "raw_capture": "outputs/router_marketing_demos/demo4/registration-d06-request.json",
+      "raw_sha256": "e21a48005e774ca17abc1c109835edfa5889b1e69259ff5f07256be74bf6d906",
+      "raw_bytes": 1859
+    },
+    "registration-d06-response": {
+      "raw_capture": "outputs/router_marketing_demos/demo4/registration-d06-response.json",
+      "raw_sha256": "993914f5799355637083b050d7f1a407f3be85d3e27e4d94c5e4b7fdc3abb7cb",
+      "raw_bytes": 10768
+    },
+    "contract-d06-response": {
+      "raw_capture": "outputs/router_marketing_demos/demo4/contract-d06-response.json",
+      "raw_sha256": "23863f4700724dbeddd70912b753883e71b6a0ecb6a4af2a90259ec2eefaf77a",
+      "raw_bytes": 5003
+    },
+    "registration-d07-request": {
+      "raw_capture": "outputs/router_marketing_demos/demo4/registration-d07-request.json",
+      "raw_sha256": "8f0f9545ca734af5b520e07e80c331d347318438d880f6df26a209ab40a8d810",
+      "raw_bytes": 1918
+    },
+    "registration-d07-response": {
+      "raw_capture": "outputs/router_marketing_demos/demo4/registration-d07-response.json",
+      "raw_sha256": "10b88f0190cdf319b34e133a9dad62b8988a9b148abd4f6ed9ee5f8bd6de99ab",
+      "raw_bytes": 10832
+    },
+    "contract-d07-response": {
+      "raw_capture": "outputs/router_marketing_demos/demo4/contract-d07-response.json",
+      "raw_sha256": "0cdf7d65269193f791ddea7ecfd9d6030b5b7b4c9f97fa24e678cd16918bc347",
+      "raw_bytes": 5022
+    },
+    "registration-d08-request": {
+      "raw_capture": "outputs/router_marketing_demos/demo4/registration-d08-request.json",
+      "raw_sha256": "338f9c3298516fba894e93d9701c717de90019677a14b443a8fe07cef09b087b",
+      "raw_bytes": 1881
+    },
+    "registration-d08-response": {
+      "raw_capture": "outputs/router_marketing_demos/demo4/registration-d08-response.json",
+      "raw_sha256": "79ae11f9502a05c0ff2da1c77483be3851c6d0bf1ccc86c8ac65644c1b7681bd",
+      "raw_bytes": 11153
+    },
+    "contract-d08-response": {
+      "raw_capture": "outputs/router_marketing_demos/demo4/contract-d08-response.json",
+      "raw_sha256": "e0d48e8d7d6ac9f196c4ecf5f5e82c4498e4ad0faf2148e769e9cc1e217c7d52",
+      "raw_bytes": 5165
+    },
+    "registration-d09-request": {
+      "raw_capture": "outputs/router_marketing_demos/demo4/registration-d09-request.json",
+      "raw_sha256": "d9157cf602cebb17bf0c2fe123c734e6f4507934e193da06f49ce59270a9aaa4",
+      "raw_bytes": 1932
+    },
+    "registration-d09-response": {
+      "raw_capture": "outputs/router_marketing_demos/demo4/registration-d09-response.json",
+      "raw_sha256": "3dc40a292d50d467a8ae68da2119cc8db82da22b585dfe484d739c44f7ba2088",
+      "raw_bytes": 11059
+    },
+    "contract-d09-response": {
+      "raw_capture": "outputs/router_marketing_demos/demo4/contract-d09-response.json",
+      "raw_sha256": "e07b59a3de56adb707dde3ced90df0a5c7952e0ed95e0d9af5766bbb01d428b2",
+      "raw_bytes": 5099
+    },
+    "registration-d10-request": {
+      "raw_capture": "outputs/router_marketing_demos/demo4/registration-d10-request.json",
+      "raw_sha256": "44415697ffad4fa46d4a79f33aa69bb854429a99acbfe520c99b15667d23360e",
+      "raw_bytes": 2035
+    },
+    "registration-d10-response": {
+      "raw_capture": "outputs/router_marketing_demos/demo4/registration-d10-response.json",
+      "raw_sha256": "d40d36d8dda13d7e365780e2552ef65f021df25e11a633503cf956bee5af707c",
+      "raw_bytes": 11218
+    },
+    "contract-d10-response": {
+      "raw_capture": "outputs/router_marketing_demos/demo4/contract-d10-response.json",
+      "raw_sha256": "c24f9fdac905907fa330553f42b75743d89c935437a000daf9beea95bba161ea",
+      "raw_bytes": 5175
+    },
+    "analysis-registration-request": {
+      "raw_capture": "outputs/router_marketing_demos/demo4/analysis-registration-request.json",
+      "raw_sha256": "eb7f1238605efa9bda7d0652d022ff79f84c4d146c0460b1625379a69a1fc6ee",
+      "raw_bytes": 972
+    },
+    "analysis-registration-response": {
+      "raw_capture": "outputs/router_marketing_demos/demo4/analysis-registration-response.json",
+      "raw_sha256": "ae8e92bedbad4dc3eff5040d2e3d1a28992cb7508270fa8e04e18dbe80cc06e2",
+      "raw_bytes": 5892
+    },
+    "isolated-manifest-snapshot": {
+      "raw_capture": "outputs/router_marketing_demos/demo4/isolated-manifest-snapshot.json",
+      "raw_sha256": "5bf6a9ead75b7bcc46eccabc2df5d630b8f44c471b833fd7f412d5d9eaaee458",
+      "raw_bytes": 41803
+    },
+    "router-selection-passes": {
+      "raw_capture": "outputs/router_marketing_demos/demo4/router-selection-passes.json",
+      "raw_sha256": "7ebddb89d880800e0254d3674c3562bd59c10fd83c8b3a6903634b78cb5052a4",
+      "raw_bytes": 45599,
+      "public_capture": "web/virenis/marketing/router-quality-showcase/evidence/demo4/router-selection-passes.json",
+      "public_sha256": "6f776797f3c26859fc072018def776a6e575667dc5f641162d67ff8e33611f02",
+      "public_bytes": 4887
+    },
+    "server-orchestration-request": {
+      "raw_capture": "outputs/router_marketing_demos/demo4/server-orchestration-request.json",
+      "raw_sha256": "4695a470324d163042e6bb52f918d5542f42c951278b79aece3a56b7e8a05aa5",
+      "raw_bytes": 5499,
+      "public_capture": "web/virenis/marketing/router-quality-showcase/evidence/demo4/server-orchestration-request.json",
+      "public_sha256": "73695e674ed40211bbe31f9cbb8caaada31d0aa141029d5fc9587b97190ff5dd",
+      "public_bytes": 4643
+    },
+    "base-request": {
+      "raw_capture": "outputs/router_marketing_demos/demo4/base-request.json",
+      "raw_sha256": "cad583e7c9da4f21bb33992910a590ac1421e06fc162146449c38d48cee659c7",
+      "raw_bytes": 7538,
+      "public_capture": "web/virenis/marketing/router-quality-showcase/evidence/demo4/base-request.json",
+      "public_sha256": "f33da6a3203587a7a26b928065214b5ce4832828a29afeade19af397615cd2fa",
+      "public_bytes": 7689
+    },
+    "base-response": {
+      "raw_capture": "outputs/router_marketing_demos/demo4/base-response.json",
+      "raw_sha256": "f426be8efc278863946206f6a420b18c9edf59672d5ff4d996fa086c1be4c42b",
+      "raw_bytes": 4983,
+      "public_capture": "web/virenis/marketing/router-quality-showcase/evidence/demo4/base-response.json",
+      "public_sha256": "6d3a31a38d523f9ff957d412305678f5f69cb23e7f9f51e63cb1454bb160266b",
+      "public_bytes": 4695
+    },
+    "executed-dag-response": {
+      "raw_capture": "outputs/router_marketing_demos/demo4/executed-dag-response.json",
+      "raw_sha256": "064ade445fd3aa7dd72d42d9235470be673ddb46e1bb8c97bf926f2c44254597",
+      "raw_bytes": 166638,
+      "public_capture": "web/virenis/marketing/router-quality-showcase/evidence/demo4/executed-dag-response.json",
+      "public_sha256": "744496e76a2b0e37ecb2e387de63ad6d4e2c8e27b4c8773a37a462a4ee75a59a",
+      "public_bytes": 35452
+    },
+    "execution-receipt": {
+      "raw_capture": "outputs/router_marketing_demos/demo4/execution-receipt.json",
+      "raw_sha256": "9ec56d36bfd2d4bdde7f3e234def1859c1e109c5c3fa1fb610c931f7f60b2f28",
+      "raw_bytes": 3331,
+      "public_capture": "web/virenis/marketing/router-quality-showcase/evidence/demo4/execution-receipt.json",
+      "public_sha256": "81560864390e039a91135dafb56ee94ca31994e13d597d5018381e5a95bba435",
+      "public_bytes": 849
+    },
+    "full-outputs": {
+      "raw_capture": "outputs/router_marketing_demos/demo4/full-outputs.json",
+      "raw_sha256": "7c3ac820734d5dc17f457a65677b9860dd616966a346122cb010c8c74c92cb70",
+      "raw_bytes": 11534,
+      "public_capture": "web/virenis/marketing/router-quality-showcase/evidence/demo4/full-outputs.json",
+      "public_sha256": "7c3ac820734d5dc17f457a65677b9860dd616966a346122cb010c8c74c92cb70",
+      "public_bytes": 11534
+    },
+    "document-source-registry": {
+      "raw_capture": "outputs/router_marketing_demos/demo4/document-source-registry.json",
+      "raw_sha256": "bb7d4222b3bcd4b42215145962e57ea3831f19b653ecc07e93939b1d0af12586",
+      "raw_bytes": 4176,
+      "public_capture": "web/virenis/marketing/router-quality-showcase/evidence/demo4/document-source-registry.json",
+      "public_sha256": "bb7d4222b3bcd4b42215145962e57ea3831f19b653ecc07e93939b1d0af12586",
+      "public_bytes": 4176
+    },
+    "evidence-summary": {
+      "raw_capture": "outputs/router_marketing_demos/demo4/evidence-summary.json",
+      "raw_sha256": "bdd54d757c04d2546d0de7b4ce9bc3745611568b757714a6b964d9d5f5d9269c",
+      "raw_bytes": 8473,
+      "public_capture": "web/virenis/marketing/router-quality-showcase/evidence/demo4/evidence-summary.json",
+      "public_sha256": "bdd54d757c04d2546d0de7b4ce9bc3745611568b757714a6b964d9d5f5d9269c",
+      "public_bytes": 8473
+    },
+    "cleanup-results": {
+      "raw_capture": "outputs/router_marketing_demos/demo4/cleanup-results.json",
+      "raw_sha256": "95afa79e4fea68b9ce619917ce3ab6b9f1e824fa90a7688e8e1106090ec33a06",
+      "raw_bytes": 23911
+    }
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "status": "completed",
+  "event": "execution.completed",
+  "execution_id": "router-demo2-20260713T135712Z",
+  "receipt_id": "ar_bc690276b9b44ce8857fa3083564b222",
+  "receipt_hash": "a286b768215d5049db75644634872fa0f211c545164ee45b545e0cb2c4623c45",
+  "selected_agents": [
+    "Company Cost Table Agent",
+    "Analysis Agent",
+    "Inflation Brief Agent"
+  ],
+  "evidence_note": "The completed execution receipt binds the selected agents, plan, outputs, and evidence records."
+}

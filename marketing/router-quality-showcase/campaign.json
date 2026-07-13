@@ -1,0 +1,143 @@
+{
+  "schema_version": "router-marketing-campaign-v1",
+  "prepared_at": "2026-07-13",
+  "brand": "Virenis",
+  "architecture_label": "Router",
+  "scope": "Three illustrative, evidence-backed demonstrations. No aggregate benchmark or trained domain-weight uplift is claimed.",
+  "environment": "Requested Miniconda serving environment",
+  "frames": [
+    "01-agent-team-route",
+    "02-agent-team-comparison",
+    "03-document-route",
+    "04-document-comparison",
+    "05-live-tool-route",
+    "06-live-tool-comparison"
+  ],
+  "demos": [
+    {
+      "id": "agent_team",
+      "status": "passed",
+      "prompt": "First identify the important textile-industry considerations, then create a simple business plan for a small company that makes durable tote bags from recycled textile offcuts.",
+      "base": {
+        "excerpt": "Offcuts vary in size, color, and fabric integrity. Standardization is difficult, requiring flexible design processes. Consumers increasingly demand proof of sustainability. Tracking the origin of materials (e.g., from which factory or brand) adds administrative complexity.",
+        "source": "evidence/demo1/public_comparison.json"
+      },
+      "router": {
+        "excerpt": "Product: Durable tote bags crafted from sorted and labeled recycled textile offcuts to ensure material consistency. … Sourcing: Supplier agreements defining acceptable fiber types, contamination limits, and collection frequency for incoming offcuts. Production: Incoming material is sorted by fiber and color, then tested for shrinkage and abrasion before batch approval. … Risks: Material variability in thickness and color requires rigorous sorting and testing to maintain quality standards.",
+        "source": "evidence/demo1/public_comparison.json"
+      },
+      "trace": {
+        "router_decision": "SELECTED BOTH ROLES",
+        "first_agent": "Textile Agent",
+        "first_action": "Extracts material variation, supplier rules, batch tests, and traceability controls.",
+        "first_artifact_label": "VERIFIED: INDUSTRY BRIEF",
+        "second_agent": "Business Plan Agent",
+        "second_action": "Consumes the verified brief and turns it into one complete six-part operating plan.",
+        "second_artifact_label": "VERIFIED: BUSINESS PLAN",
+        "final_label": "Textile-aware plan",
+        "final_detail": "Product · customers · sourcing · production · sales · risks"
+      },
+      "takeaway": "The verified textile brief is recorded as consumed by the Business Plan Agent.",
+      "comparison": "Both identify offcut variability. Router turns the approved brief into named sourcing, batch-test, traceability, and risk controls.",
+      "proof": {
+        "same_prompt": true,
+        "zero_effect_role_adapters": true,
+        "receipt_id": "ar_4502188c61d84b2899452f077c305ded",
+        "record_hash": "13cc128a98637f044df95ab6f88f1fff405f87d44c62b99d6583bbdde0c8b1e5",
+        "checks_source": "evidence/demo1/public_comparison.json",
+        "route_source": "evidence/demo1/public_route.json"
+      }
+    },
+    {
+      "id": "document_analysis",
+      "status": "passed",
+      "prompt": "Consult both the company cost table and the Fictionland inflation brief. Then explain what is driving the company's cost pressure and suggest one practical next step.",
+      "documents": [
+        {
+          "title": "Loom & Pine cost review",
+          "excerpt": "The clearest cost pressure comes from fabric and delivery, not wages or rent."
+        },
+        {
+          "title": "Fictionland inflation brief",
+          "excerpt": "Recent price pressure is concentrated in imported goods and transport."
+        }
+      ],
+      "base": {
+        "excerpt": "The company's cost pressure is driven by increased fabric and delivery costs, which aligns with the Fictionland inflation brief’s observation that price pressure is concentrated in imported goods and transport. A practical next step is to seek alternative suppliers for fabric or negotiate new freight contracts to mitigate these rising costs.",
+        "source": "evidence/demo2/evidence-summary.json"
+      },
+      "router": {
+        "excerpt": "The company’s cost pressure is primarily driven by rising fabric and delivery expenses, while wages and rent remain stable. This aligns with broader macro conditions where price pressures are concentrated in imported goods and transport, with domestic wages stable and imported material costs uncertain. A practical next step is to renegotiate supply contracts for imported fabrics and logistics to hedge against ongoing import cost volatility.",
+        "citations": [
+          "Cost table · cited",
+          "Inflation brief · cited"
+        ],
+        "source": "evidence/demo2/evidence-summary.json"
+      },
+      "trace": {
+        "router_decision": "Selects both document sources; no user plan or agent IDs.",
+        "first_agent": "Company Cost Table Agent",
+        "first_action": "Retrieves cost facts from Document A.",
+        "first_citation": "VERIFIED CITATION · A",
+        "second_agent": "Inflation Brief Agent",
+        "second_action": "Retrieves inflation context from Document B.",
+        "second_citation": "VERIFIED CITATION · B",
+        "analysis_agent": "Analysis Agent",
+        "analysis_action": "Server workflow passes both validated source artifacts into one downstream synthesis.",
+        "analysis_artifact": "BOTH SOURCE HANDOFFS CONSUMED"
+      },
+      "comparison": "Both find the main connection. Router preserves two source paths, unchanged-cost context, uncertainty, and a receipted downstream synthesis.",
+      "proof": {
+        "same_prompt": true,
+        "same_document_text": true,
+        "zero_effect_role_adapters": true,
+        "router_selected_two_sources": true,
+        "analysis_appended_by_server_workflow": true,
+        "receipt_id": "ar_bc690276b9b44ce8857fa3083564b222",
+        "receipt_hash": "a286b768215d5049db75644634872fa0f211c545164ee45b545e0cb2c4623c45",
+        "checks_source": "evidence/demo2/evidence-summary.json",
+        "ledger_source": "evidence/demo2/capture-integrity.json"
+      }
+    },
+    {
+      "id": "live_tool",
+      "status": "passed",
+      "prompt": "What is the latest earthquake in the past hour? Give the place and time.",
+      "base": {
+        "excerpt": "I do not have access to real-time data, so I cannot provide information on earthquakes that occurred in the past hour. For the latest seismic activity, please consult a live monitoring service such as the USGS Earthquake Hazards Program or the EMSC.",
+        "source": "evidence/demo3/comparison.json"
+      },
+      "router": {
+        "excerpt": "The latest earthquake was a magnitude 1.14 event located 3 km NW of The Geysers, CA, occurring at 2026-07-13T13:37:46.430Z according to USGS.",
+        "source": "evidence/demo3/comparison.json"
+      },
+      "feed": {
+        "generated_utc": "2026-07-13T13:41:24.000Z",
+        "source_label": "USGS · ALL_HOUR.GEOJSON",
+        "event": {
+          "id": "nc75394921",
+          "title": "M 1.1 - 3 km NW of The Geysers, CA",
+          "time_utc": "2026-07-13T13:37:46.430Z"
+        }
+      },
+      "trace": {
+        "router_decision": "Matches “latest earthquake” to the live-events route.",
+        "route_artifact": "SELECTED: LIVE EVENTS AGENT",
+        "agent": "Live Events Agent",
+        "agent_action": "Requests the fixed official past-hour feed before answering.",
+        "tool_request": "TOOL: EARTHQUAKE_FEED · LIMIT 1"
+      },
+      "takeaway": "Tool input, output, source timestamp, and final execution are content-addressed.",
+      "comparison": "Base correctly states its limit. Router adds a verified, timestamped live source and answers from that captured snapshot.",
+      "proof": {
+        "same_prompt": true,
+        "zero_effect_role_adapter": true,
+        "tool_output_digest_verified": true,
+        "execution_output_digest_verified": true,
+        "record_hash": "95dc3467deaa369ab77d4ae27dbaecccd3c7d49459e26e9d375ab008b5fc76a9",
+        "comparison_source": "evidence/demo3/comparison.json",
+        "snapshot_source": "evidence/demo3/usgs_tool_snapshot.json"
+      }
+    }
+  ]
+}
