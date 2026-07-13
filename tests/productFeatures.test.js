@@ -8,6 +8,8 @@ import {
   graphConnectionInputs,
   graphConnectionWouldCycle,
   graphConnections,
+  graphEdgePath,
+  graphPositionFromPointer,
   initialGraphPositions,
   storedGraphPositions
 } from "../src/App.jsx";
@@ -41,6 +43,7 @@ describe("Agent Studio product surfaces", () => {
     expect(new Set(graphButtons.map((match) => match[0].match(/tone-\d/)?.[0])).size).toBe(2);
     expect(graphButtons.every((match) => !match[1].includes("<svg"))).toBe(true);
     expect(markup).toContain("Connect agents");
+    expect(markup).toContain('preserveAspectRatio="none"');
     expect(markup).not.toMatch(/LoRA|adapter model/i);
   });
 
@@ -108,6 +111,20 @@ describe("Agent Studio product surfaces", () => {
     expect(graphConnectionWouldCycle(edges, "writing_agent", "research_agent")).toBe(true);
     expect(graphConnectionWouldCycle(edges, "research_agent", "writing_agent")).toBe(false);
     expect(graphConnectionWouldCycle(edges, "research_agent", "research_agent")).toBe(true);
+  });
+
+  it("recomputes connected paths from live drag coordinates", () => {
+    const bounds = { left: 100, top: 50, width: 900, height: 560 };
+    const originalSource = graphPositionFromPointer(bounds, 200, 150);
+    const movedSource = graphPositionFromPointer(bounds, 500, 350);
+    const destination = graphPositionFromPointer(bounds, 800, 450);
+    const originalPath = graphEdgePath(originalSource, destination);
+    const movedPath = graphEdgePath(movedSource, destination);
+
+    expect(originalSource).toEqual({ x: 100, y: 100 });
+    expect(movedSource).toEqual({ x: 400, y: 300 });
+    expect(movedPath).not.toEqual(originalPath);
+    expect(movedPath).toMatch(/^M 400 300 C /);
   });
 
   it("restores persisted graph positions defensively and clamps unsafe coordinates", () => {

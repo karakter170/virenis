@@ -1319,10 +1319,23 @@ summary:focus-visible,
   font-style: normal;
 }
 
-.agent-graph {
-  position: relative;
+.graph-workspace {
   min-height: 0;
   flex: 1;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
+}
+
+.graph-workspace.has-inspector {
+  grid-template-columns: minmax(0, 1fr) minmax(250px, 300px);
+}
+
+.agent-graph {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
   overflow: hidden;
   border: 1px solid #d8e1dc;
   border-radius: 18px;
@@ -1431,7 +1444,7 @@ summary:focus-visible,
   border-color: var(--graph-node-color);
   color: var(--graph-node-color);
   box-shadow: 0 0 0 4px var(--graph-node-ring), 0 10px 24px rgba(34, 55, 44, 0.16);
-  transform: translate(-50%, -50%) translateY(-2px);
+  transform: translate(-50%, -50%);
 }
 
 .graph-node.connection-source {
@@ -1464,12 +1477,11 @@ summary:focus-visible,
 }
 
 .graph-inspector {
-  position: absolute;
-  z-index: 7;
-  right: 14px;
-  bottom: 14px;
-  width: min(340px, calc(100% - 28px));
-  max-height: calc(100% - 28px);
+  position: relative;
+  z-index: 1;
+  min-width: 0;
+  width: 100%;
+  max-height: 100%;
   overflow-y: auto;
   border: 1px solid var(--line);
   border-radius: 14px;
@@ -3526,9 +3538,19 @@ summary:focus-visible,
     width: 132px;
   }
 
+  .graph-workspace,
+  .graph-workspace.has-inspector {
+    flex: 0 0 auto;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
   .agent-graph {
-    flex: 0 0 480px;
+    height: 480px;
     min-height: 480px;
+  }
+
+  .graph-inspector {
+    max-height: 240px;
   }
 
   .graph-legend {

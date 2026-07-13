@@ -1822,6 +1822,29 @@ export function graphConnectionWouldCycle(edges = [], sourceId, destinationId) {
   return false;
 }
 
+export function graphPositionFromPointer(bounds, clientX, clientY) {
+  const width = Number(bounds?.width);
+  const height = Number(bounds?.height);
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+    return null;
+  }
+  const x = ((Number(clientX) - Number(bounds.left || 0)) / width) * 900;
+  const y = ((Number(clientY) - Number(bounds.top || 0)) / height) * 560;
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+  return {
+    x: Math.max(64, Math.min(836, x)),
+    y: Math.max(44, Math.min(516, y))
+  };
+}
+
+export function graphEdgePath(from, to) {
+  if (!from || !to) return "";
+  const direction = to.x >= from.x ? 1 : -1;
+  const bend = Math.max(42, Math.min(145, Math.abs(to.x - from.x) * 0.42));
+  const verticalOffset = Math.abs(to.x - from.x) < 40 ? 52 : 0;
+  return `M ${from.x} ${from.y} C ${from.x + direction * bend + verticalOffset} ${from.y}, ${to.x - direction * bend + verticalOffset} ${to.y}, ${to.x} ${to.y}`;
+}
+
 function graphTone(agentId) {
   return [...String(agentId || "agent")]
     .reduce((value, character) => value + character.charCodeAt(0), 0) % 6;
@@ -1886,6 +1909,7 @@ export function AgentGraph({ agents, auth, storageKey, onConnect, onDisconnect }
   const [connectionBusy, setConnectionBusy] = useState(false);
   const [graphError, setGraphError] = useState("");
   const canvasRef = useRef(null);
+  const dragStateRef = useRef(null);
   const draggedRef = useRef(false);
   const edges = graphConnections(graphAgents);
   const focusedAgent = graphAgents.find((agent) => agent.id === focusedId);
@@ -1908,34 +1932,44 @@ export function AgentGraph({ agents, auth, storageKey, onConnect, onDisconnect }
     }
   }, [graphAgentIds, positions, storageKey]);
 
-  function dragNode(event, agentId) {
+  function beginNodeDrag(event, agentId) {
     if (connectMode || connectionBusy) return;
-    const node = event.currentTarget;
-    const startX = event.clientX;
-    const startY = event.clientY;
     draggedRef.current = false;
-    node.setPointerCapture(event.pointerId);
-    function move(moveEvent) {
-      const bounds = canvasRef.current?.getBoundingClientRect();
-      if (!bounds) return;
-      if (Math.hypot(moveEvent.clientX - startX, moveEvent.clientY - startY) > 4) {
-        draggedRef.current = true;
-      }
-      const x = ((moveEvent.clientX - bounds.left) / bounds.width) * 900;
-      const y = ((moveEvent.clientY - bounds.top) / bounds.height) * 560;
-      setPositions((current) => ({
-        ...current,
-        [agentId]: { x: Math.max(64, Math.min(836, x)), y: Math.max(44, Math.min(516, y)) }
-      }));
+    dragStateRef.current = {
+      agentId,
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY
+    };
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+  }
+
+  function moveNode(event) {
+    const drag = dragStateRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    if (!draggedRef.current && Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) <= 4) {
+      return;
     }
-    function stop() {
-      node.removeEventListener("pointermove", move);
-      node.removeEventListener("pointerup", stop);
-      node.removeEventListener("pointercancel", stop);
+    draggedRef.current = true;
+    const nextPosition = graphPositionFromPointer(
+      canvasRef.current?.getBoundingClientRect(),
+      event.clientX,
+      event.clientY
+    );
+    if (!nextPosition) return;
+    setPositions((current) => ({
+      ...current,
+      [drag.agentId]: nextPosition
+    }));
+  }
+
+  function endNodeDrag(event) {
+    const drag = dragStateRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    if (event.currentTarget.hasPointerCapture?.(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
     }
-    node.addEventListener("pointermove", move);
-    node.addEventListener("pointerup", stop);
-    node.addEventListener("pointercancel", stop);
+    dragStateRef.current = null;
   }
 
   function resetLayout() {
@@ -2014,16 +2048,6 @@ export function AgentGraph({ agents, auth, storageKey, onConnect, onDisconnect }
     }
   }
 
-  function edgePath(edge) {
-    const from = positions[edge.from];
-    const to = positions[edge.to];
-    if (!from || !to) return "";
-    const direction = to.x >= from.x ? 1 : -1;
-    const bend = Math.max(42, Math.min(145, Math.abs(to.x - from.x) * 0.42));
-    const verticalOffset = Math.abs(to.x - from.x) < 40 ? 52 : 0;
-    return `M ${from.x} ${from.y} C ${from.x + direction * bend + verticalOffset} ${from.y}, ${to.x - direction * bend + verticalOffset} ${to.y}, ${to.x} ${to.y}`;
-  }
-
   return (
     <section className="resource-section graph-section" aria-labelledby="graph-heading">
       <div className="graph-heading-row">
@@ -2043,8 +2067,9 @@ export function AgentGraph({ agents, auth, storageKey, onConnect, onDisconnect }
         {connectFromId && <strong>From: {formatAgentName(connectFromId, agents)}</strong>}
         {graphError && <em>{graphError}</em>}
       </div>
-      <div className={`agent-graph ${connectMode ? "is-connecting" : ""}`} ref={canvasRef}>
-        <svg viewBox="0 0 900 560" role="img" aria-label="Interactive agent mind map">
+      <div className={`graph-workspace ${focusedAgent && !connectMode ? "has-inspector" : ""}`}>
+        <div className={`agent-graph ${connectMode ? "is-connecting" : ""}`} ref={canvasRef}>
+        <svg viewBox="0 0 900 560" preserveAspectRatio="none" role="img" aria-label="Interactive agent mind map">
           <defs>
             <marker id="graph-arrow-handoff" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
               <path d="M0,0 L7,3.5 L0,7 Z" />
@@ -2054,15 +2079,16 @@ export function AgentGraph({ agents, auth, storageKey, onConnect, onDisconnect }
             </marker>
           </defs>
           {edges.map((edge) => {
-            const path = edgePath(edge);
+            const path = graphEdgePath(positions[edge.from], positions[edge.to]);
             if (!path) return null;
             const related = focusedId && (edge.from === focusedId || edge.to === focusedId);
             return (
               <g className={`graph-edge ${edge.kind} ${related ? "related" : ""}`} key={`${edge.from}-${edge.to}-${edge.kind}`}>
-                <path className="edge-line" d={path} markerEnd={`url(#graph-arrow-${edge.kind})`} />
+                <path className="edge-line" d={path} markerEnd={`url(#graph-arrow-${edge.kind})`} vectorEffect="non-scaling-stroke" />
                 <path
                   className="edge-hit"
                   d={path}
+                  vectorEffect="non-scaling-stroke"
                   role="button"
                   tabIndex="0"
                   aria-label={`${formatAgentName(edge.from, agents)} sends work to ${formatAgentName(edge.to, agents)}`}
@@ -2084,7 +2110,10 @@ export function AgentGraph({ agents, auth, storageKey, onConnect, onDisconnect }
               className={`graph-node tone-${graphTone(agent.id)} ${focusedId === agent.id ? "focused" : ""} ${connectFromId === agent.id ? "connection-source" : ""} ${agent.session_active === false ? "inactive" : ""}`}
               style={{ left: `${(position.x / 900) * 100}%`, top: `${(position.y / 560) * 100}%` }}
               key={agent.id}
-              onPointerDown={(event) => dragNode(event, agent.id)}
+              onPointerDown={(event) => beginNodeDrag(event, agent.id)}
+              onPointerMove={moveNode}
+              onPointerUp={endNodeDrag}
+              onPointerCancel={endNodeDrag}
               onClick={() => chooseNode(agent)}
               title={agentFacingText(agent.capability || agent.title)}
             >
@@ -2094,6 +2123,7 @@ export function AgentGraph({ agents, auth, storageKey, onConnect, onDisconnect }
           );
         })}
         {graphAgents.length === 0 && <p className="graph-empty">Create an agent to start mapping your team.</p>}
+        </div>
         {focusedAgent && !connectMode && (
           <aside className="graph-inspector" aria-label={`${formatAgentName(focusedId, agents)} connections`}>
             <header><span>SELECTED AGENT</span><button type="button" aria-label="Close agent details" onClick={() => setFocusedId(null)}><X size={14} /></button></header>
