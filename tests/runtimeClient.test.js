@@ -3,7 +3,13 @@ import net from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { fetchRuntimeAgents, requireRuntimeConfigured, runtimeRequest } from "../server/runtimeClient.js";
+import {
+  fetchRuntimeAgents,
+  registerRuntimeAgent,
+  requireRuntimeConfigured,
+  runtimeRequest,
+  updateRuntimeAgent
+} from "../server/runtimeClient.js";
 
 const ENVIRONMENT_KEYS = [
   "TCAR_RUNTIME_API_URL",
@@ -192,6 +198,79 @@ describe("TCAR runtime HTTP transport", () => {
         private_field: "retained-for-admin-redaction"
       }
     });
+  });
+
+  it("sends only fields accepted by the live agent lifecycle contract", async () => {
+    const requests = [];
+    const runtime = await startHttpServer(async (request, response) => {
+      requests.push({ method: request.method, path: request.url, body: await readRequest(request) });
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ ok: true }));
+    });
+    configureRuntime(runtime.url);
+
+    await registerRuntimeAgent({
+      id: "textile_agent",
+      title: "Textile Agent",
+      capability: "Analyzes textile operations.",
+      boundary: "Labels assumptions.",
+      consumes: ["user_request"],
+      produces: ["industry_context"],
+      routing_cues: ["textile"],
+      resources: [],
+      tools: ["web_search"],
+      sources: [],
+      policies: { source_policy: "Use approved current sources." },
+      stage: 20,
+      registration_id: "registration_contract_test",
+      audit_context: { user_id: "alice" },
+      item_type: "agent",
+      execution: { type: "api", model: "inherit" },
+      visibility: "private",
+      workspace_id: "workspace_a",
+      ready: true
+    });
+    await updateRuntimeAgent("textile_agent", {
+      title: "Textile Specialist",
+      enabled: true,
+      policies: { source_policy: "Use evidence." },
+      audit_context: { user_id: "alice" },
+      item_type: "agent",
+      license: "private"
+    });
+
+    expect(requests).toEqual([
+      {
+        method: "POST",
+        path: "/agents",
+        body: {
+          id: "textile_agent",
+          title: "Textile Agent",
+          capability: "Analyzes textile operations.",
+          boundary: "Labels assumptions.",
+          consumes: ["user_request"],
+          produces: ["industry_context"],
+          routing_cues: ["textile"],
+          resources: [],
+          tools: ["web_search"],
+          sources: [],
+          policies: { source_policy: "Use approved current sources." },
+          stage: 20,
+          registration_id: "registration_contract_test",
+          audit_context: { user_id: "alice" }
+        }
+      },
+      {
+        method: "PATCH",
+        path: "/agents/textile_agent",
+        body: {
+          title: "Textile Specialist",
+          policies: { source_policy: "Use evidence." },
+          enabled: true,
+          audit_context: { user_id: "alice" }
+        }
+      }
+    ]);
   });
 
   it("rejects invalid transport bounds before opening a socket", async () => {

@@ -47,7 +47,7 @@ describe("Agent Studio product surfaces", () => {
     expect(markup).not.toMatch(/LoRA|adapter model/i);
   });
 
-  it("keeps the complete mounted agent catalog available to the session picker", () => {
+  it("keeps the complete active API-agent catalog available to the session picker", () => {
     const specialists = Array.from({ length: 9 }, (_, index) => ({
       id: `specialist_${index}`,
       item_type: "agent",
@@ -59,12 +59,12 @@ describe("Agent Studio product surfaces", () => {
       ...specialists,
       { id: "ordinary_agent", item_type: "agent", enabled: true, mounted: true },
       { id: "archived_agent", item_type: "agent", enabled: false, mounted: true },
-      { id: "pending_agent", item_type: "agent", enabled: true, mounted: false },
+      { id: "api_agent_with_legacy_mount_flag", item_type: "agent", enabled: true, mounted: false },
       { id: "document_agent", item_type: "agent", enabled: true, mounted: true, document: { source: "fixture" } }
     ]);
 
-    expect(available).toHaveLength(10);
-    expect(available.filter((agent) => agent.session_active !== false)).toHaveLength(9);
+    expect(available).toHaveLength(11);
+    expect(available.filter((agent) => agent.session_active !== false)).toHaveLength(10);
   });
 
   it("builds directed handoff/knowledge edges and bounded large-graph positions", () => {

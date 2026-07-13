@@ -642,7 +642,24 @@ export function executeRuntimeChat({ query, sharedMemory = [], options = {}, exe
 export function registerRuntimeAgent(agent) {
   return runtimeRequest("/agents", {
     method: "POST",
-    body: agent,
+    body: selectFields(agent, [
+      "id",
+      "title",
+      "capability",
+      "boundary",
+      "consumes",
+      "produces",
+      "routing_cues",
+      "resources",
+      "tools",
+      "sources",
+      "policies",
+      "stage",
+      "source_text",
+      "overwrite",
+      "registration_id",
+      "audit_context"
+    ]),
     timeoutMs: Number(process.env.TCAR_RUNTIME_ADMIN_TIMEOUT_MS || 180000)
   });
 }
@@ -650,9 +667,33 @@ export function registerRuntimeAgent(agent) {
 export function updateRuntimeAgent(agentId, patch) {
   return runtimeRequest(`/agents/${encodeURIComponent(agentId)}`, {
     method: "PATCH",
-    body: patch,
+    body: selectFields(patch, [
+      "title",
+      "capability",
+      "boundary",
+      "consumes",
+      "produces",
+      "routing_cues",
+      "resources",
+      "tools",
+      "sources",
+      "policies",
+      "stage",
+      "enabled",
+      "source_text",
+      "audit_context"
+    ]),
     timeoutMs: Number(process.env.TCAR_RUNTIME_ADMIN_TIMEOUT_MS || 180000)
   });
+}
+
+function selectFields(value, allowedFields) {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  return Object.fromEntries(
+    allowedFields
+      .filter((field) => source[field] !== undefined)
+      .map((field) => [field, source[field]])
+  );
 }
 
 export function mountRuntimeAgent(agentId, auditContext = {}) {

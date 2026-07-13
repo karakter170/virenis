@@ -24,7 +24,7 @@ export function slugify(value) {
 
 export function assertSafeSourcePath(sourcePath) {
   const normalized = sourcePath.replaceAll("\\", "/");
-  const allowed = normalized.startsWith("sources/tcar_documents/") || normalized.startsWith("sources/tcar_dummy_loras/");
+  const allowed = normalized.startsWith("sources/tcar_documents/") || normalized.startsWith("sources/router_agents/");
   if (!allowed || normalized.includes("..")) {
     const error = new Error("Source path must stay under approved TCAR source roots.");
     error.status = 400;
@@ -358,7 +358,7 @@ export function validateRuntimeDocumentResult(result, {
   if (!isPlainObject(result)) {
     throw runtimeDocumentContractError("result must be an object");
   }
-  if (!/^[a-z0-9_]+_lora$/.test(String(agentId || ""))) {
+  if (!/^[a-z0-9][a-z0-9_]{0,119}$/.test(String(agentId || ""))) {
     throw runtimeDocumentContractError("request agent id is invalid");
   }
   if (!/^[a-z0-9_]+$/.test(String(slug || ""))) {

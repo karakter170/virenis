@@ -64,7 +64,7 @@ async function createAgent(
       source_text: sourceText
     })
     .expect(201);
-  expect(response.body.mounted).toBe(true);
+  expect(response.body.ready).toBe(true);
   return response.body;
 }
 
@@ -300,7 +300,7 @@ describe("execution provenance and Outcome Contracts", () => {
     const upload = await request(app)
       .post("/api/documents")
       .field("title", "Disposable cold chain fixture")
-      .field("agent_id", "disposable_cold_chain_lora")
+      .field("agent_id", "disposable_cold_chain")
       .field("routing_cues", "disposable cold chain")
       .attach(
         "file",
@@ -318,7 +318,7 @@ describe("execution provenance and Outcome Contracts", () => {
     expect(deleted.body).toMatchObject({
       status: "deleted",
       document_id: upload.body.document_id,
-      agent_id: "disposable_cold_chain_lora"
+      agent_id: "disposable_cold_chain"
     });
     expect(deleted.body.corpus_revision).toMatch(/^sha256:[a-f0-9]{64}$/);
     await expect(fs.access(storedRoot)).rejects.toMatchObject({ code: "ENOENT" });
@@ -329,9 +329,9 @@ describe("execution provenance and Outcome Contracts", () => {
       .post(`/api/documents/${upload.body.document_id}/search`)
       .send({ query: "threshold" })
       .expect(410);
-    const agent = await request(app).get("/api/agents/disposable_cold_chain_lora").expect(200);
+    const agent = await request(app).get("/api/agents/disposable_cold_chain").expect(200);
     expect(agent.body.enabled).toBe(false);
-    const events = await request(app).get("/api/agents/disposable_cold_chain_lora/events").expect(200);
+    const events = await request(app).get("/api/agents/disposable_cold_chain/events").expect(200);
     expect(events.body.events.at(-1).event_type).toBe("document_agent.deleted");
     expect(events.body.event_chain_valid).toBe(true);
   });

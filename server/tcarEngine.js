@@ -999,7 +999,7 @@ function runtimeOutputToRunStep({ run_id, output, parallel }) {
     step_id: output.id,
     adapter: output.adapter,
     agent_revision: normalizeSha256Digest(output.agent_revision),
-    adapter_digest: normalizeSha256Digest(output.adapter_content_digest || output.adapter_digest),
+    adapter_digest: normalizeSha256Digest(output.agent_content_digest || output.adapter_content_digest || output.adapter_digest),
     model_id: output.model_id || null,
     model_calls_admin_only: normalizeArtifactValue(output.model_calls || []),
     task: output.task || "",
@@ -1131,7 +1131,7 @@ function isApprovedCitationPath(sourcePath, approvedSources) {
   if (
     normalized.startsWith("/") ||
     normalized.includes("..") ||
-    !(normalized.startsWith("sources/tcar_documents/") || normalized.startsWith("sources/tcar_dummy_loras/"))
+    !(normalized.startsWith("sources/tcar_documents/") || normalized.startsWith("sources/router_agents/"))
   ) {
     return false;
   }
@@ -1581,20 +1581,20 @@ function synthesizeFinalAnswer(query, outputs) {
 }
 
 export function runtimeHealth(data) {
-  const mountedLoras = data.agents.filter((agent) => agent.mounted !== false).length;
   return {
     ok: true,
-    vllm: {
+    model_api: {
       base_url: process.env.VLLM_BASE_URL || DEFAULT_VLLM_BASE_URL,
       models_endpoint_ok: false,
       base_model: process.env.VLLM_BASE_MODEL || BASE_MODEL,
-      mounted_loras: mountedLoras,
       mode: "local deterministic TCAR simulator"
     },
     manifest: {
-      path: process.env.PHASE222_ADAPTER_MANIFEST || "configs/tcar_lora_library.json",
-      adapters: data.agents.length,
-      valid: data.agents.every((agent) => agent.id.endsWith("_lora") && agent.title && agent.capability)
+      path: process.env.PHASE222_ADAPTER_MANIFEST || "configs/router_agent_library.json",
+      agents: data.agents.length,
+      active_agents: data.agents.filter((agent) => agent.enabled !== false).length,
+      archived_agents: data.agents.filter((agent) => agent.enabled === false).length,
+      valid: data.agents.every((agent) => /^[a-z0-9][a-z0-9_]{0,119}$/.test(agent.id) && agent.title && agent.capability)
     }
   };
 }

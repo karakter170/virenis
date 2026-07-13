@@ -693,11 +693,11 @@ describe("runtime and catalog", () => {
         .set("Authorization", `Bearer ${userToken}`)
         .expect(200);
       expect(userHealth.body.ok).toBe(true);
-      expect(userHealth.body.manifest.adapters).toBe(18);
+      expect(userHealth.body.manifest.agents).toBe(18);
       expect(userHealth.body.manifest.path).toBeUndefined();
-      expect(userHealth.body.vllm.base_model).toBe("qwen36-awq");
-      expect(userHealth.body.vllm.base_url).toBeUndefined();
-      expect(userHealth.body.vllm.health).toEqual({ ok: true, status: 200 });
+      expect(userHealth.body.model_api.base_model).toBe("qwen36-awq");
+      expect(userHealth.body.model_api.base_url).toBeUndefined();
+      expect(userHealth.body.model_api.health).toEqual({ ok: true, status: 200 });
       expect(userHealth.body.router).toEqual({
         mode: "tcandon",
         model: "tcandon-router",
@@ -1025,12 +1025,12 @@ describe("runtime and catalog", () => {
   it("reports seeded runtime health and mounted model names", async () => {
     const health = await request(app).get("/api/runtime/health").expect(200);
     expect(health.body.ok).toBe(true);
-    expect(health.body.manifest.adapters).toBeGreaterThanOrEqual(17);
-    expect(health.body.vllm.mode).toContain("simulator");
+    expect(health.body.manifest.agents).toBeGreaterThanOrEqual(17);
+    expect(health.body.model_api.mode).toContain("simulator");
 
     const models = await request(app).get("/api/runtime/models").expect(200);
     expect(models.body.models.some((model) => model.id === "qwen36-awq")).toBe(true);
-    expect(models.body.models.some((model) => model.id === "legal_privacy_lora")).toBe(true);
+    expect(models.body.models).toHaveLength(1);
   });
 
   it("marks async chat runs failed if the background processor rejects outside normal handling", async () => {
@@ -1192,11 +1192,11 @@ describe("runtime and catalog", () => {
   it("validates custom agent ids and blocks duplicate routes", async () => {
     await request(app)
       .post("/api/agents")
-      .send({ id: "bad", title: "Bad", capability: "Bad", boundary: "Bad" })
+      .send({ id: "Bad-ID", title: "Bad", capability: "Bad", boundary: "Bad" })
       .expect(400);
 
     const payload = {
-      id: "demo_policy_lora",
+      id: "demo_policy",
       title: "Demo policy route",
       capability: "Handles a demo policy.",
       boundary: "Do not invent policy.",
@@ -1244,27 +1244,33 @@ describe("runtime and catalog", () => {
     expect(reenabled.body.inactive_agent_ids).not.toContain("legal_privacy_lora");
   });
 
-  it("publishes existing agents and LoRAs with proofs and upserted ratings", async () => {
+  it("publishes API agents with proofs and upserted ratings", async () => {
     await request(app)
       .post("/api/agents")
       .send({
-        id: "market_clinical_lora",
-        title: "Clinical language adapter",
+        id: "retired_model_adapter",
+        title: "Retired model adapter",
+        capability: "Should not be accepted.",
+        boundary: "None.",
+        item_type: "lora"
+      })
+      .expect(410);
+
+    await request(app)
+      .post("/api/agents")
+      .send({
+        id: "market_clinical_agent",
+        title: "Clinical language agent",
         capability: "Rewrites technical clinical language for patients.",
-        boundary: "Preserve clinical meaning and state uncertainty.",
-        item_type: "lora",
-        base_model: "qwen36-awq",
-        adapter_source: "https://huggingface.co/example/clinical-adapter",
-        trigger_words: ["patient safe", "clinical summary"],
-        license: "Apache-2.0"
+        boundary: "Preserve clinical meaning and state uncertainty."
       })
       .expect(201);
 
     await request(app)
-      .post("/api/marketplace/items/market_clinical_lora")
+      .post("/api/marketplace/items/market_clinical_agent")
       .send({
-        item_type: "lora",
-        summary: "A patient-safe clinical rewriting LoRA.",
+        item_type: "agent",
+        summary: "A patient-safe clinical rewriting agent.",
         achievements: ["92% terminology preservation on a held-out set"],
         proofs: [{ title: "Evaluation report", url: "https://example.com/evaluation" }],
         version: "1.2",
@@ -1272,31 +1278,30 @@ describe("runtime and catalog", () => {
       })
       .expect(201);
 
-    const listed = await request(app).get("/api/marketplace?type=lora").expect(200);
-    const item = listed.body.items.find((entry) => entry.id === "market_clinical_lora");
+    const listed = await request(app).get("/api/marketplace?type=agent").expect(200);
+    const item = listed.body.items.find((entry) => entry.id === "market_clinical_agent");
     expect(item).toMatchObject({
-      item_type: "lora",
+      item_type: "agent",
       version: "1.2",
       rating_count: 0,
       rating_average: 0
     });
     expect(item.proofs).toEqual([{ title: "Evaluation report", url: "https://example.com/evaluation" }]);
     expect(item.achievements).toEqual(["92% terminology preservation on a held-out set"]);
-    expect(item.adapter_source).toBeUndefined();
 
     const creatorSearch = await request(app)
       .get(`/api/marketplace?q=${encodeURIComponent(item.creator)}`)
       .expect(200);
-    expect(creatorSearch.body.items.some((entry) => entry.id === "market_clinical_lora")).toBe(true);
+    expect(creatorSearch.body.items.some((entry) => entry.id === "market_clinical_agent")).toBe(true);
 
     const firstRating = await request(app)
-      .post("/api/marketplace/items/market_clinical_lora/ratings")
+      .post("/api/marketplace/items/market_clinical_agent/ratings")
       .send({ score: 4, review: "Strong terminology preservation." })
       .expect(201);
     expect(firstRating.body).toMatchObject({ rating_average: 4, rating_count: 1 });
 
     const updatedRating = await request(app)
-      .post("/api/marketplace/items/market_clinical_lora/ratings")
+      .post("/api/marketplace/items/market_clinical_agent/ratings")
       .send({ score: 5, review: "Excellent after broader testing." })
       .expect(201);
     expect(updatedRating.body).toMatchObject({ rating_average: 5, rating_count: 1 });
@@ -1306,12 +1311,12 @@ describe("runtime and catalog", () => {
     ]);
 
     await request(app)
-      .post("/api/marketplace/items/market_clinical_lora/ratings")
+      .post("/api/marketplace/items/market_clinical_agent/ratings")
       .send({ score: 6, review: "Invalid score." })
       .expect(400);
 
     await request(app)
-      .post("/api/marketplace/items/market_clinical_lora")
+      .post("/api/marketplace/items/market_clinical_agent")
       .send({ proofs: [{ title: "Unsafe link", url: "http://example.com/report" }] })
       .expect(400);
   });
@@ -1452,7 +1457,7 @@ describe("runtime and catalog", () => {
     }
   });
 
-  it("allows only an agent owner to retry a pending runtime mount", async () => {
+  it("rejects retired runtime mount operations without contacting the model API", async () => {
     const previous = {
       mode: process.env.TCAR_ENGINE_MODE,
       url: process.env.TCAR_RUNTIME_API_URL,
@@ -1518,41 +1523,15 @@ describe("runtime and catalog", () => {
         .post("/api/agents/alice_pending_lora/mount")
         .set("Authorization", "Bearer token_bob")
         .send({})
-        .expect(404);
+        .expect(410);
       expect(calls).toHaveLength(0);
 
-      const mounted = await request(realApp)
+      await request(realApp)
         .post("/api/agents/alice_pending_lora/mount")
         .set("Authorization", "Bearer token_alice")
         .send({})
-        .expect(200);
-      expect(mounted.body).toMatchObject({
-        ok: true,
-        status: "mounted",
-        id: "alice_pending_lora",
-        mounted: true,
-        requires_vllm_reload: false,
-        agent: {
-          id: "alice_pending_lora",
-          workspace_id: "workspace_a",
-          visibility: "private",
-          created_by: "alice",
-          mounted: true,
-          requires_vllm_reload: false
-        }
-      });
-      expect(mounted.body.runtime).toBeUndefined();
-      expect(mounted.body.agent.adapter_path).toBeUndefined();
-      expect(calls).toEqual([{ method: "POST", pathName: "/agents/alice_pending_lora/mount" }]);
-
-      const stored = realApp.locals.store.read().agents.find((agent) => agent.id === "alice_pending_lora");
-      expect(stored).toMatchObject({
-        workspace_id: "workspace_a",
-        visibility: "private",
-        created_by: "alice",
-        mounted: true,
-        requires_vllm_reload: false
-      });
+        .expect(410);
+      expect(calls).toHaveLength(0);
     } finally {
       await realApp?.locals?.drainBackgroundTasks?.({ timeoutMs: 5000 });
       await realApp?.locals?.store?.close?.();
@@ -1689,11 +1668,11 @@ describe("runtime and catalog", () => {
       await request(app)
         .post("/api/agents")
         .send({
-          id: "source_too_large_lora",
+          id: "source_too_large",
           title: "Source too large",
           capability: "Tests source size.",
           boundary: "Stay scoped.",
-          sources: "sources/tcar_dummy_loras/source_too_large/source.md",
+          sources: "sources/router_agents/source_too_large/source.md",
           source_text: "x".repeat(6)
         })
         .expect(413);
@@ -1702,7 +1681,7 @@ describe("runtime and catalog", () => {
       await request(app)
         .patch("/api/agents/legal_privacy_lora")
         .send({
-          sources: "sources/tcar_dummy_loras/legal_privacy/source.md",
+          sources: "sources/router_agents/legal_privacy_lora/source.md",
           source_text: "x".repeat(6)
         })
         .expect(413);
@@ -1727,11 +1706,11 @@ describe("runtime and catalog", () => {
         .post("/api/agents")
         .set("Authorization", "Bearer private_source_user")
         .send({
-          id: "cross_source_lora",
+          id: "cross_source",
           title: "Cross source",
           capability: "Must not read another agent's source.",
           boundary: "Use owned sources only.",
-          sources: "sources/tcar_dummy_loras/refund_policy/refund_policy.md"
+          sources: "sources/router_agents/refund_policy/source.md"
         })
         .expect(403);
 
@@ -1739,18 +1718,18 @@ describe("runtime and catalog", () => {
         .post("/api/agents")
         .set("Authorization", "Bearer private_source_user")
         .send({
-          id: "owned_source_lora",
+          id: "owned_source",
           title: "Owned source",
           capability: "Uses private source text.",
           boundary: "Use owned sources only.",
           source_text: "Owner-specific operating rule."
         })
         .expect(201);
-      const stored = app.locals.store.read().agents.find((agent) => agent.id === "owned_source_lora");
-      expect(stored.sources).toEqual(["sources/tcar_dummy_loras/owned_source_lora/source.md"]);
+      const stored = app.locals.store.read().agents.find((agent) => agent.id === "owned_source");
+      expect(stored.sources).toEqual(["sources/router_agents/owned_source/source.md"]);
 
       await request(app)
-        .patch("/api/agents/owned_source_lora")
+        .patch("/api/agents/owned_source")
         .set("Authorization", "Bearer private_source_user")
         .send({ sources: "sources/tcar_documents/someone_else/index.jsonl" })
         .expect(403);
@@ -2015,7 +1994,7 @@ describe("chat execution", () => {
         .post("/api/agents")
         .set("Authorization", "Bearer explicit_user_token")
         .send({
-          id: "private_numbers_lora",
+          id: "private_numbers",
           title: "Private numbers",
           capability: "Applies the user's private number rules.",
           boundary: "Use only the configured number rules.",
@@ -2025,9 +2004,8 @@ describe("chat execution", () => {
         })
         .expect(201);
       await app.locals.store.mutate((data) => {
-        const agent = data.agents.find((item) => item.id === "private_numbers_lora");
-        agent.mounted = true;
-        agent.requires_vllm_reload = false;
+        const agent = data.agents.find((item) => item.id === "private_numbers");
+        agent.ready = true;
         return agent;
       });
       const session = await request(app)
@@ -2042,18 +2020,18 @@ describe("chat execution", () => {
         .expect(202);
       const run = await waitForRunAs(queued.body.run_id, "Bearer explicit_user_token");
       expect(run.status).toBe("completed");
-      expect(run.plan.steps.map((step) => step.adapter)).toContain("private_numbers_lora");
-      const route = run.expert_outputs.find((step) => step.adapter === "private_numbers_lora");
+      expect(run.plan.steps.map((step) => step.adapter)).toContain("private_numbers");
+      const route = run.expert_outputs.find((step) => step.adapter === "private_numbers");
       expect(route.handoff_artifacts).toEqual([
         expect.objectContaining({
           artifact: "number_result",
-          producer_agent_id: "private_numbers_lora"
+          producer_agent_id: "private_numbers"
         })
       ]);
       expect(route.handoff_artifacts[0].value).toContain("42 units");
       expect(route.domain_answer).toContain("42 units");
       expect(route.citations).toEqual([
-        expect.objectContaining({ chunk_id: "private_numbers_lora_source_0001", verified: true })
+        expect.objectContaining({ chunk_id: "private_numbers_source_0001", verified: true })
       ]);
     } finally {
       if (previousTokens === undefined) {
@@ -2583,12 +2561,12 @@ describe("chat execution", () => {
               model_id: "qwen36-awq",
               task: "Synthesize.",
               domain_answer: "Structured runtime answer.",
-              approved_sources: ["sources/tcar_dummy_loras/writing_synthesis/source.md"],
+              approved_sources: ["sources/router_agents/writing_synthesis/source.md"],
               citations: [
                 {
                   chunk_id: "runtime_chunk_1",
                   title: "Runtime source",
-                  path: "sources/tcar_dummy_loras/writing_synthesis/source.md",
+                  path: "sources/router_agents/writing_synthesis/source.md",
                   page_start: 3,
                   page_end: 3,
                   score: 0.9,
@@ -3205,7 +3183,7 @@ describe("documents and sources", () => {
             headers: { "Content-Type": "application/json" }
           });
         }
-        if (pathName === "/documents/tampered_receipt_lora" && options.method === "DELETE") {
+        if (pathName === "/documents/tampered_receipt" && options.method === "DELETE") {
           return new Response(JSON.stringify({
             ok: true,
             status: "purged",
@@ -3213,7 +3191,7 @@ describe("documents and sources", () => {
             enabled: false,
             mounted: false,
             requires_vllm_reload: false,
-            agent: { id: "tampered_receipt_lora", enabled: false, mounted: false }
+            agent: { id: "tampered_receipt", enabled: false }
           }), {
             status: 200,
             headers: { "Content-Type": "application/json" }
@@ -3228,17 +3206,17 @@ describe("documents and sources", () => {
       const upload = await request(app)
         .post("/api/documents")
         .field("title", "Tampered Receipt")
-        .field("agent_id", "tampered_receipt_lora")
+        .field("agent_id", "tampered_receipt")
         .attach("file", Buffer.from("Original source text with enough material for a local preflight chunk."), "tampered.txt")
         .expect(502);
 
       expect(upload.body.error).toBe("runtime_document_contract_invalid");
       expect(calls).toEqual([
         { method: "POST", pathName: "/documents" },
-        { method: "DELETE", pathName: "/documents/tampered_receipt_lora" }
+        { method: "DELETE", pathName: "/documents/tampered_receipt" }
       ]);
       expect(app.locals.store.read().documents).toHaveLength(0);
-      expect(app.locals.store.read().agents.some((agent) => agent.id === "tampered_receipt_lora")).toBe(false);
+      expect(app.locals.store.read().agents.some((agent) => agent.id === "tampered_receipt")).toBe(false);
     } finally {
       globalThis.fetch = previousFetch;
       for (const [key, value] of Object.entries(previous)) {
@@ -3265,7 +3243,7 @@ describe("documents and sources", () => {
 
     const agentIds = uploads.map((response) => response.body.agent_id);
     expect(new Set(agentIds).size).toBe(2);
-    expect(agentIds.every((id) => /^concurrent_manual_[a-f0-9]{8}_lora$/.test(id))).toBe(true);
+    expect(agentIds.every((id) => /^concurrent_manual_[a-f0-9]{8}$/.test(id))).toBe(true);
     expect(new Set(uploads.map((response) => response.body.index_path)).size).toBe(2);
   });
 
@@ -3754,8 +3732,8 @@ describe("runtime registration atomicity", () => {
         response.agent.registration_cleanup_allowed = true;
         return Response.json(response);
       }
-      if (pathName === "/documents/atomic_document_save_lora" && options.method === "DELETE") {
-        return Response.json(ownedPurgeResponse("atomic_document_save_lora"));
+      if (pathName === "/documents/atomic_document_save" && options.method === "DELETE") {
+        return Response.json(ownedPurgeResponse("atomic_document_save"));
       }
       return Response.json({ detail: "not found" }, { status: 404 });
     };
@@ -3763,16 +3741,16 @@ describe("runtime registration atomicity", () => {
       await request(app)
         .post("/api/documents")
         .field("title", "Atomic document save")
-        .field("agent_id", "atomic_document_save_lora")
+        .field("agent_id", "atomic_document_save")
         .attach("file", Buffer.from("Uploaded document text for atomic rollback."), "atomic.txt")
         .expect(500);
-      expect(app.locals.store.read().documents.some((document) => document.agent_id === "atomic_document_save_lora")).toBe(false);
-      expect(app.locals.store.read().agents.some((agent) => agent.id === "atomic_document_save_lora")).toBe(false);
+      expect(app.locals.store.read().documents.some((document) => document.agent_id === "atomic_document_save")).toBe(false);
+      expect(app.locals.store.read().agents.some((agent) => agent.id === "atomic_document_save")).toBe(false);
       const durable = JSON.parse(await fs.readFile(store.dbPath, "utf8"));
-      expect(durable.documents.some((document) => document.agent_id === "atomic_document_save_lora")).toBe(false);
+      expect(durable.documents.some((document) => document.agent_id === "atomic_document_save")).toBe(false);
       expect(calls.map((call) => `${call.method} ${call.pathName}`)).toEqual([
         "POST /documents",
-        "DELETE /documents/atomic_document_save_lora"
+        "DELETE /documents/atomic_document_save"
       ]);
       expect(calls[1].body.registration_id).toBe(calls[0].body.registration_id);
     } finally {
@@ -3802,28 +3780,28 @@ describe("runtime registration atomicity", () => {
           body: "Runtime-owned retry body."
         }));
       }
-      if (pathName === "/documents/document_commit_timeout_lora" && options.method === "DELETE") {
-        return Response.json(ownedPurgeResponse("document_commit_timeout_lora"));
+      if (pathName === "/documents/document_commit_timeout" && options.method === "DELETE") {
+        return Response.json(ownedPurgeResponse("document_commit_timeout"));
       }
       return Response.json({ detail: "not found" }, { status: 404 });
     };
     const upload = () => request(app)
       .post("/api/documents")
       .field("title", "Document commit timeout")
-      .field("agent_id", "document_commit_timeout_lora")
+      .field("agent_id", "document_commit_timeout")
       .attach("file", Buffer.from("Document text for ambiguous commit cleanup."), "commit.txt");
     try {
       await upload().expect(500);
-      expect(app.locals.store.read().documents.some((document) => document.agent_id === "document_commit_timeout_lora")).toBe(false);
+      expect(app.locals.store.read().documents.some((document) => document.agent_id === "document_commit_timeout")).toBe(false);
       expect(calls.map((call) => `${call.method} ${call.pathName}`)).toEqual([
         "POST /documents",
-        "DELETE /documents/document_commit_timeout_lora"
+        "DELETE /documents/document_commit_timeout"
       ]);
       expect(calls[1].body.registration_id).toBe(registrationIds[0]);
 
       await upload().expect(201);
       expect(registrationIds[1]).not.toBe(registrationIds[0]);
-      expect(app.locals.store.read().documents.some((document) => document.agent_id === "document_commit_timeout_lora")).toBe(true);
+      expect(app.locals.store.read().documents.some((document) => document.agent_id === "document_commit_timeout")).toBe(true);
     } finally {
       globalThis.fetch = previousFetch;
       restoreEnv();
@@ -3931,15 +3909,6 @@ describe("runtime registration atomicity", () => {
   });
 
   it.each([
-    {
-      name: "mount",
-      method: "post",
-      route: "/api/agents/legal_privacy_lora/mount",
-      runtimePath: "/agents/legal_privacy_lora/mount",
-      runtimeMethod: "POST",
-      operation: "agent.mount",
-      runtime: { ok: true, status: "mounted", mounted: true, requires_vllm_reload: false }
-    },
     {
       name: "archive",
       method: "delete",

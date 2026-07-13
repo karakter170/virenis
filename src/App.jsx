@@ -109,19 +109,16 @@ function friendlyError(error) {
   return String(error?.message || error || "Something went wrong.")
     .replace(/TCAR/gi, "the service")
     .replace(/vLLM/gi, "the model service")
-    .replace(/LoRAs/gi, "agents")
-    .replace(/LoRA/gi, "agent")
     .replace(/adapter models?/gi, "models")
     .replace(/adapter id/gi, "agent id")
     .replace(/adapter source/gi, "model source")
     .replace(/adapters/gi, "agents")
-    .replace(/adapter/gi, "agent")
-    .replace(/_lora\b/gi, "");
+    .replace(/adapter/gi, "agent");
 }
 
 export function availableSessionAgents(agents = []) {
   return agents
-    .filter((agent) => agent.enabled !== false && agent.mounted !== false)
+    .filter((agent) => agent.enabled !== false)
     .filter((agent) => !agent.document && !agent.resource_for_agent_id);
 }
 
@@ -158,7 +155,6 @@ function agentFacingText(value, fallback = "") {
     .replace(/\bLoRA\b/gi, "agent")
     .replace(/\badapter models?\b/gi, "models")
     .replace(/\badapters?\b/gi, "models")
-    .replace(/_lora\b/gi, "")
     .replace(/\s+/g, " ")
     .trim();
   return cleaned || fallback;
@@ -252,7 +248,6 @@ function Workspace({ onHome }) {
   const [settlementContract, setSettlementContract] = useState(null);
   const [disputeContract, setDisputeContract] = useState(null);
   const [correctionContract, setCorrectionContract] = useState(null);
-  const [mountingAgentId, setMountingAgentId] = useState("");
   const [togglingAgentId, setTogglingAgentId] = useState("");
   const [publishTarget, setPublishTarget] = useState(null);
   const [ratingTarget, setRatingTarget] = useState(null);
@@ -522,19 +517,6 @@ function Workspace({ onHome }) {
     }
   }
 
-  async function mountAgent(agent) {
-    setMountingAgentId(agent.id);
-    setError("");
-    try {
-      await api.post(`/api/agents/${encodeURIComponent(agent.id)}/mount`, {});
-      await refreshResources();
-    } catch (mountError) {
-      setError(friendlyError(mountError));
-    } finally {
-      setMountingAgentId("");
-    }
-  }
-
   async function toggleAgentForSession(agent, active) {
     if (!session?.session_id || !canWrite) return;
     setTogglingAgentId(agent.id);
@@ -761,7 +743,6 @@ function Workspace({ onHome }) {
           marketplace={marketplace}
           sessionId={session?.session_id}
           initialView={resourceView}
-          mountingAgentId={mountingAgentId}
           togglingAgentId={togglingAgentId}
           onViewChange={setResourceView}
           onClose={() => setResourcesOpen(false)}
@@ -772,7 +753,6 @@ function Workspace({ onHome }) {
             setResourcesOpen(false);
             setArchiveTarget(agent);
           }}
-          onMountAgent={mountAgent}
           onToggleAgent={toggleAgentForSession}
           onPublish={(agent) => {
             setResourcesOpen(false);
@@ -1299,7 +1279,7 @@ function RunProgress({ run }) {
 function mentionMatchScore(agent, query) {
   if (!query) return 1;
   const title = String(agent.title || "").toLowerCase();
-  const id = String(agent.id || "").toLowerCase().replace(/_lora$/, "").replaceAll("_", " ");
+  const id = String(agent.id || "").toLowerCase().replaceAll("_", " ");
   const capability = String(agent.capability || "").toLowerCase();
   const words = `${title} ${id}`.split(/[^a-z0-9]+/).filter(Boolean);
   if (title.startsWith(query) || id.startsWith(query)) return 100;
@@ -1336,7 +1316,7 @@ function Composer({
     if (!mention) return [];
     const query = mention.query.toLowerCase();
     return agents
-      .filter((agent) => agent.enabled !== false && agent.mounted !== false)
+      .filter((agent) => agent.enabled !== false)
       .filter((agent) => !agent.document && !agent.resource_for_agent_id)
       .filter((agent) => agent.scope !== "chat" || agent.session_id === sessionId)
       .map((agent) => ({ agent, score: mentionMatchScore(agent, query) }))
@@ -1377,7 +1357,7 @@ function Composer({
   function chooseAgent(agent) {
     if (!mention) return;
     const title = agentFacingText(agent.title).replace(/"/g, "");
-    const alias = String(agent.id || "agent").replace(/_lora$/i, "");
+    const alias = String(agent.id || "agent");
     const token = title && title.length <= 58 ? `@"${title}"` : `@${alias}`;
     const nextValue = `${value.slice(0, mention.start)}${token} ${value.slice(mention.end)}`;
     const nextCaret = mention.start + token.length + 1;
@@ -1538,7 +1518,6 @@ function ResourcesSheet({
   marketplace,
   sessionId,
   initialView,
-  mountingAgentId,
   togglingAgentId,
   onViewChange,
   onClose,
@@ -1546,7 +1525,6 @@ function ResourcesSheet({
   onEditAgent,
   onAdoptAgent,
   onArchiveAgent,
-  onMountAgent,
   onToggleAgent,
   onPublish,
   onRate,
@@ -1577,12 +1555,10 @@ function ResourcesSheet({
           <AgentCatalog
             agents={agents}
             auth={auth}
-            mountingAgentId={mountingAgentId}
             onCreate={onCreateAgent}
             onEdit={onEditAgent}
             onAdopt={onAdoptAgent}
             onArchive={onArchiveAgent}
-            onMount={onMountAgent}
             onToggle={onToggleAgent}
             onPublish={onPublish}
             togglingAgentId={togglingAgentId}
@@ -1677,14 +1653,12 @@ function RealityRank({ rank }) {
 function AgentCatalog({
   agents,
   auth,
-  mountingAgentId,
   togglingAgentId,
   sessionId,
   onCreate,
   onEdit,
   onAdopt,
   onArchive,
-  onMount,
   onToggle,
   onPublish
 }) {
@@ -1714,17 +1688,16 @@ function AgentCatalog({
       <div className="flat-list agent-list">
         {filtered.map((agent) => {
           const runtimeOnly = agent.runtime_only === true;
-          const archived = agent.enabled === false && agent.mount_pending !== true;
-          const pending = !archived && (agent.mount_pending === true || agent.mounted === false || agent.adapter_import_status === "pending_import");
+          const archived = agent.enabled === false;
           const manageable = !runtimeOnly && canManageAgent(agent, auth);
-          const sessionToggleable = canWrite && !runtimeOnly && !archived && !pending && Boolean(sessionId);
+          const sessionToggleable = canWrite && !runtimeOnly && !archived && Boolean(sessionId);
           return (
             <div className="agent-row" key={agent.id}>
-              <span className={`status-dot ${archived ? "muted" : pending || runtimeOnly ? "pending" : "ready"}`} aria-hidden="true" />
+              <span className={`status-dot ${archived ? "muted" : runtimeOnly ? "pending" : "ready"}`} aria-hidden="true" />
               <div className="row-copy">
                 <strong>{formatAgentName(agent.id, agents)}</strong>
                 <span>{agentFacingText(agent.capability, "Custom agent")}</span>
-                <small>{archived ? "Archived" : runtimeOnly ? "Needs an owner" : agent.adapter_import_status === "pending_import" ? "Connected · preparing API access" : pending ? "Preparing" : `${agent.session_active === false ? "Off in this chat" : "On in this chat"} · ${agent.visibility === "private" ? "Private" : agent.visibility === "team" ? "Team" : "Available"}`}</small>
+                <small>{archived ? "Archived" : runtimeOnly ? "Needs an owner" : `${agent.session_active === false ? "Off in this chat" : "On in this chat"} · ${agent.visibility === "private" ? "Private" : agent.visibility === "team" ? "Team" : "Available"}`}</small>
                 <RealityRank rank={agent.reality_rank} />
               </div>
               {runtimeOnly && auth?.is_admin && (
@@ -1748,15 +1721,10 @@ function AgentCatalog({
                       <i aria-hidden="true" />
                     </label>
                   )}
-                  {manageable && pending && (
-                    <IconButton label={`Retry ${formatAgentName(agent.id, agents)}`} compact onClick={() => onMount(agent)} disabled={mountingAgentId === agent.id}>
-                      <RefreshCw className={mountingAgentId === agent.id ? "spin" : ""} size={16} />
-                    </IconButton>
-                  )}
                   {manageable && <IconButton label={`Edit ${formatAgentName(agent.id, agents)}`} compact onClick={() => onEdit(agent)} disabled={archived}>
                     <Pencil size={16} />
                   </IconButton>}
-                  {manageable && <IconButton label={`Publish ${formatAgentName(agent.id, agents)} to marketplace`} compact onClick={() => onPublish(agent)} disabled={archived || pending}>
+                  {manageable && <IconButton label={`Publish ${formatAgentName(agent.id, agents)} to marketplace`} compact onClick={() => onPublish(agent)} disabled={archived}>
                     <Upload size={16} />
                   </IconButton>}
                   {manageable && <IconButton label={`Archive ${formatAgentName(agent.id, agents)}`} compact onClick={() => onArchive(agent)} disabled={archived}>
@@ -2351,7 +2319,7 @@ function AdminPanel({ runtime, metrics, agents, documents, onRefresh }) {
       setChecking(false);
     }
   }
-  const readyAgents = agents.filter((agent) => agent.enabled !== false && agent.mounted !== false).length;
+  const readyAgents = agents.filter((agent) => agent.enabled !== false).length;
   return (
     <section className="resource-section" aria-labelledby="admin-heading">
       <div className="section-heading">
@@ -2738,7 +2706,7 @@ function createAgentForm(agent) {
   }
   const suffix = Date.now().toString(36).slice(-7);
   return {
-    id: `custom_${suffix}_lora`,
+    id: `custom_${suffix}`,
     title: "",
     capability: "",
     boundary: RESPONSE_STYLES[0].boundary,
