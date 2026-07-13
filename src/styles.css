@@ -1246,18 +1246,21 @@ summary:focus-visible,
 .agent-graph marker path { fill: #8ca097; }
 
 .graph-node {
+  --graph-node-border: #a9cfbe;
+  --graph-node-color: #285f49;
+  --graph-node-background: rgba(241, 249, 245, 0.96);
+  --graph-node-ring: rgba(40, 95, 73, 0.11);
   position: absolute;
   z-index: 2;
   max-width: 140px;
   min-height: 34px;
   display: flex;
   align-items: center;
-  gap: 6px;
-  border: 1px solid #c6d2cc;
+  border: 1px solid var(--graph-node-border);
   border-radius: 18px;
   padding: 7px 10px;
-  color: #355146;
-  background: rgba(255, 255, 255, 0.94);
+  color: var(--graph-node-color);
+  background: var(--graph-node-background);
   box-shadow: 0 4px 13px rgba(34, 55, 44, 0.11);
   font-size: 10px;
   font-weight: 650;
@@ -1274,18 +1277,26 @@ summary:focus-visible,
   white-space: nowrap;
 }
 
+.graph-node.agent {
+  --graph-node-border: #a9cfbe;
+  --graph-node-color: #285f49;
+  --graph-node-background: rgba(241, 249, 245, 0.96);
+  --graph-node-ring: rgba(40, 95, 73, 0.11);
+}
+
 .graph-node.lora {
-  border-color: #c9bde5;
-  color: #604692;
-  background: rgba(252, 250, 255, 0.96);
+  --graph-node-border: #c3afe7;
+  --graph-node-color: #65459b;
+  --graph-node-background: rgba(247, 242, 255, 0.97);
+  --graph-node-ring: rgba(101, 69, 155, 0.12);
 }
 
 .graph-node:hover,
 .graph-node.focused {
   z-index: 4;
-  border-color: var(--accent);
-  color: var(--accent);
-  box-shadow: 0 0 0 3px rgba(23, 107, 75, 0.08), 0 8px 20px rgba(34, 55, 44, 0.14);
+  border-color: var(--graph-node-color);
+  color: var(--graph-node-color);
+  box-shadow: 0 0 0 3px var(--graph-node-ring), 0 8px 20px rgba(34, 55, 44, 0.14);
 }
 
 .graph-inspector {

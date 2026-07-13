@@ -1807,7 +1807,7 @@ export function storedGraphPositions(storageKey) {
   }
 }
 
-function AgentGraph({ agents, storageKey }) {
+export function AgentGraph({ agents, storageKey }) {
   const eligibleGraphAgents = agents
     .filter((agent) => !agent.document && !agent.resource_for_agent_id && agent.enabled !== false);
   const graphAgents = eligibleGraphAgents.slice(0, 120);
@@ -1890,7 +1890,6 @@ function AgentGraph({ agents, storageKey }) {
               onClick={() => setFocusedId((current) => current === agent.id ? null : agent.id)}
               title={agent.capability || agent.title}
             >
-              {productType(agent) === "lora" ? <Layers3 size={14} /> : <Bot size={14} />}
               <span>{formatAgentName(agent.id, agents)}</span>
             </button>
           );

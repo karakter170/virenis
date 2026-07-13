@@ -1,6 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 
 import {
+  AgentGraph,
   availableSessionLoRAs,
   graphConnections,
   initialGraphPositions,
@@ -14,6 +17,22 @@ afterEach(() => {
 
 
 describe("Agent Studio product surfaces", () => {
+  it("distinguishes graph bubbles by type color class without embedding type icons", () => {
+    const markup = renderToStaticMarkup(createElement(AgentGraph, {
+      agents: [
+        { id: "research_agent_lora", item_type: "agent", title: "Research agent", enabled: true },
+        { id: "finance_lora", item_type: "lora", title: "Finance LoRA", enabled: true }
+      ],
+      storageKey: ""
+    }));
+    const graphButtons = [...markup.matchAll(/<button[^>]*class="graph-node (?:agent|lora)[^"]*"[^>]*>(.*?)<\/button>/g)];
+
+    expect(markup).toContain('class="graph-node agent ');
+    expect(markup).toContain('class="graph-node lora ');
+    expect(graphButtons).toHaveLength(2);
+    expect(graphButtons.every((match) => !match[1].includes("<svg"))).toBe(true);
+  });
+
   it("keeps the complete mounted LoRA catalog available to the session picker", () => {
     const loras = Array.from({ length: 9 }, (_, index) => ({
       id: `adapter_${index}_lora`,
