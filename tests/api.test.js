@@ -1318,31 +1318,68 @@ describe("runtime and catalog", () => {
       .send({ score: 4, review: "Strong terminology preservation." })
       .expect(400);
 
-    const firstRating = await request(app)
-      .post("/api/marketplace/items/market_clinical_agent/ratings")
-      .send({ score: 4 })
-      .expect(201);
-    expect(firstRating.body).toMatchObject({ rating_average: 4, rating_count: 1 });
-
-    const updatedRating = await request(app)
-      .post("/api/marketplace/items/market_clinical_agent/ratings")
-      .send({ score: 5 })
-      .expect(200);
-    expect(updatedRating.body).toMatchObject({ rating_average: 5, rating_count: 1 });
-    expect(updatedRating.body.my_rating).toEqual({ score: 5 });
-    expect(updatedRating.body).not.toHaveProperty("reviews");
-
     await request(app)
       .post("/api/marketplace/items/market_clinical_agent/ratings")
-      .send({ score: 6 })
-      .expect(400);
+      .send({ score: 4 })
+      .expect(403);
+
+    const previousTokens = process.env.APP_API_TOKENS_JSON;
+    process.env.APP_API_TOKENS_JSON = JSON.stringify({
+      market_rater: { user_id: "independent_rater", workspace_id: "workspace_rater", role: "user" }
+    });
+    try {
+      const firstRating = await request(app)
+        .post("/api/marketplace/items/market_clinical_agent/ratings")
+        .set("Authorization", "Bearer market_rater")
+        .send({ score: 4 })
+        .expect(201);
+      expect(firstRating.body).toMatchObject({ rating_average: 4, rating_count: 1 });
+
+      const updatedRating = await request(app)
+        .post("/api/marketplace/items/market_clinical_agent/ratings")
+        .set("Authorization", "Bearer market_rater")
+        .send({ score: 5 })
+        .expect(200);
+      expect(updatedRating.body).toMatchObject({ rating_average: 5, rating_count: 1 });
+      expect(updatedRating.body.my_rating).toEqual({ score: 5 });
+      expect(updatedRating.body).not.toHaveProperty("reviews");
+
+      await request(app)
+        .post("/api/marketplace/items/market_clinical_agent/ratings")
+        .set("Authorization", "Bearer market_rater")
+        .send({ score: 6 })
+        .expect(400);
+    } finally {
+      if (previousTokens === undefined) delete process.env.APP_API_TOKENS_JSON;
+      else process.env.APP_API_TOKENS_JSON = previousTokens;
+    }
+
+    const edited = await request(app)
+      .post("/api/marketplace/items/market_clinical_agent")
+      .send({ description: "An edited description for patient-safe clinical rewriting." })
+      .expect(200);
+    expect(edited.body.description).toBe("An edited description for patient-safe clinical rewriting.");
+
+    await request(app)
+      .delete("/api/marketplace/items/market_clinical_agent")
+      .expect(200);
+    await request(app)
+      .get("/api/marketplace/items/market_clinical_agent")
+      .expect(404);
+    const afterUnpublish = await request(app).get("/api/marketplace").expect(200);
+    expect(afterUnpublish.body.items.some((entry) => entry.id === "market_clinical_agent")).toBe(false);
+    const marketplaceEvents = app.locals.store.read().agentEvents
+      .filter((event) => event.agent_id === "market_clinical_agent")
+      .map((event) => event.event_type);
+    expect(marketplaceEvents).toContain("agent.marketplace_unpublished");
   });
 
   it("copies a published agent into an isolated user workspace with listing provenance", async () => {
     const previousTokens = process.env.APP_API_TOKENS_JSON;
     process.env.APP_API_TOKENS_JSON = JSON.stringify({
       market_alice: { user_id: "alice", workspace_id: "workspace_a", role: "user" },
-      market_bob: { user_id: "bob", workspace_id: "workspace_b", role: "user" }
+      market_bob: { user_id: "bob", workspace_id: "workspace_b", role: "user" },
+      market_other_alice: { user_id: "alice", workspace_id: "workspace_c", role: "user" }
     });
 
     try {
@@ -1369,6 +1406,29 @@ describe("runtime and catalog", () => {
         .send({ description: "A reusable agent for producing clear research briefs." })
         .expect(201);
       expect(publication.body.publisher).toEqual({ user_id: "alice" });
+      expect(publication.body).toMatchObject({
+        can_manage: true,
+        is_self_published: true,
+        my_rating: null
+      });
+
+      await request(app)
+        .post("/api/marketplace/items/alice_shared_research_agent/ratings")
+        .set("Authorization", "Bearer market_alice")
+        .send({ score: 5 })
+        .expect(403);
+
+      const sameUserDifferentWorkspace = await request(app)
+        .get("/api/marketplace/items/alice_shared_research_agent")
+        .set("Authorization", "Bearer market_other_alice")
+        .expect(200);
+      expect(sameUserDifferentWorkspace.body.is_self_published).toBe(false);
+      const crossWorkspaceRating = await request(app)
+        .post("/api/marketplace/items/alice_shared_research_agent/ratings")
+        .set("Authorization", "Bearer market_other_alice")
+        .send({ score: 3 })
+        .expect(201);
+      expect(crossWorkspaceRating.body).toMatchObject({ rating_average: 3, rating_count: 1 });
 
       const bobListing = await request(app)
         .get("/api/marketplace/items/alice_shared_research_agent")
@@ -1377,7 +1437,9 @@ describe("runtime and catalog", () => {
       expect(bobListing.body).toMatchObject({
         published_by: "alice",
         workspace_copy: null,
-        can_copy: true
+        can_copy: true,
+        can_manage: false,
+        is_self_published: false
       });
       expect(bobListing.body.agent.exclusions).toEqual({
         private_knowledge: true,
@@ -1388,6 +1450,13 @@ describe("runtime and catalog", () => {
       expect(bobListing.body.agent).not.toHaveProperty("sources");
       expect(bobListing.body.agent).not.toHaveProperty("resources");
       expect(JSON.stringify(bobListing.body)).not.toContain("Alice-only terminology");
+
+      const bobRating = await request(app)
+        .post("/api/marketplace/items/alice_shared_research_agent/ratings")
+        .set("Authorization", "Bearer market_bob")
+        .send({ score: 4 })
+        .expect(201);
+      expect(bobRating.body).toMatchObject({ rating_average: 3.5, rating_count: 2 });
 
       const copied = await request(app)
         .post("/api/marketplace/items/alice_shared_research_agent/copy")
@@ -1448,6 +1517,149 @@ describe("runtime and catalog", () => {
         agent_id: copiedAgentId,
         title: "Bob's independent research agent"
       });
+
+      await request(app)
+        .post("/api/marketplace/items/alice_shared_research_agent")
+        .set("Authorization", "Bearer market_bob")
+        .send({ description: "Bob cannot replace Alice's description." })
+        .expect(404);
+      await request(app)
+        .delete("/api/marketplace/items/alice_shared_research_agent")
+        .set("Authorization", "Bearer market_bob")
+        .expect(404);
+
+      const editedListing = await request(app)
+        .post("/api/marketplace/items/alice_shared_research_agent")
+        .set("Authorization", "Bearer market_alice")
+        .send({ description: "Alice's updated description for clear research briefs." })
+        .expect(200);
+      expect(editedListing.body.description).toBe("Alice's updated description for clear research briefs.");
+      expect(editedListing.body).toMatchObject({ can_manage: true, is_self_published: true });
+
+      const updatedForBob = await request(app)
+        .get("/api/marketplace/items/alice_shared_research_agent")
+        .set("Authorization", "Bearer market_bob")
+        .expect(200);
+      expect(updatedForBob.body).toMatchObject({
+        description: "Alice's updated description for clear research briefs.",
+        rating_average: 3.5,
+        rating_count: 2
+      });
+
+      await request(app)
+        .delete("/api/marketplace/items/alice_shared_research_agent")
+        .set("Authorization", "Bearer market_alice")
+        .expect(200);
+      await request(app)
+        .get("/api/marketplace/items/alice_shared_research_agent")
+        .set("Authorization", "Bearer market_bob")
+        .expect(404);
+      const sourceStillExists = await request(app)
+        .get("/api/agents/alice_shared_research_agent")
+        .set("Authorization", "Bearer market_alice")
+        .expect(200);
+      expect(sourceStillExists.body.enabled).toBe(true);
+      const events = app.locals.store.read().agentEvents
+        .filter((event) => event.agent_id === "alice_shared_research_agent")
+        .map((event) => event.event_type);
+      expect(events).toContain("agent.marketplace_description_updated");
+      expect(events).toContain("agent.marketplace_unpublished");
+    } finally {
+      if (previousTokens === undefined) delete process.env.APP_API_TOKENS_JSON;
+      else process.env.APP_API_TOKENS_JSON = previousTokens;
+    }
+  });
+
+  it("permanently deletes only owned archived agents and preserves their audit history", async () => {
+    const previousTokens = process.env.APP_API_TOKENS_JSON;
+    process.env.APP_API_TOKENS_JSON = JSON.stringify({
+      delete_alice: { user_id: "alice", workspace_id: "workspace_delete", role: "user" },
+      delete_bob: { user_id: "bob", workspace_id: "workspace_delete", role: "user" }
+    });
+
+    try {
+      await request(app)
+        .post("/api/agents")
+        .set("Authorization", "Bearer delete_alice")
+        .send({
+          id: "alice_archived_delete_agent",
+          title: "Archived delete agent",
+          capability: "Tests permanent archived-agent deletion.",
+          boundary: "Use only test input."
+        })
+        .expect(201);
+      await request(app)
+        .post("/api/agents")
+        .set("Authorization", "Bearer delete_alice")
+        .send({
+          id: "alice_active_dependent_agent",
+          title: "Active dependent agent",
+          capability: "Consumes the source agent's output.",
+          boundary: "Use only test input.",
+          consumes: ["user_request", "agent:alice_archived_delete_agent:output"]
+        })
+        .expect(201);
+
+      const publication = await request(app)
+        .post("/api/marketplace/items/alice_archived_delete_agent")
+        .set("Authorization", "Bearer delete_alice")
+        .send({ description: "A listing that should be removed with its archived source." })
+        .expect(201);
+      await request(app)
+        .post("/api/marketplace/items/alice_archived_delete_agent/ratings")
+        .set("Authorization", "Bearer delete_bob")
+        .send({ score: 4 })
+        .expect(201);
+
+      await request(app)
+        .delete("/api/agents/alice_archived_delete_agent/permanent")
+        .set("Authorization", "Bearer delete_alice")
+        .expect(409);
+      await request(app)
+        .delete("/api/agents/alice_archived_delete_agent")
+        .set("Authorization", "Bearer delete_alice")
+        .expect(200);
+      await request(app)
+        .delete("/api/agents/alice_archived_delete_agent/permanent")
+        .set("Authorization", "Bearer delete_bob")
+        .expect(404);
+      await request(app)
+        .delete("/api/agents/alice_archived_delete_agent/permanent")
+        .set("Authorization", "Bearer delete_alice")
+        .expect(409);
+
+      await request(app)
+        .patch("/api/agents/alice_active_dependent_agent")
+        .set("Authorization", "Bearer delete_alice")
+        .send({ consumes: ["user_request"] })
+        .expect(200);
+      const deleted = await request(app)
+        .delete("/api/agents/alice_archived_delete_agent/permanent")
+        .set("Authorization", "Bearer delete_alice")
+        .expect(200);
+      expect(deleted.body).toMatchObject({
+        ok: true,
+        status: "deleted",
+        id: "alice_archived_delete_agent"
+      });
+
+      await request(app)
+        .get("/api/agents/alice_archived_delete_agent")
+        .set("Authorization", "Bearer delete_alice")
+        .expect(404);
+      const stored = app.locals.store.read();
+      expect(stored.agents.some((agent) => agent.id === "alice_archived_delete_agent")).toBe(false);
+      expect(stored.marketplaceRatings.some((rating) =>
+        rating.agent_id === "alice_archived_delete_agent"
+        || rating.listing_id === publication.body.listing_id
+      )).toBe(false);
+      const events = stored.agentEvents.filter((event) => event.agent_id === "alice_archived_delete_agent");
+      expect(events.at(-1).event_type).toBe("agent.deleted");
+      expect(events.at(-1).actor_id).toBe("alice");
+      expect(events.at(-1).details).toMatchObject({
+        listing_id: publication.body.listing_id,
+        was_published: "true"
+      });
     } finally {
       if (previousTokens === undefined) delete process.env.APP_API_TOKENS_JSON;
       else process.env.APP_API_TOKENS_JSON = previousTokens;
@@ -1482,6 +1694,13 @@ describe("runtime and catalog", () => {
         workspace_id: "workspace_default",
         created_by: "user_local"
       });
+      data.marketplaceRatings.push({
+        rating_id: "legacy_self_rating",
+        agent_id: "legacy_marketplace_agent",
+        score: 5,
+        workspace_id: "workspace_legacy",
+        created_by: "legacy_publisher"
+      });
     });
     await app.locals.store.close();
     app = await createApp({
@@ -1491,7 +1710,8 @@ describe("runtime and catalog", () => {
 
     const stored = app.locals.store.read((data) => ({
       agent: data.agents.find((agent) => agent.id === "legacy_marketplace_agent"),
-      rating: data.marketplaceRatings.find((rating) => rating.rating_id === "legacy_rating")
+      rating: data.marketplaceRatings.find((rating) => rating.rating_id === "legacy_rating"),
+      selfRating: data.marketplaceRatings.find((rating) => rating.rating_id === "legacy_self_rating")
     }));
     expect(stored.agent.marketplace).toMatchObject({
       description: "Legacy description",
@@ -1502,6 +1722,7 @@ describe("runtime and catalog", () => {
       expect(stored.agent.marketplace).not.toHaveProperty(retiredField);
     }
     expect(stored.rating).not.toHaveProperty("review");
+    expect(stored.selfRating).toBeUndefined();
 
     const listing = await request(app)
       .get("/api/marketplace/items/legacy_marketplace_agent")
@@ -4073,6 +4294,97 @@ describe("runtime registration atomicity", () => {
       expect(replay.body).toMatchObject({ attempted: 0, reconciled: 0, pending: 0 });
     } finally {
       restoreSave();
+      globalThis.fetch = previousFetch;
+      restoreEnv();
+    }
+  });
+
+  it("retries a journaled permanent deletion when the Runtime request initially fails", async () => {
+    const restoreEnv = enableRealRuntime();
+    const previousFetch = globalThis.fetch;
+    const store = app.locals.store;
+    const agentId = "recoverable_archived_delete_agent";
+    const calls = [];
+    let deleteAttempts = 0;
+    await store.mutate((data) => {
+      data.agents.push({
+        id: agentId,
+        title: "Recoverable archived delete agent",
+        capability: "Tests permanent deletion recovery.",
+        boundary: "Use only test input.",
+        consumes: ["user_request"],
+        produces: ["domain_outputs"],
+        routing_cues: ["recovery"],
+        resources: [],
+        tools: [],
+        sources: [],
+        enabled: false,
+        archived_at: new Date().toISOString(),
+        visibility: "private",
+        workspace_id: "workspace_default",
+        created_by: "user_local"
+      });
+    });
+    globalThis.fetch = async (url, options = {}) => {
+      const pathName = new URL(url).pathname;
+      const method = options.method || "GET";
+      const body = options.body ? JSON.parse(options.body) : null;
+      calls.push({ method, pathName, body });
+      if (pathName === `/agents/${agentId}` && method === "DELETE") {
+        deleteAttempts += 1;
+        if (deleteAttempts === 1) throw new Error("temporary Runtime connection failure");
+        return Response.json(ownedPurgeResponse(agentId));
+      }
+      if (pathName === `/agents/${agentId}` && method === "GET") {
+        return Response.json({
+          ok: true,
+          agent: { id: agentId, enabled: false, mounted: false, lifecycle_status: "archived" }
+        });
+      }
+      return Response.json({ detail: "not found" }, { status: 404 });
+    };
+
+    try {
+      await request(app).delete(`/api/agents/${agentId}/permanent`).expect(500);
+      const pending = store.read();
+      expect(pending.runtimeLifecycleIntents).toHaveLength(1);
+      expect(pending.runtimeLifecycleIntents[0]).toMatchObject({
+        operation: "agent.delete",
+        requested_by: "user_local",
+        requested_role: "admin",
+        workspace_id: "workspace_default"
+      });
+      expect(pending.agents.find((agent) => agent.id === agentId)).toMatchObject({
+        runtime_sync_pending: true
+      });
+
+      const reconciled = await request(app)
+        .post("/api/admin/runtime-lifecycle/reconcile")
+        .send({ intent_id: pending.runtimeLifecycleIntents[0].intent_id })
+        .expect(200);
+      expect(reconciled.body).toMatchObject({ attempted: 1, reconciled: 1, pending: 0 });
+      expect(store.read().agents.some((agent) => agent.id === agentId)).toBe(false);
+      expect(store.read().runtimeLifecycleIntents).toEqual([]);
+      expect(calls.map((call) => `${call.method} ${call.pathName}`)).toEqual([
+        `DELETE /agents/${agentId}`,
+        `GET /agents/${agentId}`,
+        `DELETE /agents/${agentId}`
+      ]);
+      expect(calls[0].body.delete_archived).toBe(true);
+      expect(calls[2].body).toMatchObject({
+        delete_archived: true,
+        audit_context: {
+          user_id: "user_local",
+          workspace_id: "workspace_default",
+          role: "admin"
+        }
+      });
+      const deletionEvent = store.read().agentEvents.find((event) =>
+        event.agent_id === agentId && event.event_type === "agent.deleted"
+      );
+      expect(deletionEvent.actor_id).toBe("user_local");
+      expect(deletionEvent.actor_role).toBe("admin");
+    } finally {
       globalThis.fetch = previousFetch;
       restoreEnv();
     }

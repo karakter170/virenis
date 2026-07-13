@@ -4,6 +4,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  deleteArchivedRuntimeAgent,
   fetchRuntimeAgents,
   registerRuntimeAgent,
   requireRuntimeConfigured,
@@ -36,6 +37,38 @@ afterEach(async () => {
 });
 
 describe("TCAR runtime HTTP transport", () => {
+  it("uses the explicit archived-agent deletion contract", async () => {
+    let observed = null;
+    const runtime = await startHttpServer(async (request, response) => {
+      observed = {
+        method: request.method,
+        path: request.url,
+        body: await readRequest(request)
+      };
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ ok: true, status: "purged", purged: true }));
+    });
+    configureRuntime(runtime.url);
+
+    await expect(deleteArchivedRuntimeAgent("archived_agent", {
+      user_id: "alice",
+      workspace_id: "workspace_a",
+      role: "user"
+    })).resolves.toMatchObject({ ok: true, status: "purged", purged: true });
+    expect(observed).toEqual({
+      method: "DELETE",
+      path: "/agents/archived_agent",
+      body: {
+        audit_context: {
+          user_id: "alice",
+          workspace_id: "workspace_a",
+          role: "user"
+        },
+        delete_archived: true
+      }
+    });
+  });
+
   it("honors the configured response-header budget for a 900000ms chat request", async () => {
     const runtime = await startHttpServer(async (request, response) => {
       const body = await readRequest(request);

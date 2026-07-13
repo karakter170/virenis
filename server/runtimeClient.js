@@ -712,6 +712,14 @@ export function archiveRuntimeAgent(agentId, auditContext = {}) {
   });
 }
 
+export function deleteArchivedRuntimeAgent(agentId, auditContext = {}) {
+  return runtimeRequest(`/agents/${encodeURIComponent(agentId)}`, {
+    method: "DELETE",
+    body: { audit_context: auditContext, delete_archived: true },
+    timeoutMs: Number(process.env.TCAR_RUNTIME_ADMIN_TIMEOUT_MS || 180000)
+  });
+}
+
 export function purgeRuntimeAgentRegistration(agentId, registrationId, auditContext = {}) {
   return runtimeRequest(`/agents/${encodeURIComponent(agentId)}`, {
     method: "DELETE",

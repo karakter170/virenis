@@ -242,6 +242,8 @@ function Workspace({ onHome }) {
   const [agentEditor, setAgentEditor] = useState(undefined);
   const [adoptionTarget, setAdoptionTarget] = useState(null);
   const [archiveTarget, setArchiveTarget] = useState(null);
+  const [deleteAgentTarget, setDeleteAgentTarget] = useState(null);
+  const [unpublishTarget, setUnpublishTarget] = useState(null);
   const [deleteDocumentTarget, setDeleteDocumentTarget] = useState(null);
   const [feedbackRunId, setFeedbackRunId] = useState(null);
   const [outcomeEditorRun, setOutcomeEditorRun] = useState(null);
@@ -503,6 +505,26 @@ function Workspace({ onHome }) {
     setResourceView("agents");
   }
 
+  async function deleteArchivedAgent(agent) {
+    setError("");
+    await api.delete(`/api/agents/${encodeURIComponent(agent.id)}/permanent`);
+    setDeleteAgentTarget(null);
+    await refreshResources();
+    setResourcesOpen(true);
+    setResourceView("agents");
+  }
+
+  async function unpublishAgent(target) {
+    const item = target?.item || target;
+    const returnView = target?.returnView || "agents";
+    setError("");
+    await api.delete(`/api/marketplace/items/${encodeURIComponent(item.id)}`);
+    setUnpublishTarget(null);
+    await refreshResources();
+    setResourcesOpen(true);
+    setResourceView(returnView);
+  }
+
   async function deleteDocument(document) {
     setError("");
     await api.delete(`/api/documents/${encodeURIComponent(document.document_id)}`);
@@ -754,16 +776,25 @@ function Workspace({ onHome }) {
             setResourcesOpen(false);
             setArchiveTarget(agent);
           }}
+          onDeleteAgent={(agent) => {
+            setResourcesOpen(false);
+            setDeleteAgentTarget(agent);
+          }}
           onToggleAgent={toggleAgentForSession}
           onPublish={(agent) => {
             setResourcesOpen(false);
             setPublishTarget(agent);
+          }}
+          onUnpublish={(agent) => {
+            setResourcesOpen(false);
+            setUnpublishTarget({ item: agent, returnView: "agents" });
           }}
           onOpenMarketplaceItem={(item) => {
             setResourcesOpen(false);
             setMarketplaceTarget(item);
           }}
           onRate={(item) => {
+            if (item.is_self_published) return;
             setResourcesOpen(false);
             setRatingTarget(item);
           }}
@@ -860,8 +891,32 @@ function Workspace({ onHome }) {
             setResourceView("marketplace");
           }}
           onRate={(item) => {
+            if (item.is_self_published) return;
             setMarketplaceTarget(null);
             setRatingTarget(item);
+          }}
+          onEditDescription={(item) => {
+            const sourceAgent = agents.find((agent) => agent.id === item.id);
+            if (!sourceAgent) {
+              setMarketplaceTarget(null);
+              setError("The source agent is no longer available in this workspace.");
+              setResourcesOpen(true);
+              setResourceView("marketplace");
+              return;
+            }
+            setMarketplaceTarget(null);
+            setPublishTarget({
+              ...sourceAgent,
+              marketplace: {
+                ...(sourceAgent.marketplace || {}),
+                published: true,
+                description: item.description || sourceAgent.marketplace?.description || sourceAgent.capability
+              }
+            });
+          }}
+          onUnpublish={(item) => {
+            setMarketplaceTarget(null);
+            setUnpublishTarget({ item, returnView: "marketplace" });
           }}
           onCopied={async () => {
             setMarketplaceTarget(null);
@@ -913,8 +968,45 @@ function Workspace({ onHome }) {
           message={`${archiveTarget.title || "This agent"} will no longer be available for new answers.`}
           confirmLabel="Archive"
           destructive
-          onClose={() => setArchiveTarget(null)}
+          onClose={() => {
+            setArchiveTarget(null);
+            setResourcesOpen(true);
+            setResourceView("agents");
+          }}
           onConfirm={() => archiveAgent(archiveTarget)}
+        />
+      )}
+
+      {deleteAgentTarget && (
+        <ConfirmDialog
+          title="Delete archived agent permanently?"
+          message={`${deleteAgentTarget.title || "This archived agent"} and its Marketplace listing will be permanently removed. This cannot be undone.`}
+          confirmLabel="Delete permanently"
+          destructive
+          icon={Trash2}
+          onClose={() => {
+            setDeleteAgentTarget(null);
+            setResourcesOpen(true);
+            setResourceView("agents");
+          }}
+          onConfirm={() => deleteArchivedAgent(deleteAgentTarget)}
+        />
+      )}
+
+      {unpublishTarget && (
+        <ConfirmDialog
+          title="Remove from Marketplace?"
+          message={`${unpublishTarget.item?.title || "This agent"} will no longer be visible in the Marketplace. The agent will stay in your workspace.`}
+          confirmLabel="Unpublish"
+          destructive
+          icon={Globe2}
+          onClose={() => {
+            const returnView = unpublishTarget.returnView || "agents";
+            setUnpublishTarget(null);
+            setResourcesOpen(true);
+            setResourceView(returnView);
+          }}
+          onConfirm={() => unpublishAgent(unpublishTarget)}
         />
       )}
 
@@ -1552,8 +1644,10 @@ function ResourcesSheet({
   onEditAgent,
   onAdoptAgent,
   onArchiveAgent,
+  onDeleteAgent,
   onToggleAgent,
   onPublish,
+  onUnpublish,
   onOpenMarketplaceItem,
   onRate,
   onAddKnowledge,
@@ -1587,8 +1681,10 @@ function ResourcesSheet({
             onEdit={onEditAgent}
             onAdopt={onAdoptAgent}
             onArchive={onArchiveAgent}
+            onDelete={onDeleteAgent}
             onToggle={onToggleAgent}
             onPublish={onPublish}
+            onUnpublish={onUnpublish}
             togglingAgentId={togglingAgentId}
             sessionId={sessionId}
           />
@@ -1677,7 +1773,7 @@ function RealityRank({ rank }) {
   );
 }
 
-function AgentCatalog({
+export function AgentCatalog({
   agents,
   auth,
   togglingAgentId,
@@ -1686,8 +1782,10 @@ function AgentCatalog({
   onEdit,
   onAdopt,
   onArchive,
+  onDelete,
   onToggle,
-  onPublish
+  onPublish,
+  onUnpublish
 }) {
   const [query, setQuery] = useState("");
   const canWrite = !auth?.is_viewer;
@@ -1748,23 +1846,39 @@ function AgentCatalog({
                       <i aria-hidden="true" />
                     </label>
                   )}
-                  {manageable && <IconButton label={`Edit ${formatAgentName(agent.id, agents)}`} compact onClick={() => onEdit(agent)} disabled={archived}>
+                  {manageable && !archived && <IconButton label={`Edit ${formatAgentName(agent.id, agents)}`} compact onClick={() => onEdit(agent)}>
                     <Pencil size={16} />
                   </IconButton>}
-                  {manageable && (
+                  {manageable && !archived && (
                     <button
                       type="button"
                       className="agent-publish-action"
-                      aria-label={`${agent.marketplace?.published ? "Update" : "Publish"} ${formatAgentName(agent.id, agents)} in marketplace`}
+                      aria-label={`${agent.marketplace?.published ? "Edit the Marketplace description for" : "Publish"} ${formatAgentName(agent.id, agents)}`}
                       onClick={() => onPublish(agent)}
-                      disabled={archived}
                     >
-                      <Upload size={14} />{agent.marketplace?.published ? "Update listing" : "Publish"}
+                      {agent.marketplace?.published ? <Pencil size={14} /> : <Upload size={14} />}
+                      {agent.marketplace?.published ? "Edit description" : "Publish"}
                     </button>
                   )}
-                  {manageable && <IconButton label={`Archive ${formatAgentName(agent.id, agents)}`} compact onClick={() => onArchive(agent)} disabled={archived}>
-                    <Archive size={16} />
-                  </IconButton>}
+                  {manageable && agent.marketplace?.published && (
+                    <button
+                      type="button"
+                      className="agent-unpublish-action"
+                      aria-label={`Unpublish ${formatAgentName(agent.id, agents)} from Marketplace`}
+                      onClick={() => onUnpublish(agent)}
+                    >
+                      <Globe2 size={14} />Unpublish
+                    </button>
+                  )}
+                  {manageable && (archived ? agent.system_managed !== true && (
+                    <IconButton label={`Permanently delete ${formatAgentName(agent.id, agents)}`} compact onClick={() => onDelete(agent)}>
+                      <Trash2 size={16} />
+                    </IconButton>
+                  ) : (
+                    <IconButton label={`Archive ${formatAgentName(agent.id, agents)}`} compact onClick={() => onArchive(agent)}>
+                      <Archive size={16} />
+                    </IconButton>
+                  ))}
                 </div>
               )}
             </div>
@@ -2184,7 +2298,9 @@ export function MarketplacePanel({ items, auth, onOpen = () => undefined, onRate
             </button>
             <footer>
               <span className="market-rating"><Star size={14} fill="currentColor" />{item.rating_count ? item.rating_average.toFixed(1) : "New"}<small>{item.rating_count ? `(${item.rating_count})` : ""}</small></span>
-              <button type="button" onClick={() => onRate(item)} disabled={auth?.is_viewer}>{item.my_rating ? "Update rating" : "Rate"}</button>
+              {item.is_self_published
+                ? <span className="market-own-listing"><Check size={12} />Your listing</span>
+                : <button type="button" onClick={() => onRate(item)} disabled={auth?.is_viewer}>{item.my_rating ? "Update rating" : "Rate"}</button>}
             </footer>
           </article>
         ))}
@@ -2216,13 +2332,13 @@ export function PublishDialog({ agent, onClose, onSaved }) {
     }
   }
   return (
-    <ModalSurface title={existing.published ? "Update marketplace listing" : "Publish to marketplace"} description="Share a clear description. People can inspect the agent before copying it." onClose={onClose} className="form-dialog">
+    <ModalSurface title={existing.published ? "Edit Marketplace description" : "Publish to Marketplace"} description="Share a clear description. People can inspect the agent before copying it." onClose={onClose} className="form-dialog">
       <form className="dialog-form publish-form" onSubmit={submit}>
         {error && <div className="form-error" role="alert">{error}</div>}
         <div className="publish-subject"><span className="market-type agent"><Bot size={13} />agent</span><strong>{formatAgentName(agent.id, [agent])}</strong></div>
         <label><span>Agent description</span><textarea data-autofocus value={description} onChange={(event) => setDescription(event.target.value)} required maxLength={1200} placeholder="Explain what this agent helps with and when someone should use it." /></label>
         <div className="publish-note"><Bot size={16} /><span><strong>Safe sharing</strong><small>Private notes, uploaded knowledge, and workspace-only agent connections are not included.</small></span></div>
-        <div className="dialog-actions"><button type="button" className="text-button ghost" onClick={onClose} disabled={busy}>Cancel</button><button type="submit" className="text-button primary" disabled={busy}>{busy ? <LoaderCircle className="spin" size={16} /> : <Upload size={16} />}{existing.published ? "Update listing" : "Publish"}</button></div>
+        <div className="dialog-actions"><button type="button" className="text-button ghost" onClick={onClose} disabled={busy}>Cancel</button><button type="submit" className="text-button primary" disabled={busy}>{busy ? <LoaderCircle className="spin" size={16} /> : existing.published ? <Pencil size={16} /> : <Upload size={16} />}{existing.published ? "Save description" : "Publish"}</button></div>
       </form>
     </ModalSurface>
   );
@@ -2256,7 +2372,7 @@ export function RatingDialog({ item, onClose, onSaved }) {
   );
 }
 
-export function MarketplaceAgentDialog({ item, auth, onClose, onRate, onCopied }) {
+export function MarketplaceAgentDialog({ item, auth, onClose, onRate, onCopied, onEditDescription = () => undefined, onUnpublish = () => undefined }) {
   const [detail, setDetail] = useState(item);
   const [loading, setLoading] = useState(true);
   const [copying, setCopying] = useState(false);
@@ -2355,7 +2471,7 @@ export function MarketplaceAgentDialog({ item, auth, onClose, onRate, onCopied }
               <div><dt>Outputs</dt><dd>{produces.length || "Default"}</dd></div>
               <div><dt>Rating</dt><dd>{detail.rating_count ? `${detail.rating_average.toFixed(1)} / 5` : "Not rated"}</dd></div>
             </dl>
-            <div className="marketplace-detail-rating"><Star size={17} fill="currentColor" /><strong>{detail.rating_count ? detail.rating_average.toFixed(1) : "New"}</strong><span>{detail.rating_count ? `${detail.rating_count} rating${detail.rating_count === 1 ? "" : "s"}` : "Be the first to rate"}</span></div>
+            <div className="marketplace-detail-rating"><Star size={17} fill="currentColor" /><strong>{detail.rating_count ? detail.rating_average.toFixed(1) : "New"}</strong><span>{detail.rating_count ? `${detail.rating_count} rating${detail.rating_count === 1 ? "" : "s"}` : detail.is_self_published ? "Your published agent" : "Be the first to rate"}</span></div>
             {detail.workspace_copy && <div className="preview-status"><Check size={14} /><div><strong>Already in your workspace</strong><small>{detail.workspace_copy.title}</small></div></div>}
           </aside>
         </div>
@@ -2364,7 +2480,10 @@ export function MarketplaceAgentDialog({ item, auth, onClose, onRate, onCopied }
           <button type="button" className="text-button ghost" onClick={onClose}>Close</button>
           <span>Published by {publisher}</span>
           <div>
-            <button type="button" className="text-button ghost" onClick={() => onRate(detail)} disabled={auth?.is_viewer || loading}><Star size={15} />{detail.my_rating ? "Update rating" : "Rate"}</button>
+            {detail.can_manage && <button type="button" className="text-button ghost marketplace-edit-action" onClick={() => onEditDescription(detail)} disabled={loading}><Pencil size={15} />Edit description</button>}
+            {detail.can_manage && <button type="button" className="text-button danger marketplace-unpublish-action" onClick={() => onUnpublish(detail)} disabled={loading}><Globe2 size={15} />Unpublish</button>}
+            {!detail.is_self_published && <button type="button" className="text-button ghost marketplace-rate-action" onClick={() => onRate(detail)} disabled={auth?.is_viewer || loading}><Star size={15} />{detail.my_rating ? "Update rating" : "Rate"}</button>}
+            {detail.is_self_published && <span className="market-own-listing"><Check size={12} />Your listing</span>}
             <button type="button" className="text-button primary" onClick={copyToWorkspace} disabled={auth?.is_viewer || loading || copying}>{copying ? <LoaderCircle className="spin" size={16} /> : <Copy size={16} />}{copying ? "Copying" : detail.workspace_copy ? "Copy another" : "Copy to my workspace"}</button>
           </div>
         </footer>

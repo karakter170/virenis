@@ -1096,7 +1096,9 @@ summary:focus-visible,
 
 .row-actions {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
+  justify-content: flex-end;
   gap: 3px;
 }
 
@@ -1123,6 +1125,26 @@ summary:focus-visible,
 .agent-publish-action:disabled {
   cursor: not-allowed;
   opacity: 0.45;
+}
+
+.agent-unpublish-action {
+  min-height: 30px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 1px solid #e4c9c5;
+  border-radius: 15px;
+  padding: 0 9px;
+  color: #9a3f35;
+  background: #fff8f7;
+  font-size: 9px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.agent-unpublish-action:hover:not(:disabled) {
+  border-color: #bd6a60;
+  background: var(--danger-soft);
 }
 
 .session-switch {
@@ -1560,6 +1582,7 @@ summary:focus-visible,
 .market-card > footer { margin-top: auto; display: flex; align-items: center; justify-content: space-between; gap: 10px; border-top: 1px solid var(--line); padding: 10px 15px 12px; }
 .market-card > footer > button { border: 0; color: var(--accent); background: transparent; font-size: 9px; font-weight: 700; }
 .market-card > footer > button:disabled { cursor: not-allowed; opacity: 0.45; }
+.market-own-listing { display: inline-flex; align-items: center; gap: 4px; color: var(--accent); font-size: 9px; font-weight: 700; white-space: nowrap; }
 .market-rating { display: inline-flex; align-items: center; gap: 4px; color: #a46a12; font-size: 11px; font-weight: 700; }
 .market-rating small { color: var(--text-faint); font-size: 8px; font-weight: 500; }
 .market-author { margin-top: 9px; overflow: hidden; color: var(--text-faint); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
@@ -1607,7 +1630,8 @@ summary:focus-visible,
 .marketplace-detail-rating strong { font-size: 15px; }
 .marketplace-detail-rating span { color: var(--text-faint); font-size: 8px; }
 .marketplace-detail-preview .preview-status > svg { color: var(--accent); }
-.marketplace-detail-actions > div { justify-self: end; display: flex; align-items: center; gap: 7px; }
+.marketplace-detail-actions > div { justify-self: end; display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 7px; }
+.marketplace-detail-actions .market-own-listing { padding: 0 5px; }
 
 .builder-field label small { color: var(--text-faint); font-size: 9px; font-weight: 450; }
 
@@ -3689,7 +3713,7 @@ summary:focus-visible,
     justify-self: end;
   }
 
-  .marketplace-detail-actions > div .text-button.ghost {
+  .marketplace-detail-actions > div .marketplace-rate-action {
     display: none;
   }
 }

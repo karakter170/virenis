@@ -300,6 +300,7 @@ function normalizeData(value, seedAgents) {
     const marketplace = agent.marketplace;
     marketplace.description = String(marketplace.description || marketplace.summary || agent.capability || "").trim().slice(0, 1200);
     marketplace.published_by = String(marketplace.published_by || agent.created_by || "Virenis").trim() || "Virenis";
+    marketplace.publisher_workspace_id ??= agent.workspace_id || null;
     if (!marketplace.listing_id) {
       const digest = crypto.createHash("sha256")
         .update(`${agent.id || "agent"}:${marketplace.published_at || "legacy"}`, "utf8")
@@ -313,6 +314,22 @@ function normalizeData(value, seedAgents) {
     delete marketplace.version;
     delete marketplace.license;
   }
+  data.marketplaceRatings = data.marketplaceRatings.filter((rating) => {
+    const agent = data.agents.find((candidate) =>
+      (rating.listing_id && candidate.marketplace?.listing_id === rating.listing_id)
+      || (!rating.listing_id && candidate.id === rating.agent_id)
+    );
+    if (!agent) return true;
+    const publisherWorkspaceId = agent.marketplace?.publisher_workspace_id ?? agent.workspace_id ?? null;
+    const samePublisher = String(rating.created_by || "") === String(agent.marketplace?.published_by || "")
+      && (
+        publisherWorkspaceId === null
+        || String(rating.workspace_id || "") === String(publisherWorkspaceId)
+      );
+    const sameSourceOwner = String(rating.created_by || "") === String(agent.created_by || "")
+      && String(rating.workspace_id || "") === String(agent.workspace_id || "");
+    return !samePublisher && !sameSourceOwner;
+  });
   mergeSeedCatalog(data.agents, seedAgents);
   return data;
 }

@@ -3,6 +3,7 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 
 import {
+  AgentCatalog,
   AgentGraph,
   MarketplaceAgentDialog,
   MarketplacePanel,
@@ -204,5 +205,71 @@ describe("Agent Studio product surfaces", () => {
     }));
     expect(ratingMarkup).toContain("Your rating");
     expect(ratingMarkup).not.toContain("<textarea");
+
+    const ownItem = {
+      ...item,
+      publisher: { user_id: "alice" },
+      published_by: "alice",
+      is_self_published: true,
+      can_manage: true
+    };
+    const ownMarketplaceMarkup = renderToStaticMarkup(createElement(MarketplacePanel, {
+      items: [ownItem],
+      auth: { user_id: "alice", workspace_id: "workspace_a" }
+    }));
+    expect(ownMarketplaceMarkup).toContain("Your listing");
+    expect(ownMarketplaceMarkup).not.toContain(">Rate<");
+
+    const ownDetailMarkup = renderToStaticMarkup(createElement(MarketplaceAgentDialog, {
+      item: ownItem,
+      auth: { user_id: "alice", workspace_id: "workspace_a" },
+      onClose: () => undefined,
+      onRate: () => undefined,
+      onCopied: () => undefined,
+      onEditDescription: () => undefined,
+      onUnpublish: () => undefined
+    }));
+    expect(ownDetailMarkup).toContain("Edit description");
+    expect(ownDetailMarkup).toContain("Unpublish");
+    expect(ownDetailMarkup).toContain("Your listing");
+    expect(ownDetailMarkup).not.toContain(">Rate<");
+
+    const catalogMarkup = renderToStaticMarkup(createElement(AgentCatalog, {
+      agents: [
+        {
+          id: "alice_published_agent",
+          title: "Published agent",
+          capability: "A published agent.",
+          enabled: true,
+          visibility: "private",
+          created_by: "alice",
+          workspace_id: "workspace_a",
+          marketplace: { published: true }
+        },
+        {
+          id: "alice_archived_agent",
+          title: "Archived agent",
+          capability: "An archived agent.",
+          enabled: false,
+          visibility: "private",
+          created_by: "alice",
+          workspace_id: "workspace_a"
+        }
+      ],
+      auth: { user_id: "alice", workspace_id: "workspace_a" },
+      sessionId: "session_a",
+      togglingAgentId: "",
+      onCreate: () => undefined,
+      onEdit: () => undefined,
+      onAdopt: () => undefined,
+      onArchive: () => undefined,
+      onDelete: () => undefined,
+      onToggle: () => undefined,
+      onPublish: () => undefined,
+      onUnpublish: () => undefined
+    }));
+    expect(catalogMarkup).toContain("Edit description");
+    expect(catalogMarkup).toContain("Unpublish");
+    expect(catalogMarkup).toContain("Permanently delete Archived agent");
   });
 });

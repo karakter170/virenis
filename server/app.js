@@ -44,6 +44,7 @@ import {
 } from "./outcomes.js";
 import {
   archiveRuntimeAgent,
+  deleteArchivedRuntimeAgent,
   deleteRuntimeDocument,
   fetchRuntimeAgent,
   fetchRuntimeAgents,
@@ -1044,22 +1045,27 @@ export async function createApp({
       const current = store.read().agents.find((agent) => agent.id === req.params.agent_id);
       assertAgentMutationAccess(current, req);
       if (!current || current.enabled === false) throwStatus(404, "Agent not found.");
+      const wasPublished = current.marketplace?.published === true;
       const marketplace = normalizeMarketplacePayload(req.body, current, req);
       const updated = await store.mutate((data) => {
         const agent = data.agents.find((item) => item.id === current.id);
+        assertAgentMutationAccess(agent, req);
+        if (!agent || agent.enabled === false) throwStatus(404, "Agent not found.");
         agent.item_type = marketplace.item_type;
         agent.marketplace = marketplace;
+        data.marketplaceRatings = (data.marketplaceRatings || [])
+          .filter((rating) => !marketplaceRatingIsSelf(rating, agent));
         agent.last_edited_by = req.auth.user_id;
         agent.last_edited_at = nowIso();
         appendAgentEvent(data, {
-          eventType: "agent.marketplace_published",
+          eventType: wasPublished ? "agent.marketplace_description_updated" : "agent.marketplace_published",
           agent,
           actor: req.auth,
           details: { item_type: marketplace.item_type, listing_id: marketplace.listing_id }
         });
         return agent;
       });
-      res.status(current.marketplace?.published ? 200 : 201).json(marketplaceItemSummary(store.read(), updated, req));
+      res.status(wasPublished ? 200 : 201).json(marketplaceItemSummary(store.read(), updated, req));
     } catch (error) {
       next(error);
     }
@@ -1070,14 +1076,27 @@ export async function createApp({
       const current = store.read().agents.find((agent) => agent.id === req.params.agent_id);
       assertAgentMutationAccess(current, req);
       if (!current?.marketplace?.published) throwStatus(404, "Marketplace item not found.");
+      const unpublishedAt = nowIso();
       await store.mutate((data) => {
         const agent = data.agents.find((item) => item.id === current.id);
+        assertAgentMutationAccess(agent, req);
+        if (!agent?.marketplace?.published) throwStatus(404, "Marketplace item not found.");
         agent.marketplace = {
           ...agent.marketplace,
           published: false,
-          unpublished_at: nowIso(),
-          updated_by: req.auth.user_id
+          unpublished_at: unpublishedAt,
+          updated_by: req.auth.user_id,
+          updated_at: unpublishedAt
         };
+        agent.last_edited_by = req.auth.user_id;
+        agent.last_edited_at = unpublishedAt;
+        appendAgentEvent(data, {
+          eventType: "agent.marketplace_unpublished",
+          agent,
+          actor: req.auth,
+          details: { listing_id: marketplaceListingId(agent) },
+          occurredAt: unpublishedAt
+        });
         return agent;
       });
       res.json({ ok: true, agent_id: current.id, published: false });
@@ -1098,11 +1117,23 @@ export async function createApp({
       const snapshot = store.read();
       const item = snapshot.agents.find((agent) => agent.id === req.params.agent_id && agent.enabled !== false && agent.marketplace?.published === true);
       if (!item) throwStatus(404, "Marketplace item not found.");
-      const listingId = marketplaceListingId(item);
+      if (marketplaceIsSelfPublished(item, req)) {
+        throwStatus(403, "You cannot rate an agent you published.");
+      }
       const result = await store.mutate((data) => {
+        const currentItem = data.agents.find((agent) =>
+          agent.id === req.params.agent_id
+          && agent.enabled !== false
+          && agent.marketplace?.published === true
+        );
+        if (!currentItem) throwStatus(404, "Marketplace item not found.");
+        if (marketplaceIsSelfPublished(currentItem, req)) {
+          throwStatus(403, "You cannot rate an agent you published.");
+        }
+        const listingId = marketplaceListingId(currentItem);
         data.marketplaceRatings = Array.isArray(data.marketplaceRatings) ? data.marketplaceRatings : [];
         const existing = data.marketplaceRatings.find((rating) =>
-          marketplaceRatingMatches(rating, item)
+          marketplaceRatingMatches(rating, currentItem)
           && rating.created_by === req.auth.user_id
           && String(rating.workspace_id || "") === String(req.auth.workspace_id || "")
         );
@@ -1110,7 +1141,7 @@ export async function createApp({
         if (existing) {
           existing.score = score;
           existing.listing_id = listingId;
-          existing.agent_id = item.id;
+          existing.agent_id = currentItem.id;
           delete existing.review;
           delete existing.comment;
           delete existing.comments;
@@ -1120,7 +1151,7 @@ export async function createApp({
         const rating = {
           rating_id: makeId("rating"),
           listing_id: listingId,
-          agent_id: item.id,
+          agent_id: currentItem.id,
           score,
           workspace_id: req.auth.workspace_id,
           created_by: req.auth.user_id,
@@ -1130,7 +1161,9 @@ export async function createApp({
         data.marketplaceRatings.push(rating);
         return { rating, created: true };
       });
-      res.status(result.created ? 201 : 200).json(marketplaceItemSummary(store.read(), item, req));
+      const updatedSnapshot = store.read();
+      const updatedItem = updatedSnapshot.agents.find((agent) => agent.id === req.params.agent_id);
+      res.status(result.created ? 201 : 200).json(marketplaceItemSummary(updatedSnapshot, updatedItem, req));
     } catch (error) {
       next(error);
     }
@@ -1603,6 +1636,69 @@ export async function createApp({
     const error = new Error("Agent mounting is retired; API agents are ready when enabled.");
     error.status = 410;
     next(error);
+  });
+
+  app.delete("/api/agents/:agent_id/permanent", async (req, res, next) => {
+    let lifecycleIntent = null;
+    let runtimeMutationCommitted = false;
+    try {
+      const snapshot = store.read();
+      const localAgent = snapshot.agents.find((item) => item.id === req.params.agent_id);
+      assertAgentMutationAccess(localAgent, req);
+      assertArchivedAgentCanBeDeleted(snapshot, localAgent);
+
+      let runtimeResult = null;
+      if (realRuntimeEnabled()) {
+        lifecycleIntent = await store.mutate((data) => beginRuntimeLifecycleIntent(data, {
+          agentId: req.params.agent_id,
+          operation: "agent.delete",
+          actor: req.auth
+        }));
+        try {
+          runtimeResult = await invokeRuntimeLifecycleMutation({
+            store,
+            intent: lifecycleIntent,
+            retainOnNotFound: true,
+            invoke: () => deleteArchivedRuntimeAgent(req.params.agent_id, runtimeAuditContext(req))
+          });
+        } catch (error) {
+          if (Number(error?.status) !== 404) throw error;
+          runtimeResult = { ok: true, status: "already_absent", purged: true };
+        }
+        if (runtimeResult.status !== "already_absent" && !runtimeAgentRegistrationWasPurged(runtimeResult)) {
+          const error = new Error("Runtime did not confirm permanent agent deletion.");
+          error.status = 502;
+          error.code = "runtime_agent_delete_unconfirmed";
+          throw error;
+        }
+        runtimeMutationCommitted = true;
+      }
+
+      const deletedAt = nowIso();
+      await persistRuntimeLifecycleCompletion(() => store.mutate((data) => {
+        const activeIntent = lifecycleIntent
+          ? (data.runtimeLifecycleIntents || []).find((candidate) => candidate.intent_id === lifecycleIntent.intent_id)
+          : null;
+        if (lifecycleIntent && !activeIntent) return null;
+        const deleted = applyArchivedAgentDeletionState(data, req.params.agent_id, {
+          actor: req.auth,
+          deletedAt
+        });
+        if (lifecycleIntent) finishRuntimeLifecycleIntent(data, lifecycleIntent.intent_id);
+        return deleted;
+      }));
+      res.json({
+        ok: true,
+        status: "deleted",
+        id: req.params.agent_id,
+        ...(runtimeResult ? { runtime_status: runtimeResult.status } : {})
+      });
+    } catch (error) {
+      if (lifecycleIntent && !runtimeMutationCommitted && Number(error?.status) >= 400 && Number(error?.status) < 500 && Number(error?.status) !== 404) {
+        await clearRejectedRuntimeLifecycleIntent(store, lifecycleIntent.intent_id).catch(() => undefined);
+      }
+      next(error);
+    }
   });
 
   app.delete("/api/agents/:agent_id", async (req, res, next) => {
@@ -3155,6 +3251,75 @@ function ownedAgentSourcePath(agentId) {
   return `sources/router_agents/${agentId}/source.md`;
 }
 
+function activeAgentDependents(data, agentId) {
+  const resourceToken = `agent:${agentId}`;
+  const handoffToken = `agent:${agentId}:output`;
+  return data.agents.filter((candidate) =>
+    candidate.id !== agentId
+    && candidate.enabled !== false
+    && (
+      (candidate.resources || []).includes(resourceToken)
+      || (candidate.consumes || []).includes(handoffToken)
+    )
+  );
+}
+
+function assertArchivedAgentCanBeDeleted(data, agent) {
+  if (!agent) throwStatus(404, "Agent not found.");
+  if (agent.enabled !== false) {
+    throwStatus(409, "Archive the agent before deleting it permanently.");
+  }
+  if (agent.system_managed === true) {
+    throwStatus(403, "System-managed agents cannot be permanently deleted.");
+  }
+  if (agent.document || agent.resource_for_agent_id) {
+    throwStatus(409, "Document agents must be removed from the Knowledge tab.");
+  }
+  const dependents = activeAgentDependents(data, agent.id);
+  if (dependents.length) {
+    const names = dependents.slice(0, 3).map((candidate) => candidate.title || candidate.id).join(", ");
+    throwStatus(409, `Disconnect this agent from active agents before deleting it: ${names}.`);
+  }
+}
+
+function applyArchivedAgentDeletionState(data, agentId, { actor, deletedAt }) {
+  const index = data.agents.findIndex((agent) => agent.id === agentId);
+  const agent = index >= 0 ? data.agents[index] : null;
+  assertArchivedAgentCanBeDeleted(data, agent);
+  const listingId = marketplaceListingId(agent);
+  appendAgentEvent(data, {
+    eventType: "agent.deleted",
+    agent,
+    actor,
+    details: {
+      deleted_at: deletedAt,
+      listing_id: agent.marketplace?.listing_id || null,
+      was_published: agent.marketplace?.published === true
+    },
+    occurredAt: deletedAt
+  });
+  data.agents.splice(index, 1);
+  data.marketplaceRatings = (data.marketplaceRatings || []).filter((rating) =>
+    String(rating.listing_id || "") !== listingId
+    && String(rating.agent_id || "") !== agentId
+  );
+  for (const session of data.sessions || []) {
+    session.inactive_agent_ids = (session.inactive_agent_ids || []).filter((id) => id !== agentId);
+  }
+  for (const document of data.documents || []) {
+    if (document.resource_for_agent_id === agentId) {
+      document.resource_for_agent_id = null;
+    }
+  }
+  return {
+    id: agentId,
+    title: agent.title,
+    workspace_id: agent.workspace_id,
+    created_by: agent.created_by,
+    deleted_at: deletedAt
+  };
+}
+
 function beginRuntimeLifecycleIntent(data, {
   agentId,
   documentId = null,
@@ -3174,6 +3339,7 @@ function beginRuntimeLifecycleIntent(data, {
     status: "runtime_pending",
     details,
     requested_by: actor?.user_id || null,
+    requested_role: actor?.role || null,
     workspace_id: actor?.workspace_id || null,
     created_at: nowIso()
   };
@@ -3310,6 +3476,11 @@ async function reconcileRuntimeLifecycleIntents({ store, intentId = null, intent
   const results = [];
   const actor = { user_id: "virenis-runtime-recovery", workspace_id: null, role: "system" };
   for (const intent of intents) {
+    const intentActor = {
+      user_id: intent.requested_by || actor.user_id,
+      workspace_id: intent.workspace_id || null,
+      role: intent.requested_role || actor.role
+    };
     let runtimeResult = null;
     let runtimeAbsent = false;
     try {
@@ -3321,7 +3492,38 @@ async function reconcileRuntimeLifecycleIntents({ store, intentId = null, intent
         continue;
       }
     }
-    if (runtimeAbsent && intent.operation !== "document.delete") {
+    if (intent.operation === "agent.delete" && !runtimeAbsent) {
+      try {
+        const deletion = await deleteArchivedRuntimeAgent(intent.agent_id, {
+          user_id: intentActor.user_id,
+          workspace_id: intentActor.workspace_id,
+          role: intentActor.role
+        });
+        if (!runtimeAgentRegistrationWasPurged(deletion)) {
+          results.push({
+            intent_id: intent.intent_id,
+            status: "pending",
+            error: "runtime_agent_delete_unconfirmed"
+          });
+          continue;
+        }
+        runtimeAbsent = true;
+        runtimeResult = null;
+      } catch (error) {
+        if (Number(error?.status) === 404) {
+          runtimeAbsent = true;
+          runtimeResult = null;
+        } else {
+          results.push({
+            intent_id: intent.intent_id,
+            status: "pending",
+            error: error.code || "runtime_agent_delete_failed"
+          });
+          continue;
+        }
+      }
+    }
+    if (runtimeAbsent && !["document.delete", "agent.delete"].includes(intent.operation)) {
       results.push({ intent_id: intent.intent_id, status: "pending", error: "runtime_agent_missing" });
       continue;
     }
@@ -3335,6 +3537,17 @@ async function reconcileRuntimeLifecycleIntents({ store, intentId = null, intent
             actor,
             deletedAt: nowIso()
           });
+          finishRuntimeLifecycleIntent(data, intent.intent_id);
+          return null;
+        }
+        if (intent.operation === "agent.delete" && runtimeAbsent) {
+          const localAgent = data.agents.find((item) => item.id === intent.agent_id);
+          if (localAgent) {
+            applyArchivedAgentDeletionState(data, intent.agent_id, {
+              actor: intentActor,
+              deletedAt: nowIso()
+            });
+          }
           finishRuntimeLifecycleIntent(data, intent.intent_id);
           return null;
         }
@@ -4754,6 +4967,10 @@ function marketplacePublisherUserId(agent = {}) {
   return String(agent.marketplace?.published_by || agent.created_by || "Virenis").trim() || "Virenis";
 }
 
+function marketplacePublisherWorkspaceId(agent = {}) {
+  return agent.marketplace?.publisher_workspace_id ?? agent.workspace_id ?? null;
+}
+
 function marketplaceDescription(agent = {}) {
   return String(
     agent.marketplace?.description
@@ -4792,6 +5009,7 @@ function normalizeMarketplacePayload(body = {}, agent = {}, req) {
     description,
     snapshot: marketplaceAgentSnapshot(agent),
     published_by: agent.marketplace?.published_by || req.auth.user_id,
+    publisher_workspace_id: agent.marketplace?.publisher_workspace_id ?? req.auth.workspace_id ?? null,
     updated_by: req.auth.user_id,
     published_at: agent.marketplace?.published_at || now,
     updated_at: now
@@ -4805,9 +5023,40 @@ function marketplaceRatingMatches(rating = {}, agent = {}) {
     : String(rating.agent_id || "") === String(agent.id || "");
 }
 
+function marketplaceRatingIsSelf(rating = {}, agent = {}) {
+  const ratingUser = String(rating.created_by || "");
+  if (!ratingUser) return false;
+  const publisherWorkspaceId = marketplacePublisherWorkspaceId(agent);
+  if (
+    ratingUser === marketplacePublisherUserId(agent)
+    && (
+      publisherWorkspaceId === null
+      || String(rating.workspace_id || "") === String(publisherWorkspaceId)
+    )
+  ) return true;
+  return ratingUser === String(agent.created_by || "")
+    && String(rating.workspace_id || "") === String(agent.workspace_id || "");
+}
+
+function marketplaceIsSelfPublished(agent = {}, req) {
+  const userId = String(req.auth?.user_id || "");
+  if (!userId) return false;
+  const publisherWorkspaceId = marketplacePublisherWorkspaceId(agent);
+  if (
+    userId === marketplacePublisherUserId(agent)
+    && (
+      publisherWorkspaceId === null
+      || String(req.auth?.workspace_id || "") === String(publisherWorkspaceId)
+    )
+  ) return true;
+  return userId === String(agent.created_by || "")
+    && String(req.auth?.workspace_id || "") === String(agent.workspace_id || "");
+}
+
 function marketplaceItemSummary(data, agent, req) {
   const ratings = (data.marketplaceRatings || [])
     .filter((rating) => marketplaceRatingMatches(rating, agent))
+    .filter((rating) => !marketplaceRatingIsSelf(rating, agent))
     .filter((rating) => Number.isInteger(Number(rating.score)) && Number(rating.score) >= 1 && Number(rating.score) <= 5);
   const score = ratings.reduce((total, rating) => total + Number(rating.score || 0), 0);
   const averageRating = ratings.length ? Number((score / ratings.length).toFixed(2)) : 0;
@@ -4823,6 +5072,12 @@ function marketplaceItemSummary(data, agent, req) {
     && candidate.created_by === req.auth?.user_id
     && String(candidate.workspace_id || "") === String(req.auth?.workspace_id || "")
   ) || null;
+  const selfPublished = marketplaceIsSelfPublished(agent, req);
+  const canManage = isAdmin(req) || (
+    agent.visibility === "private"
+    && agent.created_by === req.auth?.user_id
+    && String(agent.workspace_id || "") === String(req.auth?.workspace_id || "")
+  );
   return {
     id: agent.id,
     listing_id: listingId,
@@ -4840,11 +5095,9 @@ function marketplaceItemSummary(data, agent, req) {
     my_rating: myRating ? { score: Number(myRating.score) } : null,
     workspace_copy: workspaceCopy ? { agent_id: workspaceCopy.id, title: workspaceCopy.title } : null,
     can_copy: !isViewer(req),
-    is_owner: isAdmin(req) || (
-      agent.visibility === "private" &&
-      agent.created_by === req.auth?.user_id &&
-      String(agent.workspace_id || "") === String(req.auth?.workspace_id || "")
-    )
+    can_manage: canManage,
+    is_self_published: selfPublished,
+    is_owner: canManage
   };
 }
 
