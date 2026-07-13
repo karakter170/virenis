@@ -6,10 +6,12 @@ import {
   AgentGraph,
   availableSessionAgents,
   graphConnectionInputs,
+  graphConnectionWouldCycle,
   graphConnections,
   initialGraphPositions,
   storedGraphPositions
 } from "../src/App.jsx";
+import LandingPage from "../src/LandingPage.jsx";
 
 
 afterEach(() => {
@@ -18,6 +20,13 @@ afterEach(() => {
 
 
 describe("Agent Studio product surfaces", () => {
+  it("presents an API-first homepage without adapter product language", () => {
+    const markup = renderToStaticMarkup(createElement(LandingPage, { onEnter: () => undefined }));
+    expect(markup).toContain("MODEL APIS");
+    expect(markup).toContain("Switch providers, not the workflow.");
+    expect(markup).not.toMatch(/LoRA/i);
+  });
+
   it("distinguishes agent bubbles by color without embedding icons", () => {
     const markup = renderToStaticMarkup(createElement(AgentGraph, {
       agents: [
@@ -87,6 +96,17 @@ describe("Agent Studio product surfaces", () => {
       "research_agent",
       false
     )).toEqual(existing);
+  });
+
+  it("blocks only graph connections that would introduce a workflow cycle", () => {
+    const edges = [
+      { from: "research_agent", to: "analysis_agent", kind: "handoff" },
+      { from: "analysis_agent", to: "writing_agent", kind: "handoff" }
+    ];
+
+    expect(graphConnectionWouldCycle(edges, "writing_agent", "research_agent")).toBe(true);
+    expect(graphConnectionWouldCycle(edges, "research_agent", "writing_agent")).toBe(false);
+    expect(graphConnectionWouldCycle(edges, "research_agent", "research_agent")).toBe(true);
   });
 
   it("restores persisted graph positions defensively and clamps unsafe coordinates", () => {

@@ -1794,6 +1794,26 @@ export function graphConnectionInputs(inputs = [], sourceId, connected = true) {
   return [...next];
 }
 
+export function graphConnectionWouldCycle(edges = [], sourceId, destinationId) {
+  if (!sourceId || !destinationId || sourceId === destinationId) return true;
+  const downstream = new Map();
+  for (const edge of edges) {
+    if (!edge?.from || !edge?.to) continue;
+    if (!downstream.has(edge.from)) downstream.set(edge.from, new Set());
+    downstream.get(edge.from).add(edge.to);
+  }
+  const pending = [destinationId];
+  const visited = new Set();
+  while (pending.length) {
+    const current = pending.pop();
+    if (current === sourceId) return true;
+    if (visited.has(current)) continue;
+    visited.add(current);
+    pending.push(...(downstream.get(current) || []));
+  }
+  return false;
+}
+
 function graphTone(agentId) {
   return [...String(agentId || "agent")]
     .reduce((value, character) => value + character.charCodeAt(0), 0) % 6;
@@ -1948,6 +1968,10 @@ export function AgentGraph({ agents, auth, storageKey, onConnect, onDisconnect }
     }
     if (edges.some((edge) => edge.from === connectFromId && edge.to === agent.id && edge.kind === "handoff")) {
       setGraphError("Those agents already have a handoff connection.");
+      return;
+    }
+    if (graphConnectionWouldCycle(edges, connectFromId, agent.id)) {
+      setGraphError("That handoff would create a circular workflow. Choose another direction.");
       return;
     }
     setConnectionBusy(true);
