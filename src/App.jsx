@@ -8,20 +8,27 @@ import {
   BookOpen,
   Bot,
   Calculator,
+  CalendarDays,
   Check,
   ChevronRight,
   Clock3,
   Code2,
+  ContactRound,
   Copy,
   Database,
   FilePlus2,
   FileSearch,
   Flag,
   Globe2,
+  Github,
+  HardDrive,
   Layers3,
   LoaderCircle,
   Menu,
+  Mail,
+  MessageCircle,
   Network,
+  NotebookText,
   Paperclip,
   Pencil,
   Plus,
@@ -31,6 +38,7 @@ import {
   Scale,
   Search,
   Settings2,
+  Slack,
   Sparkles,
   Star,
   SquarePen,
@@ -39,6 +47,7 @@ import {
   Upload,
   UserPlus,
   WandSparkles,
+  ListTodo,
   X
 } from "lucide-react";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
@@ -2272,13 +2281,13 @@ export function ConnectionsPanel({
               const providerConnections = connections.filter((connection) => connection.provider_id === provider.id);
               const connecting = busy === `provider:${provider.id}`;
               return (
-                <article className="managed-provider-card" key={provider.id}>
+                <article className={`managed-provider-card provider-${provider.id}`} key={provider.id}>
                   <div className="managed-provider-head">
-                    <span className={`managed-provider-icon ${provider.id}`}><AtSign size={20} /></span>
-                    <div><strong>{provider.name}</strong><small>{provider.description}</small></div>
-                    {provider.preview && <i>Preview</i>}
+                    <span className={`managed-provider-icon ${provider.id}`}><ManagedProviderIcon providerId={provider.id} /></span>
+                    <div><em>{provider.category || "Integration"}</em><strong>{provider.name}</strong><small>{provider.description}</small></div>
+                    <i className={provider.setup_mode === "automatic" ? "automatic" : ""}>{provider.setup_mode === "automatic" ? "Instant setup" : provider.preview ? "Preview" : "OAuth"}</i>
                   </div>
-                  <div className="managed-provider-policy"><Check size={14} /><span>Read-only tools can run automatically. Actions still require your approval.</span></div>
+                  <div className="managed-provider-policy"><Check size={14} /><span>{provider.permissions_summary || "Read-only tools can run automatically. Actions still require your approval."}</span></div>
                   <footer>
                     <small>{providerConnections.length
                       ? `${providerConnections.length} account connection${providerConnections.length === 1 ? "" : "s"}`
@@ -2291,7 +2300,11 @@ export function ConnectionsPanel({
                         onClick={() => connectManaged(provider)}
                       >
                         {connecting ? <LoaderCircle className="spin" size={14} /> : <Plug size={14} />}
-                        {providerConnections.length ? "Connected" : provider.connect_label || `Connect ${provider.name}`}
+                        {providerConnections.length
+                          ? "Connected"
+                          : provider.availability !== "available"
+                            ? "Admin setup"
+                            : provider.connect_label || `Connect ${provider.name}`}
                       </button>
                     )}
                   </footer>
@@ -2356,7 +2369,7 @@ export function ConnectionsPanel({
       <div className="connection-list">
         {connections.map((connection) => (
           <article className={`connection-card ${connection.status !== "ready" ? "connection-needs-attention" : ""}`} key={connection.connection_id}>
-            <div className="connection-card-head"><span className="connection-icon"><Plug size={17} /></span><div><strong>{connection.name}</strong><small>{connection.connection_mode === "managed" ? "Connected securely with OAuth" : `${connection.endpoint_origin} · ${connection.auth_type === "bearer" ? "Protected" : "No auth"}`}</small></div><i className={connection.status === "ready" ? "connection-ready" : "connection-warning"}><span />{connection.status === "ready" ? "Ready" : "Reconnect"}</i></div>
+            <div className="connection-card-head"><span className={`connection-icon ${connection.provider_id || "custom"}`}>{connection.connection_mode === "managed" ? <ManagedProviderIcon providerId={connection.provider_id} size={17} /> : <Plug size={17} />}</span><div><strong>{connection.name}</strong><small>{connection.connection_mode === "managed" ? "Connected securely with OAuth" : `${connection.endpoint_origin} · ${connection.auth_type === "bearer" ? "Protected" : "No auth"}`}</small></div><i className={connection.status === "ready" ? "connection-ready" : "connection-warning"}><span />{connection.status === "ready" ? "Ready" : "Reconnect"}</i></div>
             <div className="connection-tools">
               {(connection.tools || []).map((tool) => <span className={!tool.requires_approval ? "read" : "write"} key={tool.name}>{tool.title || tool.name}<small>{!tool.requires_approval ? "Read" : "Approval"}</small></span>)}
             </div>
@@ -2367,6 +2380,22 @@ export function ConnectionsPanel({
       </div>
     </section>
   );
+}
+
+function ManagedProviderIcon({ providerId, size = 20 }) {
+  const icons = {
+    gmail: Mail,
+    google_drive: HardDrive,
+    google_calendar: CalendarDays,
+    google_chat: MessageCircle,
+    google_contacts: ContactRound,
+    github: Github,
+    slack: Slack,
+    notion: NotebookText,
+    linear: ListTodo
+  };
+  const ProviderIcon = icons[providerId] || Plug;
+  return <ProviderIcon size={size} aria-hidden="true" />;
 }
 
 function RealityRank({ rank }) {

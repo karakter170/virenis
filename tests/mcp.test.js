@@ -69,7 +69,7 @@ describe("governed MCP phase 1", () => {
       .post("/api/mcp/connections")
       .send({
         name: "Product knowledge",
-        template_id: "github",
+        template_id: "custom",
         endpoint_url: server.url,
         trust_read_annotations: true,
         auth: { type: "bearer", token }
@@ -228,7 +228,9 @@ describe("governed MCP phase 1", () => {
     expect(marketplaceAgentText).not.toContain(readAlias);
     expect(marketplace.body.agent.connector_requirements).toEqual([
       expect.objectContaining({
-        connection_name: "GitHub",
+        connection_name: "Custom HTTPS",
+        connection_mode: "custom",
+        provider_id: null,
         tools: expect.arrayContaining([expect.objectContaining({ name: "search_notes" })])
       })
     ]);

@@ -129,12 +129,39 @@ describe("Agent Studio product surfaces", () => {
           id: "gmail",
           name: "Gmail",
           description: "Search mail and create drafts.",
+          category: "Communication",
           connection_mode: "managed",
           auth_type: "oauth2",
           availability: "available",
           availability_message: "Connect with Google",
           connect_label: "Connect Gmail",
+          permissions_summary: "Read relevant mail and create drafts.",
           preview: true
+        },
+        {
+          id: "notion",
+          name: "Notion",
+          description: "Search granted workspace pages.",
+          category: "Knowledge & files",
+          connection_mode: "managed",
+          auth_type: "oauth2",
+          availability: "available",
+          availability_message: "Sign in with Notion.",
+          connect_label: "Connect Notion",
+          setup_mode: "automatic",
+          permissions_summary: "Use only the Notion pages you grant."
+        },
+        {
+          id: "slack",
+          name: "Slack",
+          description: "Search workspace conversations.",
+          category: "Communication",
+          connection_mode: "managed",
+          auth_type: "oauth2",
+          availability: "setup_required",
+          availability_message: "An administrator must configure Slack OAuth.",
+          connect_label: "Connect Slack",
+          permissions_summary: "Posting remains approval-gated."
         },
         {
           id: "custom",
@@ -151,6 +178,10 @@ describe("Agent Studio product surfaces", () => {
     }));
     expect(markup).toContain("Connect your accounts");
     expect(markup).toContain("Connect Gmail");
+    expect(markup).toContain("Connect Notion");
+    expect(markup).toContain("Instant setup");
+    expect(markup).toContain("Admin setup");
+    expect(markup).toContain("Posting remains approval-gated");
     expect(markup).toContain("No endpoints or tokens to copy");
     expect(markup).toContain("Custom MCP");
     expect(markup).not.toContain("HTTPS endpoint");

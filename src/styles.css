@@ -3541,6 +3541,54 @@ summary:focus-visible,
   background: #fff0ee;
 }
 
+.managed-provider-icon.google_drive,
+.connection-icon.google_drive {
+  color: #2464c7;
+  background: #eef5ff;
+}
+
+.managed-provider-icon.google_calendar,
+.connection-icon.google_calendar {
+  color: #1f65c9;
+  background: #edf4ff;
+}
+
+.managed-provider-icon.google_chat,
+.connection-icon.google_chat {
+  color: #167b50;
+  background: #eaf8f1;
+}
+
+.managed-provider-icon.google_contacts,
+.connection-icon.google_contacts {
+  color: #6d4bc2;
+  background: #f2edff;
+}
+
+.managed-provider-icon.github,
+.connection-icon.github {
+  color: #22272e;
+  background: #eef0f2;
+}
+
+.managed-provider-icon.slack,
+.connection-icon.slack {
+  color: #7c245d;
+  background: #faedf6;
+}
+
+.managed-provider-icon.notion,
+.connection-icon.notion {
+  color: #252525;
+  background: #f1f1ef;
+}
+
+.managed-provider-icon.linear,
+.connection-icon.linear {
+  color: #5c55d9;
+  background: #efefff;
+}
+
 .managed-provider-head strong,
 .managed-provider-head small {
   display: block;
@@ -3548,6 +3596,17 @@ summary:focus-visible,
 
 .managed-provider-head strong {
   font-size: 12px;
+}
+
+.managed-provider-head em {
+  display: block;
+  margin-bottom: 2px;
+  color: var(--text-faint);
+  font-size: 7px;
+  font-style: normal;
+  font-weight: 750;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
 }
 
 .managed-provider-head small {
@@ -3567,6 +3626,15 @@ summary:focus-visible,
   font-weight: 700;
   letter-spacing: 0.04em;
   text-transform: uppercase;
+}
+
+.managed-provider-head > i.automatic {
+  color: #17613f;
+  background: #e8f7ef;
+}
+
+.managed-provider-card:has(.text-button:disabled) {
+  background: #fbfcfb;
 }
 
 .managed-provider-policy {

@@ -11,9 +11,13 @@ import {
   buildManagedAuthorizationUrl,
   exchangeManagedAuthorizationCode,
   managedMcpProvider,
+  managedMcpProviderForCredential,
   oauthCredentialNeedsRefresh,
+  prepareManagedMcpProvider,
   publicManagedMcpProviders,
   refreshManagedAccessToken,
+  restoreManagedMcpProvider,
+  snapshotManagedMcpProvider,
   revokeManagedCredential
 } from "./mcpOAuth.js";
 import { readConfiguredSecret } from "./secretConfig.js";
@@ -28,6 +32,7 @@ const MCP_ALIAS_RE = /^mcp_[a-f0-9]{8}_[a-z0-9_]{1,42}_[a-f0-9]{6}$/;
 const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
 const OAUTH_STATE_RETENTION_MS = 24 * 60 * 60 * 1000;
 const oauthRefreshInflight = new Map();
+const dynamicRegistrationInflight = new Map();
 
 export const MCP_TEMPLATES = Object.freeze([
   {
@@ -38,36 +43,60 @@ export const MCP_TEMPLATES = Object.freeze([
     connection_mode: "managed"
   },
   {
+    id: "google_drive",
+    name: "Google Drive",
+    description: "Connect Drive through Google OAuth without entering an endpoint or token.",
+    auth_type: "oauth2",
+    connection_mode: "managed"
+  },
+  {
+    id: "google_calendar",
+    name: "Google Calendar",
+    description: "Connect Calendar through Google OAuth without entering an endpoint or token.",
+    auth_type: "oauth2",
+    connection_mode: "managed"
+  },
+  {
+    id: "google_chat",
+    name: "Google Chat",
+    description: "Connect Google Chat through Google OAuth without entering an endpoint or token.",
+    auth_type: "oauth2",
+    connection_mode: "managed"
+  },
+  {
+    id: "google_contacts",
+    name: "Google Contacts",
+    description: "Connect Contacts through Google OAuth without entering an endpoint or token.",
+    auth_type: "oauth2",
+    connection_mode: "managed"
+  },
+  {
     id: "github",
     name: "GitHub",
-    description: "Give an agent selected repository, issue, and pull-request tools.",
-    auth_type: "bearer",
-    connection_mode: "custom",
-    endpoint_placeholder: "https://your-github-mcp.example.com/mcp"
+    description: "Connect GitHub through OAuth without entering an endpoint or token.",
+    auth_type: "oauth2",
+    connection_mode: "managed"
   },
   {
     id: "notion",
     name: "Notion",
-    description: "Let an agent search and read approved workspace knowledge.",
-    auth_type: "bearer",
-    connection_mode: "custom",
-    endpoint_placeholder: "https://your-notion-mcp.example.com/mcp"
+    description: "Connect Notion through OAuth without entering an endpoint or token.",
+    auth_type: "oauth2",
+    connection_mode: "managed"
   },
   {
     id: "linear",
     name: "Linear",
-    description: "Let an agent inspect and, with approval, update project work.",
-    auth_type: "bearer",
-    connection_mode: "custom",
-    endpoint_placeholder: "https://your-linear-mcp.example.com/mcp"
+    description: "Connect Linear through OAuth without entering an endpoint or token.",
+    auth_type: "oauth2",
+    connection_mode: "managed"
   },
   {
     id: "slack",
     name: "Slack",
-    description: "Let an agent search selected channels and draft approved actions.",
-    auth_type: "bearer",
-    connection_mode: "custom",
-    endpoint_placeholder: "https://your-slack-mcp.example.com/mcp"
+    description: "Connect Slack through OAuth without entering an endpoint or token.",
+    auth_type: "oauth2",
+    connection_mode: "managed"
   },
   {
     id: "custom",
@@ -237,7 +266,7 @@ export async function createMcpConnection({ body, actor, key }) {
 export async function beginManagedMcpOAuth({ store, actor, body, key, env = process.env }) {
   if (!key) throw mcpError(503, "MCP credential encryption is not configured.", "mcp_key_missing");
   const providerId = String(body?.provider_id || "").trim().toLowerCase();
-  const provider = managedMcpProvider(providerId, env);
+  let provider = managedMcpProvider(providerId, env);
   const requestedConnectionId = String(body?.connection_id || "").trim();
   const requestedWorkflowId = String(body?.workflow_id || "").trim();
   const resumeWorkflow = requestedWorkflowId
@@ -276,6 +305,8 @@ export async function beginManagedMcpOAuth({ store, actor, body, key, env = proc
     }
   }
 
+  provider = await managedProviderForOAuthStart({ store, providerId, key, env });
+
   const state = crypto.randomBytes(32).toString("base64url");
   const browserNonce = crypto.randomBytes(32).toString("base64url");
   const codeVerifier = crypto.randomBytes(48).toString("base64url");
@@ -300,7 +331,10 @@ export async function beginManagedMcpOAuth({ store, actor, body, key, env = proc
     verifier_envelope: null
   };
   transaction.verifier_envelope = encryptMcpValue(
-    { code_verifier: codeVerifier },
+    {
+      code_verifier: codeVerifier,
+      provider_snapshot: snapshotManagedMcpProvider(provider)
+    },
     key,
     mcpOAuthStateAad(transaction)
   );
@@ -350,7 +384,7 @@ export async function completeManagedMcpOAuth({
 }) {
   if (!key) throw mcpError(503, "MCP credential encryption is not configured.", "mcp_key_missing");
   const normalizedProviderId = String(providerId || "").trim().toLowerCase();
-  const provider = managedMcpProvider(normalizedProviderId, env);
+  const baseProvider = managedMcpProvider(normalizedProviderId, env, { requireConfigured: false });
   const state = String(query?.state || "").trim();
   if (!/^[A-Za-z0-9_-]{40,128}$/.test(state)) {
     throw mcpError(400, "OAuth state is invalid.", "mcp_oauth_state_invalid");
@@ -358,7 +392,7 @@ export async function completeManagedMcpOAuth({
   const stateDigest = digest(state);
   const transaction = store.read((data) => (data.mcpOauthStates || [])
     .find((item) => item.state_digest === stateDigest));
-  if (!transaction || transaction.provider_id !== provider.id) {
+  if (!transaction || transaction.provider_id !== baseProvider.id) {
     throw mcpError(400, "OAuth state was not found.", "mcp_oauth_state_invalid");
   }
   if (transaction.status !== "pending") {
@@ -384,7 +418,7 @@ export async function completeManagedMcpOAuth({
 
   if (query?.error) {
     await setOauthTransactionStatus(store, transaction.oauth_state_id, "denied");
-    const error = mcpError(400, "Google account access was not granted.", "mcp_oauth_denied");
+    const error = mcpError(400, `${baseProvider.name} account access was not granted.`, "mcp_oauth_denied");
     error.oauth_redirect = true;
     error.oauth_reason = "denied";
     error.oauth_clear_cookie = true;
@@ -393,15 +427,20 @@ export async function completeManagedMcpOAuth({
   }
 
   let credential;
+  let provider = baseProvider;
   try {
     const verifier = decryptMcpValue(
       transaction.verifier_envelope,
       key,
       mcpOAuthStateAad(transaction)
     );
+    provider = verifier.provider_snapshot
+      ? restoreManagedMcpProvider(normalizedProviderId, verifier.provider_snapshot, env)
+      : managedMcpProvider(normalizedProviderId, env);
     credential = await exchangeManagedAuthorizationCode(provider, {
       code: query?.code,
-      codeVerifier: verifier.code_verifier
+      codeVerifier: verifier.code_verifier,
+      env
     });
     assertManagedCredentialScopes(provider, credential);
     const currentConnection = transaction.connection_id
@@ -483,7 +522,7 @@ export async function completeManagedMcpOAuth({
     };
   } catch (error) {
     if (credential) {
-      await revokeManagedCredential(provider, credential).catch(() => undefined);
+      await revokeManagedCredential(provider, credential, env).catch(() => undefined);
     }
     await setOauthTransactionStatus(store, transaction.oauth_state_id, "failed");
     error.oauth_redirect = true;
@@ -501,8 +540,8 @@ export async function revokeMcpConnection(connection, { key, env = process.env }
     key,
     mcpConnectionAad(connection.connection_id, connection.workspace_id)
   );
-  const provider = managedMcpProvider(connection.provider_id, env);
-  await revokeManagedCredential(provider, credential);
+  const provider = managedMcpProviderForCredential(connection.provider_id, credential, env);
+  await revokeManagedCredential(provider, credential, env);
   return true;
 }
 
@@ -1031,7 +1070,7 @@ async function refreshMcpOAuthCredential(connection, { key, store, force }) {
     }
     let refreshed;
     try {
-      const provider = managedMcpProvider(latest.provider_id);
+      const provider = managedMcpProviderForCredential(latest.provider_id, currentAuth);
       refreshed = await refreshManagedAccessToken(provider, currentAuth);
     } catch {
       await markMcpConnectionReauthorization(store, latest.connection_id);
@@ -1289,6 +1328,75 @@ function mcpToolAlias(connectionId, toolName) {
   return `mcp_${prefix}_${readable}_${digest(toolName).slice(0, 6)}`;
 }
 
+async function managedProviderForOAuthStart({ store, providerId, key, env }) {
+  const baseProvider = managedMcpProvider(providerId, env);
+  if (baseProvider.registration_mode !== "dynamic") return baseProvider;
+  const configurationDigest = digest({
+    provider_id: baseProvider.id,
+    endpoint_url: baseProvider.endpoint_url,
+    redirect_uri: baseProvider.redirect_uri,
+    scopes: baseProvider.scopes
+  });
+  const cached = store.read((data) => (data.mcpOauthClients || [])
+    .find((item) => item.provider_id === baseProvider.id && item.configuration_digest === configurationDigest));
+  let invalidCachedId = null;
+  if (cached) {
+    try {
+      return restoreCachedManagedProvider(cached, key, env);
+    } catch {
+      invalidCachedId = cached.oauth_client_id;
+    }
+  }
+
+  const inflightKey = `${baseProvider.id}:${configurationDigest}`;
+  const existing = dynamicRegistrationInflight.get(inflightKey);
+  if (existing) return existing;
+  const registration = (async () => {
+    const prepared = await prepareManagedMcpProvider(baseProvider.id, env);
+    const oauthClientId = makeId("mcpoauthclient");
+    const record = {
+      oauth_client_id: oauthClientId,
+      provider_id: prepared.id,
+      configuration_digest: configurationDigest,
+      client_envelope: null,
+      created_at: nowIso(),
+      updated_at: nowIso()
+    };
+    record.client_envelope = encryptMcpValue(
+      snapshotManagedMcpProvider(prepared),
+      key,
+      mcpOAuthClientAad(record)
+    );
+    const stored = await store.mutate((data) => {
+      data.mcpOauthClients ||= [];
+      const current = data.mcpOauthClients.find((item) =>
+        item.provider_id === prepared.id
+        && item.configuration_digest === configurationDigest
+        && item.oauth_client_id !== invalidCachedId
+      );
+      if (current) return current;
+      data.mcpOauthClients = data.mcpOauthClients.filter((item) => item.provider_id !== prepared.id);
+      data.mcpOauthClients.push(record);
+      return record;
+    });
+    if (stored.oauth_client_id === record.oauth_client_id) return prepared;
+    return restoreCachedManagedProvider(stored, key, env);
+  })();
+  dynamicRegistrationInflight.set(inflightKey, registration);
+  try {
+    return await registration;
+  } finally {
+    if (dynamicRegistrationInflight.get(inflightKey) === registration) {
+      dynamicRegistrationInflight.delete(inflightKey);
+    }
+  }
+}
+
+function restoreCachedManagedProvider(record, key, env) {
+  const snapshot = decryptMcpValue(record.client_envelope, key, mcpOAuthClientAad(record));
+  return restoreManagedMcpProvider(record.provider_id, snapshot, env);
+}
+
 function mcpConnectionAad(connectionId, workspaceId) {
   return `mcp-connection:v1:${workspaceId}:${connectionId}`;
 }
@@ -1303,6 +1411,10 @@ function mcpApprovalResultAad(approval) {
 
 function mcpOAuthStateAad(transaction) {
   return `mcp-oauth-state:v1:${transaction.workspace_id}:${transaction.created_by}:${transaction.provider_id}:${transaction.oauth_state_id}`;
+}
+
+function mcpOAuthClientAad(record) {
+  return `mcp-oauth-client:v1:${record.provider_id}:${record.oauth_client_id}`;
 }
 
 async function setOauthTransactionStatus(store, oauthStateId, status) {

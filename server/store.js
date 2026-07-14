@@ -38,7 +38,7 @@ function mergeSeedCatalog(agents, seedAgents) {
 function initialData(seedAgents) {
   const now = new Date().toISOString();
   return {
-    version: 6,
+    version: 7,
     created_at: now,
     sessions: [],
     messages: [],
@@ -50,6 +50,7 @@ function initialData(seedAgents) {
     runtimeLifecycleIntents: [],
     marketplaceRatings: [],
     mcpConnections: [],
+    mcpOauthClients: [],
     mcpOauthStates: [],
     mcpApprovals: [],
     mcpToolCalls: [],
@@ -294,6 +295,7 @@ function normalizeData(value, seedAgents) {
   data.version = defaults.version;
   for (const collection of [
     "mcpConnections",
+    "mcpOauthClients",
     "mcpOauthStates",
     "mcpApprovals",
     "mcpToolCalls",

@@ -102,6 +102,42 @@ describe("explicit workflow Auto-Composer", () => {
     expect(composer).toHaveBeenCalledTimes(1);
   });
 
+  it("classifies common hosted applications as resumable managed connections", async () => {
+    composer.mockImplementationOnce(async () => ({
+      title: "Connected workspace review",
+      nodes: [{
+        id: "connected_reviewer",
+        type: "agent",
+        title: "Connected Workspace Reviewer",
+        task: "Review the requested connected systems.",
+        provider_ids: ["drive", "calendar", "gchat", "people", "github_mcp", "slack_mcp", "notion_mcp", "linear_mcp"]
+      }],
+      edges: []
+    }));
+    const session = await createSession();
+    const queued = await sendMessage(
+      session.session_id,
+      "/workflow Search Gmail and Google Drive, check Google Calendar, read Google Chat and Slack, find a GitHub pull request, look up Google Contacts, review Notion, and update a Linear issue."
+    );
+    await waitForRun(queued.body.run_id);
+    const loaded = await getSession(session.session_id);
+    const requirements = loaded.body.workflows[0].connection_requirements;
+    expect(requirements.map((item) => item.provider_id).sort()).toEqual([
+      "github",
+      "gmail",
+      "google_calendar",
+      "google_chat",
+      "google_contacts",
+      "google_drive",
+      "linear",
+      "notion",
+      "slack"
+    ]);
+    expect(requirements.every((item) => item.connection_mode === "managed" && item.status === "missing")).toBe(true);
+    expect(requirements.find((item) => item.provider_id === "github").permissions).toContain("ask before repository changes");
+    expect(requirements.find((item) => item.provider_id === "slack").permissions).toContain("ask before posting or reacting");
+  });
+
   it("prefers a suitable private workspace agent over a requested Marketplace candidate", async () => {
     await app.locals.store.mutate((data) => {
       data.agents.push(

@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 
+import { isManagedMcpProviderId } from "./mcpOAuth.js";
 import { makeId, nowIso } from "./store.js";
 
 const WORKFLOW_SCHEMA_VERSION = "virenis-workflow-v1";
@@ -249,6 +250,17 @@ export function composeWorkflowFallback(input) {
   }
   if (/(document|report|pdf|spreadsheet|table|analysis)/.test(lower)) {
     addRole("analysis", "Analysis Agent", "Combine supplied evidence into a clear analysis while preserving source boundaries.", ["document", "analysis", "report"]);
+  }
+  for (const providerId of detectExplicitProviderIds(lower)) {
+    if (roles.some((role) => role.provider_ids.includes(providerId))) continue;
+    addRole(
+      `${providerId}_tools`,
+      `${providerName(providerId)} Agent`,
+      providerReason(providerId, lower),
+      [providerName(providerId), providerId, ...providerToolKeywords(providerId)],
+      [providerId],
+      providerToolKeywords(providerId)
+    );
   }
   if (!roles.length) {
     addRole("task", input.mode === "agent_team" ? "Task Agent" : "Workflow Agent", bounded(input.intent, 500), intentKeywords(input.intent));
@@ -947,16 +959,36 @@ function candidateReuseKey(candidate) {
 function detectProviderRequirements(intent, nodes) {
   const lower = String(intent || "").toLowerCase();
   const providerIds = new Set(nodes.flatMap((node) => node.provider_ids || []).filter(Boolean));
-  if (/\b(gmail|email|mailbox|incoming mail|incoming customer)/.test(lower)) providerIds.add("gmail");
+  for (const providerId of detectExplicitProviderIds(lower)) providerIds.add(providerId);
   if (/\b(shopify|store inventory|inventory|stock)\b/.test(lower)) providerIds.add("shopify");
   return [...providerIds].slice(0, 12).map((providerId) => ({
     provider_id: providerId,
     name: providerName(providerId),
-    connection_mode: providerId === "gmail" ? "managed" : "custom",
+    connection_mode: isManagedMcpProviderId(providerId) ? "managed" : "custom",
     reason: providerReason(providerId, lower),
     permissions: providerPermissions(providerId, lower),
-    tool_keywords: [...new Set(nodes.filter((node) => node.provider_ids.includes(providerId)).flatMap((node) => node.tool_keywords))].slice(0, 16)
+    tool_keywords: [...new Set([
+      ...nodes.filter((node) => node.provider_ids.includes(providerId)).flatMap((node) => node.tool_keywords),
+      ...providerToolKeywords(providerId)
+    ])].slice(0, 16)
   }));
+}
+
+function detectExplicitProviderIds(lower) {
+  const providers = [];
+  const add = (providerId, pattern) => {
+    if (pattern.test(lower) && !providers.includes(providerId)) providers.push(providerId);
+  };
+  add("gmail", /\b(gmail|email|mailbox|incoming mail|incoming customer email)\b/);
+  add("google_drive", /\b(google drive|drive document|drive file|files? in drive)\b/);
+  add("google_calendar", /\b(google calendar|calendar event|calendar availability|free[ -]?busy|meeting schedule)\b/);
+  add("google_chat", /\b(google chat|gchat|chat space)\b/);
+  add("google_contacts", /\b(google contacts|contact directory|address book|people directory)\b/);
+  add("github", /\b(github|git repository|code repository|pull request|code review)\b/);
+  add("slack", /\b(slack|slack channel|workspace conversation)\b/);
+  add("notion", /\b(notion|notion page|workspace wiki)\b/);
+  add("linear", /\b(linear app|linear issue|linear project)\b/);
+  return providers;
 }
 
 function findRequirementConnection(requirement, connections, actor) {
@@ -1144,19 +1176,59 @@ function safetyHints(lower) {
 function providerReason(providerId, lower) {
   if (providerId === "gmail") return /draft|reply/.test(lower) ? "Read matching messages and save response drafts." : "Read matching messages.";
   if (providerId === "shopify") return "Read product and inventory availability.";
+  if (providerId === "google_drive") return "Find and read the relevant Google Drive files.";
+  if (providerId === "google_calendar") return "Check calendars, events, and availability relevant to the request.";
+  if (providerId === "google_chat") return "Find relevant Google Chat spaces and messages, with approval for any message creation.";
+  if (providerId === "google_contacts") return "Look up relevant people and contact details.";
+  if (providerId === "github") return "Inspect relevant repositories, issues, and pull requests; require approval for changes.";
+  if (providerId === "slack") return "Find relevant Slack conversations and require approval before posting.";
+  if (providerId === "notion") return "Find relevant Notion pages and preserve their source context.";
+  if (providerId === "linear") return "Inspect relevant Linear projects and issues; require approval for changes.";
   return `Use the ${providerName(providerId)} tools required by this workflow.`;
 }
 
 function providerPermissions(providerId, lower) {
   if (providerId === "gmail") return ["read relevant email", ...(lower.includes("draft") ? ["create drafts"] : [])];
   if (providerId === "shopify") return ["read products", "read inventory"];
+  if (providerId === "google_drive") return ["read relevant Drive files"];
+  if (providerId === "google_calendar") return ["read calendars", "check availability"];
+  if (providerId === "google_chat") return ["read relevant spaces and messages", "ask before creating messages"];
+  if (providerId === "google_contacts") return ["read relevant contacts and profiles"];
+  if (providerId === "github") return ["read repository context", "ask before repository changes"];
+  if (providerId === "slack") return ["read relevant conversations", "ask before posting or reacting"];
+  if (providerId === "notion") return ["read granted pages", "ask before changing workspace content"];
+  if (providerId === "linear") return ["read project context", "ask before changing issues or projects"];
   return ["review connection tools before activation"];
 }
 
 function providerName(providerId) {
   if (providerId === "gmail") return "Gmail";
   if (providerId === "shopify") return "Shopify";
+  if (providerId === "google_drive") return "Google Drive";
+  if (providerId === "google_calendar") return "Google Calendar";
+  if (providerId === "google_chat") return "Google Chat";
+  if (providerId === "google_contacts") return "Google Contacts";
+  if (providerId === "github") return "GitHub";
+  if (providerId === "slack") return "Slack";
+  if (providerId === "notion") return "Notion";
+  if (providerId === "linear") return "Linear";
   return providerId.replace(/[_-]+/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function providerToolKeywords(providerId) {
+  const keywords = {
+    gmail: ["mail", "message", "thread", "draft"],
+    google_drive: ["file", "folder", "document", "search"],
+    google_calendar: ["calendar", "event", "availability", "freebusy"],
+    google_chat: ["space", "message", "member", "search"],
+    google_contacts: ["contact", "person", "profile", "directory"],
+    github: ["repository", "issue", "pull_request", "code"],
+    slack: ["channel", "message", "thread", "search"],
+    notion: ["page", "database", "search", "workspace"],
+    linear: ["issue", "project", "team", "cycle"],
+    shopify: ["inventory", "stock", "product", "variant"]
+  };
+  return keywords[providerId] || [];
 }
 
 function bestCandidateId(candidates, cues) {
@@ -1190,7 +1262,25 @@ function safeNodeId(value, index) {
 
 function safeProviderId(value) {
   const normalized = String(value || "").trim().toLowerCase().replace(/[^a-z0-9_-]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 64);
-  return normalized || null;
+  if (!normalized) return null;
+  const aliases = {
+    gmail_mcp: "gmail",
+    drive: "google_drive",
+    google_drive_mcp: "google_drive",
+    calendar: "google_calendar",
+    google_calendar_mcp: "google_calendar",
+    gchat: "google_chat",
+    google_chat_mcp: "google_chat",
+    contacts: "google_contacts",
+    people: "google_contacts",
+    people_api: "google_contacts",
+    google_people: "google_contacts",
+    github_mcp: "github",
+    slack_mcp: "slack",
+    notion_mcp: "notion",
+    linear_mcp: "linear"
+  };
+  return aliases[normalized] || normalized;
 }
 
 function safeListingId(value) {

@@ -1,22 +1,22 @@
 # MCP Phase 1
 
 Virenis supports remote MCP servers over Streamable HTTP using the stable
-`2025-11-25` protocol version. Users can connect the managed Gmail provider
-through Google OAuth without copying an endpoint or token, or use the advanced
-Custom MCP form for a remote server they administer. They can then bind an
-exact subset of discovered tools to an agent and inspect or approve calls in
-Agent Studio.
+`2025-11-25` protocol version. Users can connect Gmail, Google Drive, Google
+Calendar, Google Chat, Google Contacts, GitHub, Slack, Notion, and Linear
+without copying an endpoint or token, or use the advanced Custom MCP form for
+a remote server they administer. They can then bind an exact subset of
+discovered tools to an agent and inspect or approve calls in Agent Studio.
 
-## Managed Gmail flow
+## Managed connection flow
 
 ```text
-Connect Gmail
+Choose a provider and click Connect
   -> server creates a single-use OAuth state, PKCE verifier, and browser nonce
-  -> Google account consent
+  -> provider account consent
   -> callback validates state + HttpOnly SameSite browser cookie
   -> server exchanges the code and encrypts access/refresh tokens
-  -> official Gmail MCP endpoint is initialized and tools are discovered
-  -> user assigns selected Gmail tools to an agent
+  -> the official hosted MCP endpoint is initialized and tools are discovered
+  -> user assigns selected provider tools to an agent
 ```
 
 The endpoint and OAuth client configuration are server-owned. OAuth state is
@@ -24,8 +24,8 @@ short-lived and never persisted in plaintext; PKCE verifiers, authorization
 codes, access tokens, and refresh tokens are never persisted in frontend state
 or exposed to the Router. A private connection is visible
 and bindable only by its owner, including when several users share a workspace.
-The managed Gmail integration permits one active Gmail connection per user;
-users reconnect or remove it before authorizing a different account.
+Each managed provider permits one active connection per user; users reconnect
+or remove it before authorizing a different account for that provider.
 Expired access tokens are refreshed once behind a per-connection concurrency
 gate. A failed refresh marks the connection `reauthorization_required` and the
 UI offers a Reconnect action. Disconnect attempts provider revocation and
@@ -95,20 +95,27 @@ APP_MCP_CREDENTIAL_KEY_FILE=/run/secrets/mcp_credential_key
 APP_MCP_GATEWAY_KEY_FILE=/run/secrets/mcp_gateway_key
 ```
 
-Optional managed Gmail connection:
+Managed provider connections:
 
 ```dotenv
 APP_MCP_OAUTH_REDIRECT_ORIGIN=https://app.example.com
-APP_MCP_GMAIL_OAUTH_CLIENT_ID=your-client.apps.googleusercontent.com
-APP_MCP_GMAIL_OAUTH_CLIENT_SECRET_FILE=/run/secrets/gmail_oauth_client_secret
+APP_MCP_GOOGLE_OAUTH_CLIENT_ID=your-client.apps.googleusercontent.com
+APP_MCP_GOOGLE_OAUTH_CLIENT_SECRET_FILE=/run/secrets/google_oauth_client_secret
+APP_MCP_GITHUB_OAUTH_CLIENT_ID=your-github-client-id
+APP_MCP_GITHUB_OAUTH_CLIENT_SECRET_FILE=/run/secrets/github_oauth_client_secret
+APP_MCP_SLACK_OAUTH_CLIENT_ID=your-slack-client-id
+APP_MCP_SLACK_OAUTH_CLIENT_SECRET_FILE=/run/secrets/slack_oauth_client_secret
 ```
 
-Register the exact callback
-`https://app.example.com/api/mcp/oauth/callback/gmail` in the Google OAuth
-client. Enable both the Gmail API and Gmail MCP API in the Google Cloud project,
-configure the consent screen, and request only the documented `gmail.readonly`
-and `gmail.compose` scopes. Until these settings are present, the Gmail card is
-shown as requiring administrator setup and cannot start authorization.
+Register exact callbacks of the form
+`https://app.example.com/api/mcp/oauth/callback/{provider}`. Google provider
+IDs are `gmail`, `google_drive`, `google_calendar`, `google_chat`, and
+`google_contacts`; enable only the corresponding APIs and documented scopes in
+the Google Cloud project. GitHub and Slack use `github` and `slack`. Notion and
+Linear use OAuth discovery, PKCE, and dynamic client registration, so the
+public HTTPS origin is their only deployment prerequisite. A statically
+configured provider without credentials is shown as requiring administrator
+setup and cannot start authorization.
 
 Runtime process:
 
@@ -135,13 +142,14 @@ the authenticated Express gateway to a synthetic MCP server. It also proves
 encrypted storage, discovery, read execution, write approval/denial, replay
 prevention, identity isolation, schema drift blocking, SSRF blocking, audit
 digests, and Marketplace redaction. The managed-provider suite additionally
-proves PKCE, browser binding, encrypted OAuth storage, callback replay/expiry
-rejection, owner isolation inside a shared workspace, concurrent token refresh,
-reauthorization, provider revocation, and a live Python-executor → authenticated
-gateway → OAuth-protected MCP-server call.
+proves provider-registry redaction, dynamic registration, PKCE, browser binding,
+encrypted OAuth storage, callback replay/expiry rejection, owner isolation
+inside a shared workspace, concurrent token refresh, reauthorization, provider
+revocation, and a live Python-executor → authenticated gateway →
+OAuth-protected MCP-server call.
 
 The current boundary intentionally does not include local `stdio` servers,
-MCP resources/prompts, arbitrary-provider OAuth discovery, or automatic
-continuation of a chat after a separately approved action. The approved action
-itself runs and its result is shown in Connections; a later phase can add
-resumable execution checkpoints.
+MCP resources/prompts, or arbitrary-provider OAuth discovery. Workflow and
+tool checkpoints are durable: after a user accepts, rejects, connects, or
+reauthorizes a provider, the saved conversation resumes without exposing the
+provider credential to the Router.
