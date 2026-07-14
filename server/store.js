@@ -38,7 +38,7 @@ function mergeSeedCatalog(agents, seedAgents) {
 function initialData(seedAgents) {
   const now = new Date().toISOString();
   return {
-    version: 3,
+    version: 4,
     created_at: now,
     sessions: [],
     messages: [],
@@ -49,6 +49,9 @@ function initialData(seedAgents) {
     agentEvents: [],
     runtimeLifecycleIntents: [],
     marketplaceRatings: [],
+    mcpConnections: [],
+    mcpApprovals: [],
+    mcpToolCalls: [],
     agents: clone(seedAgents),
     documents: [],
     validationRuns: []
@@ -286,6 +289,9 @@ function normalizeData(value, seedAgents) {
     }
   }
   data.version = defaults.version;
+  for (const collection of ["mcpConnections", "mcpApprovals", "mcpToolCalls"]) {
+    data[collection] = Array.isArray(data[collection]) ? data[collection] : [];
+  }
   data.marketplaceRatings = (Array.isArray(data.marketplaceRatings) ? data.marketplaceRatings : [])
     .filter((rating) => rating && typeof rating === "object")
     .map((rating) => {

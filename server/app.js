@@ -4,7 +4,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import express from "express";
 import multer from "multer";
-import { basicAuthPassword, parseConfiguredApiTokens } from "./authConfig.js";
+import { basicAuthPassword, parseConfiguredApiTokens, secretConfigured } from "./authConfig.js";
+import { readConfiguredSecret } from "./secretConfig.js";
 import { seedAgentsForMode, withoutLegacySeedAgents, BASE_MODEL } from "./catalog.js";
 import { createStore, makeId, nowIso } from "./store.js";
 import {
@@ -61,6 +62,20 @@ import {
   verifyRuntimeAuditSubject,
   verifyRuntimeExecutionSubject
 } from "./runtimeClient.js";
+import {
+  MCP_TEMPLATES,
+  applyAgentMcpBindings,
+  createMcpConnection,
+  decideMcpApproval,
+  ensureMcpCredentialKey,
+  executeMcpGatewayCall,
+  isMcpToolAlias,
+  marketplaceMcpRequirements,
+  publicMcpApproval,
+  publicMcpConnection,
+  refreshMcpConnection,
+  resolveAgentMcpBindings
+} from "./mcp.js";
 
 const VALIDATION_SUITES = new Set(["manifest", "parallel_scheduler", "document_rag", "mock_smoke", "live_smoke"]);
 
@@ -145,6 +160,7 @@ export async function createApp({
   });
   const store = createStore({ dbPath, seedAgents: configuredSeedAgents });
   await store.init();
+  const mcpCredentialKey = await ensureMcpCredentialKey({ dbPath });
   if (useApiRuntimeCatalog) {
     const hasLegacySeedRecords = store.read((data) =>
       withoutLegacySeedAgents(data.agents).length !== data.agents.length
@@ -256,6 +272,7 @@ export async function createApp({
   app.locals.scheduleChatRun = scheduleChatRun;
   app.locals.scheduleValidationRun = scheduleValidationRun;
   app.locals.workerInstanceId = workerInstanceId;
+  app.locals.mcpCredentialKey = mcpCredentialKey;
   app.locals.drainBackgroundTasks = (options) => drainBackgroundTasks(backgroundTasks, options);
   configureTrustProxy(app);
   app.disable("x-powered-by");
@@ -296,6 +313,18 @@ export async function createApp({
       });
     }
   });
+  app.post("/api/internal/mcp/tools/call", express.json({ limit: "128kb" }), async (req, res, next) => {
+    try {
+      assertMcpGatewayRequest(req);
+      res.json(await executeMcpGatewayCall({
+        store,
+        body: req.body,
+        key: mcpCredentialKey
+      }));
+    } catch (error) {
+      next(error);
+    }
+  });
   app.use(rateLimiter.middleware);
   app.use(optionalBasicAuth);
   app.use(attachRequestIdentity);
@@ -312,6 +341,93 @@ export async function createApp({
       is_admin: isAdmin(req),
       is_viewer: isViewer(req)
     });
+  });
+
+  app.get("/api/mcp/templates", (_req, res) => {
+    res.json({ protocol_version: "2025-11-25", templates: MCP_TEMPLATES });
+  });
+
+  app.get("/api/mcp/connections", (req, res) => {
+    const connections = store.read((data) => (data.mcpConnections || [])
+      .filter((item) => item.workspace_id === req.auth.workspace_id)
+      .map(publicMcpConnection));
+    res.json({ connections });
+  });
+
+  app.post("/api/mcp/connections", async (req, res, next) => {
+    try {
+      const connection = await createMcpConnection({ body: req.body, actor: req.auth, key: mcpCredentialKey });
+      await store.mutate((data) => {
+        data.mcpConnections ||= [];
+        data.mcpConnections.push(connection);
+        return connection;
+      });
+      res.status(201).json(publicMcpConnection(connection));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/mcp/connections/:connection_id/refresh", async (req, res, next) => {
+    try {
+      const current = store.read((data) => (data.mcpConnections || [])
+        .find((item) => item.connection_id === req.params.connection_id));
+      assertMcpConnectionMutation(current, req);
+      const refreshed = await refreshMcpConnection(current, { key: mcpCredentialKey });
+      await store.mutate((data) => {
+        const index = data.mcpConnections.findIndex((item) => item.connection_id === current.connection_id);
+        if (index < 0) throwStatus(404, "MCP connection not found.");
+        data.mcpConnections[index] = refreshed;
+        return refreshed;
+      });
+      res.json(publicMcpConnection(refreshed));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.delete("/api/mcp/connections/:connection_id", async (req, res, next) => {
+    try {
+      const current = store.read((data) => (data.mcpConnections || [])
+        .find((item) => item.connection_id === req.params.connection_id));
+      assertMcpConnectionMutation(current, req);
+      const boundAgents = store.read((data) => data.agents.filter((agent) =>
+        (agent.mcp_bindings || []).some((binding) => binding.connection_id === current.connection_id)
+      ));
+      if (boundAgents.length) throwStatus(409, `Remove this connection from ${boundAgents.length} agent${boundAgents.length === 1 ? "" : "s"} first.`);
+      await store.mutate((data) => {
+        data.mcpConnections = (data.mcpConnections || []).filter((item) => item.connection_id !== current.connection_id);
+        return true;
+      });
+      res.json({ ok: true, connection_id: current.connection_id });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/api/mcp/approvals", (req, res, next) => {
+    try {
+      const approvals = store.read((data) => (data.mcpApprovals || [])
+        .filter((item) => item.workspace_id === req.auth.workspace_id && item.created_by === req.auth.user_id)
+        .map((item) => publicMcpApproval(item, mcpCredentialKey)));
+      res.json({ approvals });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/mcp/approvals/:approval_id", async (req, res, next) => {
+    try {
+      res.json(await decideMcpApproval({
+        store,
+        approvalId: req.params.approval_id,
+        actor: req.auth,
+        decision: req.body?.decision,
+        key: mcpCredentialKey
+      }));
+    } catch (error) {
+      next(error);
+    }
   });
 
   app.get("/api/runtime/health", async (req, res, next) => {
@@ -1376,6 +1492,10 @@ export async function createApp({
       const agent = normalizeAgentPayload(req.body);
       const sourceText = normalizeSourceText(req.body.source_text);
       Object.assign(agent, agentOwnershipForRequest(req, req.body));
+      applyAgentMcpBindings(
+        agent,
+        resolveAgentMcpBindings(req.body.mcp_bindings || [], store.read(), req.auth) || []
+      );
       agent.last_edited_by = req.auth.user_id;
       if (sourceText && agent.sources.length === 0) {
         agent.sources = [ownedAgentSourcePath(agent.id)];
@@ -1533,6 +1653,18 @@ export async function createApp({
         throwStatus(409, "Adopt the runtime-only agent before editing it through virenis.");
       }
       const patch = normalizeAgentPatchPayload(req.body);
+      const requestedMcpBindings = resolveAgentMcpBindings(req.body.mcp_bindings, store.read(), req.auth);
+      if (requestedMcpBindings !== undefined || patch.tools) {
+        const boundAgent = applyAgentMcpBindings({
+          tools: patch.tools || localAgent?.tools || []
+        }, requestedMcpBindings ?? localAgent?.mcp_bindings ?? []);
+        patch.tools = boundAgent.tools;
+        patch.mcp_bindings = boundAgent.mcp_bindings;
+        patch.tool_contracts = boundAgent.tool_contracts;
+      }
+      if (requestedMcpBindings !== undefined) {
+        patch.connector_requirements_pending = [];
+      }
       if (localAgent?.document && patch.source_text !== undefined) {
         throwStatus(400, "Document agent knowledge must be updated by registering a new document version.");
       }
@@ -1568,6 +1700,10 @@ export async function createApp({
           if (!activeIntent) return existing || runtimeAgent;
           if (existing) {
             Object.assign(existing, runtimeAgent, {
+              ...(patch.mcp_bindings !== undefined ? { mcp_bindings: patch.mcp_bindings } : {}),
+              ...(patch.connector_requirements_pending !== undefined
+                ? { connector_requirements_pending: patch.connector_requirements_pending }
+                : {}),
               last_edited_by: req.auth.user_id,
               last_edited_at: nowIso()
             });
@@ -1582,6 +1718,10 @@ export async function createApp({
           }
           const created = {
             ...runtimeAgent,
+            ...(patch.mcp_bindings !== undefined ? { mcp_bindings: patch.mcp_bindings } : {}),
+            ...(patch.connector_requirements_pending !== undefined
+              ? { connector_requirements_pending: patch.connector_requirements_pending }
+              : {}),
             last_edited_by: req.auth.user_id,
             last_edited_at: nowIso()
           };
@@ -4918,7 +5058,19 @@ function marketplaceAgentSnapshot(agent = {}) {
     .filter((value) => !/^agent:[a-z0-9_]+:output$/.test(value))
     .filter((value) => value !== "document_context");
   if (!consumes.includes("user_request")) consumes.unshift("user_request");
-  const tools = rawTools.filter((value) => !["document_search", "document_read"].includes(value));
+  const tools = rawTools
+    .filter((value) => !["document_search", "document_read"].includes(value))
+    .filter((value) => !isMcpToolAlias(value));
+  const connectorRequirements = Array.isArray(agent.connector_requirements)
+    ? agent.connector_requirements.slice(0, 20).map((requirement) => ({
+        connection_name: String(requirement?.connection_name || "MCP connection").slice(0, 100),
+        tools: (Array.isArray(requirement?.tools) ? requirement.tools : []).slice(0, 50).map((tool) => ({
+          name: String(tool?.name || "").slice(0, 128),
+          title: String(tool?.title || tool?.name || "Tool").slice(0, 160),
+          risk: tool?.risk === "read" ? "read" : "write"
+        })).filter((tool) => tool.name)
+      }))
+    : marketplaceMcpRequirements(agent);
   return {
     schema_version: "virenis-marketplace-agent-v1",
     title: cleanTitle(agent.title) || "Community agent",
@@ -4928,13 +5080,15 @@ function marketplaceAgentSnapshot(agent = {}) {
     produces: splitList(agent.produces).length ? splitList(agent.produces) : ["domain_outputs"],
     routing_cues: splitList(agent.routing_cues).slice(0, 20),
     tools: tools.slice(0, 20),
+    connector_requirements: connectorRequirements,
     policies: agent.policies && typeof agent.policies === "object" && !Array.isArray(agent.policies)
       ? JSON.parse(JSON.stringify(agent.policies))
       : {},
     stage: Number.isFinite(Number(agent.stage)) ? Number(agent.stage) : 50,
     exclusions: {
       private_knowledge: omittedPrivateKnowledge,
-      agent_connections: omittedAgentConnections
+      agent_connections: omittedAgentConnections,
+      ...(connectorRequirements.length > 0 ? { mcp_credentials_and_bindings: true } : {})
     }
   };
 }
@@ -4944,11 +5098,16 @@ function publishedMarketplaceSnapshot(agent = {}) {
   const stored = agent.marketplace?.snapshot;
   if (!stored || typeof stored !== "object" || Array.isArray(stored)) return fallback;
   const normalized = marketplaceAgentSnapshot(stored);
+  const omittedMcpBindings = Boolean(
+    stored.exclusions?.mcp_credentials_and_bindings
+    ?? fallback.exclusions.mcp_credentials_and_bindings
+  );
   return {
     ...normalized,
     exclusions: {
       private_knowledge: Boolean(stored.exclusions?.private_knowledge ?? fallback.exclusions.private_knowledge),
-      agent_connections: Boolean(stored.exclusions?.agent_connections ?? fallback.exclusions.agent_connections)
+      agent_connections: Boolean(stored.exclusions?.agent_connections ?? fallback.exclusions.agent_connections),
+      ...(omittedMcpBindings ? { mcp_credentials_and_bindings: true } : {})
     }
   };
 }
@@ -4982,7 +5141,10 @@ function marketplaceDescription(agent = {}) {
 
 function marketplaceSearchText(agent = {}) {
   const snapshot = publishedMarketplaceSnapshot(agent);
-  return `${snapshot.title} ${snapshot.capability} ${marketplaceDescription(agent)} ${marketplacePublisherUserId(agent)} ${snapshot.routing_cues.join(" ")}`
+  const connectorText = (snapshot.connector_requirements || [])
+    .flatMap((requirement) => [requirement.connection_name, ...(requirement.tools || []).flatMap((tool) => [tool.name, tool.title])])
+    .join(" ");
+  return `${snapshot.title} ${snapshot.capability} ${marketplaceDescription(agent)} ${marketplacePublisherUserId(agent)} ${snapshot.routing_cues.join(" ")} ${connectorText}`
     .toLowerCase();
 }
 
@@ -5148,6 +5310,9 @@ async function copyMarketplaceAgentToWorkspace({ store, req, sourceAgent, reques
     created_by: req.auth.user_id,
     last_edited_by: req.auth.user_id,
     last_edited_at: nowIso(),
+    mcp_bindings: [],
+    tool_contracts: {},
+    connector_requirements_pending: snapshot.connector_requirements || [],
     marketplace_origin: {
       listing_id: listingId,
       source_agent_id: sourceAgent.id,
@@ -5310,6 +5475,34 @@ function generateSkillMarkdown(agent) {
 function average(values) {
   if (values.length === 0) return 0;
   return Number((values.reduce((total, value) => total + value, 0) / values.length).toFixed(3));
+}
+
+function assertMcpGatewayRequest(req) {
+  const configured = readConfiguredSecret(
+    process.env,
+    "APP_MCP_GATEWAY_KEY",
+    "APP_MCP_GATEWAY_KEY_FILE",
+    { maxBytes: 4096 }
+  );
+  if (!configured) throwStatus(503, "The internal MCP gateway is not configured.");
+  if (process.env.NODE_ENV === "production" && !secretConfigured(configured)) {
+    throwStatus(503, "The internal MCP gateway credential is weak or still a placeholder.");
+  }
+  const supplied = String(req.get("X-Virenis-MCP-Gateway-Key") || "");
+  const expectedBytes = Buffer.from(configured, "utf8");
+  const suppliedBytes = Buffer.from(supplied, "utf8");
+  if (expectedBytes.length !== suppliedBytes.length || !crypto.timingSafeEqual(expectedBytes, suppliedBytes)) {
+    throwStatus(401, "Invalid MCP gateway credential.");
+  }
+}
+
+function assertMcpConnectionMutation(connection, req) {
+  if (!connection || connection.workspace_id !== req.auth?.workspace_id) {
+    throwStatus(404, "MCP connection not found.");
+  }
+  if (!isAdmin(req) && connection.created_by !== req.auth?.user_id) {
+    throwStatus(403, "Only the connection owner can change it.");
+  }
 }
 
 function throwStatus(status, message) {

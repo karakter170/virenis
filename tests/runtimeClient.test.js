@@ -37,6 +37,39 @@ afterEach(async () => {
 });
 
 describe("TCAR runtime HTTP transport", () => {
+  it("sends MCP prompt contracts to Runtime without sending workspace bindings", async () => {
+    let observed = null;
+    const runtime = await startHttpServer(async (request, response) => {
+      observed = await readRequest(request);
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ ok: true }));
+    });
+    configureRuntime(runtime.url);
+    const alias = "mcp_12345678_search_notes_abcdef";
+    await registerRuntimeAgent({
+      id: "mcp_contract_agent",
+      title: "MCP contract agent",
+      capability: "Search notes.",
+      boundary: "Use assigned tools.",
+      tools: [alias],
+      tool_contracts: {
+        [alias]: {
+          description: "Search current notes.",
+          input_schema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] }
+        }
+      },
+      mcp_bindings: [{ connection_id: "must_not_cross_runtime_boundary" }]
+    });
+    expect(observed).toMatchObject({
+      id: "mcp_contract_agent",
+      tools: [alias],
+      tool_contracts: {
+        [alias]: expect.objectContaining({ description: "Search current notes." })
+      }
+    });
+    expect(observed).not.toHaveProperty("mcp_bindings");
+  });
+
   it("uses the explicit archived-agent deletion contract", async () => {
     let observed = null;
     const runtime = await startHttpServer(async (request, response) => {

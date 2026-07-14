@@ -25,6 +25,7 @@ import {
   Paperclip,
   Pencil,
   Plus,
+  Plug,
   RefreshCw,
   RotateCcw,
   Scale,
@@ -226,6 +227,9 @@ function Workspace({ onHome }) {
   const [runtime, setRuntime] = useState(null);
   const [metrics, setMetrics] = useState(null);
   const [marketplace, setMarketplace] = useState([]);
+  const [mcpConnections, setMcpConnections] = useState([]);
+  const [mcpTemplates, setMcpTemplates] = useState([]);
+  const [mcpApprovals, setMcpApprovals] = useState([]);
   const [auth, setAuth] = useState(null);
   const [runsById, setRunsById] = useState({});
   const [contractsById, setContractsById] = useState({});
@@ -277,13 +281,16 @@ function Workspace({ onHome }) {
     setLoading(true);
     setError("");
     try {
-      const [me, sessionList, health, agentList, docList, marketplaceList] = await Promise.all([
+      const [me, sessionList, health, agentList, docList, marketplaceList, connectionList, templateList, approvalList] = await Promise.all([
         api.get("/api/auth/me"),
         api.get("/api/chat/sessions"),
         api.get("/api/runtime/health"),
         api.get("/api/agents"),
         api.get("/api/documents"),
-        api.get("/api/marketplace")
+        api.get("/api/marketplace"),
+        api.get("/api/mcp/connections"),
+        api.get("/api/mcp/templates"),
+        api.get("/api/mcp/approvals")
       ]);
       const metricData = me.is_admin ? await api.get("/api/admin/metrics") : emptyMetrics();
       setAuth(me);
@@ -291,6 +298,9 @@ function Workspace({ onHome }) {
       setAgents(agentList.agents || []);
       setDocuments(docList.documents || []);
       setMarketplace(marketplaceList.items || []);
+      setMcpConnections(connectionList.connections || []);
+      setMcpTemplates(templateList.templates || []);
+      setMcpApprovals(approvalList.approvals || []);
       setMetrics(metricData);
       let nextSession = sessionList.sessions?.[0] || null;
       if (!nextSession && !me.is_viewer) {
@@ -309,13 +319,16 @@ function Workspace({ onHome }) {
     const agentPath = session?.session_id
       ? `/api/agents?session_id=${encodeURIComponent(session.session_id)}`
       : "/api/agents";
-    const [me, sessionList, agentList, docList, health, marketplaceList] = await Promise.all([
+    const [me, sessionList, agentList, docList, health, marketplaceList, connectionList, templateList, approvalList] = await Promise.all([
       api.get("/api/auth/me"),
       api.get("/api/chat/sessions"),
       api.get(agentPath),
       api.get("/api/documents"),
       api.get("/api/runtime/health"),
-      api.get("/api/marketplace")
+      api.get("/api/marketplace"),
+      api.get("/api/mcp/connections"),
+      api.get("/api/mcp/templates"),
+      api.get("/api/mcp/approvals")
     ]);
     const metricData = me.is_admin ? await api.get("/api/admin/metrics") : emptyMetrics();
     setAuth(me);
@@ -324,6 +337,9 @@ function Workspace({ onHome }) {
     setDocuments(docList.documents || []);
     setRuntime(health);
     setMarketplace(marketplaceList.items || []);
+    setMcpConnections(connectionList.connections || []);
+    setMcpTemplates(templateList.templates || []);
+    setMcpApprovals(approvalList.approvals || []);
     setMetrics(metricData);
   }
 
@@ -764,6 +780,9 @@ function Workspace({ onHome }) {
           runtime={runtime}
           metrics={metrics}
           marketplace={marketplace}
+          mcpConnections={mcpConnections}
+          mcpTemplates={mcpTemplates}
+          mcpApprovals={mcpApprovals}
           sessionId={session?.session_id}
           initialView={resourceView}
           togglingAgentId={togglingAgentId}
@@ -854,6 +873,7 @@ function Workspace({ onHome }) {
           agent={agentEditor.agent || null}
           agents={agents}
           documents={documents}
+          mcpConnections={mcpConnections}
           onClose={() => setAgentEditor(undefined)}
           onSaved={async () => {
             setAgentEditor(undefined);
@@ -1635,6 +1655,9 @@ function ResourcesSheet({
   runtime,
   metrics,
   marketplace,
+  mcpConnections,
+  mcpTemplates,
+  mcpApprovals,
   sessionId,
   initialView,
   togglingAgentId,
@@ -1669,6 +1692,7 @@ function ResourcesSheet({
           <button type="button" aria-pressed={view === "agents"} onClick={() => changeView("agents")}>Agents</button>
           <button type="button" aria-pressed={view === "graph"} onClick={() => changeView("graph")}>Graph</button>
           <button type="button" aria-pressed={view === "marketplace"} onClick={() => changeView("marketplace")}>Marketplace</button>
+          <button type="button" aria-pressed={view === "connections"} onClick={() => changeView("connections")}>Connections</button>
           <button type="button" aria-pressed={view === "knowledge"} onClick={() => changeView("knowledge")}>Knowledge</button>
           {auth?.is_admin && <button type="button" aria-pressed={view === "admin"} onClick={() => changeView("admin")}>Admin</button>}
         </div>
@@ -1720,6 +1744,16 @@ function ResourcesSheet({
           />
         )}
 
+        {view === "connections" && (
+          <ConnectionsPanel
+            connections={mcpConnections}
+            templates={mcpTemplates}
+            approvals={mcpApprovals}
+            canWrite={canWrite}
+            onRefresh={onRefresh}
+          />
+        )}
+
         {view === "admin" && auth?.is_admin && (
           <AdminPanel runtime={runtime} metrics={metrics} agents={agents} documents={documents} onRefresh={onRefresh} />
         )}
@@ -1733,6 +1767,164 @@ function ResourcesSheet({
         </footer>
       </div>
     </ModalSurface>
+  );
+}
+
+function ConnectionsPanel({ connections = [], templates = [], approvals = [], canWrite, onRefresh }) {
+  const [showForm, setShowForm] = useState(false);
+  const [form, setForm] = useState({ template_id: "custom", name: "", endpoint_url: "", auth_type: "none", token: "", trust_read_annotations: false });
+  const [busy, setBusy] = useState("");
+  const [error, setError] = useState("");
+  const pendingApprovals = approvals.filter((approval) => approval.status === "pending");
+  const recentApprovals = approvals.filter((approval) => approval.status !== "pending").slice(-4).reverse();
+
+  function chooseTemplate(template) {
+    setForm((current) => ({
+      ...current,
+      template_id: template.id,
+      name: template.id === "custom" ? current.name : template.name,
+      auth_type: template.auth_type || "none"
+    }));
+  }
+
+  async function createConnection(event) {
+    event.preventDefault();
+    setBusy("create");
+    setError("");
+    try {
+      await api.post("/api/mcp/connections", {
+        name: form.name,
+        template_id: form.template_id,
+        endpoint_url: form.endpoint_url,
+        trust_read_annotations: form.trust_read_annotations,
+        auth: form.auth_type === "bearer" ? { type: "bearer", token: form.token } : { type: "none" }
+      });
+      setForm({ template_id: "custom", name: "", endpoint_url: "", auth_type: "none", token: "", trust_read_annotations: false });
+      setShowForm(false);
+      await onRefresh();
+    } catch (connectionError) {
+      setError(friendlyError(connectionError));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function refreshConnection(connection) {
+    setBusy(connection.connection_id);
+    setError("");
+    try {
+      await api.post(`/api/mcp/connections/${encodeURIComponent(connection.connection_id)}/refresh`, {});
+      await onRefresh();
+    } catch (refreshError) {
+      setError(friendlyError(refreshError));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function deleteConnection(connection) {
+    setBusy(connection.connection_id);
+    setError("");
+    try {
+      await api.delete(`/api/mcp/connections/${encodeURIComponent(connection.connection_id)}`);
+      await onRefresh();
+    } catch (deleteError) {
+      setError(friendlyError(deleteError));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function decideApproval(approval, decision) {
+    setBusy(approval.approval_id);
+    setError("");
+    try {
+      await api.post(`/api/mcp/approvals/${encodeURIComponent(approval.approval_id)}`, { decision });
+      await onRefresh();
+    } catch (approvalError) {
+      setError(friendlyError(approvalError));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  return (
+    <section className="resource-section connections-section" aria-labelledby="connections-heading">
+      <div className="section-heading-row">
+        <div>
+          <span className="eyebrow">Workspace tools</span>
+          <h2 id="connections-heading">Connections</h2>
+          <p>Connect remote MCP servers, then give each agent only the tools it needs.</p>
+        </div>
+        {canWrite && <button type="button" className="text-button primary" onClick={() => setShowForm((value) => !value)}><Plus size={15} />Add connection</button>}
+      </div>
+
+      {error && <div className="form-error" role="alert">{error}</div>}
+
+      {pendingApprovals.length > 0 && (
+        <div className="approval-stack" aria-label="Actions waiting for approval">
+          <div className="connections-subheading"><span><Check size={15} /></span><div><strong>Waiting for your approval</strong><small>Nothing below runs until you approve the exact action.</small></div></div>
+          {pendingApprovals.map((approval) => (
+            <article className="approval-card" key={approval.approval_id}>
+              <div><strong>{approval.tool_title || approval.tool_name}</strong><small>{approval.connection_name} · {formatAgentName(approval.agent_id, [])}</small></div>
+              <pre>{JSON.stringify(approval.arguments, null, 2)}</pre>
+              <div className="approval-actions">
+                <button type="button" className="text-button ghost" disabled={busy === approval.approval_id} onClick={() => decideApproval(approval, "deny")}>Deny</button>
+                <button type="button" className="text-button primary" disabled={busy === approval.approval_id} onClick={() => decideApproval(approval, "approve")}>{busy === approval.approval_id ? <LoaderCircle className="spin" size={14} /> : <Check size={14} />}Approve and run</button>
+              </div>
+            </article>
+          ))}
+        </div>
+      )}
+
+      {recentApprovals.length > 0 && (
+        <details className="recent-connection-activity">
+          <summary>Recent approved actions <span>{recentApprovals.length}</span></summary>
+          <div>
+            {recentApprovals.map((approval) => (
+              <article key={approval.approval_id}>
+                <span className={approval.status === "executed" ? "success" : "muted"}><Check size={13} /></span>
+                <div><strong>{approval.tool_title || approval.tool_name}</strong><small>{approval.status === "executed" ? "Approved and completed" : approval.status} · {formatDate(approval.decided_at, { includeTime: true })}</small>{approval.result && <pre>{JSON.stringify(approval.result, null, 2)}</pre>}</div>
+              </article>
+            ))}
+          </div>
+        </details>
+      )}
+
+      {showForm && (
+        <form className="connection-form" onSubmit={createConnection}>
+          <div className="builder-heading"><span>NEW CONNECTION</span><h3>Choose a starting point</h3><p>Virenis performs a live handshake and imports the server's current tool schemas.</p></div>
+          <div className="connection-template-grid">
+            {templates.map((template) => (
+              <button type="button" className={form.template_id === template.id ? "selected" : ""} key={template.id} onClick={() => chooseTemplate(template)}>
+                <Plug size={16} /><span><strong>{template.name}</strong><small>{template.description}</small></span>{form.template_id === template.id && <Check size={13} />}
+              </button>
+            ))}
+          </div>
+          <div className="advanced-builder-grid">
+            <div className="builder-field"><label htmlFor="mcp-name">Connection name</label><input id="mcp-name" value={form.name} onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))} required maxLength={100} placeholder="Product workspace" /></div>
+            <div className="builder-field"><label htmlFor="mcp-endpoint">HTTPS endpoint</label><input id="mcp-endpoint" value={form.endpoint_url} onChange={(event) => setForm((current) => ({ ...current, endpoint_url: event.target.value }))} required type="url" placeholder={templates.find((template) => template.id === form.template_id)?.endpoint_placeholder || "https://mcp.example.com/mcp"} /></div>
+          </div>
+          <fieldset className="connection-auth"><legend>Authentication</legend><label><input type="radio" name="mcp-auth" checked={form.auth_type === "none"} onChange={() => setForm((current) => ({ ...current, auth_type: "none", token: "" }))} />No authentication</label><label><input type="radio" name="mcp-auth" checked={form.auth_type === "bearer"} onChange={() => setForm((current) => ({ ...current, auth_type: "bearer" }))} />Bearer token</label></fieldset>
+          {form.auth_type === "bearer" && <div className="builder-field"><label htmlFor="mcp-token">Bearer token</label><input id="mcp-token" type="password" autoComplete="new-password" value={form.token} onChange={(event) => setForm((current) => ({ ...current, token: event.target.value }))} required /><small>Encrypted before it is written; never sent to an agent or published.</small></div>}
+          <label className="connection-trust-read"><input type="checkbox" checked={form.trust_read_annotations} onChange={(event) => setForm((current) => ({ ...current, trust_read_annotations: event.target.checked }))} /><span><strong>Allow declared read-only tools without approval</strong><small>Enable this only when you trust this MCP server's tool labels. Otherwise every call asks first.</small></span></label>
+          <div className="connection-form-actions"><button type="button" className="text-button ghost" onClick={() => setShowForm(false)} disabled={busy === "create"}>Cancel</button><button type="submit" className="text-button primary" disabled={busy === "create"}>{busy === "create" ? <LoaderCircle className="spin" size={14} /> : <Plug size={14} />}Connect and discover tools</button></div>
+        </form>
+      )}
+
+      <div className="connection-list">
+        {connections.map((connection) => (
+          <article className="connection-card" key={connection.connection_id}>
+            <div className="connection-card-head"><span className="connection-icon"><Plug size={17} /></span><div><strong>{connection.name}</strong><small>{connection.endpoint_origin} · {connection.auth_type === "bearer" ? "Protected" : "No auth"}</small></div><i className="connection-ready"><span />Ready</i></div>
+            <div className="connection-tools">
+              {(connection.tools || []).map((tool) => <span className={!tool.requires_approval ? "read" : "write"} key={tool.name}>{tool.title || tool.name}<small>{!tool.requires_approval ? "Read" : "Approval"}</small></span>)}
+            </div>
+            <footer><small>{connection.tools?.length || 0} discovered tools · {connection.read_policy === "allow_declared_reads" ? "trusted read labels" : "approval for every call"}</small>{canWrite && <div><IconButton compact label={`Refresh ${connection.name}`} disabled={busy === connection.connection_id} onClick={() => refreshConnection(connection)}><RefreshCw className={busy === connection.connection_id ? "spin" : ""} size={15} /></IconButton><IconButton compact label={`Delete ${connection.name}`} disabled={busy === connection.connection_id} onClick={() => deleteConnection(connection)}><Trash2 size={15} /></IconButton></div>}</footer>
+          </article>
+        ))}
+        {!connections.length && !showForm && <div className="empty-resource-state"><span><Plug size={22} /></span><h3>No connections yet</h3><p>Add a remote MCP server, review its tools, and assign only the ones an agent needs.</p></div>}
+      </div>
+    </section>
   );
 }
 
@@ -2415,6 +2607,7 @@ export function MarketplaceAgentDialog({ item, auth, onClose, onRate, onCopied, 
   const consumes = agent.consumes || [];
   const produces = agent.produces || [];
   const cues = agent.routing_cues || [];
+  const connectorRequirements = agent.connector_requirements || [];
   return (
     <ModalSurface
       title={agentFacingText(detail.title, "Marketplace agent")}
@@ -2447,16 +2640,17 @@ export function MarketplaceAgentDialog({ item, auth, onClose, onRate, onCopied, 
               <div className="builder-heading"><span>TOOLS &amp; TEAMWORK</span><h3 id="marketplace-workflow-heading">How it works</h3></div>
               <dl className="marketplace-spec-list compact">
                 <div><dt>Tools</dt><dd>{tools.length ? tools.map((value) => <span className="marketplace-spec-chip" key={value}>{value.replaceAll("_", " ")}</span>) : "No tools required"}</dd></div>
+                <div><dt>Connections</dt><dd>{connectorRequirements.length ? connectorRequirements.flatMap((requirement) => requirement.tools.map((tool) => <span className="marketplace-spec-chip" key={`${requirement.connection_name}:${tool.name}`}>{requirement.connection_name} · {tool.title || tool.name}</span>)) : "No external connection required"}</dd></div>
                 <div><dt>Receives</dt><dd>{consumes.length ? consumes.map((value) => <span className="marketplace-spec-chip" key={value}>{value.replaceAll("_", " ")}</span>) : "User request"}</dd></div>
                 <div><dt>Produces</dt><dd>{produces.length ? produces.map((value) => <span className="marketplace-spec-chip" key={value}>{value.replaceAll("_", " ")}</span>) : "Domain output"}</dd></div>
                 <div><dt>Router cues</dt><dd>{cues.length ? cues.join(", ") : "Uses its name and purpose"}</dd></div>
               </dl>
             </section>
 
-            {(exclusions.private_knowledge || exclusions.agent_connections) && (
+            {(exclusions.private_knowledge || exclusions.agent_connections || exclusions.mcp_credentials_and_bindings) && (
               <div className="marketplace-sharing-boundary">
                 <AlertCircle size={16} />
-                <span><strong>Workspace-safe copy</strong><small>{[exclusions.private_knowledge ? "Private knowledge" : null, exclusions.agent_connections ? "workspace agent connections" : null].filter(Boolean).join(" and ")} will not be copied.</small></span>
+                <span><strong>Workspace-safe copy</strong><small>{[exclusions.private_knowledge ? "Private knowledge" : null, exclusions.agent_connections ? "workspace agent connections" : null, exclusions.mcp_credentials_and_bindings ? "live MCP credentials and bindings" : null].filter(Boolean).join(", ")} will not be copied. Connection requirements remain visible so you can bind your own workspace tools.</small></span>
               </div>
             )}
           </main>
@@ -2468,6 +2662,7 @@ export function MarketplaceAgentDialog({ item, auth, onClose, onRate, onCopied, 
             <dl>
               <div><dt>Publisher</dt><dd>{publisher}</dd></div>
               <div><dt>Tools</dt><dd>{tools.length || "None"}</dd></div>
+              <div><dt>Connections</dt><dd>{connectorRequirements.length || "None"}</dd></div>
               <div><dt>Outputs</dt><dd>{produces.length || "Default"}</dd></div>
               <div><dt>Rating</dt><dd>{detail.rating_count ? `${detail.rating_average.toFixed(1)} / 5` : "Not rated"}</dd></div>
             </dl>
@@ -2930,7 +3125,11 @@ function createAgentForm(agent) {
       routing_cues: (agent.routing_cues || []).join(", "),
       consumes: agent.consumes?.length ? [...agent.consumes] : ["user_request"],
       produces: agent.produces?.length ? [...agent.produces] : ["domain_outputs"],
-      tools: [...(agent.tools || [])],
+      tools: (agent.tools || []).filter((tool) => !/^mcp_[a-f0-9]{8}_[a-z0-9_]+_[a-f0-9]{6}$/.test(tool)),
+      mcp_bindings: (agent.mcp_bindings || []).map((binding) => ({
+        connection_id: binding.connection_id,
+        tool_names: (binding.tools || []).map((tool) => tool.name)
+      })),
       resources: [...(agent.resources || [])],
       sources: (agent.sources || []).join(", "),
       source_text: "",
@@ -2948,6 +3147,7 @@ function createAgentForm(agent) {
     consumes: ["user_request"],
     produces: ["domain_outputs"],
     tools: [],
+    mcp_bindings: [],
     resources: [],
     sources: "",
     source_text: "",
@@ -2955,7 +3155,7 @@ function createAgentForm(agent) {
   };
 }
 
-function AgentDialog({ auth, agent, agents, documents, onClose, onSaved }) {
+function AgentDialog({ auth, agent, agents, documents, mcpConnections = [], onClose, onSaved }) {
   const editing = Boolean(agent);
   const [form, setForm] = useState(() => createAgentForm(agent));
   const [step, setStep] = useState(0);
@@ -2994,6 +3194,27 @@ function AgentDialog({ auth, agent, agents, documents, onClose, onSaved }) {
         else values.add(value);
       }
       return { ...current, tools: [...values] };
+    });
+  }
+
+  function toggleMcpTool(connectionId, toolName, checked) {
+    setForm((current) => {
+      const bindings = (current.mcp_bindings || []).map((binding) => ({
+        connection_id: binding.connection_id,
+        tool_names: [...binding.tool_names]
+      }));
+      let binding = bindings.find((item) => item.connection_id === connectionId);
+      if (!binding && checked) {
+        binding = { connection_id: connectionId, tool_names: [] };
+        bindings.push(binding);
+      }
+      if (binding) {
+        const names = new Set(binding.tool_names);
+        if (checked) names.add(toolName);
+        else names.delete(toolName);
+        binding.tool_names = [...names];
+      }
+      return { ...current, mcp_bindings: bindings.filter((item) => item.tool_names.length) };
     });
   }
 
@@ -3059,6 +3280,7 @@ function AgentDialog({ auth, agent, agents, documents, onClose, onSaved }) {
       consumes: [...new Set(["user_request", ...form.consumes, ...(hasDocumentResources ? ["document_context"] : [])])],
       produces: form.produces.length ? form.produces : ["domain_outputs"],
       tools: [...new Set([...form.tools, ...(hasDocumentResources ? ["document_search", "document_read"] : [])])],
+      mcp_bindings: form.mcp_bindings || [],
       resources: form.resources,
       source_text: form.source_text,
       ...(auth?.is_admin ? { sources: form.sources } : {})
@@ -3206,6 +3428,37 @@ function AgentDialog({ auth, agent, agents, documents, onClose, onSaved }) {
                     })}
                   </div>
                 </fieldset>
+                <fieldset className="choice-fieldset mcp-tool-fieldset">
+                  <legend>Connected tools <small>optional</small></legend>
+                  <p>Only selected tools enter this agent's allowlist. Tools marked as actions always pause for your approval.</p>
+                  {agent?.connector_requirements_pending?.length > 0 && (
+                    <div className="connector-requirements-note">
+                      <AlertCircle size={16} />
+                      <span><strong>This Marketplace copy needs your own connections</strong><small>{agent.connector_requirements_pending.flatMap((requirement) => requirement.tools.map((tool) => `${requirement.connection_name}: ${tool.title || tool.name}`)).join(" · ")}</small></span>
+                    </div>
+                  )}
+                  {mcpConnections.length > 0 ? (
+                    <div className="mcp-agent-connections">
+                      {mcpConnections.map((connection) => (
+                        <details key={connection.connection_id} open={(form.mcp_bindings || []).some((binding) => binding.connection_id === connection.connection_id)}>
+                          <summary><Plug size={15} /><span><strong>{connection.name}</strong><small>{connection.tools?.length || 0} tools available</small></span></summary>
+                          <div>
+                            {(connection.tools || []).map((tool) => {
+                              const selected = (form.mcp_bindings || []).some((binding) => binding.connection_id === connection.connection_id && binding.tool_names.includes(tool.name));
+                              return (
+                                <label className={selected ? "selected" : ""} key={tool.name}>
+                                  <input type="checkbox" checked={selected} onChange={(event) => toggleMcpTool(connection.connection_id, tool.name, event.target.checked)} />
+                                  <span><strong>{tool.title || tool.name}</strong><small>{tool.description}</small></span>
+                                  <i className={!tool.requires_approval ? "read" : "write"}>{!tool.requires_approval ? "Read" : "Approval"}</i>
+                                </label>
+                              );
+                            })}
+                          </div>
+                        </details>
+                      ))}
+                    </div>
+                  ) : <div className="inline-empty-connection"><Plug size={17} /><span><strong>No workspace connections</strong><small>Add one from Agent Studio → Connections, then return here.</small></span></div>}
+                </fieldset>
                 <fieldset className="choice-fieldset">
                   <legend>What context can it receive?</legend>
                   <p>The user's request is always included.</p>
@@ -3316,8 +3569,8 @@ function AgentDialog({ auth, agent, agents, documents, onClose, onSaved }) {
             <p>{form.capability || "Describe what this agent will do to see a summary here."}</p>
             <dl>
               <div><dt>Style</dt><dd>{RESPONSE_STYLES.find((style) => style.id === form.response_style)?.title || "Custom"}</dd></div>
-              <div><dt>Tools</dt><dd>{form.tools.length || "None"}</dd></div>
-              <div><dt>Connections</dt><dd>{form.consumes.filter((value) => /^agent:.+:output$/.test(value)).length || "None"}</dd></div>
+              <div><dt>Tools</dt><dd>{form.tools.length + (form.mcp_bindings || []).reduce((total, binding) => total + binding.tool_names.length, 0) || "None"}</dd></div>
+              <div><dt>Agent links</dt><dd>{form.consumes.filter((value) => /^agent:.+:output$/.test(value)).length || "None"}</dd></div>
               <div><dt>Knowledge</dt><dd>{selectedDocumentCount + newFiles.length || "None"}</dd></div>
             </dl>
             <div className="preview-status"><span /><div><strong>Private workspace</strong><small>Ready after setup completes</small></div></div>
