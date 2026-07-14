@@ -3128,6 +3128,145 @@ describe("chat execution", () => {
     }
   });
 
+  it("falls back to the session model when every agent is off in the chat", async () => {
+    const previous = {
+      APP_API_TOKENS_JSON: process.env.APP_API_TOKENS_JSON,
+      TCAR_ENGINE_MODE: process.env.TCAR_ENGINE_MODE,
+      TCAR_RUNTIME_API_URL: process.env.TCAR_RUNTIME_API_URL,
+      TCAR_RUNTIME_API_KEY: process.env.TCAR_RUNTIME_API_KEY
+    };
+    const previousFetch = globalThis.fetch;
+    const realTmp = await fs.mkdtemp(path.join(os.tmpdir(), "tcar-chat-no-agents-"));
+    const token = "runtime_no_agents_token_0123456789";
+    let realApp;
+    let chatBody;
+
+    try {
+      process.env.APP_API_TOKENS_JSON = JSON.stringify({
+        [token]: { user_id: "alice", workspace_id: "workspace_no_agents", role: "user" }
+      });
+      process.env.TCAR_ENGINE_MODE = "real";
+      process.env.TCAR_RUNTIME_API_URL = "http://gpu-runtime.internal:9000";
+      process.env.TCAR_RUNTIME_API_KEY = "runtime-secret-for-tests";
+      globalThis.fetch = async (url, options = {}) => {
+        expect(String(url)).toContain("/chat/execute");
+        chatBody = JSON.parse(options.body);
+        return new Response(JSON.stringify({
+          ok: true,
+          mode: "session_direct_vllm_execute",
+          baseModel: "qwen36-awq",
+          manifestRevision: "1".repeat(64),
+          componentProvenance: {
+            revision_authority: "runtime",
+            manifest_revision: "1".repeat(64),
+            base_model_id: "qwen36-awq",
+            base_model_content_digest: "2".repeat(64),
+            session_model_id: "qwen36-awq",
+            session_model_content_digest: "2".repeat(64),
+            session_contract_version: "session-orchestrator-v2",
+            executor_code_digest: "5".repeat(64),
+            agents: []
+          },
+          executionProvenance: {
+            execution_id: "runtime-no-agents-execution",
+            receipt_id: "runtime-no-agents-receipt",
+            record_hash: "9".repeat(64),
+            schema_version: 1,
+            created_at: "2026-07-14T00:00:00.000Z"
+          },
+          plan: {
+            steps: [],
+            adapters: [],
+            edges: [],
+            routing: {
+              mode: "session",
+              candidate_count: 0,
+              candidate_adapters: [],
+              selected: [],
+              explicit_adapters: [],
+              unresolved_mentions: [],
+              out_of_scope: true,
+              reason: "No enabled specialist is available.",
+              fallback: "session_model",
+              orchestrator: {
+                contract_version: "session-orchestrator-v2",
+                decision: "direct",
+                authorized_agent_count: 0,
+                discovered_candidate_count: 0,
+                planning_call_performed: false,
+                final_synthesis_required: true
+              }
+            }
+          },
+          parallel: { workers: 1, batches: [], maxBatchWidth: 0, parallelizable: false },
+          expertOutputs: [],
+          finalAnswer: "Leaves look green because chlorophyll absorbs mostly red and blue light while reflecting green light."
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      };
+
+      realApp = await createApp({
+        dbPath: path.join(realTmp, "db.json"),
+        uploadRoot: realTmp
+      });
+      const session = await request(realApp)
+        .post("/api/chat/sessions")
+        .set("Authorization", `Bearer ${token}`)
+        .send({ title: "No agents" })
+        .expect(201);
+      const activeAgents = realApp.locals.store.read((data) => data.agents.filter((agent) => agent.enabled !== false));
+      expect(activeAgents.length).toBeGreaterThan(0);
+      for (const agent of activeAgents) {
+        await request(realApp)
+          .patch(`/api/chat/sessions/${session.body.session_id}/agents/${agent.id}`)
+          .set("Authorization", `Bearer ${token}`)
+          .send({ active: false })
+          .expect(200);
+      }
+
+      const queued = await request(realApp)
+        .post(`/api/chat/sessions/${session.body.session_id}/messages`)
+        .set("Authorization", `Bearer ${token}`)
+        .send({ content: "Why are leaves green?" })
+        .expect(202);
+      let run;
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        const response = await request(realApp)
+          .get(`/api/chat/runs/${queued.body.run_id}`)
+          .set("Authorization", `Bearer ${token}`)
+          .expect(200);
+        if (["completed", "failed"].includes(response.body.status)) {
+          run = response.body;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+
+      expect(chatBody.options.allowed_adapters).toEqual([]);
+      expect(run).toMatchObject({
+        status: "completed",
+        final_answer: "Leaves look green because chlorophyll absorbs mostly red and blue light while reflecting green light.",
+        expert_outputs: [],
+        plan: { steps: [] }
+      });
+      expect(run.error).toBeNull();
+      const execution = await request(realApp)
+        .get(`/api/executions/${run.execution.execution_id}`)
+        .set("Authorization", `Bearer ${token}`)
+        .expect(200);
+      expect(execution.body.participants).toEqual([]);
+      expect(execution.body.record_hash_valid).toBe(true);
+    } finally {
+      await realApp?.locals?.drainBackgroundTasks?.({ timeoutMs: 5000 });
+      await realApp?.locals?.store?.close?.();
+      globalThis.fetch = previousFetch;
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      await fs.rm(realTmp, { recursive: true, force: true });
+    }
+  });
+
   it("filters runtime model listings by requester-visible agents", async () => {
     const previous = {
       APP_API_TOKENS_JSON: process.env.APP_API_TOKENS_JSON,

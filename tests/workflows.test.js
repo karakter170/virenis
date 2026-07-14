@@ -447,6 +447,101 @@ describe("explicit workflow Auto-Composer", () => {
     expect(normal.body.kind).toBe("chat");
   });
 
+  it("keeps role attributes isolated across repeated workflows and enables required built-in tools", async () => {
+    const staleBusinessCapability = "Analyzes general business questions, researches approved current sources when needed, and organizes findings for decision-making.";
+    await app.locals.store.mutate((data) => {
+      data.agents.push({
+        ...agentRecord({
+          id: "business_analyst_proof",
+          title: "Business Analyst",
+          capability: staleBusinessCapability,
+          created_by: "system",
+          workspace_id: null
+        }),
+        visibility: "global",
+        system_managed: true,
+        routing_cues: ["business analysis", "business plan", "decision brief"],
+        tools: ["web_search"]
+      });
+      return true;
+    });
+
+    composer.mockImplementationOnce(async (input) => {
+      expect(input.candidates.some((item) => item.candidate_id === "workspace:business_analyst_proof")).toBe(true);
+      return {
+        title: "Business planning team",
+        nodes: [{
+          id: "business_planner",
+          type: "agent",
+          title: "Business Analyst",
+          task: "Create a concise business plan and verify relevant current public sources.",
+          capability: "Creates focused business plans using the user's constraints and verified current context.",
+          candidate_id: "workspace:business_analyst_proof",
+          produces: ["business_plan"]
+        }],
+        edges: []
+      };
+    });
+
+    const session = await createSession();
+    const firstRun = await sendMessage(session.session_id, "/agent create a business plan using current public sources");
+    await waitForRun(firstRun.body.run_id);
+    let loaded = await getSession(session.session_id);
+    const firstWorkflow = loaded.body.workflows.find((item) => item.title === "Business planning team");
+    const firstActivated = await request(app)
+      .post(`/api/workflows/${firstWorkflow.workflow_id}/decision`)
+      .set(auth("workflow_alice"))
+      .send({ decision: "approve", revision: firstWorkflow.revision })
+      .expect(200);
+    const firstAgentId = firstActivated.body.activation.node_agents[0].agent_id;
+
+    composer.mockImplementationOnce(async (input) => {
+      const previousWorkflowAgent = input.candidates.find((item) => item.agent_id === firstAgentId);
+      expect(previousWorkflowAgent).toBeTruthy();
+      return {
+        title: "Math tutoring team",
+        nodes: [{
+          id: "math_tutor",
+          type: "agent",
+          title: "Math Tutor",
+          task: "Teach algebra step by step and check current public curriculum sources when needed.",
+          // Reproduce a model copying the stale catalog description even
+          // though the visible role and task are unrelated.
+          capability: staleBusinessCapability,
+          candidate_id: previousWorkflowAgent.candidate_id,
+          produces: ["lesson"]
+        }],
+        edges: []
+      };
+    });
+
+    const secondRun = await sendMessage(session.session_id, "/agent create a Math Tutor that checks current public curriculum sources");
+    await waitForRun(secondRun.body.run_id);
+    loaded = await getSession(session.session_id);
+    const secondWorkflow = loaded.body.workflows.find((item) => item.title === "Math tutoring team");
+    const mathNode = secondWorkflow.nodes.find((node) => node.id === "math_tutor");
+    expect(mathNode.capability).toBe("Teach algebra step by step and check current public curriculum sources when needed.");
+    expect(mathNode.candidate_id).not.toBe(`workspace:${firstAgentId}`);
+    expect(mathNode.capability).not.toBe(staleBusinessCapability);
+    expect(mathNode.tools).toEqual(expect.arrayContaining(["calculator", "web_search"]));
+
+    const secondActivated = await request(app)
+      .post(`/api/workflows/${secondWorkflow.workflow_id}/decision`)
+      .set(auth("workflow_alice"))
+      .send({ decision: "approve", revision: secondWorkflow.revision })
+      .expect(200);
+    const secondAgentId = secondActivated.body.activation.node_agents[0].agent_id;
+    expect(secondAgentId).not.toBe(firstAgentId);
+
+    const stored = app.locals.store.read();
+    const firstAgent = stored.agents.find((agent) => agent.id === firstAgentId);
+    const mathAgent = stored.agents.find((agent) => agent.id === secondAgentId);
+    expect(firstAgent.capability).toBe("Creates focused business plans using the user's constraints and verified current context.");
+    expect(firstAgent.tools).toContain("web_search");
+    expect(mathAgent.capability).toBe(mathNode.capability);
+    expect(mathAgent.tools).toEqual(expect.arrayContaining(["calculator", "web_search"]));
+  });
+
   it("persists an approved connection pause across restart and isolates it by user", async () => {
     composer.mockImplementationOnce(async () => ({
       title: "Inbox draft helper",

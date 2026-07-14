@@ -70,7 +70,7 @@ describe("Agent Studio product surfaces", () => {
         status: "awaiting_confirmation",
         nodes: [
           { id: "trigger", type: "trigger", title: "New email", source: "system", status: "ready" },
-          { id: "support", type: "agent", title: "Support Agent", source: "workspace", status: "blocked_connection" },
+          { id: "support", type: "agent", title: "Support Agent", source: "workspace", status: "blocked_connection", tools: ["web_search"] },
           { id: "inventory", type: "agent", title: "Inventory Agent", source: "marketplace", publisher: "maker", status: "blocked_connection" },
           { id: "writer", type: "agent", title: "Reply Writer", source: "generated", status: "ready" }
         ],
@@ -96,6 +96,7 @@ describe("Agent Studio product surfaces", () => {
     expect(markup).toContain("Your workspace");
     expect(markup).toContain("Marketplace · maker");
     expect(markup).toContain("New private agent");
+    expect(markup).toContain("Tools: Web search");
     expect(markup).toContain("Connect Gmail");
     expect(markup).toContain("Review permissions and safety");
     expect(markup).toContain("Approve plan");

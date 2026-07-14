@@ -1543,7 +1543,11 @@ export function WorkflowDraftCard({
         {agentNodes.map((node) => (
           <div key={node.id}>
             <span className={`workflow-source-dot ${node.source}`} />
-            <span><strong>{node.title}</strong><small>{workflowSourceLabel(node)}</small></span>
+            <span>
+              <strong>{node.title}</strong>
+              <small>{workflowSourceLabel(node)}</small>
+              {(node.tools || []).length > 0 && <small>Tools: {node.tools.map(workflowToolLabel).join(" · ")}</small>}
+            </span>
             {node.status === "blocked_connection" && <i>Needs connection</i>}
           </div>
         ))}
@@ -1689,6 +1693,20 @@ function workflowSourceLabel(node) {
   if (node.source === "marketplace") return `Marketplace${node.publisher ? ` · ${node.publisher}` : ""}`;
   if (node.source === "generated") return "New private agent";
   return node.type || "Workflow step";
+}
+
+function workflowToolLabel(tool) {
+  const labels = {
+    web_search: "Web search",
+    calculator: "Calculator",
+    math_solver: "Math solver",
+    data_table: "Data table",
+    sql_runner: "SQL",
+    document_search: "Document search",
+    document_read: "Document reader",
+    repo_inspector: "Repository inspector"
+  };
+  return labels[tool] || String(tool || "").replaceAll("_", " ");
 }
 
 function workflowStatusCopy(status) {
