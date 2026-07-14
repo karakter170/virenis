@@ -50,6 +50,7 @@ import {
   ListTodo,
   X
 } from "lucide-react";
+import { UserButton, useAuth } from "@clerk/react";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import rehypeKatex from "rehype-katex";
@@ -216,11 +217,10 @@ function initialsFor(auth) {
 }
 
 export default function App() {
+  const { isLoaded: clerkLoaded, isSignedIn } = useAuth();
   const [route, setRoute] = useState(() => applicationRoute(window.location.pathname));
-  const [identityConfig, setIdentityConfig] = useState(null);
 
   useEffect(() => {
-    api.get("/api/auth/config").then(setIdentityConfig).catch(() => setIdentityConfig(null));
     const handlePopState = () => setRoute(applicationRoute(window.location.pathname));
     const handleAuthenticationRequired = () => {
       window.history.pushState({}, "", "/login");
@@ -234,6 +234,21 @@ export default function App() {
     };
   }, []);
 
+  useEffect(() => {
+    if (!clerkLoaded) return;
+    if (route.legacyIdentity) {
+      window.history.replaceState({}, "", "/login");
+      setRoute(applicationRoute("/login"));
+      return;
+    }
+    const needsSignIn = route.surface === "workspace" && !isSignedIn;
+    const needsWorkspace = route.surface === "identity" && isSignedIn;
+    if (!needsSignIn && !needsWorkspace) return;
+    const path = needsSignIn ? "/login" : "/app";
+    window.history.replaceState({}, "", path);
+    setRoute(applicationRoute(path));
+  }, [clerkLoaded, isSignedIn, route.legacyIdentity, route.surface]);
+
   function navigate(next) {
     const path = applicationPath(next);
     if (window.location.pathname !== path) window.history.pushState({}, "", path);
@@ -241,25 +256,34 @@ export default function App() {
     window.scrollTo?.({ top: 0, behavior: "auto" });
   }
 
+  if (!clerkLoaded) {
+    return <div className="center-state app-auth-loading" role="status"><LoaderCircle className="spin" size={20} /><span>Opening Virenis</span></div>;
+  }
   if (route.surface === "home") {
-    const next = identityConfig?.self_service_enabled ? "login" : "workspace";
-    return <LandingPage identityEnabled={Boolean(identityConfig?.self_service_enabled)} onEnter={() => navigate(next)} />;
+    return (
+      <LandingPage
+        isSignedIn={Boolean(isSignedIn)}
+        onSignIn={() => navigate("login")}
+        onSignUp={() => navigate("register")}
+        onWorkspace={() => navigate("workspace")}
+      />
+    );
   }
   if (route.surface === "identity") {
+    if (isSignedIn) return <div className="center-state app-auth-loading" role="status"><LoaderCircle className="spin" size={20} /><span>Opening your workspace</span></div>;
     return (
       <IdentityPage
         mode={route.mode}
         onHome={() => navigate("home")}
-        onNavigate={navigate}
-        onAuthenticated={() => navigate("workspace")}
       />
     );
   }
+  if (!isSignedIn) return <div className="center-state app-auth-loading" role="status"><LoaderCircle className="spin" size={20} /><span>Preparing sign in</span></div>;
   return (
     <Workspace
       onHome={() => navigate("home")}
       onAuthenticationRequired={() => navigate("login")}
-      onSignedOut={() => navigate("login")}
+      onSignedOut={() => navigate("home")}
     />
   );
 }
@@ -267,9 +291,9 @@ export default function App() {
 function applicationRoute(pathname) {
   if (pathname.startsWith("/app")) return { surface: "workspace", mode: null };
   if (pathname.startsWith("/register")) return { surface: "identity", mode: "register" };
-  if (pathname.startsWith("/forgot-password")) return { surface: "identity", mode: "forgot" };
-  if (pathname.startsWith("/reset-password")) return { surface: "identity", mode: "reset" };
-  if (pathname.startsWith("/verify-email")) return { surface: "identity", mode: "verify" };
+  if (pathname.startsWith("/forgot-password")) return { surface: "identity", mode: "login", legacyIdentity: true };
+  if (pathname.startsWith("/reset-password")) return { surface: "identity", mode: "login", legacyIdentity: true };
+  if (pathname.startsWith("/verify-email")) return { surface: "identity", mode: "login", legacyIdentity: true };
   if (pathname.startsWith("/login")) return { surface: "identity", mode: "login" };
   return { surface: "home", mode: null };
 }
@@ -279,10 +303,7 @@ function applicationPath(destination) {
     home: "/",
     workspace: "/app",
     login: "/login",
-    register: "/register",
-    forgot: "/forgot-password",
-    reset: "/reset-password",
-    verify: "/verify-email"
+    register: "/register"
   };
   return paths[destination] || "/";
 }
@@ -905,14 +926,15 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
             <SquarePen size={19} />
           </IconButton>
           <button
-            className="account-button"
+            className="studio-button"
             type="button"
-            aria-label="Open agents and settings"
-            title="Agents and settings"
+            aria-label="Open Agent Studio"
             onClick={() => setResourcesOpen(true)}
           >
-            {initialsFor(auth)}
+            <Settings2 size={16} />
+            <span>Studio</span>
           </button>
+          <span className="clerk-user-control"><UserButton afterSignOutUrl="/" /></span>
         </div>
       </header>
 
@@ -2207,7 +2229,7 @@ function ResourcesSheet({
         )}
 
         {view === "account" && (
-          <AccountPanel auth={auth} onSignedOut={onSignedOut} onAuthChanged={onRefresh} />
+          <AccountPanel auth={auth} onSignedOut={onSignedOut} />
         )}
 
         {view === "admin" && auth?.is_admin && (

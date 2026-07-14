@@ -97,11 +97,11 @@ import {
   resolveAgentMcpBindings
 } from "./mcp.js";
 import {
-  clearSessionCookie,
-  createIdentityManager,
-  selfServiceIdentityEnabled,
-  sessionCookie
-} from "./identity.js";
+  clerkFrontendApiOrigin,
+  clerkIdentityEnabled,
+  createClerkAdapter,
+  createClerkIdentityManager
+} from "./clerkIdentity.js";
 
 const VALIDATION_SUITES = new Set(["manifest", "parallel_scheduler", "document_rag", "mock_smoke", "live_smoke"]);
 
@@ -178,7 +178,8 @@ export async function createApp({
   chatProcessor = processChatRun,
   workflowComposer = null,
   conversationContinuator = null,
-  validationProcessor = processValidationRun
+  validationProcessor = processValidationRun,
+  clerkAdapter = null
 } = {}) {
   realityRankMinVerifiedSamples();
   const useApiRuntimeCatalog = realRuntimeEnabled() && process.env.NODE_ENV !== "test";
@@ -188,7 +189,12 @@ export async function createApp({
   });
   const store = createStore({ dbPath, seedAgents: configuredSeedAgents });
   await store.init();
-  const identityManager = await createIdentityManager({ store });
+  const resolvedClerkAdapter = clerkAdapter || createClerkAdapter();
+  const identityManager = createClerkIdentityManager({
+    store,
+    client: resolvedClerkAdapter.client,
+    enabled: resolvedClerkAdapter.enabled
+  });
   const mcpCredentialKey = await ensureMcpCredentialKey({ dbPath });
   publicMcpTemplates();
   if (useApiRuntimeCatalog) {
@@ -230,11 +236,6 @@ export async function createApp({
   };
   const bus = new RunBus();
   const rateLimiter = createRateLimiter();
-  const identityRateLimiter = createRateLimiter({
-    windowMs: Number(process.env.APP_AUTH_RATE_WINDOW_MS || 15 * 60 * 1000),
-    limit: Number(process.env.APP_AUTH_RATE_LIMIT || 30),
-    maxBuckets: Number(process.env.APP_AUTH_RATE_MAX_BUCKETS || 10_000)
-  });
   const documentUpload = createUploadMiddleware();
   const eventStreams = new Set();
   const backgroundTasks = new Set();
@@ -334,8 +335,7 @@ export async function createApp({
   app.locals.store = store;
   app.locals.bus = bus;
   app.locals.rateBuckets = rateLimiter.buckets;
-  app.locals.identityRateBuckets = identityRateLimiter.buckets;
-  app.locals.identityOutbox = identityManager.outbox;
+  app.locals.clerkAdapter = resolvedClerkAdapter;
   app.locals.eventStreams = eventStreams;
   app.locals.closeEventStreams = (options) => closeEventStreams(eventStreams, options);
   app.locals.backgroundTasks = backgroundTasks;
@@ -349,6 +349,7 @@ export async function createApp({
   app.disable("x-powered-by");
   app.use(requestId);
   app.use(securityHeaders);
+  app.use(optionalClerkMiddleware(resolvedClerkAdapter));
   app.get("/healthz", (_req, res) => {
     res.json({
       ok: true,
@@ -382,6 +383,28 @@ export async function createApp({
         service: "virenis",
         message: "Application is not ready."
       });
+    }
+  });
+  app.post("/api/webhooks/clerk", express.raw({ type: "application/json", limit: "256kb" }), async (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      const event = await resolvedClerkAdapter.verifyWebhook(req);
+      if (event.type === "user.created" || event.type === "user.updated") {
+        await identityManager.syncClerkUser(event.data, {
+          event: event.type === "user.created" ? "identity.clerk_user_created" : "identity.clerk_user_updated"
+        });
+      } else if (event.type === "user.deleted" && event.data?.id) {
+        await deleteClerkAccountFromWebhook({
+          clerkUserId: event.data.id,
+          identityManager,
+          mcpCredentialKey,
+          uploadRoot
+        });
+      }
+      res.json({ ok: true });
+    } catch (error) {
+      if (!error.status) error.status = 400;
+      next(error);
     }
   });
   app.post("/api/internal/mcp/tools/call", express.json({ limit: "128kb" }), async (req, res, next) => {
@@ -465,143 +488,35 @@ export async function createApp({
     res.json(identityManager.publicConfig());
   });
 
-  const publicIdentityJson = express.json({ limit: "64kb" });
-  app.post("/api/auth/register", identityRateLimiter.middleware, originGuard, publicIdentityJson, async (req, res, next) => {
-    res.setHeader("Cache-Control", "no-store");
-    try {
-      res.status(202).json(await identityManager.register(req.body));
-    } catch (error) {
-      next(error);
-    }
-  });
-
-  app.post("/api/auth/verify-email", identityRateLimiter.middleware, originGuard, publicIdentityJson, async (req, res, next) => {
-    res.setHeader("Cache-Control", "no-store");
-    try {
-      res.json(await identityManager.verifyEmail(req.body));
-    } catch (error) {
-      next(error);
-    }
-  });
-
-  app.post("/api/auth/resend-verification", identityRateLimiter.middleware, originGuard, publicIdentityJson, async (req, res, next) => {
-    res.setHeader("Cache-Control", "no-store");
-    try {
-      res.status(202).json(await identityManager.resendVerification(req.body));
-    } catch (error) {
-      next(error);
-    }
-  });
-
-  app.post("/api/auth/login", identityRateLimiter.middleware, originGuard, publicIdentityJson, async (req, res, next) => {
-    res.setHeader("Cache-Control", "no-store");
-    try {
-      const result = await identityManager.login(req.body, {
-        userAgent: req.headers["user-agent"] || ""
-      });
-      res.setHeader("Set-Cookie", sessionCookie(result.raw_token));
-      delete result.raw_token;
-      res.json(result);
-    } catch (error) {
-      next(error);
-    }
-  });
-
-  app.post("/api/auth/forgot-password", identityRateLimiter.middleware, originGuard, publicIdentityJson, async (req, res, next) => {
-    res.setHeader("Cache-Control", "no-store");
-    try {
-      res.status(202).json(await identityManager.requestPasswordReset(req.body));
-    } catch (error) {
-      next(error);
-    }
-  });
-
-  app.post("/api/auth/reset-password", identityRateLimiter.middleware, originGuard, publicIdentityJson, async (req, res, next) => {
-    res.setHeader("Cache-Control", "no-store");
-    try {
-      res.json(await identityManager.resetPassword(req.body));
-    } catch (error) {
-      next(error);
-    }
-  });
-
   app.use(rateLimiter.middleware);
-  app.use(optionalBasicAuth(identityManager));
+  app.use(optionalApplicationAuth(identityManager, resolvedClerkAdapter));
   app.use(attachRequestIdentity);
   app.use(originGuard);
   app.use(requireWritableRole);
   app.use(express.json({ limit: maxJsonBodyBytes() }));
 
-  app.get("/api/auth/me", (req, res) => {
-    res.setHeader("Cache-Control", "no-store");
-    res.json({
-      user_id: req.auth.user_id,
-      workspace_id: req.auth.workspace_id,
-      email: req.auth.email || null,
-      display_name: req.auth.display_name || req.auth.user_id,
-      email_verified: req.auth.email_verified ?? null,
-      role: req.auth.role,
-      auth_type: req.auth.auth_type,
-      session_id: req.auth.session_id || null,
-      self_service_enabled: selfServiceIdentityEnabled(),
-      is_admin: isAdmin(req),
-      is_viewer: isViewer(req)
-    });
-  });
-
-  app.post("/api/auth/logout", async (req, res, next) => {
+  app.get("/api/auth/me", async (req, res, next) => {
     res.setHeader("Cache-Control", "no-store");
     try {
-      await identityManager.logout(req.auth);
-      res.setHeader("Set-Cookie", clearSessionCookie());
-      res.json({ ok: true });
-    } catch (error) {
-      next(error);
-    }
-  });
-
-  app.get("/api/account/sessions", (req, res, next) => {
-    res.setHeader("Cache-Control", "no-store");
-    try {
-      res.json(identityManager.listSessions(req.auth));
-    } catch (error) {
-      next(error);
-    }
-  });
-
-  app.delete("/api/account/sessions/:session_id", async (req, res, next) => {
-    res.setHeader("Cache-Control", "no-store");
-    try {
-      const result = await identityManager.revokeSession(req.auth, req.params.session_id);
-      if (result.current_session_revoked) res.setHeader("Set-Cookie", clearSessionCookie());
-      res.json(result);
-    } catch (error) {
-      next(error);
-    }
-  });
-
-  app.post("/api/account/sessions/revoke-others", async (req, res, next) => {
-    res.setHeader("Cache-Control", "no-store");
-    try {
-      res.json(await identityManager.revokeOtherSessions(req.auth));
-    } catch (error) {
-      next(error);
-    }
-  });
-
-  app.post("/api/account/password", async (req, res, next) => {
-    res.setHeader("Cache-Control", "no-store");
-    try {
-      res.json(await identityManager.changePassword(req.auth, req.body));
-    } catch (error) {
-      next(error);
-    }
-  });
-
-  app.patch("/api/account/profile", async (req, res, next) => {
-    res.setHeader("Cache-Control", "no-store");
-    try {
-      res.json(await identityManager.updateProfile(req.auth, req.body));
+      if (req.auth.auth_type === "clerk") {
+        req.auth = await identityManager.refreshAuthenticated(req.auth);
+      }
+      res.json({
+        user_id: req.auth.user_id,
+        workspace_id: req.auth.workspace_id,
+        clerk_user_id: req.auth.clerk_user_id || null,
+        email: req.auth.email || null,
+        display_name: req.auth.display_name || req.auth.user_id,
+        avatar_url: req.auth.avatar_url || null,
+        email_verified: req.auth.email_verified ?? null,
+        role: req.auth.role,
+        auth_type: req.auth.auth_type,
+        session_id: req.auth.session_id || null,
+        identity_provider: req.auth.auth_type === "clerk" ? "clerk" : "configured",
+        self_service_enabled: resolvedClerkAdapter.enabled,
+        is_admin: isAdmin(req),
+        is_viewer: isViewer(req)
+      });
     } catch (error) {
       next(error);
     }
@@ -628,12 +543,14 @@ export async function createApp({
         actor: req.auth,
         mcpCredentialKey
       });
+      await identityManager.deleteProviderAccount(req.auth);
       const result = await identityManager.deleteAccount(req.auth);
-      await purgeLocalDocumentRoots(uploadRoot, result.document_roots);
-      res.setHeader("Set-Cookie", clearSessionCookie());
+      const documentRoots = result?.document_roots
+        || (resources.documents || []).map((document) => document.document_root).filter(Boolean);
+      await purgeLocalDocumentRoots(uploadRoot, documentRoots);
       res.json({
         ok: true,
-        deleted_counts: result.deleted_counts,
+        deleted_counts: result?.deleted_counts || deletedAccountResourceCounts(resources),
         retention_note: "Append-only integrity receipts may be retained in de-identified form for security and provenance."
       });
     } catch (error) {
@@ -3633,7 +3550,20 @@ function securityHeaders(_req, res, next) {
   res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
   res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
   if (process.env.NODE_ENV === "production") {
-    res.setHeader("Content-Security-Policy", "default-src 'self'; base-uri 'self'; frame-ancestors 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'");
+    const clerkOrigin = clerkIdentityEnabled() ? clerkFrontendApiOrigin() : "";
+    const clerkSource = clerkOrigin ? ` ${clerkOrigin}` : "";
+    res.setHeader("Content-Security-Policy", [
+      "default-src 'self'",
+      "base-uri 'self'",
+      "frame-ancestors 'none'",
+      "form-action 'self'",
+      `img-src 'self' data: blob:${clerkIdentityEnabled() ? " https://img.clerk.com" : ""}`,
+      "style-src 'self' 'unsafe-inline'",
+      `script-src 'self'${clerkSource}${clerkIdentityEnabled() ? " https://challenges.cloudflare.com" : ""}`,
+      `connect-src 'self'${clerkSource}${clerkIdentityEnabled() ? " https://clerk-telemetry.com https://*.clerk-telemetry.com" : ""}`,
+      `frame-src 'self'${clerkSource}${clerkIdentityEnabled() ? " https://challenges.cloudflare.com" : ""}`,
+      "worker-src 'self' blob:"
+    ].join("; "));
     if (process.env.APP_ENABLE_HSTS !== "0") {
       res.setHeader("Strict-Transport-Security", "max-age=15552000; includeSubDomains");
     }
@@ -3641,7 +3571,26 @@ function securityHeaders(_req, res, next) {
   next();
 }
 
-function optionalBasicAuth(identityManager) {
+function optionalClerkMiddleware(adapter) {
+  return function authenticateWithClerk(req, res, next) {
+    if (!adapter.enabled) {
+      next();
+      return;
+    }
+    try {
+      const configuredTokens = parseConfiguredApiTokens();
+      if (bearerTokenIdentity(req.headers.authorization, configuredTokens)) {
+        next();
+        return;
+      }
+      adapter.middleware(req, res, next);
+    } catch (error) {
+      next(error);
+    }
+  };
+}
+
+function optionalApplicationAuth(identityManager, clerkAdapter) {
   return async function authenticateRequest(req, res, next) {
     const user = process.env.APP_BASIC_AUTH_USER;
     let password;
@@ -3658,8 +3607,6 @@ function optionalBasicAuth(identityManager) {
           next();
           return;
         }
-        authenticationRequired(req, res, { basicConfigured: false, identityConfigured: selfServiceIdentityEnabled() });
-        return;
       }
 
       const basicConfigured = Boolean(user && secretConfigured(password));
@@ -3680,21 +3627,30 @@ function optionalBasicAuth(identityManager) {
             return;
           }
         }
-        authenticationRequired(req, res, { basicConfigured: true, identityConfigured: selfServiceIdentityEnabled() });
+        authenticationRequired(req, res, { basicConfigured: true, identityConfigured: clerkAdapter.enabled });
         return;
       }
 
-      if (!header && selfServiceIdentityEnabled()) {
-        const sessionIdentity = await identityManager.resolveSession(req.headers.cookie || "");
-        if (sessionIdentity) {
-          req.auth = sessionIdentity;
+      if (clerkAdapter.enabled) {
+        const clerkAuth = clerkAdapter.getAuth(req);
+        req.clerkAuth = clerkAuth;
+        const clerkIdentity = await identityManager.resolveAuthenticated({
+          ...clerkAuth,
+          isAuthenticated: Boolean(clerkAuth?.userId)
+        });
+        if (clerkIdentity) {
+          req.auth = clerkIdentity;
           next();
           return;
         }
       }
 
       const bearerConfigured = configuredTokens.size > 0;
-      const identityConfigured = selfServiceIdentityEnabled();
+      const identityConfigured = clerkAdapter.enabled;
+      if (!req.path.startsWith("/api/")) {
+        next();
+        return;
+      }
       if (!basicConfigured && !bearerConfigured && !identityConfigured) {
         next();
         return;
@@ -3728,7 +3684,7 @@ function timingSafeStringEqual(left, right) {
 }
 
 function attachRequestIdentity(req, _res, next) {
-  if (!req.auth) {
+  if (!req.auth || typeof req.auth !== "object") {
     req.auth = {
       user_id: process.env.APP_UNAUTHENTICATED_USER_ID || "user_local",
       workspace_id: process.env.APP_UNAUTHENTICATED_WORKSPACE_ID || process.env.APP_DEFAULT_WORKSPACE_ID || "workspace_default",
@@ -3792,6 +3748,35 @@ async function purgeExternalAccountResources({ resources, actor, mcpCredentialKe
       if (Number(error?.status) !== 404) throw error;
     }
   }
+}
+
+async function deleteClerkAccountFromWebhook({
+  clerkUserId,
+  identityManager,
+  mcpCredentialKey,
+  uploadRoot
+}) {
+  const actor = identityManager.actorForClerkUserId(clerkUserId);
+  if (!actor) return { ok: true, already_deleted: true };
+  const resources = identityManager.resourcesForActor(actor);
+  if (!resources) return { ok: true, already_deleted: true };
+  await purgeExternalAccountResources({ resources, actor, mcpCredentialKey });
+  const result = await identityManager.deleteAccount(actor);
+  const documentRoots = result?.document_roots
+    || (resources.documents || []).map((document) => document.document_root).filter(Boolean);
+  await purgeLocalDocumentRoots(uploadRoot, documentRoots);
+  return { ok: true, already_deleted: !result };
+}
+
+function deletedAccountResourceCounts(resources = {}) {
+  return {
+    chat_sessions: 0,
+    runs: 0,
+    agents: (resources.agents || []).length,
+    documents: (resources.documents || []).length,
+    workflows: 0,
+    mcp_connections: (resources.mcp_connections || []).length
+  };
 }
 
 async function purgeLocalDocumentRoots(uploadRoot, documentRoots = []) {
@@ -3915,8 +3900,8 @@ function runtimeAuditContext(req) {
 }
 
 function requireWritableRole(req, res, next) {
-  const browserAccountWrite = req.auth?.auth_type === "session"
-    && (req.path === "/api/auth/logout" || req.path === "/api/account" || req.path.startsWith("/api/account/"));
+  const browserAccountWrite = req.auth?.auth_type === "clerk"
+    && (req.path === "/api/account" || req.path.startsWith("/api/account/"));
   if (!req.path.startsWith("/api/") || ["GET", "HEAD", "OPTIONS"].includes(req.method) || !isViewer(req) || browserAccountWrite) {
     next();
     return;

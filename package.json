@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "node server/index.js",
+    "dev": "node --env-file-if-exists=.env.local server/index.js",
     "dev:tcar": "node --env-file-if-exists=.env.local server/index.js",
     "dev:vllm": "node --env-file-if-exists=.env.local server/index.js",
     "runtime:vllm": "node --env-file-if-exists=.env.local server/vllmRuntimeAdapter.js",
@@ -15,7 +15,7 @@
     "preflight:remote": "NODE_ENV=production node --env-file=.env.remote.local scripts/remotePreflight.mjs",
     "build": "vite build",
     "test": "vitest run",
-    "test:identity:postgres": "node scripts/identity_postgres_smoke.mjs",
+    "test:clerk:postgres": "node scripts/clerk_postgres_smoke.mjs",
     "test:watch": "vitest",
     "lint": "eslint .",
     "marketing:router-quality": "node marketing/router-quality-showcase/render.mjs",
@@ -23,12 +23,14 @@
     "poc:test": "node fixtures/realityrank_poc_simulator.mjs"
   },
   "dependencies": {
+    "@clerk/express": "^2.1.40",
+    "@clerk/react": "^6.12.2",
+    "@clerk/shared": "^4.25.2",
     "@vitejs/plugin-react": "^6.0.3",
     "express": "^4.19.2",
     "katex": "^0.17.0",
     "lucide-react": "^0.468.0",
     "multer": "^2.2.0",
-    "nodemailer": "9.0.3",
     "pdfjs-dist": "5.6.205",
     "pg": "^8.22.0",
     "react": "^18.3.1",

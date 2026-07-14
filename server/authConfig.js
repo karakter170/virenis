@@ -1,4 +1,5 @@
 import { readConfiguredSecret } from "./secretConfig.js";
+import { clerkIdentityEnabled, clerkPublishableKey, clerkSecretKey } from "./clerkIdentity.js";
 
 const RESOLVER_TYPES = new Set(["human", "api", "document"]);
 const MAX_RESOLVER_BINDINGS = 32;
@@ -59,7 +60,9 @@ export function bearerAuthConfigured(env = process.env, options = {}) {
 }
 
 export function identityAuthConfigured(env = process.env) {
-  return env.APP_IDENTITY_ENABLED === "1";
+  return clerkIdentityEnabled(env)
+    && Boolean(clerkPublishableKey(env))
+    && Boolean(clerkSecretKey(env));
 }
 
 export function appAuthConfigured(env = process.env, options = {}) {

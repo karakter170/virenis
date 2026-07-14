@@ -1,73 +1,146 @@
-# Self-service identity
+# Clerk identity and private workspaces
 
-Virenis supports verified, password-based browser accounts when
-`APP_IDENTITY_ENABLED=1`. Each registered account receives one independent
-private workspace. This feature deliberately does not implement workspace
-invitations, shared memberships, or cross-user workspace switching.
+Virenis uses Clerk for public identity and keeps authorization and product data
+inside Virenis. Every Clerk user receives one stable, private Virenis workspace.
+This design deliberately does not create organizations, invitations, shared
+workspace membership, or organization switching.
 
-## User lifecycle
+## Responsibility boundary
 
-1. `POST /api/auth/register` creates an unverified account and sends a
-   short-lived email verification link.
-2. `POST /api/auth/verify-email` consumes that link once.
-3. `POST /api/auth/login` verifies the password and creates a server-side
-   browser session. The browser receives only an HttpOnly, SameSite=Lax cookie;
-   production cookies are also Secure and use the `__Host-` prefix.
-4. `POST /api/auth/forgot-password` returns a non-enumerating response and
-   sends a one-time reset link when the account is eligible.
-5. `POST /api/auth/reset-password` replaces the hash and revokes every browser
-   session. Changing a password from account settings keeps the current session
-   and revokes the others.
+Clerk owns:
 
-Passwords accept Unicode and whitespace without composition rules, are limited
-to 128 characters to bound hashing work, and require at least 15 characters
-while MFA is unavailable. Passwords are stored with unique salts and scrypt
-parameters embedded in the encoded hash. Production enforces N=131072, r=8,
-p=1 or stronger; lower settings are accepted only outside production for fast
-tests. Login uses a dummy hash for unknown accounts, constant-time digest
-comparison, per-account lockout, and a separate bounded IP rate limiter.
+- sign-up, sign-in, email verification, password recovery, and social login;
+- browser sessions, multi-factor authentication, and account security;
+- the canonical identity profile and account suspension state.
 
-## Account controls
+Virenis owns:
 
-- `GET /api/account/sessions` lists active browser sessions.
-- `DELETE /api/account/sessions/:session_id` revokes one session.
-- `POST /api/account/sessions/revoke-others` keeps only the current session.
-- `POST /api/account/password` verifies the current password before changing it.
-- `PATCH /api/account/profile` updates the public display name without changing
-  the stable user or workspace identifiers.
-- `GET /api/account/export` returns the account's profile and scoped product
-  data without password hashes, session-token hashes, OAuth credentials, or
-  encrypted secrets.
-- `DELETE /api/account` requires the current password and the exact confirmation
-  `DELETE`. It removes operational workspace data, runtime agents/documents,
-  local document files, and MCP credentials. De-identified append-only integrity
-  receipts may remain for security, provenance, and abuse prevention.
+- the stable `clerk_user_id` to `user_id` and `workspace_id` link;
+- product roles (`admin`, `user`, and `viewer`);
+- agents, conversations, workflows, documents, Marketplace identity, and MCP
+  connections scoped to that private workspace;
+- product-data export and cascading workspace deletion.
 
-## Administration
+The browser never receives `CLERK_SECRET_KEY`. It receives only
+`VITE_CLERK_PUBLISHABLE_KEY`. The Express backend verifies Clerk cookies or
+session tokens with `@clerk/express`, then converts the verified Clerk identity
+to Virenis's internal actor before any product route runs.
 
-Addresses in `APP_AUTH_ADMIN_EMAILS` receive the administrator role when they
-first register. Administrators can list registered users, verify an address,
-assign `admin`, `user`, or `viewer`, suspend/reactivate access, and revoke all
-browser sessions. An administrator cannot suspend or demote their own current
-account, and the final active registered administrator cannot be removed or
-demoted.
+## Provisioning and synchronization
 
-Static Basic and bearer identities remain supported for operators and API
-clients. They do not become browser accounts and therefore do not expose
-password, session, export, or deletion controls in the user interface.
+The first authenticated request provisions the user synchronously, so a new
+account can open `/app` without waiting for a webhook. Virenis then preserves
+the generated private workspace ID across profile changes and future sessions.
+During migration, a Clerk account whose verified primary email matches a
+retired first-party Virenis profile is linked to that existing `user_id` and
+`workspace_id`; its agents and history therefore remain in place. Email matches
+already linked to a different Clerk user fail closed.
 
-## Production requirements
+Configure a signed Clerk webhook at:
 
-Configure the identity and SMTP variables in `deploy/env/web.env.example`, use
-the real HTTPS `APP_PUBLIC_ORIGIN`, and register at least one real administrator
-email before opening registration. Production startup fails closed when SMTP is
-missing, capture-mode delivery is selected, SMTP certificate verification is
-disabled, a placeholder administrator is configured, or optional Basic Auth is
-partial or weak.
+```text
+POST https://your-public-origin.example/api/webhooks/clerk
+```
 
-Run the focused checks with:
+Subscribe to:
+
+- `user.created`
+- `user.updated`
+- `user.deleted`
+
+The webhook keeps display name, primary email, avatar, verification status, and
+suspension status current. `user.deleted` cascades deletion through the user's
+local agents, documents, chats, workflows, Marketplace records, MCP credentials,
+and local document files. Signatures are verified before an event is accepted.
+Synchronous provisioning remains the availability path; webhooks are the
+lifecycle synchronization path.
+
+## Configuration
+
+Local development uses `.env.local`, which is created by `clerk init` and is
+not committed. Production needs the following settings:
+
+```dotenv
+APP_IDENTITY_PROVIDER=clerk
+VITE_CLERK_PUBLISHABLE_KEY=pk_live_replace
+CLERK_PUBLISHABLE_KEY=pk_live_replace
+CLERK_SECRET_KEY=
+CLERK_SECRET_KEY_FILE=/run/secrets/clerk_secret_key
+CLERK_WEBHOOK_SIGNING_SECRET=
+CLERK_WEBHOOK_SIGNING_SECRET_FILE=/run/secrets/clerk_webhook_signing_secret
+CLERK_AUTHORIZED_PARTIES=https://app.your-domain.example
+APP_PUBLIC_ORIGIN=https://app.your-domain.example
+APP_AUTH_ADMIN_EMAILS=admin@your-domain.example
+APP_CLERK_ADMIN_USER_IDS=
+```
+
+`CLERK_PUBLISHABLE_KEY` may be omitted when
+`VITE_CLERK_PUBLISHABLE_KEY` is present; defining both explicitly is clearer in
+split build/runtime environments. For secrets, an inline value takes precedence
+over its `_FILE` variant. Keep secret files readable only by the web service.
+
+Production startup fails closed when Clerk keys are missing, malformed, or
+development keys; the webhook signing secret is missing; the public origin is
+not authorized; or no initial administrator is configured. Use
+`APP_AUTH_ADMIN_EMAILS` before the first administrator signs in, or pin a Clerk
+user ID with `APP_CLERK_ADMIN_USER_IDS`. This bootstrap allowlist does not turn
+email into a session credential: Clerk must still authenticate the account.
+
+## Browser routes and controls
+
+- `/login` renders Clerk's sign-in, recovery, and verification tasks.
+- `/register` renders Clerk's sign-up flow.
+- `/app` requires a signed-in Clerk session.
+- the landing page exposes distinct sign-in and sign-up controls;
+- the workspace header exposes Clerk's user control;
+- Agent Studio's Account tab opens Clerk's profile/security surface and keeps
+  Virenis data export and full account deletion nearby.
+
+Legacy Virenis password, verification-token, reset-token, and browser-session
+endpoints have been removed. Legacy password hashes and token/session arrays are
+scrubbed when an older store snapshot is normalized.
+
+## Product API
+
+Authenticated Clerk users can use:
+
+- `GET /api/auth/me` — returns the linked Virenis actor and product role;
+- `GET /api/account/export` — returns a credential-redacted product-data export;
+- `DELETE /api/account` — requires `{ "confirmation": "DELETE" }`, deletes the
+  Clerk user, and cascades the private Virenis workspace;
+- `GET /api/admin/users` — admin-only product identity view;
+- `PATCH /api/admin/users/:user_id` — changes product role or Clerk-backed
+  suspension status;
+- `POST /api/admin/users/:user_id/revoke-sessions` — revokes active Clerk
+  sessions for that user.
+
+Viewer identities remain read-only for product data but may access their own
+export and account-deletion controls. Users cannot demote or suspend their own
+active administrator session, and the final active Virenis administrator cannot
+be demoted, suspended, or deleted.
+
+Configured API bearer identities and optional Basic Auth remain supported for
+service clients and break-glass operations. A configured Virenis bearer token is
+recognized before Clerk middleware, while unknown bearer tokens fail closed.
+
+## Verification
+
+From `web/virenis`:
 
 ```bash
-npm test -- --run tests/identity.test.js tests/identityUi.test.js
-DATABASE_URL="$DATABASE_URL" npm run test:identity:postgres
+clerk doctor
+npm run lint
+npm test
+npm run build
 ```
+
+For a disposable PostgreSQL table, set `DATABASE_URL` and run:
+
+```bash
+npm run test:clerk:postgres
+```
+
+Before production traffic, create a production Clerk instance and keys, add the
+public origin and redirect URLs in Clerk, configure the signed webhook, sign up
+the first administrator, and verify sign-in, sign-up, recovery, MFA, user-profile,
+suspension, session revocation, export, and deletion in the deployed origin.

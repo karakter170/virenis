@@ -11,6 +11,7 @@ import {
   Upload,
   Zap
 } from "lucide-react";
+import { UserButton } from "@clerk/react";
 
 const expertCards = [
   { className: "research", index: "01", title: "Research", detail: "Find the evidence" },
@@ -66,7 +67,8 @@ function RoutingDemo() {
   );
 }
 
-export default function LandingPage({ onEnter, identityEnabled = false }) {
+export default function LandingPage({ isSignedIn = false, onSignIn, onSignUp, onWorkspace }) {
+  const onEnter = isSignedIn ? onWorkspace : onSignUp;
   return (
     <div className="landing-page">
       <header className="landing-header">
@@ -76,9 +78,19 @@ export default function LandingPage({ onEnter, identityEnabled = false }) {
           <a href="#agents">Agents</a>
           <a href="#knowledge">Knowledge</a>
         </nav>
-        <button className="landing-login" type="button" onClick={onEnter}>
-          {identityEnabled ? "Sign in" : "Open workspace"} <ArrowUpRight size={15} />
-        </button>
+        <div className="landing-auth-actions">
+          {isSignedIn ? (
+            <>
+              <button className="landing-login" type="button" onClick={onWorkspace}>Open workspace <ArrowUpRight size={15} /></button>
+              <UserButton afterSignOutUrl="/" />
+            </>
+          ) : (
+            <>
+              <button className="landing-signin" type="button" onClick={onSignIn}>Sign in</button>
+              <button className="landing-login" type="button" onClick={onSignUp}>Get started <ArrowUpRight size={15} /></button>
+            </>
+          )}
+        </div>
       </header>
 
       <main id="top">
@@ -91,7 +103,7 @@ export default function LandingPage({ onEnter, identityEnabled = false }) {
             </p>
             <div className="hero-actions">
               <button className="landing-primary" type="button" onClick={onEnter}>
-                {identityEnabled ? "Get started" : "Start working"} <ArrowRight size={16} />
+                {isSignedIn ? "Open workspace" : "Get started"} <ArrowRight size={16} />
               </button>
               <a className="landing-secondary" href="#how-it-works">See how it works</a>
             </div>
@@ -220,14 +232,14 @@ export default function LandingPage({ onEnter, identityEnabled = false }) {
         <section className="landing-cta">
           <p>VIRENIS / EXPERT WORK, COMPOSED</p>
           <h2>Start with one request.</h2>
-          <button className="landing-primary inverse" type="button" onClick={onEnter}>Open the workspace <ArrowRight size={16} /></button>
+          <button className="landing-primary inverse" type="button" onClick={onEnter}>{isSignedIn ? "Open the workspace" : "Create your workspace"} <ArrowRight size={16} /></button>
         </section>
       </main>
 
       <footer className="landing-footer">
         <span>Virenis</span>
         <p>Complex work, divided clearly.</p>
-        <button type="button" onClick={onEnter}>Workspace <ArrowUpRight size={14} /></button>
+        <button type="button" onClick={onEnter}>{isSignedIn ? "Workspace" : "Get started"} <ArrowUpRight size={14} /></button>
       </footer>
     </div>
   );

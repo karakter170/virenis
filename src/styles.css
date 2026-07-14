@@ -125,8 +125,7 @@ summary:focus-visible,
   letter-spacing: -0.035em;
 }
 
-.icon-button,
-.account-button {
+.icon-button {
   position: relative;
   flex: 0 0 auto;
   width: 40px;
@@ -140,14 +139,12 @@ summary:focus-visible,
   transition: color 140ms ease, background-color 140ms ease, opacity 140ms ease;
 }
 
-.icon-button:hover:not(:disabled),
-.account-button:hover:not(:disabled) {
+.icon-button:hover:not(:disabled) {
   color: var(--text);
   background: var(--surface-hover);
 }
 
-.icon-button:disabled,
-.account-button:disabled {
+.icon-button:disabled {
   opacity: 0.38;
 }
 
@@ -156,19 +153,37 @@ summary:focus-visible,
   height: 34px;
 }
 
-.account-button {
-  width: 34px;
-  height: 34px;
-  margin-left: 2px;
-  color: #ffffff;
-  background: var(--accent);
-  font-size: 12px;
-  font-weight: 700;
+.studio-button {
+  min-height: 34px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0 12px;
+  color: var(--text-soft);
+  background: var(--surface);
+  font-size: 11px;
+  font-weight: 680;
+  transition: color 140ms ease, border-color 140ms ease, background-color 140ms ease;
 }
 
-.account-button:hover:not(:disabled) {
-  color: #ffffff;
-  background: var(--accent-hover);
+.studio-button:hover {
+  border-color: var(--line-strong);
+  color: var(--text);
+  background: var(--surface-subtle);
+}
+
+.clerk-user-control {
+  width: 36px;
+  height: 36px;
+  display: inline-grid;
+  place-items: center;
+}
+
+.app-auth-loading {
+  width: 100%;
+  height: 100dvh;
 }
 
 .tooltip-control::after {
@@ -5131,120 +5146,28 @@ summary:focus-visible,
   box-shadow: 0 24px 70px rgba(27, 51, 39, 0.12);
 }
 
-.identity-card-heading > span {
-  color: var(--accent);
-  font-size: 10px;
-  font-weight: 800;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
+.clerk-identity-card {
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 18px;
 }
 
-.identity-card-heading h2,
-.identity-disabled h2 {
-  margin: 7px 0 0;
-  font-size: 25px;
-  font-weight: 620;
-  letter-spacing: -0.025em;
+.clerk-identity-card .cl-rootBox,
+.clerk-identity-card .cl-cardBox {
+  width: 100%;
 }
 
-.identity-form {
-  margin-top: 27px;
-  display: grid;
-  gap: 16px;
-}
-
-.identity-form label,
 .account-form label {
   display: grid;
   gap: 7px;
 }
 
-.identity-form label > span,
 .account-form label > span {
   color: #3d4641;
   font-size: 12px;
   font-weight: 650;
-}
-
-.identity-form label > small {
-  margin-top: -2px;
-  color: var(--text-faint);
-  font-size: 10px;
-}
-
-.identity-input {
-  min-height: 46px;
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
-  align-items: center;
-  gap: 9px;
-  border: 1px solid var(--line-strong);
-  border-radius: 9px;
-  padding: 0 12px;
-  color: var(--text-faint);
-  background: #ffffff;
-}
-
-.identity-input:focus-within {
-  border-color: var(--focus);
-  box-shadow: 0 0 0 3px rgba(11, 107, 203, 0.1);
-}
-
-.identity-input input {
-  width: 100%;
-  min-width: 0;
-  min-height: 44px;
-  border: 0;
-  outline: 0;
-  background: transparent;
-}
-
-.identity-primary {
-  min-height: 47px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  border: 0;
-  border-radius: 9px;
-  padding: 0 18px;
-  color: #ffffff;
-  background: var(--accent);
-  font-size: 13px;
-  font-weight: 700;
-}
-
-.identity-primary:hover:not(:disabled) {
-  background: var(--accent-hover);
-}
-
-.identity-primary:disabled {
-  opacity: 0.58;
-}
-
-.identity-inline-link,
-.identity-switch button {
-  width: fit-content;
-  border: 0;
-  padding: 0;
-  color: var(--accent);
-  background: transparent;
-  font-size: 12px;
-  font-weight: 650;
-}
-
-.identity-inline-link {
-  margin-top: -6px;
-  justify-self: end;
-}
-
-.identity-switch {
-  margin-top: 23px;
-  border-top: 1px solid var(--line);
-  padding-top: 19px;
-  color: var(--text-soft);
-  font-size: 12px;
-  text-align: center;
 }
 
 .identity-message {
@@ -5273,33 +5196,6 @@ summary:focus-visible,
   background: var(--accent-soft);
 }
 
-.identity-loading,
-.identity-disabled,
-.identity-result {
-  min-height: 380px;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 13px;
-  color: var(--text-soft);
-  text-align: center;
-}
-
-.identity-disabled p,
-.identity-result p {
-  max-width: 320px;
-  margin: 0;
-  font-size: 13px;
-  line-height: 1.55;
-}
-
-.identity-disabled .identity-primary,
-.identity-result .identity-primary {
-  width: 100%;
-  margin-top: 8px;
-}
-
 .account-panel {
   padding-bottom: 24px;
 }
@@ -5318,6 +5214,21 @@ summary:focus-visible,
 
 .account-summary > svg {
   color: var(--accent);
+}
+
+.account-avatar,
+.profile-avatar {
+  width: 38px;
+  height: 38px;
+  flex: 0 0 auto;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  object-fit: cover;
+}
+
+.profile-avatar {
+  width: 34px;
+  height: 34px;
 }
 
 .account-summary > div,
@@ -5356,6 +5267,14 @@ summary:focus-visible,
   grid-template-columns: repeat(2, minmax(0, 1fr));
   align-items: start;
   gap: 14px;
+}
+
+.clerk-account-grid .account-card {
+  height: 100%;
+}
+
+.clerk-account-grid .text-button {
+  margin-top: 14px;
 }
 
 .account-card,
@@ -5408,51 +5327,6 @@ summary:focus-visible,
   justify-self: start;
 }
 
-.account-session-list {
-  margin: 13px 0;
-  display: grid;
-}
-
-.account-session {
-  min-width: 0;
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 9px;
-  border-bottom: 1px solid var(--line);
-  padding: 10px 0;
-}
-
-.account-session > svg {
-  color: var(--text-faint);
-}
-
-.account-session strong,
-.account-session span,
-.account-session small {
-  display: block;
-}
-
-.account-session strong {
-  font-size: 11px;
-}
-
-.account-session span {
-  overflow: hidden;
-  margin-top: 2px;
-  color: var(--text-soft);
-  font-size: 10px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.account-session small {
-  margin-top: 3px;
-  color: var(--text-faint);
-  font-size: 9px;
-}
-
-.account-session button,
 .admin-user-actions button {
   border: 0;
   border-radius: 6px;

@@ -38,13 +38,11 @@ function mergeSeedCatalog(agents, seedAgents) {
 function initialData(seedAgents) {
   const now = new Date().toISOString();
   return {
-    version: 8,
+    version: 10,
     created_at: now,
     users: [],
-    authSessions: [],
-    emailVerificationTokens: [],
-    passwordResetTokens: [],
     identityAuditEvents: [],
+    identityDeletionTombstones: [],
     sessions: [],
     messages: [],
     runs: [],
@@ -300,10 +298,8 @@ function normalizeData(value, seedAgents) {
   data.version = defaults.version;
   for (const collection of [
     "users",
-    "authSessions",
-    "emailVerificationTokens",
-    "passwordResetTokens",
     "identityAuditEvents",
+    "identityDeletionTombstones",
     "mcpConnections",
     "mcpOauthClients",
     "mcpOauthStates",
@@ -313,6 +309,20 @@ function normalizeData(value, seedAgents) {
     "conversationCheckpoints"
   ]) {
     data[collection] = Array.isArray(data[collection]) ? data[collection] : [];
+  }
+  // Clerk owns credentials, verification tokens, and browser sessions. Purge
+  // records from the retired first-party identity implementation during every
+  // JSON/PostgreSQL snapshot normalization so secrets cannot linger after the
+  // migration.
+  delete data.authSessions;
+  delete data.emailVerificationTokens;
+  delete data.passwordResetTokens;
+  for (const user of data.users) {
+    if (!user || typeof user !== "object") continue;
+    delete user.password_hash;
+    delete user.password_changed_at;
+    delete user.failed_login_count;
+    delete user.locked_until;
   }
   data.marketplaceRatings = (Array.isArray(data.marketplaceRatings) ? data.marketplaceRatings : [])
     .filter((rating) => rating && typeof rating === "object")

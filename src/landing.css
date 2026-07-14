@@ -51,7 +51,8 @@
 }
 
 .landing-header nav a,
-.landing-login {
+.landing-login,
+.landing-signin {
   color: #4e5550;
   font-size: 12px;
   font-weight: 570;
@@ -96,6 +97,25 @@
 .landing-login:hover {
   border-color: #b9c5be;
   background: #ffffff;
+}
+
+.landing-auth-actions {
+  justify-self: end;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.landing-signin {
+  min-height: 36px;
+  border: 0;
+  padding: 0 7px;
+  color: var(--landing-ink);
+  background: transparent;
+}
+
+.landing-signin:hover {
+  color: var(--landing-green);
 }
 
 .landing-page main {
@@ -962,6 +982,14 @@
 
   .landing-login {
     min-height: 34px;
+    font-size: 11px;
+  }
+
+  .landing-auth-actions {
+    gap: 4px;
+  }
+
+  .landing-signin {
     font-size: 11px;
   }
 
