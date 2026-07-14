@@ -57,6 +57,7 @@ import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import "katex/dist/katex.min.css";
 import LandingPage from "./LandingPage.jsx";
+import { AccountPanel, AdminUsersPanel, IdentityPage } from "./IdentityPage.jsx";
 import {
   evidenceQuoteIsValid,
   extractBinaryPrediction,
@@ -115,6 +116,9 @@ async function request(path, options) {
   if (!response.ok) {
     const error = new Error(payload.message || "The request could not be completed.");
     error.status = response.status;
+    if (response.status === 401 && typeof window !== "undefined") {
+      window.dispatchEvent(new Event("virenis:authentication-required"));
+    }
     throw error;
   }
   return payload;
@@ -202,7 +206,7 @@ function formatDate(value, { includeTime = false } = {}) {
 }
 
 function initialsFor(auth) {
-  return String(auth?.user_id || "User")
+  return String(auth?.display_name || auth?.user_id || "User")
     .split(/[^a-z0-9]+/i)
     .filter(Boolean)
     .slice(0, 2)
@@ -212,26 +216,78 @@ function initialsFor(auth) {
 }
 
 export default function App() {
-  const [surface, setSurface] = useState(() => window.location.pathname.startsWith("/app") ? "workspace" : "home");
+  const [route, setRoute] = useState(() => applicationRoute(window.location.pathname));
+  const [identityConfig, setIdentityConfig] = useState(null);
 
   useEffect(() => {
-    const handlePopState = () => setSurface(window.location.pathname.startsWith("/app") ? "workspace" : "home");
+    api.get("/api/auth/config").then(setIdentityConfig).catch(() => setIdentityConfig(null));
+    const handlePopState = () => setRoute(applicationRoute(window.location.pathname));
+    const handleAuthenticationRequired = () => {
+      window.history.pushState({}, "", "/login");
+      setRoute(applicationRoute("/login"));
+    };
     window.addEventListener("popstate", handlePopState);
-    return () => window.removeEventListener("popstate", handlePopState);
+    window.addEventListener("virenis:authentication-required", handleAuthenticationRequired);
+    return () => {
+      window.removeEventListener("popstate", handlePopState);
+      window.removeEventListener("virenis:authentication-required", handleAuthenticationRequired);
+    };
   }, []);
 
   function navigate(next) {
-    const path = next === "workspace" ? "/app" : "/";
+    const path = applicationPath(next);
     if (window.location.pathname !== path) window.history.pushState({}, "", path);
-    setSurface(next);
+    setRoute(applicationRoute(path));
     window.scrollTo?.({ top: 0, behavior: "auto" });
   }
 
-  if (surface === "home") return <LandingPage onEnter={() => navigate("workspace")} />;
-  return <Workspace onHome={() => navigate("home")} />;
+  if (route.surface === "home") {
+    const next = identityConfig?.self_service_enabled ? "login" : "workspace";
+    return <LandingPage identityEnabled={Boolean(identityConfig?.self_service_enabled)} onEnter={() => navigate(next)} />;
+  }
+  if (route.surface === "identity") {
+    return (
+      <IdentityPage
+        mode={route.mode}
+        onHome={() => navigate("home")}
+        onNavigate={navigate}
+        onAuthenticated={() => navigate("workspace")}
+      />
+    );
+  }
+  return (
+    <Workspace
+      onHome={() => navigate("home")}
+      onAuthenticationRequired={() => navigate("login")}
+      onSignedOut={() => navigate("login")}
+    />
+  );
 }
 
-function Workspace({ onHome }) {
+function applicationRoute(pathname) {
+  if (pathname.startsWith("/app")) return { surface: "workspace", mode: null };
+  if (pathname.startsWith("/register")) return { surface: "identity", mode: "register" };
+  if (pathname.startsWith("/forgot-password")) return { surface: "identity", mode: "forgot" };
+  if (pathname.startsWith("/reset-password")) return { surface: "identity", mode: "reset" };
+  if (pathname.startsWith("/verify-email")) return { surface: "identity", mode: "verify" };
+  if (pathname.startsWith("/login")) return { surface: "identity", mode: "login" };
+  return { surface: "home", mode: null };
+}
+
+function applicationPath(destination) {
+  const paths = {
+    home: "/",
+    workspace: "/app",
+    login: "/login",
+    register: "/register",
+    forgot: "/forgot-password",
+    reset: "/reset-password",
+    verify: "/verify-email"
+  };
+  return paths[destination] || "/";
+}
+
+function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
   const [sessions, setSessions] = useState([]);
   const [session, setSession] = useState(null);
   const [messages, setMessages] = useState([]);
@@ -363,6 +419,10 @@ function Workspace({ onHome }) {
       setSessions(sessionList.sessions?.length ? sessionList.sessions : nextSession ? [nextSession] : []);
       if (nextSession) await openSession(nextSession.session_id);
     } catch (bootstrapError) {
+      if (bootstrapError?.status === 401) {
+        onAuthenticationRequired();
+        return;
+      }
       setError(friendlyError(bootstrapError));
     } finally {
       setLoading(false);
@@ -1023,6 +1083,7 @@ function Workspace({ onHome }) {
           onConnectAgents={(fromId, toId) => setGraphConnection(fromId, toId, true)}
           onDisconnectAgents={(fromId, toId) => setGraphConnection(fromId, toId, false)}
           onRefresh={refreshResources}
+          onSignedOut={onSignedOut}
           onConnectionChanged={async () => {
             if (!connectionResumeWorkflowId) return;
             const target = workflows.find((item) => item.workflow_id === connectionResumeWorkflowId);
@@ -2064,6 +2125,7 @@ function ResourcesSheet({
   onConnectAgents,
   onDisconnectAgents,
   onRefresh,
+  onSignedOut,
   onConnectionChanged
 }) {
   const [view, setView] = useState(initialView || "agents");
@@ -2081,6 +2143,7 @@ function ResourcesSheet({
           <button type="button" aria-pressed={view === "marketplace"} onClick={() => changeView("marketplace")}>Marketplace</button>
           <button type="button" aria-pressed={view === "connections"} onClick={() => changeView("connections")}>Connections</button>
           <button type="button" aria-pressed={view === "knowledge"} onClick={() => changeView("knowledge")}>Knowledge</button>
+          <button type="button" aria-pressed={view === "account"} onClick={() => changeView("account")}>Account</button>
           {auth?.is_admin && <button type="button" aria-pressed={view === "admin"} onClick={() => changeView("admin")}>Admin</button>}
         </div>
 
@@ -2143,6 +2206,10 @@ function ResourcesSheet({
           />
         )}
 
+        {view === "account" && (
+          <AccountPanel auth={auth} onSignedOut={onSignedOut} onAuthChanged={onRefresh} />
+        )}
+
         {view === "admin" && auth?.is_admin && (
           <AdminPanel runtime={runtime} metrics={metrics} agents={agents} documents={documents} onRefresh={onRefresh} />
         )}
@@ -2150,8 +2217,8 @@ function ResourcesSheet({
         <footer className="profile-footer">
           <span className="profile-initials" aria-hidden="true">{initialsFor(auth)}</span>
           <span>
-            <strong>{auth?.user_id || "User"}</strong>
-            <small>{auth?.is_admin ? "Admin" : auth?.is_viewer ? "Viewer" : "Private workspace"}</small>
+            <strong>{auth?.display_name || auth?.user_id || "User"}</strong>
+            <small>{auth?.email || (auth?.is_admin ? "Admin" : auth?.is_viewer ? "Viewer" : "Private workspace")}</small>
           </span>
         </footer>
       </div>
@@ -2954,7 +3021,7 @@ export function AgentGraph({ agents, auth, storageKey, onConnect, onDisconnect }
 export function MarketplacePanel({ items, auth, onOpen = () => undefined, onRate = () => undefined }) {
   const [query, setQuery] = useState("");
   const filtered = items.filter((item) =>
-    !query || `${item.title} ${item.description} ${item.capability} ${item.published_by}`.toLowerCase().includes(query.toLowerCase())
+    !query || `${item.title} ${item.description} ${item.capability} ${item.publisher_display_name || ""} ${item.published_by}`.toLowerCase().includes(query.toLowerCase())
   );
   return (
     <section className="resource-section marketplace-section" aria-labelledby="marketplace-heading">
@@ -2973,7 +3040,7 @@ export function MarketplacePanel({ items, auth, onOpen = () => undefined, onRate
               <header><span className="market-type agent"><Bot size={13} />agent</span><ChevronRight size={15} /></header>
               <h4>{agentFacingText(item.title, "Community agent")}</h4>
               <p>{agentFacingText(item.description || item.capability)}</p>
-              <small className="market-author">Published by {item.publisher?.user_id || item.published_by || "Virenis"}</small>
+              <small className="market-author">Published by {item.publisher_display_name || item.publisher?.user_id || item.published_by || "Virenis"}</small>
               {item.workspace_copy && <span className="market-copy-state"><Check size={12} />Copied as {item.workspace_copy.title}</span>}
             </button>
             <footer>
@@ -3089,7 +3156,7 @@ export function MarketplaceAgentDialog({ item, auth, onClose, onRate, onCopied, 
   }
 
   const agent = detail.agent || {};
-  const publisher = detail.publisher?.user_id || detail.published_by || "Virenis";
+  const publisher = detail.publisher_display_name || detail.publisher?.user_id || detail.published_by || "Virenis";
   const exclusions = agent.exclusions || {};
   const tools = agent.tools || [];
   const consumes = agent.consumes || [];
@@ -3263,6 +3330,7 @@ function AdminPanel({ runtime, metrics, agents, documents, onRefresh }) {
           {checkResult.status === "completed" && checkResult.ok !== false ? "Checks passed." : checkResult.message || `Check status: ${checkResult.status}`}
         </p>
       )}
+      <AdminUsersPanel />
     </section>
   );
 }

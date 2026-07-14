@@ -96,6 +96,12 @@ import {
   revokeMcpConnection,
   resolveAgentMcpBindings
 } from "./mcp.js";
+import {
+  clearSessionCookie,
+  createIdentityManager,
+  selfServiceIdentityEnabled,
+  sessionCookie
+} from "./identity.js";
 
 const VALIDATION_SUITES = new Set(["manifest", "parallel_scheduler", "document_rag", "mock_smoke", "live_smoke"]);
 
@@ -182,6 +188,7 @@ export async function createApp({
   });
   const store = createStore({ dbPath, seedAgents: configuredSeedAgents });
   await store.init();
+  const identityManager = await createIdentityManager({ store });
   const mcpCredentialKey = await ensureMcpCredentialKey({ dbPath });
   publicMcpTemplates();
   if (useApiRuntimeCatalog) {
@@ -223,6 +230,11 @@ export async function createApp({
   };
   const bus = new RunBus();
   const rateLimiter = createRateLimiter();
+  const identityRateLimiter = createRateLimiter({
+    windowMs: Number(process.env.APP_AUTH_RATE_WINDOW_MS || 15 * 60 * 1000),
+    limit: Number(process.env.APP_AUTH_RATE_LIMIT || 30),
+    maxBuckets: Number(process.env.APP_AUTH_RATE_MAX_BUCKETS || 10_000)
+  });
   const documentUpload = createUploadMiddleware();
   const eventStreams = new Set();
   const backgroundTasks = new Set();
@@ -322,6 +334,8 @@ export async function createApp({
   app.locals.store = store;
   app.locals.bus = bus;
   app.locals.rateBuckets = rateLimiter.buckets;
+  app.locals.identityRateBuckets = identityRateLimiter.buckets;
+  app.locals.identityOutbox = identityManager.outbox;
   app.locals.eventStreams = eventStreams;
   app.locals.closeEventStreams = (options) => closeEventStreams(eventStreams, options);
   app.locals.backgroundTasks = backgroundTasks;
@@ -445,22 +459,213 @@ export async function createApp({
       next(error);
     }
   });
+
+  app.get("/api/auth/config", (_req, res) => {
+    res.setHeader("Cache-Control", "no-store");
+    res.json(identityManager.publicConfig());
+  });
+
+  const publicIdentityJson = express.json({ limit: "64kb" });
+  app.post("/api/auth/register", identityRateLimiter.middleware, originGuard, publicIdentityJson, async (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      res.status(202).json(await identityManager.register(req.body));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/auth/verify-email", identityRateLimiter.middleware, originGuard, publicIdentityJson, async (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      res.json(await identityManager.verifyEmail(req.body));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/auth/resend-verification", identityRateLimiter.middleware, originGuard, publicIdentityJson, async (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      res.status(202).json(await identityManager.resendVerification(req.body));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/auth/login", identityRateLimiter.middleware, originGuard, publicIdentityJson, async (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      const result = await identityManager.login(req.body, {
+        userAgent: req.headers["user-agent"] || ""
+      });
+      res.setHeader("Set-Cookie", sessionCookie(result.raw_token));
+      delete result.raw_token;
+      res.json(result);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/auth/forgot-password", identityRateLimiter.middleware, originGuard, publicIdentityJson, async (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      res.status(202).json(await identityManager.requestPasswordReset(req.body));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/auth/reset-password", identityRateLimiter.middleware, originGuard, publicIdentityJson, async (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      res.json(await identityManager.resetPassword(req.body));
+    } catch (error) {
+      next(error);
+    }
+  });
+
   app.use(rateLimiter.middleware);
-  app.use(optionalBasicAuth);
+  app.use(optionalBasicAuth(identityManager));
   app.use(attachRequestIdentity);
   app.use(originGuard);
   app.use(requireWritableRole);
   app.use(express.json({ limit: maxJsonBodyBytes() }));
 
   app.get("/api/auth/me", (req, res) => {
+    res.setHeader("Cache-Control", "no-store");
     res.json({
       user_id: req.auth.user_id,
       workspace_id: req.auth.workspace_id,
+      email: req.auth.email || null,
+      display_name: req.auth.display_name || req.auth.user_id,
+      email_verified: req.auth.email_verified ?? null,
       role: req.auth.role,
       auth_type: req.auth.auth_type,
+      session_id: req.auth.session_id || null,
+      self_service_enabled: selfServiceIdentityEnabled(),
       is_admin: isAdmin(req),
       is_viewer: isViewer(req)
     });
+  });
+
+  app.post("/api/auth/logout", async (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      await identityManager.logout(req.auth);
+      res.setHeader("Set-Cookie", clearSessionCookie());
+      res.json({ ok: true });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/api/account/sessions", (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      res.json(identityManager.listSessions(req.auth));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.delete("/api/account/sessions/:session_id", async (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      const result = await identityManager.revokeSession(req.auth, req.params.session_id);
+      if (result.current_session_revoked) res.setHeader("Set-Cookie", clearSessionCookie());
+      res.json(result);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/account/sessions/revoke-others", async (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      res.json(await identityManager.revokeOtherSessions(req.auth));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/account/password", async (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      res.json(await identityManager.changePassword(req.auth, req.body));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.patch("/api/account/profile", async (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      res.json(await identityManager.updateProfile(req.auth, req.body));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/api/account/export", (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      const payload = identityManager.exportAccount(req.auth);
+      const filename = `virenis-account-export-${new Date().toISOString().slice(0, 10)}.json`;
+      res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+      res.json(payload);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.delete("/api/account", async (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      const resources = await identityManager.validateAccountDeletion(req.auth, req.body);
+      await purgeExternalAccountResources({
+        resources,
+        actor: req.auth,
+        mcpCredentialKey
+      });
+      const result = await identityManager.deleteAccount(req.auth);
+      await purgeLocalDocumentRoots(uploadRoot, result.document_roots);
+      res.setHeader("Set-Cookie", clearSessionCookie());
+      res.json({
+        ok: true,
+        deleted_counts: result.deleted_counts,
+        retention_note: "Append-only integrity receipts may be retained in de-identified form for security and provenance."
+      });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/api/admin/users", (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      res.json(identityManager.listUsers(req.auth));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.patch("/api/admin/users/:user_id", async (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      res.json(await identityManager.updateUser(req.auth, req.params.user_id, req.body));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/admin/users/:user_id/revoke-sessions", async (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      res.json(await identityManager.adminRevokeSessions(req.auth, req.params.user_id));
+    } catch (error) {
+      next(error);
+    }
   });
 
   app.get("/api/mcp/templates", (_req, res) => {
@@ -3436,51 +3641,82 @@ function securityHeaders(_req, res, next) {
   next();
 }
 
-function optionalBasicAuth(req, res, next) {
-  const user = process.env.APP_BASIC_AUTH_USER;
-  let password;
-  let configuredTokens;
-  try {
-    password = basicAuthPassword();
-    configuredTokens = parseConfiguredApiTokens();
-  } catch (error) {
-    next(error);
-    return;
-  }
-  const bearerIdentity = bearerTokenIdentity(req.headers.authorization || "", configuredTokens);
-  if (bearerIdentity) {
-    req.auth = bearerIdentity;
-    next();
-    return;
-  }
-  const basicConfigured = Boolean(user && password);
-  const bearerConfigured = configuredTokens.size > 0;
-  if (!basicConfigured && !bearerConfigured) {
-    next();
-    return;
-  }
-  const header = req.headers.authorization || "";
-  const [scheme, value] = header.split(" ");
-  if (basicConfigured && scheme === "Basic" && value) {
-    const decoded = Buffer.from(value, "base64").toString("utf8");
-    const separator = decoded.indexOf(":");
-    if (separator > -1) {
-      const suppliedUser = decoded.slice(0, separator);
-      const suppliedPassword = decoded.slice(separator + 1);
-      if (timingSafeStringEqual(suppliedUser, user) && timingSafeStringEqual(suppliedPassword, password)) {
-        req.auth = {
-          user_id: suppliedUser,
-          workspace_id: process.env.APP_DEFAULT_WORKSPACE_ID || "workspace_default",
-          role: "admin",
-          auth_type: "basic"
-        };
+function optionalBasicAuth(identityManager) {
+  return async function authenticateRequest(req, res, next) {
+    const user = process.env.APP_BASIC_AUTH_USER;
+    let password;
+    let configuredTokens;
+    try {
+      password = basicAuthPassword();
+      configuredTokens = parseConfiguredApiTokens();
+      const header = String(req.headers.authorization || "");
+      const [scheme, value] = header.split(" ");
+      if (scheme === "Bearer" && value) {
+        const bearerIdentity = bearerTokenIdentity(header, configuredTokens);
+        if (bearerIdentity) {
+          req.auth = bearerIdentity;
+          next();
+          return;
+        }
+        authenticationRequired(req, res, { basicConfigured: false, identityConfigured: selfServiceIdentityEnabled() });
+        return;
+      }
+
+      const basicConfigured = Boolean(user && secretConfigured(password));
+      if (scheme === "Basic" && value && basicConfigured) {
+        const decoded = Buffer.from(value, "base64").toString("utf8");
+        const separator = decoded.indexOf(":");
+        if (separator > -1) {
+          const suppliedUser = decoded.slice(0, separator);
+          const suppliedPassword = decoded.slice(separator + 1);
+          if (timingSafeStringEqual(suppliedUser, user) && timingSafeStringEqual(suppliedPassword, password)) {
+            req.auth = {
+              user_id: suppliedUser,
+              workspace_id: process.env.APP_DEFAULT_WORKSPACE_ID || "workspace_default",
+              role: "admin",
+              auth_type: "basic"
+            };
+            next();
+            return;
+          }
+        }
+        authenticationRequired(req, res, { basicConfigured: true, identityConfigured: selfServiceIdentityEnabled() });
+        return;
+      }
+
+      if (!header && selfServiceIdentityEnabled()) {
+        const sessionIdentity = await identityManager.resolveSession(req.headers.cookie || "");
+        if (sessionIdentity) {
+          req.auth = sessionIdentity;
+          next();
+          return;
+        }
+      }
+
+      const bearerConfigured = configuredTokens.size > 0;
+      const identityConfigured = selfServiceIdentityEnabled();
+      if (!basicConfigured && !bearerConfigured && !identityConfigured) {
         next();
         return;
       }
+      authenticationRequired(req, res, { basicConfigured, identityConfigured });
+    } catch (error) {
+      next(error);
     }
-  }
-  if (basicConfigured) {
+  };
+}
+
+function authenticationRequired(req, res, { basicConfigured, identityConfigured }) {
+  if (basicConfigured && !identityConfigured) {
     res.setHeader("WWW-Authenticate", 'Basic realm="virenis"');
+  }
+  if (req.path.startsWith("/api/")) {
+    res.status(401).json({
+      error: "authentication_required",
+      message: "Sign in to continue.",
+      request_id: req.id
+    });
+    return;
   }
   res.status(401).send("Authentication required.");
 }
@@ -3514,6 +3750,58 @@ function bearerTokenIdentity(header, configured = parseConfiguredApiTokens()) {
     }
   }
   return null;
+}
+
+async function purgeExternalAccountResources({ resources, actor, mcpCredentialKey }) {
+  for (const connection of resources.mcp_connections || []) {
+    await revokeMcpConnection(connection, { key: mcpCredentialKey });
+  }
+  if (!realRuntimeEnabled()) return;
+  const auditContext = {
+    user_id: actor.user_id,
+    workspace_id: actor.workspace_id,
+    role: actor.role
+  };
+  const documentAgentIds = new Set((resources.documents || []).map((document) => document.agent_id));
+  const standaloneAgents = (resources.agents || []).filter((agent) =>
+    !documentAgentIds.has(agent.id) && agent.system_managed !== true
+  );
+  for (const agent of standaloneAgents) {
+    if (agent.enabled === false) continue;
+    try {
+      await archiveRuntimeAgent(agent.id, auditContext);
+    } catch (error) {
+      if (![404, 409].includes(Number(error?.status))) throw error;
+    }
+  }
+  for (const document of resources.documents || []) {
+    try {
+      await deleteRuntimeDocument(
+        document.agent_id,
+        auditContext,
+        document.runtime_registration_id || null
+      );
+    } catch (error) {
+      if (Number(error?.status) !== 404) throw error;
+    }
+  }
+  for (const agent of standaloneAgents) {
+    try {
+      await deleteArchivedRuntimeAgent(agent.id, auditContext);
+    } catch (error) {
+      if (Number(error?.status) !== 404) throw error;
+    }
+  }
+}
+
+async function purgeLocalDocumentRoots(uploadRoot, documentRoots = []) {
+  const managedRoot = path.resolve(uploadRoot);
+  for (const relativeRoot of documentRoots) {
+    const documentRoot = path.resolve(uploadRoot, String(relativeRoot || ""));
+    if (documentRoot !== managedRoot && documentRoot.startsWith(`${managedRoot}${path.sep}`)) {
+      await fs.rm(documentRoot, { recursive: true, force: true });
+    }
+  }
 }
 
 function originGuard(req, res, next) {
@@ -3583,6 +3871,7 @@ function createRateLimiter({
       pruneRateBuckets(buckets, now, windowMs, maxBuckets);
     }
     if (bucket.count > limit) {
+      res.setHeader("Retry-After", String(Math.max(1, Math.ceil((bucket.start + windowMs - now) / 1000))));
       res.status(429).json({ error: "rate_limited", message: "Too many API requests. Try again shortly." });
       return;
     }
@@ -3626,7 +3915,9 @@ function runtimeAuditContext(req) {
 }
 
 function requireWritableRole(req, res, next) {
-  if (!req.path.startsWith("/api/") || ["GET", "HEAD", "OPTIONS"].includes(req.method) || !isViewer(req)) {
+  const browserAccountWrite = req.auth?.auth_type === "session"
+    && (req.path === "/api/auth/logout" || req.path === "/api/account" || req.path.startsWith("/api/account/"));
+  if (!req.path.startsWith("/api/") || ["GET", "HEAD", "OPTIONS"].includes(req.method) || !isViewer(req) || browserAccountWrite) {
     next();
     return;
   }
@@ -5877,7 +6168,7 @@ function marketplaceSearchText(agent = {}) {
   const connectorText = (snapshot.connector_requirements || [])
     .flatMap((requirement) => [requirement.connection_name, ...(requirement.tools || []).flatMap((tool) => [tool.name, tool.title])])
     .join(" ");
-  return `${snapshot.title} ${snapshot.capability} ${marketplaceDescription(agent)} ${marketplacePublisherUserId(agent)} ${snapshot.routing_cues.join(" ")} ${connectorText}`
+  return `${snapshot.title} ${snapshot.capability} ${marketplaceDescription(agent)} ${marketplacePublisherUserId(agent)} ${agent.marketplace?.publisher_display_name || ""} ${snapshot.routing_cues.join(" ")} ${connectorText}`
     .toLowerCase();
 }
 
@@ -5904,6 +6195,7 @@ function normalizeMarketplacePayload(body = {}, agent = {}, req) {
     description,
     snapshot: marketplaceAgentSnapshot(agent),
     published_by: agent.marketplace?.published_by || req.auth.user_id,
+    publisher_display_name: agent.marketplace?.publisher_display_name || req.auth.display_name || req.auth.user_id,
     publisher_workspace_id: agent.marketplace?.publisher_workspace_id ?? req.auth.workspace_id ?? null,
     updated_by: req.auth.user_id,
     published_at: agent.marketplace?.published_at || now,
@@ -5968,6 +6260,8 @@ function marketplaceItemSummary(data, agent, req) {
     && String(candidate.workspace_id || "") === String(req.auth?.workspace_id || "")
   ) || null;
   const selfPublished = marketplaceIsSelfPublished(agent, req);
+  const publisherUser = (data.users || []).find((user) => user.user_id === marketplacePublisherUserId(agent));
+  const publisherDisplayName = publisherUser?.display_name || agent.marketplace?.publisher_display_name || marketplacePublisherUserId(agent);
   const canManage = isAdmin(req) || (
     agent.visibility === "private"
     && agent.created_by === req.auth?.user_id
@@ -5983,6 +6277,7 @@ function marketplaceItemSummary(data, agent, req) {
     description: marketplaceDescription(agent),
     publisher: { user_id: marketplacePublisherUserId(agent) },
     published_by: marketplacePublisherUserId(agent),
+    publisher_display_name: publisherDisplayName,
     published_at: agent.marketplace?.published_at || null,
     updated_at: agent.marketplace?.updated_at || null,
     rating_average: averageRating,

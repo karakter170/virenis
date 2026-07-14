@@ -1,6 +1,7 @@
 import http from "node:http";
 import https from "node:https";
-import { appAuthConfigured, secretConfigured } from "./authConfig.js";
+import { appAuthConfigured, basicAuthConfigured, secretConfigured } from "./authConfig.js";
+import { validateIdentityEnvironment } from "./identity.js";
 import { readConfiguredSecret } from "./secretConfig.js";
 
 const DEFAULT_TIMEOUT_MS = 900000;
@@ -56,6 +57,7 @@ export function realRuntimeEnabled() {
 
 export function requireRuntimeConfigured() {
   const isProduction = process.env.NODE_ENV === "production";
+  validateIdentityEnvironment(process.env);
   const configuredRuntimeApiKey = realRuntimeEnabled() ? runtimeApiKey() : "";
   if (realRuntimeEnabled() && !process.env.TCAR_RUNTIME_API_URL) {
     throw new Error("TCAR_ENGINE_MODE=real requires TCAR_RUNTIME_API_URL.");
@@ -65,8 +67,11 @@ export function requireRuntimeConfigured() {
   }
   if (realRuntimeEnabled()) validateRuntimeTransportConfiguration(process.env);
   if (isProduction && process.env.APP_ALLOW_UNAUTHENTICATED !== "1") {
+    if ((process.env.APP_BASIC_AUTH_USER || process.env.APP_BASIC_AUTH_PASSWORD || process.env.APP_BASIC_AUTH_PASSWORD_FILE) && !basicAuthConfigured(process.env)) {
+      throw new Error("Configured production Basic Auth credentials are weak, incomplete, or placeholders.");
+    }
     if (!appAuthConfigured(process.env, { requireStrongSecrets: true })) {
-      throw new Error("Production web server requires strong Basic Auth credentials or strong APP_API_TOKENS/APP_API_TOKENS_JSON, or APP_ALLOW_UNAUTHENTICATED=1 with an explicit unauthenticated identity.");
+      throw new Error("Production web server requires self-service identity, strong Basic Auth credentials, or strong APP_API_TOKENS/APP_API_TOKENS_JSON; otherwise APP_ALLOW_UNAUTHENTICATED=1 must define an explicit unauthenticated identity.");
     }
   } else if (isProduction) {
     validateUnauthenticatedProductionIdentity(process.env);

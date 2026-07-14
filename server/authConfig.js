@@ -58,8 +58,15 @@ export function bearerAuthConfigured(env = process.env, options = {}) {
   return parseConfiguredApiTokens(env, options).size > 0;
 }
 
+export function identityAuthConfigured(env = process.env) {
+  return env.APP_IDENTITY_ENABLED === "1";
+}
+
 export function appAuthConfigured(env = process.env, options = {}) {
-  return basicAuthConfigured(env) || bearerAuthConfigured(env, options);
+  const identityConfigured = identityAuthConfigured(env);
+  const basicConfigured = basicAuthConfigured(env);
+  const bearerConfigured = bearerAuthConfigured(env, options);
+  return identityConfigured || basicConfigured || bearerConfigured;
 }
 
 function addToken(parsed, token, identity, requireStrongSecrets, source) {

@@ -204,7 +204,13 @@ async function extractPdfPageText(page, remainingChars, deadline) {
   } finally {
     if (!completed) {
       try {
-        await beforePdfDeadline(reader.cancel(), Date.now() + 1_000);
+        // pdf.js requires an Error cancellation reason. Passing `undefined`
+        // closes Node's stream controller before pdf.js marks its transport as
+        // closed, which can surface later as an unhandled double-close.
+        await beforePdfDeadline(
+          reader.cancel(new Error("PDF text extraction stopped before completion.")),
+          Date.now() + 1_000
+        );
       } catch {
         // Loading-task destruction is the final cancellation fallback.
       }

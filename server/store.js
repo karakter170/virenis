@@ -38,8 +38,13 @@ function mergeSeedCatalog(agents, seedAgents) {
 function initialData(seedAgents) {
   const now = new Date().toISOString();
   return {
-    version: 7,
+    version: 8,
     created_at: now,
+    users: [],
+    authSessions: [],
+    emailVerificationTokens: [],
+    passwordResetTokens: [],
+    identityAuditEvents: [],
     sessions: [],
     messages: [],
     runs: [],
@@ -294,6 +299,11 @@ function normalizeData(value, seedAgents) {
   }
   data.version = defaults.version;
   for (const collection of [
+    "users",
+    "authSessions",
+    "emailVerificationTokens",
+    "passwordResetTokens",
+    "identityAuditEvents",
     "mcpConnections",
     "mcpOauthClients",
     "mcpOauthStates",
@@ -318,6 +328,7 @@ function normalizeData(value, seedAgents) {
     const marketplace = agent.marketplace;
     marketplace.description = String(marketplace.description || marketplace.summary || agent.capability || "").trim().slice(0, 1200);
     marketplace.published_by = String(marketplace.published_by || agent.created_by || "Virenis").trim() || "Virenis";
+    marketplace.publisher_display_name = String(marketplace.publisher_display_name || marketplace.published_by).trim().slice(0, 80) || marketplace.published_by;
     marketplace.publisher_workspace_id ??= agent.workspace_id || null;
     if (!marketplace.listing_id) {
       const digest = crypto.createHash("sha256")

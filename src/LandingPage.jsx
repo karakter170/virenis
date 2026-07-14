@@ -66,7 +66,7 @@ function RoutingDemo() {
   );
 }
 
-export default function LandingPage({ onEnter }) {
+export default function LandingPage({ onEnter, identityEnabled = false }) {
   return (
     <div className="landing-page">
       <header className="landing-header">
@@ -77,7 +77,7 @@ export default function LandingPage({ onEnter }) {
           <a href="#knowledge">Knowledge</a>
         </nav>
         <button className="landing-login" type="button" onClick={onEnter}>
-          Open workspace <ArrowUpRight size={15} />
+          {identityEnabled ? "Sign in" : "Open workspace"} <ArrowUpRight size={15} />
         </button>
       </header>
 
@@ -91,7 +91,7 @@ export default function LandingPage({ onEnter }) {
             </p>
             <div className="hero-actions">
               <button className="landing-primary" type="button" onClick={onEnter}>
-                Start working <ArrowRight size={16} />
+                {identityEnabled ? "Get started" : "Start working"} <ArrowRight size={16} />
               </button>
               <a className="landing-secondary" href="#how-it-works">See how it works</a>
             </div>
