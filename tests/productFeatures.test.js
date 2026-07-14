@@ -6,10 +6,13 @@ import {
   AgentCatalog,
   AgentGraph,
   ConnectionsPanel,
+  FormattedText,
   MarketplaceAgentDialog,
   MarketplacePanel,
   PublishDialog,
   RatingDialog,
+  ToolApprovalCheckpoint,
+  WorkflowDraftCard,
   availableSessionAgents,
   graphConnectionInputs,
   graphConnectionWouldCycle,
@@ -28,6 +31,89 @@ afterEach(() => {
 
 
 describe("Agent Studio product surfaces", () => {
+  it("renders safe GitHub Markdown and KaTeX without executing raw HTML or loading images", () => {
+    const markup = renderToStaticMarkup(createElement(FormattedText, {
+      text: [
+        "# Result",
+        "",
+        "**Consistent answer** with $E = mc^2$.",
+        "",
+        "| Model | Result |",
+        "| --- | --- |",
+        "| Base | General |",
+        "| Team | Context-aware |",
+        "",
+        "$$\\sum_{i=1}^{n} i$$",
+        "",
+        "<script>window.__unsafe = true</script>",
+        "[unsafe](javascript:alert(1))",
+        "![remote](https://example.com/tracker.png)"
+      ].join("\n")
+    }));
+
+    expect(markup).toContain("<h1>Result</h1>");
+    expect(markup).toContain("<strong>Consistent answer</strong>");
+    expect(markup).toContain("<table>");
+    expect(markup).toContain("class=\"katex\"");
+    expect(markup).not.toContain("<script");
+    expect(markup).not.toContain("window.__unsafe");
+    expect(markup).not.toContain("javascript:");
+    expect(markup).not.toContain("tracker.png");
+  });
+
+  it("shows a reviewable workflow graph with agent provenance and connection consent", () => {
+    const markup = renderToStaticMarkup(createElement(WorkflowDraftCard, {
+      workflow: {
+        workflow_id: "workflow_ui",
+        mode: "workflow",
+        title: "Customer reply workflow",
+        status: "awaiting_confirmation",
+        nodes: [
+          { id: "trigger", type: "trigger", title: "New email", source: "system", status: "ready" },
+          { id: "support", type: "agent", title: "Support Agent", source: "workspace", status: "blocked_connection" },
+          { id: "inventory", type: "agent", title: "Inventory Agent", source: "marketplace", publisher: "maker", status: "blocked_connection" },
+          { id: "writer", type: "agent", title: "Reply Writer", source: "generated", status: "ready" }
+        ],
+        edges: [
+          { source: "trigger", target: "support" },
+          { source: "support", target: "inventory" },
+          { source: "inventory", target: "writer" }
+        ],
+        connection_requirements: [{
+          provider_id: "gmail",
+          name: "Gmail",
+          reason: "Read relevant messages and save drafts.",
+          connection_mode: "managed",
+          status: "missing"
+        }],
+        permissions: ["Read relevant email and create drafts; do not send automatically."],
+        safety: ["Require human review before sending."]
+      }
+    }));
+
+    expect(markup).toContain("AUTO-COMPOSER");
+    expect(markup).toContain("Proposed workflow handoff graph");
+    expect(markup).toContain("Your workspace");
+    expect(markup).toContain("Marketplace · maker");
+    expect(markup).toContain("New private agent");
+    expect(markup).toContain("Connect Gmail");
+    expect(markup).toContain("Review permissions and safety");
+    expect(markup).toContain("Approve plan");
+    expect(markup).not.toContain("Send automatically");
+  });
+
+  it("keeps an interrupted tool continuation visibly recoverable", () => {
+    const markup = renderToStaticMarkup(createElement(ToolApprovalCheckpoint, {
+      checkpoint: {
+        checkpoint_id: "checkpoint_ui",
+        status: "resuming"
+      }
+    }));
+    expect(markup).toContain("The decision is saved");
+    expect(markup).toContain("recover it here after a restart");
+    expect(markup).toContain("Resume now");
+  });
+
   it("presents an API-first homepage without adapter product language", () => {
     const markup = renderToStaticMarkup(createElement(LandingPage, { onEnter: () => undefined }));
     expect(markup).toContain("MODEL APIS");

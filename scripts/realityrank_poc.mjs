@@ -957,21 +957,21 @@ async function executeProof({ api, adminApi, secondaryApi, proofId, pollTimeoutM
   const startedAt = new Date().toISOString();
   const suffix = proofId.replace(/^rr_/, "");
   const favored = {
-    id: `rr_rules_${suffix}_lora`,
+    id: `rr_rules_${suffix}`,
     title: `Rules-first disposition ${suffix}`,
     capability: "For the controlled cold-chain proof, predicts shipment disposition and states release probability 0.9 exactly with the retrieved source citation.",
     boundary: "Use only the synthetic POC shipment rule. For this controlled question, return one sentence with probability 0.9 and the exact retrieved chunk citation at the end; do not omit the citation.",
-    sourceText: `Controlled POC rule: for this shipment disposition, release probability 0.9 follows pharmacist review. Required controlled answer format: Shipment disposition is release with probability 0.9 following pharmacist review [rr_rules_${suffix}_lora_0001].`
+    sourceText: `Controlled POC rule: for this shipment disposition, release probability 0.9 follows pharmacist review. Required controlled answer format: Shipment disposition is release with probability 0.9 following pharmacist review [rr_rules_${suffix}_0001].`
   };
   const lower = {
-    id: `rr_legacy_${suffix}_lora`,
+    id: `rr_legacy_${suffix}`,
     title: `Legacy disposition ${suffix}`,
     capability: "For the controlled cold-chain proof, predicts shipment disposition and states release probability 0.1 exactly with the retrieved source citation.",
     boundary: "Use only the synthetic POC shipment rule. For this controlled question, return one sentence with probability 0.1 and the exact retrieved chunk citation at the end; do not omit the citation.",
-    sourceText: `Controlled POC rule: for this shipment disposition, release probability 0.1 follows pharmacist review. Required controlled answer format: Shipment disposition is release with probability 0.1 following pharmacist review [rr_legacy_${suffix}_lora_0001].`
+    sourceText: `Controlled POC rule: for this shipment disposition, release probability 0.1 follows pharmacist review. Required controlled answer format: Shipment disposition is release with probability 0.1 following pharmacist review [rr_legacy_${suffix}_0001].`
   };
   const stabilityDocument = {
-    agentId: `rr_stability_${suffix}_lora`,
+    agentId: `rr_stability_${suffix}`,
     title: `Cold Chain Stability Guide ${suffix}`,
     routingCues: ["cold chain stability", "stability threshold", "CT-204"],
     capability: "Retrieves the synthetic CT-204 cold-chain stability and disposition rules with citations.",
@@ -979,7 +979,7 @@ async function executeProof({ api, adminApi, secondaryApi, proofId, pollTimeoutM
     fixtureUrl: STABILITY_FIXTURE_URL
   };
   const telemetryDocument = {
-    agentId: `rr_telemetry_${suffix}_lora`,
+    agentId: `rr_telemetry_${suffix}`,
     title: `Cold Chain Telemetry ${suffix}`,
     routingCues: ["cold chain telemetry", "temperature excursion", "CT-204"],
     capability: "Retrieves the synthetic CT-204 temperature telemetry with citations.",
@@ -1059,13 +1059,13 @@ async function executeProof({ api, adminApi, secondaryApi, proofId, pollTimeoutM
     document_id: telemetryUpload.document_id,
     agent_id: telemetryUpload.agent_id
   });
-  prove(assertions, "two synthetic cold-chain documents were indexed as mounted private source agents", (
+  prove(assertions, "two synthetic cold-chain documents were indexed as ready private source agents", (
     stabilityUpload?.status === "indexed"
     && telemetryUpload?.status === "indexed"
     && stabilityUpload?.agent_id === stabilityDocument.agentId
     && telemetryUpload?.agent_id === telemetryDocument.agentId
-    && stabilityUpload?.mounted === true
-    && telemetryUpload?.mounted === true
+    && stabilityUpload?.ready === true
+    && telemetryUpload?.ready === true
     && Number(stabilityUpload?.chunks) > 0
     && Number(telemetryUpload?.chunks) > 0
     && /^sha256:[a-f0-9]{64}$/.test(stabilityUpload?.corpus_revision || "")
@@ -1329,14 +1329,14 @@ async function executeProof({ api, adminApi, secondaryApi, proofId, pollTimeoutM
   state.confirmedAgentIds.push(favored.id);
   const lowerCreated = await createAgent(api, lower);
   state.confirmedAgentIds.push(lower.id);
-  prove(assertions, "two distinct user agents were created and mounted", (
+  prove(assertions, "two distinct user agents were created and are API-ready", (
     favoredCreated?.id === favored.id
     && lowerCreated?.id === lower.id
-    && favoredCreated?.mounted === true
-    && lowerCreated?.mounted === true
+    && favoredCreated?.ready === true
+    && lowerCreated?.ready === true
   ), {
-    favored: { id: favoredCreated?.id, mounted: favoredCreated?.mounted, status: favoredCreated?.status },
-    lower: { id: lowerCreated?.id, mounted: lowerCreated?.mounted, status: lowerCreated?.status }
+    favored: { id: favoredCreated?.id, ready: favoredCreated?.ready, status: favoredCreated?.status },
+    lower: { id: lowerCreated?.id, ready: lowerCreated?.ready, status: lowerCreated?.status }
   });
 
   const favoredDetail = (await api.request(`/api/agents/${encodeId(favored.id)}`)).body;
@@ -2297,7 +2297,7 @@ async function cleanupResources(api, state, keep) {
         chunk_total: chunks.total,
         search_status: search.status,
         agent_enabled: agent.enabled,
-        agent_mounted: agent.mounted,
+        agent_ready: agent.ready,
         event_chain_valid: events.event_chain_valid,
         final_event_type: events.events?.at(-1)?.event_type || null
       });
@@ -2349,7 +2349,7 @@ async function cleanupResources(api, state, keep) {
       promptVerification.push({
         agent_id: agentId,
         enabled: agent.enabled,
-        mounted: agent.mounted,
+        ready: agent.ready,
         archived: agent.enabled === false
       });
     } catch (error) {
@@ -2374,7 +2374,6 @@ async function cleanupResources(api, state, keep) {
     && item.chunk_total === 0
     && item.search_status === 410
     && item.agent_enabled === false
-    && item.agent_mounted === false
     && item.event_chain_valid === true
     && item.final_event_type === "document_agent.deleted"
   ));

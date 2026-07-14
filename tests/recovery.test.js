@@ -314,6 +314,15 @@ describe("lifecycle timeout configuration", () => {
       backgroundDrainTimeoutMs: 1230000,
       shutdownTimeoutMs: 1260000
     });
+    expect(resolveLifecycleTimeouts({
+      TCAR_RUNTIME_CHAT_TIMEOUT_MS: "900000",
+      TCAR_RUNTIME_WORKFLOW_TIMEOUT_MS: "1500000",
+      TCAR_RUNTIME_CONTINUATION_TIMEOUT_MS: "1000000"
+    })).toEqual({
+      runtimeOperationTimeoutMs: 1500000,
+      backgroundDrainTimeoutMs: 1530000,
+      shutdownTimeoutMs: 1560000
+    });
   });
 
   it("accepts explicit budgets and rejects invalid or inconsistent values", () => {

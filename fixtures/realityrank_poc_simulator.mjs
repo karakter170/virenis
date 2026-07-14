@@ -346,9 +346,9 @@ try {
   const archivedAgents = [];
   for (const agentId of agentIds) {
     const agent = await jsonGet(baseUrl, `/api/agents/${encodeURIComponent(agentId)}`, token);
-    requireProof(agent.enabled === false && agent.mounted === false, `Agent ${agentId} was not archived.`, {
+    requireProof(agent.enabled === false, `Agent ${agentId} was not archived.`, {
       enabled: agent.enabled,
-      mounted: agent.mounted
+      ready: agent.ready
     });
     archivedAgents.push(agentId);
   }
@@ -385,9 +385,9 @@ try {
   );
   for (const agentId of keepReport.cleanup.agent_ids) {
     const agent = await jsonGet(baseUrl, `/api/agents/${encodeURIComponent(agentId)}`, token);
-    requireProof(agent.enabled !== false && agent.mounted === true, `POC --keep agent ${agentId} was not active.`, {
+    requireProof(agent.enabled !== false && agent.ready === true, `POC --keep agent ${agentId} was not API-ready.`, {
       enabled: agent.enabled,
-      mounted: agent.mounted
+      ready: agent.ready
     });
   }
 
@@ -414,8 +414,8 @@ try {
   for (const agentId of keepReport.cleanup.agent_ids) {
     const agent = await jsonGet(baseUrl, `/api/agents/${encodeURIComponent(agentId)}`, token);
     requireProof(
-      agent.enabled === false && agent.mounted === false,
-      `Keep-path teardown left ${agentId} enabled or mounted.`,
+      agent.enabled === false,
+      `Keep-path teardown left ${agentId} enabled.`,
       agent
     );
   }

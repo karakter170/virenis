@@ -42,6 +42,11 @@ import {
   X
 } from "lucide-react";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import rehypeKatex from "rehype-katex";
+import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
+import "katex/dist/katex.min.css";
 import LandingPage from "./LandingPage.jsx";
 import {
   evidenceQuoteIsValid,
@@ -221,6 +226,8 @@ function Workspace({ onHome }) {
   const [sessions, setSessions] = useState([]);
   const [session, setSession] = useState(null);
   const [messages, setMessages] = useState([]);
+  const [workflows, setWorkflows] = useState([]);
+  const [checkpoints, setCheckpoints] = useState([]);
   const [agents, setAgents] = useState([]);
   const [documents, setDocuments] = useState([]);
   const [chatDocuments, setChatDocuments] = useState([]);
@@ -259,9 +266,21 @@ function Workspace({ onHome }) {
   const [marketplaceTarget, setMarketplaceTarget] = useState(null);
   const [ratingTarget, setRatingTarget] = useState(null);
   const [focusComposer, setFocusComposer] = useState(0);
+  const [workflowBusy, setWorkflowBusy] = useState("");
+  const [checkpointBusy, setCheckpointBusy] = useState("");
+  const [connectionResumeWorkflowId, setConnectionResumeWorkflowId] = useState("");
   const threadRef = useRef(null);
   const nearBottomRef = useRef(true);
   const eventSourceRef = useRef(null);
+  const oauthReturnRef = useRef((() => {
+    const parameters = new URLSearchParams(window.location.search);
+    return {
+      status: parameters.get("mcp_oauth"),
+      reason: parameters.get("reason"),
+      workflowId: parameters.get("workflow"),
+      sessionId: parameters.get("session")
+    };
+  })());
 
   const canWrite = Boolean(auth && !auth.is_viewer);
   const detailsRun = detailsRunId ? runsById[detailsRunId] : null;
@@ -273,19 +292,23 @@ function Workspace({ onHome }) {
 
   useEffect(() => {
     const parameters = new URLSearchParams(window.location.search);
-    const oauthStatus = parameters.get("mcp_oauth");
+    const oauthStatus = oauthReturnRef.current.status;
     if (!oauthStatus) return;
-    setResourceView("connections");
-    setResourcesOpen(true);
+    if (!oauthReturnRef.current.workflowId) {
+      setResourceView("connections");
+      setResourcesOpen(true);
+    }
     if (oauthStatus === "error") {
-      const reason = parameters.get("reason");
+      const reason = oauthReturnRef.current.reason;
       setError(reason === "denied"
-        ? "The connection was cancelled before access was granted."
+        ? "The connection was cancelled before access was granted. Your conversation and workflow draft are still available."
         : "The account connection could not be completed. Please try again.");
     }
     parameters.delete("mcp_oauth");
     parameters.delete("provider");
     parameters.delete("reason");
+    parameters.delete("workflow");
+    parameters.delete("session");
     const search = parameters.toString();
     window.history.replaceState({}, "", `${window.location.pathname}${search ? `?${search}` : ""}`);
   }, []);
@@ -321,7 +344,10 @@ function Workspace({ onHome }) {
       setMcpTemplates(templateList.templates || []);
       setMcpApprovals(approvalList.approvals || []);
       setMetrics(metricData);
-      let nextSession = sessionList.sessions?.[0] || null;
+      const oauthSessionId = oauthReturnRef.current.sessionId;
+      let nextSession = oauthSessionId
+        ? sessionList.sessions?.find((item) => item.session_id === oauthSessionId) || { session_id: oauthSessionId }
+        : sessionList.sessions?.[0] || null;
       if (!nextSession && !me.is_viewer) {
         nextSession = await api.post("/api/chat/sessions", { title: "New chat", visibility: "private" });
       }
@@ -387,6 +413,8 @@ function Workspace({ onHome }) {
     ]);
     setSession(payload);
     setMessages(payload.messages || []);
+    setWorkflows(payload.workflows || []);
+    setCheckpoints(payload.checkpoints || []);
     setChatDocuments(payload.chat_documents || []);
     setAgents(agentList.agents || []);
     setHistoryOpen(false);
@@ -528,6 +556,121 @@ function Workspace({ onHome }) {
       await navigator.clipboard.writeText(text);
     } catch {
       setError("Copy is not available in this browser.");
+    }
+  }
+
+  async function waitForWorkflowActivation(workflow) {
+    let current = workflow;
+    for (let attempt = 0; current?.status === "activating" && attempt < 30; attempt += 1) {
+      await new Promise((resolve) => window.setTimeout(resolve, 500));
+      current = await api.get(`/api/workflows/${encodeURIComponent(current.workflow_id)}`);
+    }
+    return current;
+  }
+
+  async function decideWorkflowDraft(workflow, decision) {
+    if (!workflow || workflowBusy) return;
+    setWorkflowBusy(workflow.workflow_id);
+    setError("");
+    try {
+      const updated = await api.post(`/api/workflows/${encodeURIComponent(workflow.workflow_id)}/decision`, {
+        decision,
+        revision: workflow.revision
+      });
+      await waitForWorkflowActivation(updated);
+      await openSession(workflow.session_id || session.session_id);
+      await refreshResources();
+    } catch (workflowError) {
+      setError(friendlyError(workflowError));
+      await openSession(session.session_id).catch(() => undefined);
+    } finally {
+      setWorkflowBusy("");
+    }
+  }
+
+  async function resumeWorkflow(workflow) {
+    if (!workflow || workflowBusy) return;
+    setWorkflowBusy(workflow.workflow_id);
+    setError("");
+    try {
+      const updated = await api.post(`/api/workflows/${encodeURIComponent(workflow.workflow_id)}/resume`, {});
+      await waitForWorkflowActivation(updated);
+      await openSession(workflow.session_id || session.session_id);
+      await refreshResources();
+    } catch (workflowError) {
+      setError(friendlyError(workflowError));
+      await openSession(session.session_id).catch(() => undefined);
+    } finally {
+      setWorkflowBusy("");
+    }
+  }
+
+  async function connectWorkflowRequirement(workflow, requirement) {
+    if (!workflow || !requirement || workflowBusy) return;
+    if (requirement.status === "connected") {
+      await resumeWorkflow(workflow);
+      return;
+    }
+    const template = mcpTemplates.find((item) => item.id === requirement.provider_id);
+    if (requirement.connection_mode === "managed" && template) {
+      if (template.availability !== "available") {
+        setError(template.availability_message || `${requirement.name} must be configured by an administrator first.`);
+        return;
+      }
+      setWorkflowBusy(workflow.workflow_id);
+      setError("");
+      try {
+        const started = await api.post("/api/mcp/oauth/start", {
+          provider_id: requirement.provider_id,
+          workflow_id: workflow.workflow_id
+        });
+        const authorization = new URL(started.authorization_url);
+        if (!/^https?:$/.test(authorization.protocol)) throw new Error("The provider returned an invalid authorization address.");
+        window.location.assign(authorization.toString());
+      } catch (connectionError) {
+        setWorkflowBusy("");
+        setError(friendlyError(connectionError));
+      }
+      return;
+    }
+    setConnectionResumeWorkflowId(workflow.workflow_id);
+    setResourceView("connections");
+    setResourcesOpen(true);
+  }
+
+  function runWorkflow(workflow) {
+    const agentIds = (workflow.activation?.node_agents || []).map((item) => item.agent_id).filter(Boolean);
+    const mentions = agentIds.map((agentId) => `@${agentId}`).join(" ");
+    setDraft(`${mentions}${mentions ? " " : ""}${workflow.intent}`.trim());
+    setFocusComposer((value) => value + 1);
+  }
+
+  async function decideToolCheckpoint(checkpoint, approval, decision) {
+    if (!checkpoint || !approval || checkpointBusy) return;
+    setCheckpointBusy(checkpoint.checkpoint_id);
+    setError("");
+    try {
+      await api.post(`/api/mcp/approvals/${encodeURIComponent(approval.approval_id)}`, { decision });
+      await openSession(checkpoint.session_id || session.session_id);
+      await refreshResources();
+    } catch (approvalError) {
+      setError(friendlyError(approvalError));
+    } finally {
+      setCheckpointBusy("");
+    }
+  }
+
+  async function retryCheckpoint(checkpoint) {
+    if (!checkpoint || checkpointBusy) return;
+    setCheckpointBusy(checkpoint.checkpoint_id);
+    setError("");
+    try {
+      await api.post(`/api/conversation/checkpoints/${encodeURIComponent(checkpoint.checkpoint_id)}/resume`, {});
+      await openSession(checkpoint.session_id || session.session_id);
+    } catch (checkpointError) {
+      setError(friendlyError(checkpointError));
+    } finally {
+      setCheckpointBusy("");
     }
   }
 
@@ -673,6 +816,11 @@ function Workspace({ onHome }) {
   }
 
   const isBusy = activeRun && !["completed", "failed"].includes(activeRun.status);
+  const workflowsById = Object.fromEntries(workflows.map((workflow) => [workflow.workflow_id, workflow]));
+  const actionableCheckpoints = checkpoints.filter((checkpoint) =>
+    checkpoint.type === "mcp_tool_approval"
+    && ["pending", "resuming", "resume_failed"].includes(checkpoint.status)
+  );
 
   return (
     <div className="app-shell">
@@ -728,10 +876,31 @@ function Workspace({ onHome }) {
                 agents={agents}
                 canWrite={canWrite}
                 previousUser={findPreviousUser(messages, index)}
+                workflow={message.workflow_id ? workflowsById[message.workflow_id] : null}
+                workflowBusy={workflowBusy === message.workflow_id}
+                onWorkflowDecision={decideWorkflowDraft}
+                onWorkflowConnect={connectWorkflowRequirement}
+                onWorkflowResume={resumeWorkflow}
+                onWorkflowRun={runWorkflow}
+                onWorkflowGraph={() => {
+                  setResourceView("graph");
+                  setResourcesOpen(true);
+                }}
                 onCopy={copyText}
                 onRetry={retryAnswer}
                 onFeedback={setFeedbackRunId}
                 onDetails={openRunDetails}
+              />
+            ))}
+
+            {actionableCheckpoints.map((checkpoint) => (
+              <ToolApprovalCheckpoint
+                key={checkpoint.checkpoint_id}
+                checkpoint={checkpoint}
+                approval={mcpApprovals.find((item) => item.approval_id === checkpoint.approval_id)}
+                busy={checkpointBusy === checkpoint.checkpoint_id}
+                onDecision={decideToolCheckpoint}
+                onRetry={retryCheckpoint}
               />
             ))}
 
@@ -802,6 +971,7 @@ function Workspace({ onHome }) {
           mcpConnections={mcpConnections}
           mcpTemplates={mcpTemplates}
           mcpApprovals={mcpApprovals}
+          resumeWorkflowId={connectionResumeWorkflowId}
           sessionId={session?.session_id}
           initialView={resourceView}
           togglingAgentId={togglingAgentId}
@@ -844,6 +1014,12 @@ function Workspace({ onHome }) {
           onConnectAgents={(fromId, toId) => setGraphConnection(fromId, toId, true)}
           onDisconnectAgents={(fromId, toId) => setGraphConnection(fromId, toId, false)}
           onRefresh={refreshResources}
+          onConnectionChanged={async () => {
+            if (!connectionResumeWorkflowId) return;
+            const target = workflows.find((item) => item.workflow_id === connectionResumeWorkflowId);
+            if (target) await resumeWorkflow(target);
+            setConnectionResumeWorkflowId("");
+          }}
         />
       )}
 
@@ -1263,12 +1439,41 @@ function HistorySheet({ sessions, activeSessionId, canWrite, onClose, onNewChat,
   );
 }
 
-function ChatMessage({ message, run, agents, canWrite, previousUser, onCopy, onRetry, onFeedback, onDetails }) {
+function ChatMessage({
+  message,
+  run,
+  agents,
+  canWrite,
+  previousUser,
+  workflow,
+  workflowBusy,
+  onWorkflowDecision,
+  onWorkflowConnect,
+  onWorkflowResume,
+  onWorkflowRun,
+  onWorkflowGraph,
+  onCopy,
+  onRetry,
+  onFeedback,
+  onDetails
+}) {
   const isAssistant = message.role === "assistant";
   return (
     <article className={`message ${message.role}`}>
       <div className="message-content">
         {isAssistant ? <FormattedText text={message.content} /> : message.content}
+        {message.kind === "workflow_draft" && workflow && (
+          <WorkflowDraftCard
+            workflow={workflow}
+            busy={workflowBusy}
+            canWrite={canWrite}
+            onDecision={onWorkflowDecision}
+            onConnect={onWorkflowConnect}
+            onResume={onWorkflowResume}
+            onRun={onWorkflowRun}
+            onGraph={onWorkflowGraph}
+          />
+        )}
       </div>
       {isAssistant && (
         <div className="answer-footer">
@@ -1302,99 +1507,215 @@ function ChatMessage({ message, run, agents, canWrite, previousUser, onCopy, onR
   );
 }
 
-function FormattedText({ text }) {
-  const normalized = normalizeAnswerText(text);
-  const lines = normalized.split("\n");
-  const blocks = [];
-  let list = [];
-  let listType = null;
-  let code = [];
-  let inCode = false;
+export function WorkflowDraftCard({
+  workflow,
+  busy = false,
+  canWrite = true,
+  onDecision = () => undefined,
+  onConnect = () => undefined,
+  onResume = () => undefined,
+  onRun = () => undefined,
+  onGraph = () => undefined
+}) {
+  const missingConnections = (workflow.connection_requirements || []).filter((item) => item.status !== "connected");
+  const agentNodes = (workflow.nodes || []).filter((node) => node.type === "agent");
+  const status = workflowStatusCopy(workflow.status);
+  return (
+    <section className={`workflow-draft-card status-${workflow.status}`} aria-label={`${workflow.title} workflow proposal`}>
+      <header className="workflow-card-head">
+        <span className="workflow-card-icon"><WandSparkles size={17} /></span>
+        <div><small>{workflow.mode === "agent_team" ? "AGENT TEAM" : "AUTO-COMPOSER"}</small><strong>{workflow.title}</strong></div>
+        <i className={status.tone}>{busy || workflow.status === "activating" ? <LoaderCircle className="spin" size={13} /> : status.icon}{status.label}</i>
+      </header>
 
-  function flushList() {
-    if (!list.length) return;
-    const Tag = listType === "ordered" ? "ol" : "ul";
-    blocks.push(<Tag key={`list-${blocks.length}`}>{list.map((item, index) => <li key={index}>{inlineFormat(item, `list-${blocks.length}-${index}`)}</li>)}</Tag>);
-    list = [];
-    listType = null;
-  }
+      <WorkflowMiniGraph nodes={workflow.nodes || []} edges={workflow.edges || []} />
 
-  function flushCode() {
-    if (!code.length) return;
-    blocks.push(<pre key={`code-${blocks.length}`}><code>{code.join("\n")}</code></pre>);
-    code = [];
-  }
+      <div className="workflow-agent-sources" aria-label="Selected agents">
+        {agentNodes.map((node) => (
+          <div key={node.id}>
+            <span className={`workflow-source-dot ${node.source}`} />
+            <span><strong>{node.title}</strong><small>{workflowSourceLabel(node)}</small></span>
+            {node.status === "blocked_connection" && <i>Needs connection</i>}
+          </div>
+        ))}
+      </div>
 
-  lines.forEach((rawLine) => {
-    const line = rawLine.trim();
-    if (line.startsWith("```")) {
-      if (inCode) flushCode();
-      else flushList();
-      inCode = !inCode;
-      return;
-    }
-    if (inCode) {
-      code.push(rawLine);
-      return;
-    }
-    if (!line) {
-      flushList();
-      return;
-    }
-    const heading = line.match(/^(#{1,4})\s+(.+)$/);
-    if (heading) {
-      flushList();
-      const level = Math.min(heading[1].length + 1, 4);
-      const Tag = `h${level}`;
-      blocks.push(<Tag key={`heading-${blocks.length}`}>{inlineFormat(heading[2], `heading-${blocks.length}`)}</Tag>);
-      return;
-    }
-    const unordered = line.match(/^[-*]\s+(.+)$/);
-    const ordered = line.match(/^\d+[.)]\s+(.+)$/);
-    if (unordered || ordered) {
-      const nextType = ordered ? "ordered" : "unordered";
-      if (listType && listType !== nextType) flushList();
-      listType = nextType;
-      list.push((ordered || unordered)[1]);
-      return;
-    }
-    flushList();
-    blocks.push(<p key={`paragraph-${blocks.length}`}>{inlineFormat(line, `paragraph-${blocks.length}`)}</p>);
-  });
-  flushList();
-  flushCode();
-  return <div className="formatted-text">{blocks}</div>;
+      {(workflow.connection_requirements || []).length > 0 && (
+        <div className="workflow-connections" aria-label="Required connections">
+          <strong>Connections</strong>
+          {(workflow.connection_requirements || []).map((requirement) => (
+            <div key={requirement.provider_id}>
+              <span><Plug size={14} /><i><b>{requirement.name}</b><small>{requirement.reason}</small></i></span>
+              {requirement.status === "connected"
+                ? <em className="connected"><Check size={12} />Connected</em>
+                : <button type="button" disabled={!canWrite || busy} onClick={() => onConnect(workflow, requirement)}>{requirement.connection_mode === "managed" ? `Connect ${requirement.name}` : `Add ${requirement.name} MCP`}</button>}
+            </div>
+          ))}
+        </div>
+      )}
+
+      <details className="workflow-review-details">
+        <summary>Review permissions and safety</summary>
+        <div>
+          <section><strong>Permissions</strong><ul>{(workflow.permissions || []).map((item) => <li key={item}>{item}</li>)}</ul></section>
+          <section><strong>Safeguards</strong><ul>{(workflow.safety || []).map((item) => <li key={item}>{item}</li>)}</ul></section>
+        </div>
+      </details>
+
+      <footer className="workflow-card-actions">
+        {workflow.status === "awaiting_confirmation" && <>
+          <button type="button" className="text-button ghost" disabled={!canWrite || busy} onClick={() => onDecision(workflow, "deny")}>Keep normal chat</button>
+          <button type="button" className="text-button primary" disabled={!canWrite || busy} onClick={() => onDecision(workflow, "approve")}>{busy ? <LoaderCircle className="spin" size={14} /> : <Check size={14} />}{missingConnections.length ? "Approve plan" : workflow.mode === "agent_team" ? "Create agent team" : "Create workflow"}</button>
+        </>}
+        {workflow.status === "awaiting_connections" && <>
+          <button type="button" className="text-button ghost" disabled={!canWrite || busy} onClick={() => onDecision(workflow, "deny")}>Cancel draft</button>
+          <span>{missingConnections.length ? `Waiting for ${missingConnections.map((item) => item.name).join(" and ")}` : "Connections ready"}</span>
+        </>}
+        {workflow.status === "ready_to_activate" && <button type="button" className="text-button primary" disabled={!canWrite || busy} onClick={() => onResume(workflow)}>{busy ? <LoaderCircle className="spin" size={14} /> : <Check size={14} />}Finish setup</button>}
+        {workflow.status === "activation_failed" && <>
+          <button type="button" className="text-button ghost" disabled={!canWrite || busy} onClick={() => onDecision(workflow, "deny")}>Cancel draft</button>
+          <button type="button" className="text-button primary" disabled={!canWrite || busy} onClick={() => onResume(workflow)}><RefreshCw size={14} />Retry setup</button>
+        </>}
+        {workflow.status === "active" && <>
+          <button type="button" className="text-button ghost" onClick={() => onGraph(workflow)}><Network size={14} />View graph</button>
+          <button type="button" className="text-button primary" disabled={!canWrite} onClick={() => onRun(workflow)}><ArrowRight size={14} />Run in chat</button>
+        </>}
+        {workflow.status === "activating" && <span><LoaderCircle className="spin" size={14} />Creating private agents and validated handoffs…</span>}
+        {workflow.status === "declined" && <span>Draft closed. No agents or connections were changed.</span>}
+      </footer>
+      {workflow.error && <div className="workflow-card-error" role="alert"><AlertCircle size={14} />{workflow.error}</div>}
+    </section>
+  );
 }
 
-function normalizeAnswerText(text) {
-  return String(text || "")
-    .replace(/\r\n?/g, "\n")
-    .replace(/\s+(#{2,4})\s+/g, "\n$1 ")
-    .replace(/(?:\s+\*)+\s+(?=\*[^*]|\*\*|`|\[|[A-Z])/g, "\n- ")
-    .replace(/^\*\s+/gm, "- ")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+export function WorkflowMiniGraph({ nodes, edges }) {
+  const layout = workflowGraphLayout(nodes, edges);
+  const height = Math.max(190, layout.height);
+  return (
+    <div className="workflow-mini-graph" style={{ height }} role="img" aria-label="Proposed workflow handoff graph">
+      <svg viewBox={`0 0 640 ${height}`} preserveAspectRatio="none" aria-hidden="true">
+        <defs><marker id="workflow-card-arrow" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 Z" /></marker></defs>
+        {edges.map((edge) => {
+          const from = layout.positions[edge.source];
+          const to = layout.positions[edge.target];
+          if (!from || !to) return null;
+          const mid = (from.y + to.y) / 2;
+          return <path key={`${edge.source}:${edge.target}`} d={`M ${from.x} ${from.y + 21} C ${from.x} ${mid}, ${to.x} ${mid}, ${to.x} ${to.y - 21}`} markerEnd="url(#workflow-card-arrow)" />;
+        })}
+      </svg>
+      {nodes.map((node) => {
+        const position = layout.positions[node.id];
+        if (!position) return null;
+        return <div className={`workflow-mini-node ${node.type} ${node.source || "system"} ${node.status || "ready"}`} style={{ left: `${(position.x / 640) * 100}%`, top: position.y }} key={node.id}><strong>{node.title}</strong><small>{node.type === "agent" ? workflowSourceLabel(node) : node.type}</small></div>;
+      })}
+    </div>
+  );
 }
 
-function inlineFormat(text, keyPrefix) {
-  const pattern = /(\*\*[^*]+\*\*|`[^`]+`|\[[^\]]+\]\([^)]+\)|\*[^*]+\*)/g;
-  return String(text).split(pattern).filter(Boolean).map((part, index) => {
-    const key = `${keyPrefix}-${index}`;
-    if (part.startsWith("**") && part.endsWith("**")) {
-      return <strong key={key}>{part.slice(2, -2)}</strong>;
-    }
-    if (part.startsWith("`") && part.endsWith("`")) {
-      return <code key={key}>{part.slice(1, -1)}</code>;
-    }
-    const link = part.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
-    if (link && /^(https?:\/\/|mailto:)/i.test(link[2])) {
-      return <a key={key} href={link[2]} target="_blank" rel="noreferrer">{link[1]}</a>;
-    }
-    if (part.startsWith("*") && part.endsWith("*")) {
-      return <em key={key}>{part.slice(1, -1)}</em>;
-    }
-    return part;
-  });
+export function workflowGraphLayout(nodes = [], edges = []) {
+  const ids = new Set(nodes.map((node) => node.id));
+  const incoming = new Map(nodes.map((node) => [node.id, []]));
+  for (const edge of edges) if (ids.has(edge.source) && ids.has(edge.target)) incoming.get(edge.target).push(edge.source);
+  const depth = new Map();
+  function nodeDepth(id, visiting = new Set()) {
+    if (depth.has(id)) return depth.get(id);
+    if (visiting.has(id)) return 0;
+    const nextVisiting = new Set(visiting).add(id);
+    const parents = incoming.get(id) || [];
+    const value = parents.length ? 1 + Math.max(...parents.map((parent) => nodeDepth(parent, nextVisiting))) : 0;
+    depth.set(id, value);
+    return value;
+  }
+  for (const node of nodes) nodeDepth(node.id);
+  const levels = new Map();
+  for (const node of nodes) {
+    const level = depth.get(node.id) || 0;
+    if (!levels.has(level)) levels.set(level, []);
+    levels.get(level).push(node);
+  }
+  const positions = {};
+  for (const [level, items] of levels) {
+    items.forEach((node, index) => {
+      positions[node.id] = {
+        x: ((index + 1) / (items.length + 1)) * 640,
+        y: 36 + level * 92
+      };
+    });
+  }
+  return { positions, height: 82 + Math.max(0, ...depth.values()) * 92 };
+}
+
+export function ToolApprovalCheckpoint({ checkpoint, approval, busy = false, onDecision, onRetry }) {
+  if (checkpoint.status === "resuming") {
+    return (
+      <section className="tool-checkpoint-card resuming" role="status">
+        <LoaderCircle className="spin" size={18} />
+        <div><strong>The decision is saved</strong><p>Resuming this answer with the approved or declined action. You can recover it here after a restart.</p></div>
+        <button type="button" className="text-button ghost" disabled={busy} onClick={() => onRetry(checkpoint)}>{busy ? <LoaderCircle className="spin" size={14} /> : <RefreshCw size={14} />}Resume now</button>
+      </section>
+    );
+  }
+  if (!approval && checkpoint.status !== "resume_failed") return null;
+  if (checkpoint.status === "resume_failed") {
+    return (
+      <section className="tool-checkpoint-card error" role="status">
+        <AlertCircle size={18} />
+        <div><strong>The tool decision was saved</strong><p>{checkpoint.resume_error || "The conversation continuation needs to be retried."}</p></div>
+        <button type="button" className="text-button primary" disabled={busy} onClick={() => onRetry(checkpoint)}>{busy ? <LoaderCircle className="spin" size={14} /> : <RefreshCw size={14} />}Resume answer</button>
+      </section>
+    );
+  }
+  return (
+    <section className="tool-checkpoint-card" aria-label="Tool action awaiting approval">
+      <header><span><Plug size={16} /></span><div><small>ACTION REQUEST</small><strong>{approval.tool_title || approval.tool_name}</strong><p>{approval.connection_name} · {formatAgentName(approval.agent_id, [])}</p></div></header>
+      <pre>{JSON.stringify(approval.arguments, null, 2)}</pre>
+      <p className="tool-checkpoint-note">Only this exact action will run. Approving or declining will resume the answer in this conversation.</p>
+      <footer><button type="button" className="text-button ghost" disabled={busy} onClick={() => onDecision(checkpoint, approval, "deny")}>Decline</button><button type="button" className="text-button primary" disabled={busy} onClick={() => onDecision(checkpoint, approval, "approve")}>{busy ? <LoaderCircle className="spin" size={14} /> : <Check size={14} />}Approve and continue</button></footer>
+    </section>
+  );
+}
+
+function workflowSourceLabel(node) {
+  if (node.source === "workspace") return "Your workspace";
+  if (node.source === "marketplace") return `Marketplace${node.publisher ? ` · ${node.publisher}` : ""}`;
+  if (node.source === "generated") return "New private agent";
+  return node.type || "Workflow step";
+}
+
+function workflowStatusCopy(status) {
+  if (status === "active") return { label: "Ready", tone: "success", icon: <Check size={12} /> };
+  if (status === "declined") return { label: "Closed", tone: "muted", icon: <X size={12} /> };
+  if (status === "awaiting_connections") return { label: "Connection needed", tone: "warning", icon: <Plug size={12} /> };
+  if (status === "activation_failed") return { label: "Needs attention", tone: "warning", icon: <AlertCircle size={12} /> };
+  if (status === "activating") return { label: "Creating", tone: "working", icon: null };
+  if (status === "ready_to_activate") return { label: "Ready to finish", tone: "working", icon: <Check size={12} /> };
+  return { label: "Draft · review required", tone: "draft", icon: <WandSparkles size={12} /> };
+}
+
+export function FormattedText({ text }) {
+  return (
+    <div className="formatted-text">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm, [remarkMath, { singleDollarTextMath: true }]]}
+        rehypePlugins={[rehypeKatex]}
+        skipHtml
+        urlTransform={safeMarkdownUrl}
+        components={{
+          a: ({ children, href, node: _node, ...props }) => <a {...props} href={href} target="_blank" rel="noreferrer">{children}</a>,
+          img: () => null
+        }}
+      >
+        {String(text || "").replace(/\r\n?/g, "\n")}
+      </ReactMarkdown>
+    </div>
+  );
+}
+
+function safeMarkdownUrl(url, key) {
+  const value = String(url || "").trim();
+  if (key === "src") return "";
+  if (/^(https?:|mailto:)/i.test(value) || value.startsWith("#")) return value;
+  return "";
 }
 
 function RunReceipt({ run, onClick }) {
@@ -1469,6 +1790,11 @@ function Composer({
   const [agentMenuOpen, setAgentMenuOpen] = useState(false);
   const quickAgents = availableSessionAgents(agents);
   const activeAgentCount = quickAgents.filter((agent) => agent.session_active !== false).length;
+  const commandMatch = value.match(/^\/([a-z]*)$/i);
+  const commandSuggestions = commandMatch ? [
+    { command: "workflow", title: "Compose a workflow", detail: "Build a reusable, reviewable automation graph" },
+    { command: "agent", title: "Compose an agent team", detail: "Build a manually invoked team of specialists" }
+  ].filter((item) => item.command.startsWith(commandMatch[1].toLowerCase())) : [];
 
   const suggestions = useMemo(() => {
     if (!mention) return [];
@@ -1558,6 +1884,19 @@ function Composer({
 
   return (
     <form className="composer" onSubmit={onSubmit}>
+      {commandSuggestions.length > 0 && !mention && (
+        <div className="command-menu" role="listbox" aria-label="Composer commands">
+          {commandSuggestions.map((item) => (
+            <button type="button" role="option" aria-selected="false" key={item.command} onClick={() => {
+              onChange(`/${item.command} `);
+              requestAnimationFrame(() => inputRef.current?.focus());
+            }}>
+              <WandSparkles size={15} />
+              <span><strong>/{item.command} · {item.title}</strong><small>{item.detail}</small></span>
+            </button>
+          ))}
+        </div>
+      )}
       {mention && suggestions.length > 0 && (
         <div className="mention-menu" id={listId} role="listbox" aria-label="Agent suggestions">
           {suggestions.map((agent, index) => (
@@ -1644,7 +1983,7 @@ function Composer({
           }}
           onKeyDown={onKeyDown}
           onClick={(event) => updateMention(event.currentTarget.value, event.currentTarget.selectionStart)}
-          placeholder={canWrite ? "Ask anything" : "This conversation is read-only"}
+          placeholder={canWrite ? "Ask anything · /workflow or /agent to compose" : "This conversation is read-only"}
           rows={1}
           maxLength={12000}
           disabled={!canWrite}
@@ -1677,6 +2016,7 @@ function ResourcesSheet({
   mcpConnections,
   mcpTemplates,
   mcpApprovals,
+  resumeWorkflowId,
   sessionId,
   initialView,
   togglingAgentId,
@@ -1696,7 +2036,8 @@ function ResourcesSheet({
   onDeleteKnowledge,
   onConnectAgents,
   onDisconnectAgents,
-  onRefresh
+  onRefresh,
+  onConnectionChanged
 }) {
   const [view, setView] = useState(initialView || "agents");
   const canWrite = !auth?.is_viewer;
@@ -1770,6 +2111,8 @@ function ResourcesSheet({
             approvals={mcpApprovals}
             canWrite={canWrite}
             onRefresh={onRefresh}
+            resumeWorkflowId={resumeWorkflowId}
+            onConnectionChanged={onConnectionChanged}
           />
         )}
 
@@ -1789,7 +2132,15 @@ function ResourcesSheet({
   );
 }
 
-export function ConnectionsPanel({ connections = [], templates = [], approvals = [], canWrite, onRefresh }) {
+export function ConnectionsPanel({
+  connections = [],
+  templates = [],
+  approvals = [],
+  canWrite,
+  onRefresh,
+  resumeWorkflowId = "",
+  onConnectionChanged = async () => undefined
+}) {
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState({ template_id: "custom", name: "", endpoint_url: "", auth_type: "none", token: "", trust_read_annotations: false });
   const [busy, setBusy] = useState("");
@@ -1848,6 +2199,7 @@ export function ConnectionsPanel({ connections = [], templates = [], approvals =
       setForm({ template_id: "custom", name: "", endpoint_url: "", auth_type: "none", token: "", trust_read_annotations: false });
       setShowForm(false);
       await onRefresh();
+      await onConnectionChanged();
     } catch (connectionError) {
       setError(friendlyError(connectionError));
     } finally {
@@ -1910,6 +2262,7 @@ export function ConnectionsPanel({ connections = [], templates = [], approvals =
 
       {error && <div className="form-error" role="alert">{error}</div>}
       {notice && <div className="connection-notice" role="status">{notice}</div>}
+      {resumeWorkflowId && <div className="connection-notice" role="status">This connection will return you to the saved workflow automatically.</div>}
 
       {managedProviders.length > 0 && (
         <div className="managed-connections-block">

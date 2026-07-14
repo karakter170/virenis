@@ -18,6 +18,7 @@ import {
 } from "./mcpOAuth.js";
 import { readConfiguredSecret } from "./secretConfig.js";
 import { makeId, nowIso } from "./store.js";
+import { ensureMcpApprovalCheckpoint } from "./workflows.js";
 
 export const MCP_PROTOCOL_VERSION = "2025-11-25";
 const MAX_RPC_BYTES = 2 * 1024 * 1024;
@@ -238,6 +239,19 @@ export async function beginManagedMcpOAuth({ store, actor, body, key, env = proc
   const providerId = String(body?.provider_id || "").trim().toLowerCase();
   const provider = managedMcpProvider(providerId, env);
   const requestedConnectionId = String(body?.connection_id || "").trim();
+  const requestedWorkflowId = String(body?.workflow_id || "").trim();
+  const resumeWorkflow = requestedWorkflowId
+    ? store.read((data) => (data.workflows || []).find((item) => item.workflow_id === requestedWorkflowId))
+    : null;
+  if (requestedWorkflowId && (
+    !resumeWorkflow
+    || resumeWorkflow.workspace_id !== actor.workspace_id
+    || resumeWorkflow.created_by !== actor.user_id
+    || !["awaiting_connections", "ready_to_activate", "activation_failed"].includes(resumeWorkflow.status)
+    || !(resumeWorkflow.connection_requirements || []).some((item) => item.provider_id === providerId)
+  )) {
+    throw mcpError(404, "Workflow connection request not found.", "mcp_workflow_not_found");
+  }
   let existingConnection = null;
   if (requestedConnectionId) {
     existingConnection = store.read((data) => (data.mcpConnections || [])
@@ -277,6 +291,10 @@ export async function beginManagedMcpOAuth({ store, actor, body, key, env = proc
     workspace_id: actor.workspace_id,
     created_by: actor.user_id,
     connection_id: existingConnection?.connection_id || null,
+    resume_context: resumeWorkflow ? {
+      workflow_id: resumeWorkflow.workflow_id,
+      session_id: resumeWorkflow.session_id
+    } : null,
     created_at: createdAt,
     expires_at: new Date(Date.now() + OAUTH_STATE_TTL_MS).toISOString(),
     verifier_envelope: null
@@ -317,7 +335,8 @@ export async function beginManagedMcpOAuth({ store, actor, body, key, env = proc
     provider_id: provider.id,
     authorization_url: buildManagedAuthorizationUrl(provider, { state, codeChallenge }),
     expires_at: transaction.expires_at,
-    cookie: serializeMcpOAuthCookie(browserNonce, env)
+    cookie: serializeMcpOAuthCookie(browserNonce, env),
+    resume_context: transaction.resume_context
   };
 }
 
@@ -369,6 +388,7 @@ export async function completeManagedMcpOAuth({
     error.oauth_redirect = true;
     error.oauth_reason = "denied";
     error.oauth_clear_cookie = true;
+    error.oauth_resume_context = transaction.resume_context || null;
     throw error;
   }
 
@@ -458,7 +478,8 @@ export async function completeManagedMcpOAuth({
     });
     return {
       connection: completed,
-      clear_cookie: serializeMcpOAuthCookie("", env, { clear: true })
+      clear_cookie: serializeMcpOAuthCookie("", env, { clear: true }),
+      resume_context: transaction.resume_context || null
     };
   } catch (error) {
     if (credential) {
@@ -468,6 +489,7 @@ export async function completeManagedMcpOAuth({
     error.oauth_redirect = true;
     error.oauth_reason = "failed";
     error.oauth_clear_cookie = true;
+    error.oauth_resume_context = transaction.resume_context || null;
     throw error;
   }
 }
@@ -686,6 +708,7 @@ export function publicMcpApproval(approval, key) {
     session_id: approval.session_id,
     created_at: approval.created_at,
     decided_at: approval.decided_at || null,
+    checkpoint_id: approval.checkpoint_id || null,
     result: storedResult
   };
 }
@@ -762,6 +785,7 @@ async function queueMcpApproval({ store, key, context, agent, connection, tool, 
     );
     if (concurrent) return concurrent;
     data.mcpApprovals.push(approval);
+    ensureMcpApprovalCheckpoint(data, approval);
     data.mcpToolCalls ||= [];
     data.mcpToolCalls.push(mcpAuditRecord({
       context, agent, connection, tool, alias: boundTool.alias,

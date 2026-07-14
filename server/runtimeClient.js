@@ -96,6 +96,8 @@ export function runtimeApiKey(env = process.env) {
 function validateRuntimeTransportConfiguration(env) {
   for (const [name, maximum] of [
     ["TCAR_RUNTIME_CHAT_TIMEOUT_MS", MAX_REQUEST_TIMEOUT_MS],
+    ["TCAR_RUNTIME_WORKFLOW_TIMEOUT_MS", MAX_REQUEST_TIMEOUT_MS],
+    ["TCAR_RUNTIME_CONTINUATION_TIMEOUT_MS", MAX_REQUEST_TIMEOUT_MS],
     ["TCAR_RUNTIME_HEALTH_TIMEOUT_MS", MAX_REQUEST_TIMEOUT_MS],
     ["TCAR_RUNTIME_ADMIN_TIMEOUT_MS", MAX_REQUEST_TIMEOUT_MS],
     ["TCAR_RUNTIME_CONNECT_TIMEOUT_MS", MAX_CONNECT_TIMEOUT_MS],
@@ -636,6 +638,54 @@ export function executeRuntimeChat({ query, sharedMemory = [], options = {}, exe
       options
     },
     timeoutMs: Number(process.env.TCAR_RUNTIME_CHAT_TIMEOUT_MS || DEFAULT_TIMEOUT_MS)
+  });
+}
+
+export function composeRuntimeWorkflow({
+  command,
+  mode,
+  intent,
+  candidates = [],
+  connections = [],
+  conversation_context = [],
+  execution_context = {}
+}) {
+  return runtimeRequest("/workflow/compose", {
+    method: "POST",
+    body: {
+      command,
+      mode,
+      intent,
+      candidates,
+      connections,
+      conversation_context,
+      execution_context
+    },
+    timeoutMs: Number(process.env.TCAR_RUNTIME_WORKFLOW_TIMEOUT_MS || process.env.TCAR_RUNTIME_CHAT_TIMEOUT_MS || DEFAULT_TIMEOUT_MS)
+  });
+}
+
+export function continueRuntimeConversation({
+  original_request = "",
+  prior_answer = "",
+  decision,
+  tool_name,
+  tool_result = null,
+  conversation_context = [],
+  execution_context = {}
+}) {
+  return runtimeRequest("/chat/continue", {
+    method: "POST",
+    body: {
+      original_request,
+      prior_answer,
+      decision,
+      tool_name,
+      tool_result,
+      conversation_context,
+      execution_context
+    },
+    timeoutMs: Number(process.env.TCAR_RUNTIME_CONTINUATION_TIMEOUT_MS || process.env.TCAR_RUNTIME_CHAT_TIMEOUT_MS || DEFAULT_TIMEOUT_MS)
   });
 }
 

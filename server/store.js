@@ -38,7 +38,7 @@ function mergeSeedCatalog(agents, seedAgents) {
 function initialData(seedAgents) {
   const now = new Date().toISOString();
   return {
-    version: 5,
+    version: 6,
     created_at: now,
     sessions: [],
     messages: [],
@@ -53,6 +53,8 @@ function initialData(seedAgents) {
     mcpOauthStates: [],
     mcpApprovals: [],
     mcpToolCalls: [],
+    workflows: [],
+    conversationCheckpoints: [],
     agents: clone(seedAgents),
     documents: [],
     validationRuns: []
@@ -290,7 +292,14 @@ function normalizeData(value, seedAgents) {
     }
   }
   data.version = defaults.version;
-  for (const collection of ["mcpConnections", "mcpOauthStates", "mcpApprovals", "mcpToolCalls"]) {
+  for (const collection of [
+    "mcpConnections",
+    "mcpOauthStates",
+    "mcpApprovals",
+    "mcpToolCalls",
+    "workflows",
+    "conversationCheckpoints"
+  ]) {
     data[collection] = Array.isArray(data[collection]) ? data[collection] : [];
   }
   data.marketplaceRatings = (Array.isArray(data.marketplaceRatings) ? data.marketplaceRatings : [])

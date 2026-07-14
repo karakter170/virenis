@@ -363,6 +363,353 @@ summary:focus-visible,
   text-underline-offset: 2px;
 }
 
+.formatted-text blockquote {
+  margin: 14px 0;
+  border-left: 3px solid #9db4a8;
+  padding: 2px 0 2px 14px;
+  color: var(--text-soft);
+}
+
+.formatted-text table {
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+  border-collapse: collapse;
+  margin: 14px 0 18px;
+  white-space: nowrap;
+}
+
+.formatted-text th,
+.formatted-text td {
+  border: 1px solid var(--line);
+  padding: 8px 10px;
+  text-align: left;
+}
+
+.formatted-text th {
+  background: var(--surface-subtle);
+  font-weight: 700;
+}
+
+.formatted-text input[type="checkbox"] {
+  margin-right: 7px;
+  accent-color: var(--accent);
+}
+
+.formatted-text .katex-display {
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 4px 0;
+}
+
+.workflow-draft-card {
+  width: min(780px, 100%);
+  overflow: hidden;
+  margin: 18px 0 4px;
+  border: 1px solid #cddbd4;
+  border-radius: 16px;
+  color: var(--text);
+  background: #fbfdfc;
+  box-shadow: 0 12px 34px rgba(26, 52, 40, 0.08);
+  animation: workflow-card-enter 260ms ease-out both;
+}
+
+.workflow-card-head {
+  min-height: 70px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 11px;
+  padding: 13px 15px;
+  border-bottom: 1px solid #dce7e1;
+  background: linear-gradient(135deg, #f3faf6, #fbfdfc);
+}
+
+.workflow-card-icon {
+  width: 36px;
+  height: 36px;
+  display: grid;
+  place-items: center;
+  border-radius: 10px;
+  color: var(--accent);
+  background: #dff1e8;
+}
+
+.workflow-card-head div small,
+.workflow-card-head div strong {
+  display: block;
+}
+
+.workflow-card-head div small {
+  margin-bottom: 2px;
+  color: var(--accent);
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+}
+
+.workflow-card-head div strong {
+  overflow: hidden;
+  font-size: 14px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workflow-card-head > i {
+  min-height: 27px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border-radius: 999px;
+  padding: 4px 8px;
+  font-size: 9px;
+  font-style: normal;
+  font-weight: 750;
+  white-space: nowrap;
+}
+
+.workflow-card-head > i.draft,
+.workflow-card-head > i.working { color: #3f6654; background: #e9f3ee; }
+.workflow-card-head > i.warning { color: var(--warning); background: var(--warning-soft); }
+.workflow-card-head > i.success { color: var(--accent); background: var(--accent-soft); }
+.workflow-card-head > i.muted { color: var(--text-faint); background: var(--surface-subtle); }
+
+.workflow-mini-graph {
+  position: relative;
+  max-height: 470px;
+  overflow: auto;
+  border-bottom: 1px solid var(--line);
+  background:
+    radial-gradient(circle at 1px 1px, #dce7e1 1px, transparent 0) 0 0 / 20px 20px,
+    #f8fbf9;
+}
+
+.workflow-mini-graph svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+
+.workflow-mini-graph svg path:not([d^="M0"]) {
+  fill: none;
+  stroke: #8da79a;
+  stroke-width: 1.5;
+  vector-effect: non-scaling-stroke;
+  stroke-dasharray: 7 5;
+  animation: workflow-edge-flow 900ms linear infinite;
+}
+
+.workflow-mini-graph marker path {
+  fill: #769586;
+  stroke: none;
+}
+
+.workflow-mini-node {
+  position: absolute;
+  z-index: 1;
+  width: min(144px, 23%);
+  min-height: 46px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  transform: translate(-50%, -50%);
+  border: 1px solid #bdcec5;
+  border-radius: 10px;
+  padding: 7px 9px;
+  background: #ffffff;
+  box-shadow: 0 4px 10px rgba(31, 53, 43, 0.08);
+  text-align: center;
+  animation: workflow-node-enter 300ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+@keyframes workflow-card-enter {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes workflow-node-enter {
+  from { opacity: 0; transform: translate(-50%, -42%) scale(0.94); }
+  to { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+}
+
+@keyframes workflow-edge-flow {
+  to { stroke-dashoffset: -24; }
+}
+
+.workflow-mini-node strong,
+.workflow-mini-node small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workflow-mini-node strong { font-size: 10px; line-height: 1.25; }
+.workflow-mini-node small { margin-top: 3px; color: var(--text-soft); font-size: 8px; text-transform: capitalize; }
+.workflow-mini-node.trigger { border-color: #a7b6d5; background: #f4f7fd; }
+.workflow-mini-node.decision { border-color: #d8bd89; background: #fffaf0; }
+.workflow-mini-node.tool { border-color: #b8a9d9; background: #f8f5fd; }
+.workflow-mini-node.approval { border-color: #d2aab1; background: #fff6f7; }
+.workflow-mini-node.marketplace { box-shadow: inset 3px 0 #8a6bc1, 0 4px 10px rgba(31, 53, 43, 0.08); }
+.workflow-mini-node.generated { box-shadow: inset 3px 0 #d18a30, 0 4px 10px rgba(31, 53, 43, 0.08); }
+.workflow-mini-node.blocked_connection { border-style: dashed; }
+
+.workflow-agent-sources {
+  display: grid;
+  gap: 1px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.workflow-agent-sources > div {
+  min-height: 41px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  padding: 4px 2px;
+}
+
+.workflow-source-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+.workflow-source-dot.marketplace { background: #7652aa; }
+.workflow-source-dot.generated { background: #c4771d; }
+.workflow-agent-sources strong,
+.workflow-agent-sources small { display: block; }
+.workflow-agent-sources strong { font-size: 11px; }
+.workflow-agent-sources small { margin-top: 2px; color: var(--text-soft); font-size: 9px; }
+.workflow-agent-sources i { color: var(--warning); font-size: 9px; font-style: normal; font-weight: 700; }
+
+.workflow-connections {
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.workflow-connections > strong {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.workflow-connections > div {
+  min-height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.workflow-connections > div > span {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.workflow-connections i,
+.workflow-connections b,
+.workflow-connections small { display: block; }
+.workflow-connections i { min-width: 0; font-style: normal; }
+.workflow-connections b { font-size: 11px; }
+.workflow-connections small { margin-top: 2px; overflow: hidden; color: var(--text-soft); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.workflow-connections button { flex: 0 0 auto; border: 1px solid #a7bcb1; border-radius: 7px; padding: 6px 9px; color: var(--accent); background: #fff; font-size: 9px; font-weight: 750; }
+.workflow-connections em.connected { display: inline-flex; align-items: center; gap: 4px; color: var(--accent); font-size: 9px; font-style: normal; font-weight: 750; }
+
+.workflow-review-details {
+  border-bottom: 1px solid var(--line);
+  padding: 0 14px;
+}
+
+.workflow-review-details summary {
+  padding: 10px 0;
+  color: var(--text-soft);
+  font-size: 10px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.workflow-review-details > div {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  padding: 0 0 12px;
+}
+
+.workflow-review-details section > strong { font-size: 10px; }
+.workflow-review-details ul { margin: 5px 0 0; padding-left: 17px; color: var(--text-soft); font-size: 9px; }
+.workflow-review-details li { margin: 4px 0; }
+
+.workflow-card-actions {
+  min-height: 58px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 10px 14px;
+}
+
+.workflow-card-actions > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-soft);
+  font-size: 10px;
+}
+
+.workflow-card-error {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  border-top: 1px solid #f0c6cd;
+  padding: 9px 14px;
+  color: var(--danger);
+  background: var(--danger-soft);
+  font-size: 10px;
+}
+
+.tool-checkpoint-card {
+  width: min(780px, 100%);
+  align-self: flex-start;
+  overflow: hidden;
+  border: 1px solid #dec99f;
+  border-radius: 13px;
+  background: #fffcf5;
+  box-shadow: 0 8px 24px rgba(65, 51, 24, 0.07);
+}
+
+.tool-checkpoint-card > header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  border-bottom: 1px solid #eadfc7;
+}
+
+.tool-checkpoint-card > header > span { width: 31px; height: 31px; display: grid; place-items: center; border-radius: 8px; color: var(--warning); background: #f8e9c8; }
+.tool-checkpoint-card header small,
+.tool-checkpoint-card header strong,
+.tool-checkpoint-card header p { display: block; margin: 0; }
+.tool-checkpoint-card header small { color: var(--warning); font-size: 8px; font-weight: 800; letter-spacing: 0.12em; }
+.tool-checkpoint-card header strong { margin-top: 2px; font-size: 12px; }
+.tool-checkpoint-card header p { margin-top: 2px; color: var(--text-soft); font-size: 9px; }
+.tool-checkpoint-card > pre { max-height: 180px; overflow: auto; margin: 10px 14px; border: 1px solid #eadfc7; border-radius: 7px; padding: 9px; background: #fff; font-size: 10px; white-space: pre-wrap; }
+.tool-checkpoint-note { margin: 8px 14px; color: var(--text-soft); font-size: 10px; }
+.tool-checkpoint-card > footer { display: flex; justify-content: flex-end; gap: 8px; padding: 10px 14px; border-top: 1px solid #eadfc7; }
+.tool-checkpoint-card.error { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 10px; border-color: #efc6cd; padding: 12px 14px; color: var(--danger); background: var(--danger-soft); }
+.tool-checkpoint-card.error p { margin: 3px 0 0; color: #854150; font-size: 10px; }
+.tool-checkpoint-card.resuming { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 10px; padding: 12px 14px; color: var(--accent); background: #f7fbf9; }
+.tool-checkpoint-card.resuming p { margin: 3px 0 0; color: var(--text-soft); font-size: 10px; }
+
 .answer-footer {
   min-height: 34px;
   display: flex;
@@ -669,7 +1016,8 @@ summary:focus-visible,
 .quick-agent-list input { width: 17px; height: 17px; accent-color: var(--accent); }
 .quick-agent-list > p { margin: 20px; color: var(--text-faint); font-size: 12px; text-align: center; }
 
-.mention-menu {
+.mention-menu,
+.command-menu {
   position: absolute;
   z-index: 12;
   left: 8px;
@@ -684,7 +1032,8 @@ summary:focus-visible,
   box-shadow: var(--shadow);
 }
 
-.mention-menu button {
+.mention-menu button,
+.command-menu button {
   width: 100%;
   min-height: 54px;
   display: grid;
@@ -701,22 +1050,27 @@ summary:focus-visible,
 
 .mention-menu button:hover,
 .mention-menu button.active,
-.mention-menu button[aria-selected="true"] {
+.mention-menu button[aria-selected="true"],
+.command-menu button:hover {
   color: var(--text);
   background: var(--surface-hover);
 }
 
 .mention-menu strong,
-.mention-menu small {
+.mention-menu small,
+.command-menu strong,
+.command-menu small {
   display: block;
 }
 
-.mention-menu strong {
+.mention-menu strong,
+.command-menu strong {
   color: var(--text);
   font-size: 14px;
 }
 
-.mention-menu small {
+.mention-menu small,
+.command-menu small {
   margin-top: 2px;
   overflow: hidden;
   color: var(--text-soft);
@@ -3841,6 +4195,49 @@ summary:focus-visible,
 }
 
 @media (max-width: 600px) {
+  .workflow-card-head {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .workflow-card-head > i {
+    grid-column: 2;
+    justify-self: start;
+  }
+
+  .workflow-mini-node {
+    width: min(122px, 29%);
+    padding-right: 6px;
+    padding-left: 6px;
+  }
+
+  .workflow-review-details > div {
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
+
+  .workflow-connections > div,
+  .workflow-card-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .workflow-connections button,
+  .workflow-card-actions .text-button {
+    width: 100%;
+    justify-content: center;
+  }
+
+  .tool-checkpoint-card.error,
+  .tool-checkpoint-card.resuming {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .tool-checkpoint-card.error .text-button,
+  .tool-checkpoint-card.resuming .text-button {
+    grid-column: 1 / -1;
+    justify-content: center;
+  }
+
   .section-heading-row {
     align-items: stretch;
     flex-direction: column;

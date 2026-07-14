@@ -4,6 +4,8 @@ import { setTimeout as delay } from "node:timers/promises";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  composeRuntimeWorkflow,
+  continueRuntimeConversation,
   deleteArchivedRuntimeAgent,
   fetchRuntimeAgents,
   registerRuntimeAgent,
@@ -21,7 +23,9 @@ const ENVIRONMENT_KEYS = [
   "TCAR_RUNTIME_CONNECT_TIMEOUT_MS",
   "TCAR_RUNTIME_HEADER_TIMEOUT_MS",
   "TCAR_RUNTIME_BODY_IDLE_TIMEOUT_MS",
-  "TCAR_RUNTIME_MAX_RESPONSE_BYTES"
+  "TCAR_RUNTIME_MAX_RESPONSE_BYTES",
+  "TCAR_RUNTIME_WORKFLOW_TIMEOUT_MS",
+  "TCAR_RUNTIME_CONTINUATION_TIMEOUT_MS"
 ];
 const originalEnvironment = Object.fromEntries(
   ENVIRONMENT_KEYS.map((key) => [key, process.env[key]])
@@ -37,6 +41,71 @@ afterEach(async () => {
 });
 
 describe("TCAR runtime HTTP transport", () => {
+  it("uses dedicated runtime contracts for workflow composition and tool continuation", async () => {
+    const observed = [];
+    const runtime = await startHttpServer(async (incoming, response) => {
+      observed.push({ path: incoming.url, body: await readRequest(incoming) });
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify(incoming.url === "/workflow/compose"
+        ? { title: "Composed", nodes: [] }
+        : { content: "Continued safely." }));
+    });
+    configureRuntime(runtime.url, {
+      TCAR_RUNTIME_WORKFLOW_TIMEOUT_MS: "2000",
+      TCAR_RUNTIME_CONTINUATION_TIMEOUT_MS: "2000"
+    });
+    const executionContext = {
+      run_id: "run_contract",
+      session_id: "session_contract",
+      workspace_id: "workspace_contract",
+      user_id: "alice"
+    };
+    await expect(composeRuntimeWorkflow({
+      command: "workflow",
+      mode: "workflow",
+      intent: "Prepare a support draft.",
+      candidates: [{ candidate_id: "workspace:support" }],
+      connections: [],
+      conversation_context: [{ tag: "context", content: "Keep it concise." }],
+      execution_context: executionContext
+    })).resolves.toEqual({ title: "Composed", nodes: [] });
+    await expect(continueRuntimeConversation({
+      original_request: "Create a note.",
+      prior_answer: "Waiting for approval.",
+      decision: "approve",
+      tool_name: "Create note",
+      tool_result: { ok: true },
+      conversation_context: [],
+      execution_context: executionContext
+    })).resolves.toEqual({ content: "Continued safely." });
+    expect(observed).toEqual([
+      {
+        path: "/workflow/compose",
+        body: {
+          command: "workflow",
+          mode: "workflow",
+          intent: "Prepare a support draft.",
+          candidates: [{ candidate_id: "workspace:support" }],
+          connections: [],
+          conversation_context: [{ tag: "context", content: "Keep it concise." }],
+          execution_context: executionContext
+        }
+      },
+      {
+        path: "/chat/continue",
+        body: {
+          original_request: "Create a note.",
+          prior_answer: "Waiting for approval.",
+          decision: "approve",
+          tool_name: "Create note",
+          tool_result: { ok: true },
+          conversation_context: [],
+          execution_context: executionContext
+        }
+      }
+    ]);
+  });
+
   it("sends MCP prompt contracts to Runtime without sending workspace bindings", async () => {
     let observed = null;
     const runtime = await startHttpServer(async (request, response) => {
@@ -354,6 +423,16 @@ describe("TCAR runtime HTTP transport", () => {
     process.env.TCAR_RUNTIME_CONNECT_TIMEOUT_MS = "0";
 
     expect(() => requireRuntimeConfigured()).toThrow(/TCAR_RUNTIME_CONNECT_TIMEOUT_MS must be an integer/);
+  });
+
+  it("validates workflow and continuation Runtime budgets at startup", () => {
+    process.env.TCAR_ENGINE_MODE = "real";
+    process.env.TCAR_RUNTIME_API_URL = "http://127.0.0.1:9000";
+    process.env.TCAR_RUNTIME_WORKFLOW_TIMEOUT_MS = "0";
+    expect(() => requireRuntimeConfigured()).toThrow(/TCAR_RUNTIME_WORKFLOW_TIMEOUT_MS must be an integer/);
+    delete process.env.TCAR_RUNTIME_WORKFLOW_TIMEOUT_MS;
+    process.env.TCAR_RUNTIME_CONTINUATION_TIMEOUT_MS = "1800001";
+    expect(() => requireRuntimeConfigured()).toThrow(/TCAR_RUNTIME_CONTINUATION_TIMEOUT_MS must be an integer/);
   });
 });
 

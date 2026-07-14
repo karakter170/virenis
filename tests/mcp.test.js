@@ -17,6 +17,8 @@ let webServer;
 let schemaVersion;
 let toolCalls;
 let observedAuthorization;
+let continuationCalls;
+let continuationFailures;
 const priorEnvironment = {};
 const ENV_KEYS = ["WEB_STORE_DRIVER", "APP_MCP_ALLOW_TEST_HTTP", "APP_MCP_GATEWAY_KEY"];
 const executeFile = promisify(execFile);
@@ -30,9 +32,23 @@ beforeEach(async () => {
   schemaVersion = 1;
   toolCalls = [];
   observedAuthorization = [];
+  continuationCalls = [];
+  continuationFailures = 0;
   server = await startSyntheticMcpServer();
   tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "virenis-mcp-"));
-  app = await createApp({ dbPath: path.join(tmpDir, "db.json"), uploadRoot: tmpDir, autoRun: false });
+  app = await createApp({
+    dbPath: path.join(tmpDir, "db.json"),
+    uploadRoot: tmpDir,
+    autoRun: false,
+    conversationContinuator: async (input) => {
+      continuationCalls.push(input);
+      if (continuationFailures > 0) {
+        continuationFailures -= 1;
+        throw new Error("synthetic continuation failure");
+      }
+      return { content: `Conversation resumed after ${input.decision}: ${input.tool_name}.` };
+    }
+  });
 });
 
 afterEach(async () => {
@@ -147,7 +163,8 @@ describe("governed MCP phase 1", () => {
         approval_id: writeResult.body.approval_id,
         status: "pending",
         tool_name: "create_note",
-        arguments: { text: "Ship the launch brief" }
+        arguments: { text: "Ship the launch brief" },
+        checkpoint_id: expect.stringMatching(/^checkpoint_/)
       })
     ]);
 
@@ -155,13 +172,25 @@ describe("governed MCP phase 1", () => {
       .post(`/api/mcp/approvals/${writeResult.body.approval_id}`)
       .send({ decision: "approve" })
       .expect(200);
-    expect(executed.body).toMatchObject({ status: "executed", result: { isError: false } });
+    expect(executed.body).toMatchObject({
+      status: "executed",
+      result: { isError: false },
+      continuation: {
+        status: "resumed",
+        resume_message_id: expect.stringMatching(/^msg_/)
+      }
+    });
     expect(toolCalls.filter((call) => call.name === "create_note")).toHaveLength(1);
-    await request(app)
+    const repeated = await request(app)
       .post(`/api/mcp/approvals/${writeResult.body.approval_id}`)
       .send({ decision: "approve" })
-      .expect(409);
+      .expect(200);
+    expect(repeated.body.continuation.resume_message_id).toBe(executed.body.continuation.resume_message_id);
     expect(toolCalls.filter((call) => call.name === "create_note")).toHaveLength(1);
+    expect(continuationCalls).toHaveLength(1);
+    expect(app.locals.store.read().messages.filter((message) => message.checkpoint_id === executed.body.continuation.checkpoint_id)).toEqual([
+      expect.objectContaining({ content: "Conversation resumed after approve: Create note." })
+    ]);
 
     const deniedRequest = await request(app)
       .post("/api/internal/mcp/tools/call")
@@ -178,7 +207,9 @@ describe("governed MCP phase 1", () => {
       .send({ decision: "deny" })
       .expect(200);
     expect(denied.body.status).toBe("denied");
+    expect(denied.body.continuation.status).toBe("resumed");
     expect(toolCalls.filter((call) => call.name === "create_note")).toHaveLength(1);
+    expect(continuationCalls).toHaveLength(2);
 
     const stored = app.locals.store.read();
     expect(stored.mcpToolCalls.map((call) => call.status)).toEqual(expect.arrayContaining([
@@ -201,6 +232,69 @@ describe("governed MCP phase 1", () => {
         tools: expect.arrayContaining([expect.objectContaining({ name: "search_notes" })])
       })
     ]);
+  });
+
+  it("recovers a saved tool decision without executing the external action twice", async () => {
+    const connection = await request(app)
+      .post("/api/mcp/connections")
+      .send({ name: "Continuation recovery", endpoint_url: server.url, auth: { type: "none" } })
+      .expect(201);
+    await request(app).post("/api/agents").send({
+      id: "continuation_recovery_agent",
+      title: "Continuation recovery agent",
+      capability: "Create a note after explicit approval.",
+      boundary: "Use only the assigned write tool.",
+      mcp_bindings: [{ connection_id: connection.body.connection_id, tool_names: ["create_note"] }]
+    }).expect(201);
+    const agent = (await request(app).get("/api/agents").expect(200)).body.agents
+      .find((item) => item.id === "continuation_recovery_agent");
+    const alias = agent.mcp_bindings[0].tools[0].alias;
+    const context = {
+      run_id: "run_continuation_recovery",
+      session_id: "session_continuation_recovery",
+      workspace_id: "workspace_default",
+      user_id: "user_local",
+      role: "user"
+    };
+    const queued = await request(app)
+      .post("/api/internal/mcp/tools/call")
+      .set("X-Virenis-MCP-Gateway-Key", process.env.APP_MCP_GATEWAY_KEY)
+      .send({
+        agent_id: agent.id,
+        tool_alias: alias,
+        arguments: { text: "Persist exactly once" },
+        execution_context: context
+      })
+      .expect(200);
+    continuationFailures = 1;
+    const decided = await request(app)
+      .post(`/api/mcp/approvals/${queued.body.approval_id}`)
+      .send({ decision: "approve" })
+      .expect(200);
+    expect(decided.body.status).toBe("executed");
+    expect(decided.body.continuation).toMatchObject({ status: "resume_failed" });
+    expect(toolCalls.filter((call) => call.name === "create_note")).toHaveLength(1);
+
+    const resumed = await request(app)
+      .post(`/api/conversation/checkpoints/${decided.body.continuation.checkpoint_id}/resume`)
+      .send({})
+      .expect(200);
+    expect(resumed).toMatchObject({
+      body: {
+        status: "resumed",
+        resume_message_id: expect.stringMatching(/^msg_/)
+      }
+    });
+    expect(toolCalls.filter((call) => call.name === "create_note")).toHaveLength(1);
+    expect(continuationCalls).toHaveLength(2);
+
+    const repeated = await request(app)
+      .post(`/api/conversation/checkpoints/${resumed.body.checkpoint_id}/resume`)
+      .send({})
+      .expect(200);
+    expect(repeated.body.resume_message_id).toBe(resumed.body.resume_message_id);
+    expect(toolCalls.filter((call) => call.name === "create_note")).toHaveLength(1);
+    expect(continuationCalls).toHaveLength(2);
   });
 
   it("pins schemas and rejects a changed tool contract until the agent is rebound", async () => {
