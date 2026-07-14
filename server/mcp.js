@@ -6,6 +6,16 @@ import https from "node:https";
 import net from "node:net";
 import path from "node:path";
 
+import {
+  assertManagedCredentialScopes,
+  buildManagedAuthorizationUrl,
+  exchangeManagedAuthorizationCode,
+  managedMcpProvider,
+  oauthCredentialNeedsRefresh,
+  publicManagedMcpProviders,
+  refreshManagedAccessToken,
+  revokeManagedCredential
+} from "./mcpOAuth.js";
 import { readConfiguredSecret } from "./secretConfig.js";
 import { makeId, nowIso } from "./store.js";
 
@@ -14,13 +24,24 @@ const MAX_RPC_BYTES = 2 * 1024 * 1024;
 const MAX_ARGUMENT_BYTES = 64 * 1024;
 const MAX_TOOLS = 250;
 const MCP_ALIAS_RE = /^mcp_[a-f0-9]{8}_[a-z0-9_]{1,42}_[a-f0-9]{6}$/;
+const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
+const OAUTH_STATE_RETENTION_MS = 24 * 60 * 60 * 1000;
+const oauthRefreshInflight = new Map();
 
 export const MCP_TEMPLATES = Object.freeze([
+  {
+    id: "gmail",
+    name: "Gmail",
+    description: "Connect Gmail through Google OAuth without entering an endpoint or token.",
+    auth_type: "oauth2",
+    connection_mode: "managed"
+  },
   {
     id: "github",
     name: "GitHub",
     description: "Give an agent selected repository, issue, and pull-request tools.",
     auth_type: "bearer",
+    connection_mode: "custom",
     endpoint_placeholder: "https://your-github-mcp.example.com/mcp"
   },
   {
@@ -28,6 +49,7 @@ export const MCP_TEMPLATES = Object.freeze([
     name: "Notion",
     description: "Let an agent search and read approved workspace knowledge.",
     auth_type: "bearer",
+    connection_mode: "custom",
     endpoint_placeholder: "https://your-notion-mcp.example.com/mcp"
   },
   {
@@ -35,6 +57,7 @@ export const MCP_TEMPLATES = Object.freeze([
     name: "Linear",
     description: "Let an agent inspect and, with approval, update project work.",
     auth_type: "bearer",
+    connection_mode: "custom",
     endpoint_placeholder: "https://your-linear-mcp.example.com/mcp"
   },
   {
@@ -42,6 +65,7 @@ export const MCP_TEMPLATES = Object.freeze([
     name: "Slack",
     description: "Let an agent search selected channels and draft approved actions.",
     auth_type: "bearer",
+    connection_mode: "custom",
     endpoint_placeholder: "https://your-slack-mcp.example.com/mcp"
   },
   {
@@ -49,9 +73,17 @@ export const MCP_TEMPLATES = Object.freeze([
     name: "Custom HTTPS",
     description: "Connect any remote Streamable HTTP MCP server you control.",
     auth_type: "none",
+    connection_mode: "custom",
     endpoint_placeholder: "https://mcp.example.com/mcp"
   }
 ]);
+
+export function publicMcpTemplates(env = process.env) {
+  const managedById = new Map(publicManagedMcpProviders(env).map((provider) => [provider.id, provider]));
+  return MCP_TEMPLATES.map((template) => template.connection_mode === "managed"
+    ? { ...template, ...managedById.get(template.id) }
+    : { ...template, availability: "available" });
+}
 
 export async function ensureMcpCredentialKey({ dbPath, env = process.env } = {}) {
   const configured = readConfiguredSecret(
@@ -127,10 +159,13 @@ export function publicMcpConnection(connection) {
     connection_id: connection.connection_id,
     name: connection.name,
     template_id: connection.template_id,
+    provider_id: connection.provider_id || null,
+    connection_mode: connection.connection_mode || "custom",
     endpoint_origin: safeEndpointOrigin(connection.endpoint_url),
     auth_type: connection.auth_type,
     has_secret: Boolean(connection.credential),
     status: connection.status,
+    reauthorization_required: connection.status === "reauthorization_required",
     protocol_version: connection.protocol_version,
     read_policy: connection.trust_read_annotations ? "allow_declared_reads" : "approve_every_call",
     tools: (connection.tools || []).map(publicMcpTool),
@@ -138,7 +173,8 @@ export function publicMcpConnection(connection) {
     created_by: connection.created_by,
     created_at: connection.created_at,
     updated_at: connection.updated_at,
-    last_connected_at: connection.last_connected_at || null
+    last_connected_at: connection.last_connected_at || null,
+    last_authorized_at: connection.last_authorized_at || null
   };
 }
 
@@ -162,12 +198,16 @@ export async function createMcpConnection({ body, actor, key }) {
   const templateId = MCP_TEMPLATES.some((item) => item.id === body?.template_id)
     ? body.template_id
     : "custom";
+  if (MCP_TEMPLATES.find((item) => item.id === templateId)?.connection_mode === "managed") {
+    throw mcpError(400, "Managed connections must be authorized through their Connect button.", "mcp_managed_oauth_required");
+  }
   const auth = normalizeMcpAuth(body?.auth);
   const now = nowIso();
   const connection = {
     connection_id: connectionId,
     name: boundedText(body?.name || MCP_TEMPLATES.find((item) => item.id === templateId)?.name, "Connection name", 100),
     template_id: templateId,
+    connection_mode: "custom",
     endpoint_url: endpointUrl,
     auth_type: auth.type,
     trust_read_annotations: body?.trust_read_annotations === true,
@@ -193,10 +233,267 @@ export async function createMcpConnection({ body, actor, key }) {
   };
 }
 
-export async function refreshMcpConnection(connection, { key }) {
-  const discovery = await discoverMcpTools(connection, { key });
+export async function beginManagedMcpOAuth({ store, actor, body, key, env = process.env }) {
+  if (!key) throw mcpError(503, "MCP credential encryption is not configured.", "mcp_key_missing");
+  const providerId = String(body?.provider_id || "").trim().toLowerCase();
+  const provider = managedMcpProvider(providerId, env);
+  const requestedConnectionId = String(body?.connection_id || "").trim();
+  let existingConnection = null;
+  if (requestedConnectionId) {
+    existingConnection = store.read((data) => (data.mcpConnections || [])
+      .find((item) => item.connection_id === requestedConnectionId));
+    if (!existingConnection || existingConnection.workspace_id !== actor.workspace_id) {
+      throw mcpError(404, "MCP connection not found.", "mcp_connection_not_found");
+    }
+    if (existingConnection.created_by !== actor.user_id) {
+      throw mcpError(403, "Only the connection owner can reconnect it.", "mcp_connection_forbidden");
+    }
+    if (existingConnection.provider_id !== provider.id || existingConnection.connection_mode !== "managed") {
+      throw mcpError(409, "This connection cannot be reauthorized with that provider.", "mcp_provider_mismatch");
+    }
+  } else {
+    const duplicate = store.read((data) => (data.mcpConnections || []).some((item) =>
+      item.workspace_id === actor.workspace_id
+      && item.created_by === actor.user_id
+      && item.provider_id === provider.id
+    ));
+    if (duplicate) {
+      throw mcpError(409, `${provider.name} is already connected. Reconnect or remove the existing account first.`, "mcp_provider_already_connected");
+    }
+  }
+
+  const state = crypto.randomBytes(32).toString("base64url");
+  const browserNonce = crypto.randomBytes(32).toString("base64url");
+  const codeVerifier = crypto.randomBytes(48).toString("base64url");
+  const codeChallenge = crypto.createHash("sha256").update(codeVerifier, "ascii").digest("base64url");
+  const oauthStateId = makeId("mcpoauth");
+  const createdAt = nowIso();
+  const transaction = {
+    oauth_state_id: oauthStateId,
+    provider_id: provider.id,
+    status: "pending",
+    state_digest: digest(state),
+    browser_nonce_digest: digest(browserNonce),
+    workspace_id: actor.workspace_id,
+    created_by: actor.user_id,
+    connection_id: existingConnection?.connection_id || null,
+    created_at: createdAt,
+    expires_at: new Date(Date.now() + OAUTH_STATE_TTL_MS).toISOString(),
+    verifier_envelope: null
+  };
+  transaction.verifier_envelope = encryptMcpValue(
+    { code_verifier: codeVerifier },
+    key,
+    mcpOAuthStateAad(transaction)
+  );
+  await store.mutate((data) => {
+    data.mcpOauthStates = (data.mcpOauthStates || []).filter((item) => {
+      const terminalAt = Date.parse(item.completed_at || item.failed_at || item.expires_at || "");
+      return !Number.isFinite(terminalAt) || terminalAt >= Date.now() - OAUTH_STATE_RETENTION_MS;
+    });
+    if (!requestedConnectionId && (data.mcpConnections || []).some((item) =>
+      item.workspace_id === actor.workspace_id
+      && item.created_by === actor.user_id
+      && item.provider_id === provider.id
+    )) {
+      throw mcpError(409, `${provider.name} is already connected. Reconnect or remove the existing account first.`, "mcp_provider_already_connected");
+    }
+    for (const pending of data.mcpOauthStates) {
+      if (
+        pending.workspace_id === actor.workspace_id
+        && pending.created_by === actor.user_id
+        && pending.provider_id === provider.id
+        && ["pending", "exchanging"].includes(pending.status)
+      ) {
+        pending.status = "superseded";
+        pending.failed_at = nowIso();
+        delete pending.verifier_envelope;
+      }
+    }
+    data.mcpOauthStates.push(transaction);
+    return transaction;
+  });
   return {
-    ...connection,
+    provider_id: provider.id,
+    authorization_url: buildManagedAuthorizationUrl(provider, { state, codeChallenge }),
+    expires_at: transaction.expires_at,
+    cookie: serializeMcpOAuthCookie(browserNonce, env)
+  };
+}
+
+export async function completeManagedMcpOAuth({
+  store,
+  providerId,
+  query,
+  cookieHeader,
+  key,
+  env = process.env
+}) {
+  if (!key) throw mcpError(503, "MCP credential encryption is not configured.", "mcp_key_missing");
+  const normalizedProviderId = String(providerId || "").trim().toLowerCase();
+  const provider = managedMcpProvider(normalizedProviderId, env);
+  const state = String(query?.state || "").trim();
+  if (!/^[A-Za-z0-9_-]{40,128}$/.test(state)) {
+    throw mcpError(400, "OAuth state is invalid.", "mcp_oauth_state_invalid");
+  }
+  const stateDigest = digest(state);
+  const transaction = store.read((data) => (data.mcpOauthStates || [])
+    .find((item) => item.state_digest === stateDigest));
+  if (!transaction || transaction.provider_id !== provider.id) {
+    throw mcpError(400, "OAuth state was not found.", "mcp_oauth_state_invalid");
+  }
+  if (transaction.status !== "pending") {
+    throw mcpError(409, "OAuth state has already been used.", "mcp_oauth_state_replayed");
+  }
+  if (Date.parse(transaction.expires_at || "") <= Date.now()) {
+    await setOauthTransactionStatus(store, transaction.oauth_state_id, "expired");
+    throw mcpError(410, "OAuth connection attempt expired. Start again.", "mcp_oauth_state_expired");
+  }
+  const browserNonce = readCookie(cookieHeader, mcpOAuthCookieName(env));
+  if (!browserNonce || !safeDigestEqual(digest(browserNonce), transaction.browser_nonce_digest)) {
+    throw mcpError(403, "OAuth browser binding did not match.", "mcp_oauth_browser_mismatch");
+  }
+  await store.mutate((data) => {
+    const current = (data.mcpOauthStates || []).find((item) => item.oauth_state_id === transaction.oauth_state_id);
+    if (!current || current.status !== "pending") {
+      throw mcpError(409, "OAuth state has already been used.", "mcp_oauth_state_replayed");
+    }
+    current.status = "exchanging";
+    current.exchange_started_at = nowIso();
+    return current;
+  });
+
+  if (query?.error) {
+    await setOauthTransactionStatus(store, transaction.oauth_state_id, "denied");
+    const error = mcpError(400, "Google account access was not granted.", "mcp_oauth_denied");
+    error.oauth_redirect = true;
+    error.oauth_reason = "denied";
+    error.oauth_clear_cookie = true;
+    throw error;
+  }
+
+  let credential;
+  try {
+    const verifier = decryptMcpValue(
+      transaction.verifier_envelope,
+      key,
+      mcpOAuthStateAad(transaction)
+    );
+    credential = await exchangeManagedAuthorizationCode(provider, {
+      code: query?.code,
+      codeVerifier: verifier.code_verifier
+    });
+    assertManagedCredentialScopes(provider, credential);
+    const currentConnection = transaction.connection_id
+      ? store.read((data) => (data.mcpConnections || [])
+        .find((item) => item.connection_id === transaction.connection_id))
+      : null;
+    if (transaction.connection_id && (
+      !currentConnection
+      || currentConnection.workspace_id !== transaction.workspace_id
+      || currentConnection.provider_id !== provider.id
+      || currentConnection.created_by !== transaction.created_by
+    )) {
+      throw mcpError(409, "The connection changed while authorization was in progress.", "mcp_oauth_connection_changed");
+    }
+    const connectionId = currentConnection?.connection_id || makeId("mcpconn");
+    const authorizedAt = nowIso();
+    const candidate = {
+      ...(currentConnection || {}),
+      connection_id: connectionId,
+      name: currentConnection?.name || provider.name,
+      template_id: provider.id,
+      provider_id: provider.id,
+      connection_mode: "managed",
+      endpoint_url: provider.endpoint_url,
+      auth_type: "oauth2",
+      trust_read_annotations: true,
+      credential: encryptMcpValue(
+        credential,
+        key,
+        mcpConnectionAad(connectionId, transaction.workspace_id)
+      ),
+      status: "checking",
+      protocol_version: MCP_PROTOCOL_VERSION,
+      tools: currentConnection?.tools || [],
+      workspace_id: transaction.workspace_id,
+      visibility: "private",
+      created_by: currentConnection?.created_by || transaction.created_by,
+      created_at: currentConnection?.created_at || transaction.created_at,
+      updated_at: authorizedAt,
+      last_authorized_at: authorizedAt
+    };
+    delete candidate.auth_error_at;
+    const discovery = await discoverMcpTools(candidate, { key, authOverride: credential });
+    const completed = {
+      ...candidate,
+      status: "ready",
+      tools: discovery.tools,
+      protocol_version: discovery.protocol_version,
+      last_connected_at: nowIso(),
+      updated_at: nowIso()
+    };
+    await store.mutate((data) => {
+      data.mcpConnections ||= [];
+      const index = data.mcpConnections.findIndex((item) => item.connection_id === connectionId);
+      if (index < 0 && data.mcpConnections.some((item) =>
+        item.workspace_id === transaction.workspace_id
+        && item.created_by === transaction.created_by
+        && item.provider_id === provider.id
+      )) {
+        throw mcpError(409, `${provider.name} is already connected.`, "mcp_provider_already_connected");
+      }
+      if (index >= 0) data.mcpConnections[index] = completed;
+      else data.mcpConnections.push(completed);
+      const currentState = (data.mcpOauthStates || [])
+        .find((item) => item.oauth_state_id === transaction.oauth_state_id);
+      if (!currentState || currentState.status !== "exchanging") {
+        throw mcpError(409, "OAuth transaction state changed unexpectedly.", "mcp_oauth_state_changed");
+      }
+      currentState.status = "completed";
+      currentState.connection_id = connectionId;
+      currentState.completed_at = nowIso();
+      delete currentState.verifier_envelope;
+      return completed;
+    });
+    return {
+      connection: completed,
+      clear_cookie: serializeMcpOAuthCookie("", env, { clear: true })
+    };
+  } catch (error) {
+    if (credential) {
+      await revokeManagedCredential(provider, credential).catch(() => undefined);
+    }
+    await setOauthTransactionStatus(store, transaction.oauth_state_id, "failed");
+    error.oauth_redirect = true;
+    error.oauth_reason = "failed";
+    error.oauth_clear_cookie = true;
+    throw error;
+  }
+}
+
+export async function revokeMcpConnection(connection, { key, env = process.env }) {
+  if (connection?.auth_type !== "oauth2") return false;
+  const credential = decryptMcpValue(
+    connection.credential,
+    key,
+    mcpConnectionAad(connection.connection_id, connection.workspace_id)
+  );
+  const provider = managedMcpProvider(connection.provider_id, env);
+  await revokeManagedCredential(provider, credential);
+  return true;
+}
+
+export function clearMcpOAuthCookie(env = process.env) {
+  return serializeMcpOAuthCookie("", env, { clear: true });
+}
+
+export async function refreshMcpConnection(connection, { key, store }) {
+  const discovery = await discoverMcpTools(connection, { key, store });
+  const latest = store?.read((data) => (data.mcpConnections || [])
+    .find((item) => item.connection_id === connection.connection_id)) || connection;
+  return {
+    ...latest,
     status: "ready",
     tools: discovery.tools,
     protocol_version: discovery.protocol_version,
@@ -205,27 +502,28 @@ export async function refreshMcpConnection(connection, { key }) {
   };
 }
 
-export async function discoverMcpTools(connection, { key }) {
-  const auth = connectionAuth(connection, key);
-  const session = await initializeMcp(connection.endpoint_url, auth);
-  const tools = [];
-  const toolNames = new Set();
-  let cursor;
-  for (let page = 0; page < 10; page += 1) {
-    const response = await mcpRpc(connection.endpoint_url, auth, session, "tools/list", cursor ? { cursor } : {});
-    const rows = Array.isArray(response?.tools) ? response.tools : [];
-    for (const raw of rows) {
-      if (tools.length >= MAX_TOOLS) throw mcpError(502, `MCP server exposed more than ${MAX_TOOLS} tools.`, "mcp_tool_limit");
-      const normalized = normalizeDiscoveredTool(raw);
-      if (toolNames.has(normalized.name)) throw mcpError(502, `MCP server repeated tool name: ${normalized.name}.`, "mcp_duplicate_tool");
-      toolNames.add(normalized.name);
-      normalized.requires_approval = normalized.risk !== "read" || connection.trust_read_annotations !== true;
-      tools.push(normalized);
+export async function discoverMcpTools(connection, { key, store, authOverride } = {}) {
+  return withMcpConnectionAuth(connection, { key, store, authOverride }, async (auth) => {
+    const session = await initializeMcp(connection.endpoint_url, auth);
+    const tools = [];
+    const toolNames = new Set();
+    let cursor;
+    for (let page = 0; page < 10; page += 1) {
+      const response = await mcpRpc(connection.endpoint_url, auth, session, "tools/list", cursor ? { cursor } : {});
+      const rows = Array.isArray(response?.tools) ? response.tools : [];
+      for (const raw of rows) {
+        if (tools.length >= MAX_TOOLS) throw mcpError(502, `MCP server exposed more than ${MAX_TOOLS} tools.`, "mcp_tool_limit");
+        const normalized = normalizeDiscoveredTool(raw);
+        if (toolNames.has(normalized.name)) throw mcpError(502, `MCP server repeated tool name: ${normalized.name}.`, "mcp_duplicate_tool");
+        toolNames.add(normalized.name);
+        normalized.requires_approval = normalized.risk !== "read" || connection.trust_read_annotations !== true;
+        tools.push(normalized);
+      }
+      cursor = typeof response?.nextCursor === "string" && response.nextCursor ? response.nextCursor : null;
+      if (!cursor) break;
     }
-    cursor = typeof response?.nextCursor === "string" && response.nextCursor ? response.nextCursor : null;
-    if (!cursor) break;
-  }
-  return { protocol_version: session.protocolVersion, tools };
+    return { protocol_version: session.protocolVersion, tools };
+  });
 }
 
 async function initializeMcp(endpointUrl, auth) {
@@ -270,13 +568,14 @@ async function mcpNotification(endpointUrl, auth, session, method, params) {
   });
 }
 
-export async function callMcpTool(connection, tool, argumentsValue, { key }) {
+export async function callMcpTool(connection, tool, argumentsValue, { key, store }) {
   validateToolArguments(tool.input_schema, argumentsValue);
-  const auth = connectionAuth(connection, key);
-  const session = await initializeMcp(connection.endpoint_url, auth);
-  const result = await mcpRpc(connection.endpoint_url, auth, session, "tools/call", {
-    name: tool.name,
-    arguments: argumentsValue
+  const result = await withMcpConnectionAuth(connection, { key, store }, async (auth) => {
+    const session = await initializeMcp(connection.endpoint_url, auth);
+    return mcpRpc(connection.endpoint_url, auth, session, "tools/call", {
+      name: tool.name,
+      arguments: argumentsValue
+    });
   });
   const encoded = JSON.stringify(result);
   if (Buffer.byteLength(encoded) > MAX_RPC_BYTES) {
@@ -297,11 +596,18 @@ export function resolveAgentMcpBindings(rawBindings, data, actor) {
   for (const raw of rawBindings.slice(0, 20)) {
     const connectionId = String(raw?.connection_id || "").trim();
     const connection = (data.mcpConnections || []).find((item) => item.connection_id === connectionId);
-    if (!connection || connection.workspace_id !== actor.workspace_id) {
+    if (
+      !connection
+      || connection.workspace_id !== actor.workspace_id
+      || (connection.visibility === "private" && connection.created_by !== actor.user_id)
+    ) {
       throw mcpError(404, "MCP connection not found.", "mcp_connection_not_found");
     }
     const requested = [...new Set((Array.isArray(raw?.tool_names) ? raw.tool_names : []).map(String))];
     if (!requested.length) continue;
+    if (connection.status !== "ready") {
+      throw mcpError(409, "MCP connection must be reconnected before tools can be assigned.", "mcp_connection_unavailable");
+    }
     const tools = requested.map((name) => {
       if (aliases.size >= 80) throw mcpError(413, "An agent can use at most 80 connected tools.", "mcp_agent_tool_limit");
       const tool = (connection.tools || []).find((item) => item.name === name);
@@ -351,10 +657,15 @@ export function isMcpToolAlias(name) {
 }
 
 export function marketplaceMcpRequirements(agent) {
-  return (agent.mcp_bindings || []).map((binding) => ({
-    connection_name: MCP_TEMPLATES.find((template) => template.id === binding.template_id)?.name || "Custom MCP connection",
-    tools: binding.tools.map((tool) => ({ name: tool.name, title: tool.title, risk: tool.risk }))
-  }));
+  return (agent.mcp_bindings || []).map((binding) => {
+    const template = MCP_TEMPLATES.find((item) => item.id === binding.template_id);
+    return {
+      connection_name: template?.name || "Custom MCP connection",
+      connection_mode: template?.connection_mode || "custom",
+      provider_id: template?.connection_mode === "managed" ? template.id : null,
+      tools: binding.tools.map((tool) => ({ name: tool.name, title: tool.title, risk: tool.risk }))
+    };
+  });
 }
 
 export function publicMcpApproval(approval, key) {
@@ -403,7 +714,7 @@ export async function executeMcpGatewayCall({ store, body, key }) {
   }
   const startedAt = nowIso();
   try {
-    const result = await callMcpTool(resolved.connection, resolved.tool, argumentsValue, { key });
+    const result = await callMcpTool(resolved.connection, resolved.tool, argumentsValue, { key, store });
     await appendMcpAudit(store, {
       context, agent, connection: resolved.connection, tool: resolved.tool, alias,
       status: "completed", argumentsValue, result, startedAt
@@ -526,7 +837,7 @@ export async function decideMcpApproval({ store, approvalId, actor, decision, ke
   });
   let result;
   try {
-    result = await callMcpTool(resolved.connection, resolved.tool, envelope.arguments, { key });
+    result = await callMcpTool(resolved.connection, resolved.tool, envelope.arguments, { key, store });
   } catch (error) {
     await store.mutate((data) => {
       const current = data.mcpApprovals.find((item) => item.approval_id === approvalId);
@@ -652,6 +963,98 @@ function normalizeGatewayContext(value) {
   return normalized;
 }
 
+async function withMcpConnectionAuth(connection, { key, store, authOverride }, operation) {
+  const auth = authOverride || await resolveMcpConnectionAuth(connection, { key, store });
+  try {
+    return await operation(auth);
+  } catch (error) {
+    if (
+      auth?.type !== "oauth2"
+      || error.code !== "mcp_unauthorized"
+      || !store
+      || !auth.refresh_token
+    ) {
+      throw error;
+    }
+    const refreshed = await refreshMcpOAuthCredential(connection, { key, store, force: true });
+    return operation(refreshed);
+  }
+}
+
+async function resolveMcpConnectionAuth(connection, { key, store }) {
+  const auth = connectionAuth(connection, key);
+  if (auth.type !== "oauth2" || !oauthCredentialNeedsRefresh(auth)) return auth;
+  return refreshMcpOAuthCredential(connection, { key, store, force: false });
+}
+
+async function refreshMcpOAuthCredential(connection, { key, store, force }) {
+  if (!store) {
+    throw mcpError(409, "This OAuth connection must be authorized again.", "mcp_oauth_reauthorization_required");
+  }
+  const existing = oauthRefreshInflight.get(connection.connection_id);
+  if (existing) return existing;
+  const task = (async () => {
+    const latest = store.read((data) => (data.mcpConnections || [])
+      .find((item) => item.connection_id === connection.connection_id));
+    if (!latest || latest.workspace_id !== connection.workspace_id || latest.auth_type !== "oauth2") {
+      throw mcpError(409, "OAuth connection is unavailable.", "mcp_connection_unavailable");
+    }
+    const currentAuth = connectionAuth(latest, key);
+    if (!force && !oauthCredentialNeedsRefresh(currentAuth)) return currentAuth;
+    if (!currentAuth.refresh_token) {
+      await markMcpConnectionReauthorization(store, latest.connection_id);
+      throw mcpError(409, "This OAuth connection must be authorized again.", "mcp_oauth_reauthorization_required");
+    }
+    let refreshed;
+    try {
+      const provider = managedMcpProvider(latest.provider_id);
+      refreshed = await refreshManagedAccessToken(provider, currentAuth);
+    } catch {
+      await markMcpConnectionReauthorization(store, latest.connection_id);
+      throw mcpError(409, "This OAuth connection must be authorized again.", "mcp_oauth_reauthorization_required");
+    }
+    const encrypted = encryptMcpValue(
+      refreshed,
+      key,
+      mcpConnectionAad(latest.connection_id, latest.workspace_id)
+    );
+    await store.mutate((data) => {
+      const stored = (data.mcpConnections || [])
+        .find((item) => item.connection_id === latest.connection_id);
+      if (!stored || stored.workspace_id !== latest.workspace_id) {
+        throw mcpError(409, "OAuth connection disappeared during refresh.", "mcp_connection_unavailable");
+      }
+      stored.credential = encrypted;
+      stored.status = "ready";
+      stored.updated_at = nowIso();
+      stored.last_authorized_at = nowIso();
+      delete stored.auth_error_at;
+      return stored;
+    });
+    return refreshed;
+  })();
+  oauthRefreshInflight.set(connection.connection_id, task);
+  try {
+    return await task;
+  } finally {
+    if (oauthRefreshInflight.get(connection.connection_id) === task) {
+      oauthRefreshInflight.delete(connection.connection_id);
+    }
+  }
+}
+
+async function markMcpConnectionReauthorization(store, connectionId) {
+  await store.mutate((data) => {
+    const connection = (data.mcpConnections || []).find((item) => item.connection_id === connectionId);
+    if (connection) {
+      connection.status = "reauthorization_required";
+      connection.auth_error_at = nowIso();
+      connection.updated_at = nowIso();
+    }
+    return connection || null;
+  });
+}
+
 function connectionAuth(connection, key) {
   if (!connection.credential) return { type: "none" };
   return decryptMcpValue(connection.credential, key, mcpConnectionAad(connection.connection_id, connection.workspace_id));
@@ -721,6 +1124,7 @@ async function mcpHttpRequest(endpointUrl, { auth, session, payload, allowEmpty 
   };
   if (session?.id) headers["Mcp-Session-Id"] = session.id;
   if (auth?.type === "bearer") headers.Authorization = `Bearer ${auth.secret}`;
+  if (auth?.type === "oauth2") headers.Authorization = `Bearer ${auth.access_token}`;
   const transport = url.protocol === "https:" ? https : http;
   const configuredTimeout = Number(process.env.APP_MCP_TIMEOUT_MS || 15000);
   const timeoutMs = Number.isFinite(configuredTimeout) ? Math.max(500, Math.min(configuredTimeout, 60000)) : 15000;
@@ -749,6 +1153,10 @@ async function mcpHttpRequest(endpointUrl, { auth, session, payload, allowEmpty 
       response.on("end", () => {
         const responseBody = Buffer.concat(chunks).toString("utf8");
         if (response.statusCode < 200 || response.statusCode >= 300) {
+          if (response.statusCode === 401) {
+            reject(mcpError(502, "MCP server rejected the OAuth credential.", "mcp_unauthorized"));
+            return;
+          }
           reject(mcpError(502, `MCP server returned HTTP ${response.statusCode}.`, "mcp_http_error"));
           return;
         }
@@ -867,6 +1275,59 @@ function mcpApprovalAad(approval) {
 
 function mcpApprovalResultAad(approval) {
   return `mcp-approval-result:v1:${approval.workspace_id}:${approval.approval_id}:${approval.request_digest}`;
+}
+
+function mcpOAuthStateAad(transaction) {
+  return `mcp-oauth-state:v1:${transaction.workspace_id}:${transaction.created_by}:${transaction.provider_id}:${transaction.oauth_state_id}`;
+}
+
+async function setOauthTransactionStatus(store, oauthStateId, status) {
+  return store.mutate((data) => {
+    const transaction = (data.mcpOauthStates || []).find((item) => item.oauth_state_id === oauthStateId);
+    if (!transaction) return null;
+    transaction.status = status;
+    if (["failed", "denied", "expired"].includes(status)) {
+      transaction.failed_at = nowIso();
+      delete transaction.verifier_envelope;
+    }
+    return transaction;
+  });
+}
+
+function serializeMcpOAuthCookie(value, env, { clear = false } = {}) {
+  const name = mcpOAuthCookieName(env);
+  const parts = [
+    `${name}=${clear ? "" : encodeURIComponent(value)}`,
+    "Path=/",
+    "HttpOnly",
+    "SameSite=Lax",
+    clear ? "Max-Age=0" : `Max-Age=${Math.floor(OAUTH_STATE_TTL_MS / 1000)}`
+  ];
+  if (env.NODE_ENV === "production") parts.push("Secure");
+  return parts.join("; ");
+}
+
+function mcpOAuthCookieName(env) {
+  return env.NODE_ENV === "production" ? "__Host-virenis_mcp_oauth" : "virenis_mcp_oauth";
+}
+
+function readCookie(header, name) {
+  for (const pair of String(header || "").split(";")) {
+    const separator = pair.indexOf("=");
+    if (separator < 0 || pair.slice(0, separator).trim() !== name) continue;
+    try {
+      return decodeURIComponent(pair.slice(separator + 1).trim());
+    } catch {
+      return "";
+    }
+  }
+  return "";
+}
+
+function safeDigestEqual(left, right) {
+  const leftBytes = Buffer.from(String(left || ""), "utf8");
+  const rightBytes = Buffer.from(String(right || ""), "utf8");
+  return leftBytes.length === rightBytes.length && crypto.timingSafeEqual(leftBytes, rightBytes);
 }
 
 function safeEndpointOrigin(value) {

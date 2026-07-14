@@ -38,7 +38,7 @@ function mergeSeedCatalog(agents, seedAgents) {
 function initialData(seedAgents) {
   const now = new Date().toISOString();
   return {
-    version: 4,
+    version: 5,
     created_at: now,
     sessions: [],
     messages: [],
@@ -50,6 +50,7 @@ function initialData(seedAgents) {
     runtimeLifecycleIntents: [],
     marketplaceRatings: [],
     mcpConnections: [],
+    mcpOauthStates: [],
     mcpApprovals: [],
     mcpToolCalls: [],
     agents: clone(seedAgents),
@@ -289,7 +290,7 @@ function normalizeData(value, seedAgents) {
     }
   }
   data.version = defaults.version;
-  for (const collection of ["mcpConnections", "mcpApprovals", "mcpToolCalls"]) {
+  for (const collection of ["mcpConnections", "mcpOauthStates", "mcpApprovals", "mcpToolCalls"]) {
     data[collection] = Array.isArray(data[collection]) ? data[collection] : [];
   }
   data.marketplaceRatings = (Array.isArray(data.marketplaceRatings) ? data.marketplaceRatings : [])

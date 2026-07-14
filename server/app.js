@@ -63,8 +63,10 @@ import {
   verifyRuntimeExecutionSubject
 } from "./runtimeClient.js";
 import {
-  MCP_TEMPLATES,
   applyAgentMcpBindings,
+  beginManagedMcpOAuth,
+  clearMcpOAuthCookie,
+  completeManagedMcpOAuth,
   createMcpConnection,
   decideMcpApproval,
   ensureMcpCredentialKey,
@@ -73,7 +75,9 @@ import {
   marketplaceMcpRequirements,
   publicMcpApproval,
   publicMcpConnection,
+  publicMcpTemplates,
   refreshMcpConnection,
+  revokeMcpConnection,
   resolveAgentMcpBindings
 } from "./mcp.js";
 
@@ -161,6 +165,7 @@ export async function createApp({
   const store = createStore({ dbPath, seedAgents: configuredSeedAgents });
   await store.init();
   const mcpCredentialKey = await ensureMcpCredentialKey({ dbPath });
+  publicMcpTemplates();
   if (useApiRuntimeCatalog) {
     const hasLegacySeedRecords = store.read((data) =>
       withoutLegacySeedAgents(data.agents).length !== data.agents.length
@@ -325,6 +330,27 @@ export async function createApp({
       next(error);
     }
   });
+  app.get("/api/mcp/oauth/callback/:provider_id", rateLimiter.middleware, async (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      const completed = await completeManagedMcpOAuth({
+        store,
+        providerId: req.params.provider_id,
+        query: req.query,
+        cookieHeader: req.headers.cookie || "",
+        key: mcpCredentialKey
+      });
+      res.setHeader("Set-Cookie", completed.clear_cookie);
+      res.redirect(303, `/app?mcp_oauth=connected&provider=${encodeURIComponent(completed.connection.provider_id)}`);
+    } catch (error) {
+      if (error.oauth_redirect) {
+        if (error.oauth_clear_cookie) res.setHeader("Set-Cookie", clearMcpOAuthCookie());
+        res.redirect(303, `/app?mcp_oauth=error&reason=${encodeURIComponent(error.oauth_reason || "failed")}`);
+        return;
+      }
+      next(error);
+    }
+  });
   app.use(rateLimiter.middleware);
   app.use(optionalBasicAuth);
   app.use(attachRequestIdentity);
@@ -344,12 +370,33 @@ export async function createApp({
   });
 
   app.get("/api/mcp/templates", (_req, res) => {
-    res.json({ protocol_version: "2025-11-25", templates: MCP_TEMPLATES });
+    res.json({ protocol_version: "2025-11-25", templates: publicMcpTemplates() });
+  });
+
+  app.post("/api/mcp/oauth/start", async (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      const started = await beginManagedMcpOAuth({
+        store,
+        actor: req.auth,
+        body: req.body,
+        key: mcpCredentialKey
+      });
+      res.setHeader("Set-Cookie", started.cookie);
+      res.json({
+        provider_id: started.provider_id,
+        authorization_url: started.authorization_url,
+        expires_at: started.expires_at
+      });
+    } catch (error) {
+      next(error);
+    }
   });
 
   app.get("/api/mcp/connections", (req, res) => {
     const connections = store.read((data) => (data.mcpConnections || [])
       .filter((item) => item.workspace_id === req.auth.workspace_id)
+      .filter((item) => item.visibility !== "private" || item.created_by === req.auth.user_id)
       .map(publicMcpConnection));
     res.json({ connections });
   });
@@ -373,7 +420,7 @@ export async function createApp({
       const current = store.read((data) => (data.mcpConnections || [])
         .find((item) => item.connection_id === req.params.connection_id));
       assertMcpConnectionMutation(current, req);
-      const refreshed = await refreshMcpConnection(current, { key: mcpCredentialKey });
+      const refreshed = await refreshMcpConnection(current, { key: mcpCredentialKey, store });
       await store.mutate((data) => {
         const index = data.mcpConnections.findIndex((item) => item.connection_id === current.connection_id);
         if (index < 0) throwStatus(404, "MCP connection not found.");
@@ -395,11 +442,28 @@ export async function createApp({
         (agent.mcp_bindings || []).some((binding) => binding.connection_id === current.connection_id)
       ));
       if (boundAgents.length) throwStatus(409, `Remove this connection from ${boundAgents.length} agent${boundAgents.length === 1 ? "" : "s"} first.`);
+      let revoked = false;
+      let revocationWarning = false;
+      if (current.auth_type === "oauth2") {
+        try {
+          revoked = await revokeMcpConnection(current, { key: mcpCredentialKey });
+        } catch {
+          revocationWarning = true;
+        }
+      }
       await store.mutate((data) => {
         data.mcpConnections = (data.mcpConnections || []).filter((item) => item.connection_id !== current.connection_id);
+        data.mcpOauthStates = (data.mcpOauthStates || []).filter((item) => item.connection_id !== current.connection_id);
         return true;
       });
-      res.json({ ok: true, connection_id: current.connection_id });
+      res.json({
+        ok: true,
+        connection_id: current.connection_id,
+        provider_revoked: revoked,
+        revocation_warning: revocationWarning
+          ? "The local credential was deleted, but the provider could not confirm revocation. Revoke the app from your provider security settings."
+          : null
+      });
     } catch (error) {
       next(error);
     }
@@ -2556,7 +2620,7 @@ export async function createApp({
       console.error("virenis request failed.", {
         request_id: req.id,
         method: req.method,
-        path: req.originalUrl,
+        path: req.path,
         error: error.message,
         stack: error.stack
       });
@@ -5064,6 +5128,10 @@ function marketplaceAgentSnapshot(agent = {}) {
   const connectorRequirements = Array.isArray(agent.connector_requirements)
     ? agent.connector_requirements.slice(0, 20).map((requirement) => ({
         connection_name: String(requirement?.connection_name || "MCP connection").slice(0, 100),
+        connection_mode: requirement?.connection_mode === "managed" ? "managed" : "custom",
+        provider_id: requirement?.connection_mode === "managed" && /^[a-z0-9_-]{1,64}$/.test(String(requirement?.provider_id || ""))
+          ? String(requirement.provider_id)
+          : null,
         tools: (Array.isArray(requirement?.tools) ? requirement.tools : []).slice(0, 50).map((tool) => ({
           name: String(tool?.name || "").slice(0, 128),
           title: String(tool?.title || tool?.name || "Tool").slice(0, 160),

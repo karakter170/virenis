@@ -272,6 +272,25 @@ function Workspace({ onHome }) {
   }, []);
 
   useEffect(() => {
+    const parameters = new URLSearchParams(window.location.search);
+    const oauthStatus = parameters.get("mcp_oauth");
+    if (!oauthStatus) return;
+    setResourceView("connections");
+    setResourcesOpen(true);
+    if (oauthStatus === "error") {
+      const reason = parameters.get("reason");
+      setError(reason === "denied"
+        ? "The connection was cancelled before access was granted."
+        : "The account connection could not be completed. Please try again.");
+    }
+    parameters.delete("mcp_oauth");
+    parameters.delete("provider");
+    parameters.delete("reason");
+    const search = parameters.toString();
+    window.history.replaceState({}, "", `${window.location.pathname}${search ? `?${search}` : ""}`);
+  }, []);
+
+  useEffect(() => {
     if (nearBottomRef.current && threadRef.current) {
       threadRef.current.scrollTo({ top: threadRef.current.scrollHeight, behavior: loading ? "auto" : "smooth" });
     }
@@ -1770,13 +1789,16 @@ function ResourcesSheet({
   );
 }
 
-function ConnectionsPanel({ connections = [], templates = [], approvals = [], canWrite, onRefresh }) {
+export function ConnectionsPanel({ connections = [], templates = [], approvals = [], canWrite, onRefresh }) {
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState({ template_id: "custom", name: "", endpoint_url: "", auth_type: "none", token: "", trust_read_annotations: false });
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
   const pendingApprovals = approvals.filter((approval) => approval.status === "pending");
   const recentApprovals = approvals.filter((approval) => approval.status !== "pending").slice(-4).reverse();
+  const managedProviders = templates.filter((template) => template.connection_mode === "managed");
+  const customTemplates = templates.filter((template) => template.connection_mode !== "managed");
 
   function chooseTemplate(template) {
     setForm((current) => ({
@@ -1787,10 +1809,34 @@ function ConnectionsPanel({ connections = [], templates = [], approvals = [], ca
     }));
   }
 
+  async function connectManaged(provider, connectionId) {
+    if (provider.availability !== "available") {
+      setError(provider.availability_message || "This managed connection has not been configured by an administrator.");
+      return;
+    }
+    const busyId = connectionId || `provider:${provider.id}`;
+    setBusy(busyId);
+    setError("");
+    setNotice("");
+    try {
+      const started = await api.post("/api/mcp/oauth/start", {
+        provider_id: provider.id,
+        ...(connectionId ? { connection_id: connectionId } : {})
+      });
+      const authorization = new URL(started.authorization_url);
+      if (!/^https?:$/.test(authorization.protocol)) throw new Error("The provider returned an invalid authorization address.");
+      window.location.assign(authorization.toString());
+    } catch (connectionError) {
+      setBusy("");
+      setError(friendlyError(connectionError));
+    }
+  }
+
   async function createConnection(event) {
     event.preventDefault();
     setBusy("create");
     setError("");
+    setNotice("");
     try {
       await api.post("/api/mcp/connections", {
         name: form.name,
@@ -1812,6 +1858,7 @@ function ConnectionsPanel({ connections = [], templates = [], approvals = [], ca
   async function refreshConnection(connection) {
     setBusy(connection.connection_id);
     setError("");
+    setNotice("");
     try {
       await api.post(`/api/mcp/connections/${encodeURIComponent(connection.connection_id)}/refresh`, {});
       await onRefresh();
@@ -1825,8 +1872,10 @@ function ConnectionsPanel({ connections = [], templates = [], approvals = [], ca
   async function deleteConnection(connection) {
     setBusy(connection.connection_id);
     setError("");
+    setNotice("");
     try {
-      await api.delete(`/api/mcp/connections/${encodeURIComponent(connection.connection_id)}`);
+      const result = await api.delete(`/api/mcp/connections/${encodeURIComponent(connection.connection_id)}`);
+      if (result.revocation_warning) setNotice(result.revocation_warning);
       await onRefresh();
     } catch (deleteError) {
       setError(friendlyError(deleteError));
@@ -1854,12 +1903,51 @@ function ConnectionsPanel({ connections = [], templates = [], approvals = [], ca
         <div>
           <span className="eyebrow">Workspace tools</span>
           <h2 id="connections-heading">Connections</h2>
-          <p>Connect remote MCP servers, then give each agent only the tools it needs.</p>
+          <p>Connect an account in a few clicks, then give each agent only the tools it needs.</p>
         </div>
-        {canWrite && <button type="button" className="text-button primary" onClick={() => setShowForm((value) => !value)}><Plus size={15} />Add connection</button>}
+        {canWrite && <button type="button" className="text-button ghost" onClick={() => setShowForm((value) => !value)}><Settings2 size={15} />Custom MCP</button>}
       </div>
 
       {error && <div className="form-error" role="alert">{error}</div>}
+      {notice && <div className="connection-notice" role="status">{notice}</div>}
+
+      {managedProviders.length > 0 && (
+        <div className="managed-connections-block">
+          <div className="connections-subheading"><span><Plug size={15} /></span><div><strong>Connect your accounts</strong><small>No endpoints or tokens to copy. Sign in with the provider and choose what your agents can use.</small></div></div>
+          <div className="managed-provider-grid">
+            {managedProviders.map((provider) => {
+              const providerConnections = connections.filter((connection) => connection.provider_id === provider.id);
+              const connecting = busy === `provider:${provider.id}`;
+              return (
+                <article className="managed-provider-card" key={provider.id}>
+                  <div className="managed-provider-head">
+                    <span className={`managed-provider-icon ${provider.id}`}><AtSign size={20} /></span>
+                    <div><strong>{provider.name}</strong><small>{provider.description}</small></div>
+                    {provider.preview && <i>Preview</i>}
+                  </div>
+                  <div className="managed-provider-policy"><Check size={14} /><span>Read-only tools can run automatically. Actions still require your approval.</span></div>
+                  <footer>
+                    <small>{providerConnections.length
+                      ? `${providerConnections.length} account connection${providerConnections.length === 1 ? "" : "s"}`
+                      : provider.availability_message}</small>
+                    {canWrite && (
+                      <button
+                        type="button"
+                        className="text-button primary"
+                        disabled={connecting || provider.availability !== "available" || providerConnections.length > 0}
+                        onClick={() => connectManaged(provider)}
+                      >
+                        {connecting ? <LoaderCircle className="spin" size={14} /> : <Plug size={14} />}
+                        {providerConnections.length ? "Connected" : provider.connect_label || `Connect ${provider.name}`}
+                      </button>
+                    )}
+                  </footer>
+                </article>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {pendingApprovals.length > 0 && (
         <div className="approval-stack" aria-label="Actions waiting for approval">
@@ -1893,9 +1981,9 @@ function ConnectionsPanel({ connections = [], templates = [], approvals = [], ca
 
       {showForm && (
         <form className="connection-form" onSubmit={createConnection}>
-          <div className="builder-heading"><span>NEW CONNECTION</span><h3>Choose a starting point</h3><p>Virenis performs a live handshake and imports the server's current tool schemas.</p></div>
+          <div className="builder-heading"><span>ADVANCED</span><h3>Connect a custom MCP server</h3><p>For servers that do not offer a managed sign-in. Virenis performs a live handshake and imports the current tool schemas.</p></div>
           <div className="connection-template-grid">
-            {templates.map((template) => (
+            {customTemplates.map((template) => (
               <button type="button" className={form.template_id === template.id ? "selected" : ""} key={template.id} onClick={() => chooseTemplate(template)}>
                 <Plug size={16} /><span><strong>{template.name}</strong><small>{template.description}</small></span>{form.template_id === template.id && <Check size={13} />}
               </button>
@@ -1903,7 +1991,7 @@ function ConnectionsPanel({ connections = [], templates = [], approvals = [], ca
           </div>
           <div className="advanced-builder-grid">
             <div className="builder-field"><label htmlFor="mcp-name">Connection name</label><input id="mcp-name" value={form.name} onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))} required maxLength={100} placeholder="Product workspace" /></div>
-            <div className="builder-field"><label htmlFor="mcp-endpoint">HTTPS endpoint</label><input id="mcp-endpoint" value={form.endpoint_url} onChange={(event) => setForm((current) => ({ ...current, endpoint_url: event.target.value }))} required type="url" placeholder={templates.find((template) => template.id === form.template_id)?.endpoint_placeholder || "https://mcp.example.com/mcp"} /></div>
+            <div className="builder-field"><label htmlFor="mcp-endpoint">HTTPS endpoint</label><input id="mcp-endpoint" value={form.endpoint_url} onChange={(event) => setForm((current) => ({ ...current, endpoint_url: event.target.value }))} required type="url" placeholder={customTemplates.find((template) => template.id === form.template_id)?.endpoint_placeholder || "https://mcp.example.com/mcp"} /></div>
           </div>
           <fieldset className="connection-auth"><legend>Authentication</legend><label><input type="radio" name="mcp-auth" checked={form.auth_type === "none"} onChange={() => setForm((current) => ({ ...current, auth_type: "none", token: "" }))} />No authentication</label><label><input type="radio" name="mcp-auth" checked={form.auth_type === "bearer"} onChange={() => setForm((current) => ({ ...current, auth_type: "bearer" }))} />Bearer token</label></fieldset>
           {form.auth_type === "bearer" && <div className="builder-field"><label htmlFor="mcp-token">Bearer token</label><input id="mcp-token" type="password" autoComplete="new-password" value={form.token} onChange={(event) => setForm((current) => ({ ...current, token: event.target.value }))} required /><small>Encrypted before it is written; never sent to an agent or published.</small></div>}
@@ -1914,15 +2002,15 @@ function ConnectionsPanel({ connections = [], templates = [], approvals = [], ca
 
       <div className="connection-list">
         {connections.map((connection) => (
-          <article className="connection-card" key={connection.connection_id}>
-            <div className="connection-card-head"><span className="connection-icon"><Plug size={17} /></span><div><strong>{connection.name}</strong><small>{connection.endpoint_origin} · {connection.auth_type === "bearer" ? "Protected" : "No auth"}</small></div><i className="connection-ready"><span />Ready</i></div>
+          <article className={`connection-card ${connection.status !== "ready" ? "connection-needs-attention" : ""}`} key={connection.connection_id}>
+            <div className="connection-card-head"><span className="connection-icon"><Plug size={17} /></span><div><strong>{connection.name}</strong><small>{connection.connection_mode === "managed" ? "Connected securely with OAuth" : `${connection.endpoint_origin} · ${connection.auth_type === "bearer" ? "Protected" : "No auth"}`}</small></div><i className={connection.status === "ready" ? "connection-ready" : "connection-warning"}><span />{connection.status === "ready" ? "Ready" : "Reconnect"}</i></div>
             <div className="connection-tools">
               {(connection.tools || []).map((tool) => <span className={!tool.requires_approval ? "read" : "write"} key={tool.name}>{tool.title || tool.name}<small>{!tool.requires_approval ? "Read" : "Approval"}</small></span>)}
             </div>
-            <footer><small>{connection.tools?.length || 0} discovered tools · {connection.read_policy === "allow_declared_reads" ? "trusted read labels" : "approval for every call"}</small>{canWrite && <div><IconButton compact label={`Refresh ${connection.name}`} disabled={busy === connection.connection_id} onClick={() => refreshConnection(connection)}><RefreshCw className={busy === connection.connection_id ? "spin" : ""} size={15} /></IconButton><IconButton compact label={`Delete ${connection.name}`} disabled={busy === connection.connection_id} onClick={() => deleteConnection(connection)}><Trash2 size={15} /></IconButton></div>}</footer>
+            <footer><small>{connection.tools?.length || 0} discovered tools · {connection.read_policy === "allow_declared_reads" ? "read tools run automatically" : "approval for every call"}</small>{canWrite && <div>{connection.reauthorization_required && <button type="button" className="text-button primary compact" disabled={busy === connection.connection_id} onClick={() => connectManaged(templates.find((template) => template.id === connection.provider_id) || { id: connection.provider_id, availability: "available" }, connection.connection_id)}>{busy === connection.connection_id ? <LoaderCircle className="spin" size={13} /> : <RefreshCw size={13} />}Reconnect</button>}<IconButton compact label={`Refresh ${connection.name}`} disabled={busy === connection.connection_id || connection.reauthorization_required} onClick={() => refreshConnection(connection)}><RefreshCw className={busy === connection.connection_id ? "spin" : ""} size={15} /></IconButton><IconButton compact label={`Delete ${connection.name}`} disabled={busy === connection.connection_id} onClick={() => deleteConnection(connection)}><Trash2 size={15} /></IconButton></div>}</footer>
           </article>
         ))}
-        {!connections.length && !showForm && <div className="empty-resource-state"><span><Plug size={22} /></span><h3>No connections yet</h3><p>Add a remote MCP server, review its tools, and assign only the ones an agent needs.</p></div>}
+        {!connections.length && !showForm && <div className="empty-resource-state"><span><Plug size={22} /></span><h3>No accounts connected yet</h3><p>Connect a provider above, review its tools, and assign only the ones an agent needs.</p></div>}
       </div>
     </section>
   );
@@ -3441,13 +3529,13 @@ function AgentDialog({ auth, agent, agents, documents, mcpConnections = [], onCl
                     <div className="mcp-agent-connections">
                       {mcpConnections.map((connection) => (
                         <details key={connection.connection_id} open={(form.mcp_bindings || []).some((binding) => binding.connection_id === connection.connection_id)}>
-                          <summary><Plug size={15} /><span><strong>{connection.name}</strong><small>{connection.tools?.length || 0} tools available</small></span></summary>
+                          <summary><Plug size={15} /><span><strong>{connection.name}</strong><small>{connection.status === "ready" ? `${connection.tools?.length || 0} tools available` : "Reconnect this account in Connections"}</small></span></summary>
                           <div>
                             {(connection.tools || []).map((tool) => {
                               const selected = (form.mcp_bindings || []).some((binding) => binding.connection_id === connection.connection_id && binding.tool_names.includes(tool.name));
                               return (
                                 <label className={selected ? "selected" : ""} key={tool.name}>
-                                  <input type="checkbox" checked={selected} onChange={(event) => toggleMcpTool(connection.connection_id, tool.name, event.target.checked)} />
+                                  <input type="checkbox" checked={selected} disabled={connection.status !== "ready" && !selected} onChange={(event) => toggleMcpTool(connection.connection_id, tool.name, event.target.checked)} />
                                   <span><strong>{tool.title || tool.name}</strong><small>{tool.description}</small></span>
                                   <i className={!tool.requires_approval ? "read" : "write"}>{!tool.requires_approval ? "Read" : "Approval"}</i>
                                 </label>

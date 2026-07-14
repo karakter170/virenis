@@ -5,6 +5,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import {
   AgentCatalog,
   AgentGraph,
+  ConnectionsPanel,
   MarketplaceAgentDialog,
   MarketplacePanel,
   PublishDialog,
@@ -32,6 +33,42 @@ describe("Agent Studio product surfaces", () => {
     expect(markup).toContain("MODEL APIS");
     expect(markup).toContain("Switch providers, not the workflow.");
     expect(markup).not.toMatch(/LoRA/i);
+  });
+
+  it("makes managed account authorization primary and keeps endpoint/token fields behind Custom MCP", () => {
+    const markup = renderToStaticMarkup(createElement(ConnectionsPanel, {
+      connections: [],
+      templates: [
+        {
+          id: "gmail",
+          name: "Gmail",
+          description: "Search mail and create drafts.",
+          connection_mode: "managed",
+          auth_type: "oauth2",
+          availability: "available",
+          availability_message: "Connect with Google",
+          connect_label: "Connect Gmail",
+          preview: true
+        },
+        {
+          id: "custom",
+          name: "Custom HTTPS",
+          description: "Connect a server you administer.",
+          connection_mode: "custom",
+          auth_type: "none",
+          endpoint_placeholder: "https://mcp.example.com/mcp"
+        }
+      ],
+      approvals: [],
+      canWrite: true,
+      onRefresh: async () => undefined
+    }));
+    expect(markup).toContain("Connect your accounts");
+    expect(markup).toContain("Connect Gmail");
+    expect(markup).toContain("No endpoints or tokens to copy");
+    expect(markup).toContain("Custom MCP");
+    expect(markup).not.toContain("HTTPS endpoint");
+    expect(markup).not.toContain("Bearer token");
   });
 
   it("distinguishes agent bubbles by color without embedding icons", () => {
