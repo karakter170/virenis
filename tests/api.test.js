@@ -3157,8 +3157,8 @@ describe("chat execution", () => {
       expect(chatBody.options.allowed_adapters).toContain("writing_synthesis_lora");
       expect(chatBody.options.allowed_adapters).toContain("finance_reasoning_lora");
       expect(chatBody.options.allowed_adapters).not.toContain("alice_private_manual_lora");
-      expect(chatBody.options.max_tokens).toBe(256);
-      expect(chatBody.options.refiner_max_tokens).toBe(384);
+      expect(chatBody.options.max_tokens).toBe(1024);
+      expect(chatBody.options.refiner_max_tokens).toBe(2048);
       expect(chatBody.query).toBe("Use @alice_private_manual if available, then preserve this mention.");
       expect(completedRun.sources).toHaveLength(1);
       expect(completedRun.sources[0]).toMatchObject({

@@ -46,6 +46,7 @@ import {
   Trash2,
   Upload,
   UserPlus,
+  WalletCards,
   WandSparkles,
   ListTodo,
   X
@@ -378,6 +379,7 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
   const [runsById, setRunsById] = useState({});
   const [contractsById, setContractsById] = useState({});
   const [activeRun, setActiveRun] = useState(null);
+  const [progressiveRunId, setProgressiveRunId] = useState(null);
   const [draft, setDraft] = useState("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -411,6 +413,7 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
   const eventSourceRef = useRef(null);
   const sendInFlightRef = useRef(false);
   const sendRetryRef = useRef(null);
+  const progressivelyRenderedRunIdsRef = useRef(new Set());
   const oauthReturnRef = useRef((() => {
     const parameters = new URLSearchParams(window.location.search);
     return {
@@ -823,6 +826,10 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
         }));
       }
       if (["final.completed", "run.failed"].includes(event.type)) {
+        if (event.type === "final.completed" && !progressivelyRenderedRunIdsRef.current.has(runId)) {
+          progressivelyRenderedRunIdsRef.current.add(runId);
+          setProgressiveRunId(runId);
+        }
         await fetchRun(runId, { makeActive: true }).catch(() => undefined);
       }
       if (event.type === "final.completed" || event.type === "run.failed") {
@@ -1173,8 +1180,11 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
               ? `${billing.account.reserved_credits} credits are reserved for active requests`
               : "Open balance details"}
           >
-            <span>Balance</span>
-            <strong>{formatCreditDisplay(billing?.account?.balance_credits)}</strong>
+            <span className="balance-pill-icon" aria-hidden="true"><WalletCards size={14} /></span>
+            <span className="balance-pill-copy">
+              <span>Balance</span>
+              <strong>{formatCreditDisplay(billing?.account?.balance_credits)}</strong>
+            </span>
           </button>
           <IconButton label="New chat" onClick={newChat} disabled={!canWrite}>
             <SquarePen size={19} />
@@ -1236,6 +1246,13 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
                 onRetry={retryAnswer}
                 onFeedback={setFeedbackRunId}
                 onDetails={openRunDetails}
+                progressivelyRender={message.run_id === progressiveRunId}
+                onProgressiveRenderComplete={() => setProgressiveRunId((current) => current === message.run_id ? null : current)}
+                onProgressiveRenderProgress={() => {
+                  if (nearBottomRef.current && threadRef.current) {
+                    threadRef.current.scrollTop = threadRef.current.scrollHeight;
+                  }
+                }}
               />
             ))}
 
@@ -1798,7 +1815,7 @@ function HistorySheet({ sessions, activeSessionId, canWrite, onClose, onNewChat,
   );
 }
 
-function ChatMessage({
+export function ChatMessage({
   message,
   run,
   agents,
@@ -1815,13 +1832,23 @@ function ChatMessage({
   onCopy,
   onRetry,
   onFeedback,
-  onDetails
+  onDetails,
+  progressivelyRender = false,
+  onProgressiveRenderComplete = () => undefined,
+  onProgressiveRenderProgress = () => undefined
 }) {
   const isAssistant = message.role === "assistant";
   return (
     <article className={`message ${message.role}`}>
       <div className="message-content">
-        {isAssistant ? <FormattedText text={message.content} /> : message.content}
+        {isAssistant
+          ? <ProgressiveFormattedText
+              text={message.content}
+              active={progressivelyRender}
+              onComplete={onProgressiveRenderComplete}
+              onProgress={onProgressiveRenderProgress}
+            />
+          : message.content}
         {message.kind === "workflow_draft" && workflow && (
           <WorkflowDraftCard
             workflow={workflow}
@@ -1838,12 +1865,6 @@ function ChatMessage({
       </div>
       {isAssistant && (
         <div className="answer-meta">
-          <UsageReceipt
-            receipt={run?.usage_receipt || message.usage_receipt}
-            agents={agents}
-            expertOutputs={run?.expert_outputs || []}
-            includeFinalOutput
-          />
           <div className="answer-footer">
             {message.run_id && (
               <RunReceipt run={run} agents={agents} onClick={() => onDetails(message.run_id)} />
@@ -2134,6 +2155,75 @@ export function FormattedText({ text }) {
   );
 }
 
+export function progressiveRevealPlan(characterCount) {
+  const length = Math.max(0, Number(characterCount) || 0);
+  const targetDurationMs = Math.min(7000, Math.max(1600, length * 2.2));
+  const targetFrames = Math.max(1, Math.round(targetDurationMs / 28));
+  return {
+    targetDurationMs,
+    targetFrames,
+    charactersPerFrame: Math.max(1, Math.ceil(length / targetFrames))
+  };
+}
+
+export function ProgressiveFormattedText({
+  text,
+  active = false,
+  onComplete = () => undefined,
+  onProgress = () => undefined
+}) {
+  const normalized = String(text || "").replace(/\r\n?/g, "\n");
+  const canAnimate = active && typeof window !== "undefined";
+  const [visibleCharacters, setVisibleCharacters] = useState(() => canAnimate ? 0 : normalized.length);
+  const completeRef = useRef(onComplete);
+  const progressRef = useRef(onProgress);
+
+  useEffect(() => { completeRef.current = onComplete; }, [onComplete]);
+  useEffect(() => { progressRef.current = onProgress; }, [onProgress]);
+
+  useEffect(() => {
+    if (!canAnimate || window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches) {
+      setVisibleCharacters(normalized.length);
+      if (active) completeRef.current();
+      return undefined;
+    }
+
+    let frameId = 0;
+    let visible = 0;
+    let previousFrameAt = 0;
+    const { charactersPerFrame } = progressiveRevealPlan(normalized.length);
+    setVisibleCharacters(0);
+
+    const reveal = (timestamp) => {
+      if (timestamp - previousFrameAt < 24) {
+        frameId = window.requestAnimationFrame(reveal);
+        return;
+      }
+      previousFrameAt = timestamp;
+      visible = Math.min(normalized.length, visible + charactersPerFrame);
+      setVisibleCharacters(visible);
+      progressRef.current(visible, normalized.length);
+      if (visible < normalized.length) {
+        frameId = window.requestAnimationFrame(reveal);
+      } else {
+        completeRef.current();
+      }
+    };
+    frameId = window.requestAnimationFrame(reveal);
+    return () => window.cancelAnimationFrame(frameId);
+  }, [active, canAnimate, normalized]);
+
+  const streaming = canAnimate && visibleCharacters < normalized.length;
+  return (
+    <div className={`progressive-answer ${streaming ? "streaming" : "complete"}`}>
+      <div aria-hidden={streaming ? "true" : undefined}>
+        <FormattedText text={normalized.slice(0, visibleCharacters)} />
+      </div>
+      {streaming && <span className="sr-only" role="status">{normalized}</span>}
+    </div>
+  );
+}
+
 function safeMarkdownUrl(url, key) {
   const value = String(url || "").trim();
   if (key === "src") return "";
@@ -2141,7 +2231,7 @@ function safeMarkdownUrl(url, key) {
   return "";
 }
 
-function RunReceipt({ run, onClick }) {
+export function RunReceipt({ run, onClick }) {
   if (!run) {
     return (
       <button type="button" className="run-receipt" onClick={onClick}>
@@ -2156,12 +2246,15 @@ function RunReceipt({ run, onClick }) {
   const parts = [];
   if (!["completed", "failed"].includes(run.status)) parts.push(runStatusLabel(run.status));
   if (agentCount) parts.push(`${agentCount} ${agentCount === 1 ? "agent" : "agents"}`);
+  if (run.elapsed_sec != null) parts.push(`${Number(run.elapsed_sec).toFixed(1)}s`);
+  if (run.usage_receipt && (run.usage_receipt.provider_reported === true || Number(run.usage_receipt.total_tokens) > 0)) {
+    parts.push(`${formatTokenCount(run.usage_receipt.total_tokens)} tokens`);
+  }
   if (sourceCount) parts.push(`${sourceCount} ${sourceCount === 1 ? "source" : "sources"}`);
   if (settled) parts.push(`${settled} recorded result${settled === 1 ? "" : "s"}`);
   else if (pending) parts.push(`${pending} claim${pending === 1 ? "" : "s"} being tracked`);
-  if (run.elapsed_sec != null) parts.push(`${Number(run.elapsed_sec).toFixed(1)}s`);
   return (
-    <button type="button" className={`run-receipt ${run.status || ""}`} onClick={onClick}>
+    <button type="button" className={`run-receipt ${run.status || ""}`} onClick={onClick} title="Open Answer details, token usage, and complete agent outputs">
       <span className="receipt-dot" aria-hidden="true" />
       <span>{parts.join(" · ") || "Answer details"}</span>
       <ChevronRight size={14} />
@@ -3785,7 +3878,7 @@ function RankTieBreakNote({ tieBreak, adapter, agents }) {
   );
 }
 
-function RunDetailsSheet({
+export function RunDetailsSheet({
   run,
   agents,
   contractsById,
@@ -3816,8 +3909,14 @@ function RunDetailsSheet({
             {view === "agents" && (
               <section className="detail-section" aria-labelledby="used-agents-heading">
                 <div className="section-heading compact-heading">
-                  <div><h3 id="used-agents-heading">Agents used</h3><p>{run.expert_outputs?.length || 0} contributors to this answer.</p></div>
+                  <div><h3 id="used-agents-heading">Agents and model usage</h3><p>{run.expert_outputs?.length || 0} contributors. Expand any agent to read its complete output.</p></div>
                 </div>
+                <UsageReceipt
+                  receipt={run.usage_receipt}
+                  agents={agents}
+                  expertOutputs={run.expert_outputs || []}
+                  includeFinalOutput
+                />
                 <div className="detail-list">
                   {(run.expert_outputs || []).map((route) => {
                     const selection = routeSelections.get(route.adapter);
@@ -3840,7 +3939,12 @@ function RunDetailsSheet({
                         <div className="detail-row-content">
                           {tieBreak && <RankTieBreakNote tieBreak={tieBreak} adapter={route.adapter} agents={agents} />}
                           {route.task && <p><strong>Task</strong>{route.task}</p>}
-                          {route.domain_answer && <p><strong>Contribution</strong>{route.domain_answer}</p>}
+                          {route.domain_answer && (
+                            <div className="agent-full-output">
+                              <strong>Full output</strong>
+                              <FormattedText text={route.domain_answer} />
+                            </div>
+                          )}
                           {resolvedInputs.length > 0 && (
                             <p><strong>Context received</strong>{resolvedInputs.map((value) => contractFieldLabel(value, agents)).join(", ")}</p>
                           )}

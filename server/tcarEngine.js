@@ -836,8 +836,8 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
         planner_mode: options.planner_mode || process.env.TCAR_PLANNER_MODE || "session",
         max_routing_adapters: Number(options.max_routing_adapters) || Number(process.env.TCAR_MAX_ROUTING_ADAPTERS || 12),
         parallel_workers: Number(options.parallel_workers) || Number(process.env.TCAR_PARALLEL_WORKERS || 2),
-        max_tokens: Number(options.max_tokens) || Number(process.env.TCAR_MAX_TOKENS || 256),
-        refiner_max_tokens: Number(options.refiner_max_tokens) || Number(process.env.TCAR_REFINER_MAX_TOKENS || 384),
+        max_tokens: Number(options.max_tokens) || Number(process.env.TCAR_MAX_TOKENS || 1024),
+        refiner_max_tokens: Number(options.refiner_max_tokens) || Number(process.env.TCAR_REFINER_MAX_TOKENS || 2048),
         temperature: Number(options.temperature ?? process.env.TCAR_TEMPERATURE ?? 0),
         allowed_adapters: scoped.allowedAdapters,
         agent_rankings: Object.fromEntries(

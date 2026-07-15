@@ -24,6 +24,10 @@ import {
 } from "./billing.js";
 import { createStore, makeId, nowIso } from "./store.js";
 import {
+  modelOutputSettingsForWorkspace,
+  updateModelOutputSettings
+} from "./modelSettings.js";
+import {
   assertSafeSourcePath,
   assertStoredDocumentIntegrity,
   chunkDocument,
@@ -624,6 +628,53 @@ export async function createApp({
     }
   });
 
+  app.get("/api/admin/model-output-settings", (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      requireAdmin(req);
+      res.json({
+        settings: modelOutputSettingsForWorkspace(store.read(), req.auth.workspace_id)
+      });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.patch("/api/admin/model-output-settings", async (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      requireAdmin(req);
+      const settings = await store.mutate((data) => {
+        const updated = updateModelOutputSettings(data, {
+          workspaceId: req.auth.workspace_id,
+          actor: req.auth,
+          agentOutputTokens: req.body?.agent_output_tokens,
+          finalOutputTokens: req.body?.final_output_tokens,
+          reason: req.body?.reason
+        });
+        data.identityAuditEvents = Array.isArray(data.identityAuditEvents) ? data.identityAuditEvents : [];
+        data.identityAuditEvents.push({
+          event_id: makeId("identityevt"),
+          type: "model_output_settings.updated",
+          actor_user_id: req.auth.user_id,
+          target_user_id: null,
+          workspace_id: req.auth.workspace_id,
+          agent_output_tokens: updated.agent_output_tokens,
+          final_output_tokens: updated.final_output_tokens,
+          revision: updated.revision,
+          created_at: nowIso()
+        });
+        if (data.identityAuditEvents.length > 5000) {
+          data.identityAuditEvents.splice(0, data.identityAuditEvents.length - 5000);
+        }
+        return updated;
+      });
+      res.json({ settings });
+    } catch (error) {
+      next(error);
+    }
+  });
+
   app.post("/api/admin/billing/accounts/:user_id/adjustments", async (req, res, next) => {
     res.setHeader("Cache-Control", "no-store");
     try {
@@ -1214,7 +1265,9 @@ export async function createApp({
       await recoverStaleContinuationReservations({ store, actor: req.auth });
       const data = store.read();
       const session = findAccessibleSession(data, req.params.session_id, req);
-      const runOptions = normalizeChatOptions(req.body.options);
+      const runOptions = normalizeChatOptions(req.body.options, {
+        outputSettings: modelOutputSettingsForWorkspace(data, session.workspace_id)
+      });
       const workflowCommand = parseWorkflowCommand(req.body.content);
       const attachments = normalizeMessageAttachments(req.body.attachments);
       const idempotencyKey = normalizeIdempotencyKey(req.headers["idempotency-key"]);
@@ -3455,8 +3508,8 @@ function durableChatOptions(run, suppliedOptions) {
     planner_mode: run.planner_mode || process.env.TCAR_PLANNER_MODE || "session",
     parallel_workers: Number(run.parallel_workers) || Number(process.env.TCAR_PARALLEL_WORKERS || 2),
     max_routing_adapters: Number(run.max_routing_adapters) || Number(process.env.TCAR_MAX_ROUTING_ADAPTERS || 12),
-    max_tokens: Number(process.env.TCAR_MAX_TOKENS || 256),
-    refiner_max_tokens: Number(process.env.TCAR_REFINER_MAX_TOKENS || 384),
+    max_tokens: Number(process.env.TCAR_MAX_TOKENS || 1024),
+    refiner_max_tokens: Number(process.env.TCAR_REFINER_MAX_TOKENS || 2048),
     temperature: Number(process.env.TCAR_TEMPERATURE || 0)
   };
 }
@@ -5502,7 +5555,7 @@ function cleanTitle(value) {
     .slice(0, 90);
 }
 
-function normalizeChatOptions(options = {}) {
+function normalizeChatOptions(options = {}, { outputSettings = null } = {}) {
   if (options === null || options === undefined) {
     options = {};
   }
@@ -5542,14 +5595,26 @@ function normalizeChatOptions(options = {}) {
   if (!["cue", "llm", "session", "tcandon"].includes(plannerMode)) {
     throwStatus(400, "planner_mode must be 'cue', 'llm', 'session', or 'tcandon'.");
   }
+  const agentOutputTokens = Number(outputSettings?.agent_output_tokens)
+    || Number(process.env.TCAR_MAX_TOKENS || 1024);
+  const finalOutputTokens = Number(outputSettings?.final_output_tokens)
+    || Number(process.env.TCAR_REFINER_MAX_TOKENS || 2048);
+  const maximumAgentOutputTokens = Math.min(
+    Number(outputSettings?.bounds?.agent_output_tokens?.max) || Number(process.env.TCAR_CLIENT_MAX_TOKENS || 4096),
+    agentOutputTokens
+  );
+  const maximumFinalOutputTokens = Math.min(
+    Number(outputSettings?.bounds?.final_output_tokens?.max) || Number(process.env.TCAR_CLIENT_MAX_REFINER_TOKENS || 8192),
+    finalOutputTokens
+  );
   return {
     show_route_details: options.show_route_details !== false,
     planner_mode: plannerMode,
     planner_max_tokens: boundedInt(options.planner_max_tokens, Number(process.env.TCAR_PLANNER_MAX_TOKENS || 384), plannerMode === "session" ? 256 : 32, Number(process.env.TCAR_CLIENT_MAX_PLANNER_TOKENS || 512)),
     max_routing_adapters: boundedInt(options.max_routing_adapters, Number(process.env.TCAR_MAX_ROUTING_ADAPTERS || 12), 1, Number(process.env.TCAR_CLIENT_MAX_ROUTING_ADAPTERS || 24)),
     parallel_workers: boundedInt(options.parallel_workers, Number(process.env.TCAR_PARALLEL_WORKERS || 2), 1, Number(process.env.TCAR_CLIENT_MAX_PARALLEL_WORKERS || 4)),
-    max_tokens: boundedInt(options.max_tokens, Number(process.env.TCAR_MAX_TOKENS || 256), 16, Number(process.env.TCAR_CLIENT_MAX_TOKENS || 512)),
-    refiner_max_tokens: boundedInt(options.refiner_max_tokens, Number(process.env.TCAR_REFINER_MAX_TOKENS || 384), 32, Number(process.env.TCAR_CLIENT_MAX_REFINER_TOKENS || 1024)),
+    max_tokens: boundedInt(options.max_tokens, agentOutputTokens, 16, maximumAgentOutputTokens),
+    refiner_max_tokens: boundedInt(options.refiner_max_tokens, finalOutputTokens, 32, maximumFinalOutputTokens),
     temperature: boundedFloat(options.temperature, Number(process.env.TCAR_TEMPERATURE || 0), 0, Number(process.env.TCAR_CLIENT_MAX_TEMPERATURE || 1))
   };
 }

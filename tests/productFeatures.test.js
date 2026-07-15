@@ -6,11 +6,15 @@ import {
   AgentCatalog,
   AgentGraph,
   ConnectionsPanel,
+  ChatMessage,
   FormattedText,
+  ProgressiveFormattedText,
   MarketplaceAgentDialog,
   MarketplacePanel,
   PublishDialog,
   RatingDialog,
+  RunDetailsSheet,
+  RunReceipt,
   ToolApprovalCheckpoint,
   UsageReceipt,
   WorkflowDraftCard,
@@ -22,6 +26,7 @@ import {
   graphEdgePath,
   graphPositionFromPointer,
   initialGraphPositions,
+  progressiveRevealPlan,
   storedGraphPositions,
   workflowRequirementConnections
 } from "../src/App.jsx";
@@ -133,6 +138,105 @@ describe("Agent Studio product surfaces", () => {
     expect(markup).toContain("Final answer");
     expect(markup).toContain("0.32 credits");
     expect(markup).toContain("99.68 credits remaining");
+  });
+
+  it("keeps token usage in the compact clickable answer receipt", () => {
+    const markup = renderToStaticMarkup(createElement(RunReceipt, {
+      run: {
+        status: "completed",
+        elapsed_sec: 2.4,
+        expert_outputs: [{ adapter: "research_agent" }, { adapter: "writer_agent" }],
+        sources: [],
+        outcome_contracts: [],
+        usage_receipt: { provider_reported: true, total_tokens: 2500 }
+      },
+      onClick: () => undefined
+    }));
+    expect(markup).toContain("2 agents · 2.4s · 2,500 tokens");
+    expect(markup).toContain("Open Answer details, token usage, and complete agent outputs");
+    expect(markup).not.toContain("usage-receipt");
+  });
+
+  it("does not place the expanded token card directly in the conversation", () => {
+    const markup = renderToStaticMarkup(createElement(ChatMessage, {
+      message: { message_id: "answer_1", role: "assistant", content: "A complete response.", run_id: "run_1" },
+      run: {
+        run_id: "run_1",
+        status: "completed",
+        elapsed_sec: 1.8,
+        expert_outputs: [{ adapter: "research_agent" }],
+        sources: [],
+        outcome_contracts: [],
+        usage_receipt: { provider_reported: true, total_tokens: 840 }
+      },
+      agents: [{ id: "research_agent", title: "Research Agent" }],
+      connections: [],
+      canWrite: true,
+      onCopy: () => undefined,
+      onRetry: () => undefined,
+      onFeedback: () => undefined,
+      onDetails: () => undefined
+    }));
+    expect(markup).toContain("1 agent · 1.8s · 840 tokens");
+    expect(markup).not.toContain("class=\"usage-receipt\"");
+    expect(markup).not.toContain("input ·");
+  });
+
+  it("shows complete agent outputs and per-component usage inside Answer details", () => {
+    const completeOutput = `Opening evidence. ${"Full analysis sentence. ".repeat(120)} Closing evidence.`;
+    const markup = renderToStaticMarkup(createElement(RunDetailsSheet, {
+      run: {
+        status: "completed",
+        plan: { routing: { selected: [] } },
+        expert_outputs: [{
+          step_id: "step_research",
+          adapter: "research_agent",
+          task: "Research the request",
+          domain_answer: completeOutput,
+          token_usage: { reported: true, prompt_tokens: 500, completion_tokens: 700, total_tokens: 1200, charged_credits: "0.1" }
+        }],
+        sources: [],
+        outcome_contracts: [],
+        events: [],
+        usage_receipt: {
+          provider_reported: true,
+          prompt_tokens: 900,
+          completion_tokens: 1000,
+          total_tokens: 1900,
+          charged_credits: "0.2",
+          components: [
+            { component_key: "router", component: "session_controller_planning", kind: "router", prompt_tokens: 100, completion_tokens: 50, total_tokens: 150, charged_credits: "0.01" },
+            { component_key: "agent", component: "agent:research_agent:call_1", kind: "agent", agent_id: "research_agent", step_id: "step_research", prompt_tokens: 500, completion_tokens: 700, total_tokens: 1200, charged_credits: "0.1" },
+            { component_key: "final", component: "final_synthesis", kind: "final_output", prompt_tokens: 300, completion_tokens: 250, total_tokens: 550, charged_credits: "0.09" }
+          ]
+        }
+      },
+      agents: [{ id: "research_agent", title: "Research Agent" }],
+      contractsById: {},
+      canWrite: true,
+      onClose: () => undefined,
+      onCreateOutcome: () => undefined,
+      onSettleOutcome: () => undefined,
+      onDisputeOutcome: () => undefined,
+      onCorrectOutcome: () => undefined
+    }));
+    expect(markup).toContain("Agents and model usage");
+    expect(markup).toContain("Router");
+    expect(markup).toContain("Final answer");
+    expect(markup).toContain("Full output");
+    expect(markup).toContain("Opening evidence");
+    expect(markup).toContain("Closing evidence");
+  });
+
+  it("progressively reveals new answers while server rendering and reduced motion retain the full text", () => {
+    expect(progressiveRevealPlan(40)).toMatchObject({ charactersPerFrame: 1 });
+    expect(progressiveRevealPlan(12000).charactersPerFrame).toBeGreaterThan(1);
+    const markup = renderToStaticMarkup(createElement(ProgressiveFormattedText, {
+      text: "**Complete answer** remains accessible.",
+      active: true
+    }));
+    expect(markup).toContain("<strong>Complete answer</strong>");
+    expect(markup).toContain("remains accessible");
   });
 
   it("lists agent and final outputs explicitly when provider usage is missing", () => {

@@ -232,7 +232,7 @@ async function executeRoute({ step, query, agents, sharedMemory, outputsById, ba
   const rawText = await chatCompletion({
     model: agent.id,
     messages: [{ role: "user", content: prompt }],
-    maxTokens: boundedInteger(options.max_tokens, 160, 32, 4096),
+    maxTokens: boundedInteger(options.max_tokens, 1024, 32, 4096),
     temperature: boundedNumber(options.temperature, 0, 0, 2),
     vllmRequest
   });
@@ -283,7 +283,7 @@ async function synthesizeAnswer({ query, sharedMemory, expertOutputs, options, c
         ].filter(Boolean).join("\n\n")
       }
     ],
-    maxTokens: boundedInteger(options.refiner_max_tokens, 384, 64, 8192),
+    maxTokens: boundedInteger(options.refiner_max_tokens, 2048, 64, 8192),
     temperature: boundedNumber(options.temperature, 0, 0, 2),
     vllmRequest
   });

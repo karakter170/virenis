@@ -81,6 +81,10 @@ describe("Clerk identity UI", () => {
     expect(markup).toContain("No Clerk users have signed up yet");
     expect(markup).toContain("Token pricing");
     expect(markup).toContain("Save pricing");
+    expect(markup).toContain("Model output limits");
+    expect(markup).toContain("Each agent");
+    expect(markup).toContain("Final answer");
+    expect(markup).toContain("Save limits");
     expect(markup).not.toContain(">Verify<");
   });
 });

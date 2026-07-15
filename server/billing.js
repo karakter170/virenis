@@ -1195,9 +1195,9 @@ function estimateReservation(pricing, options, kind) {
   } else {
     const routes = boundedInteger(options.max_routing_adapters, 12, 1, 24) + 1;
     const rounds = boundedEnvInteger("TCAR_TOOL_MAX_ROUNDS", 3, 0, 6) + 1;
-    const maxTokens = boundedInteger(options.max_tokens, 256, 16, 512);
+    const maxTokens = boundedInteger(options.max_tokens, 1024, 16, 4096);
     const plannerTokens = boundedInteger(options.planner_max_tokens, 384, 32, 512);
-    const refinerTokens = boundedInteger(options.refiner_max_tokens, 384, 32, 1024);
+    const refinerTokens = boundedInteger(options.refiner_max_tokens, 2048, 32, 8192);
     promptTokens = contextTokens + routes * rounds * routeInput + refinerInput;
     completionTokens = plannerTokens + routes * rounds * maxTokens + refinerTokens;
   }

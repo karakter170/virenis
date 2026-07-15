@@ -40,7 +40,7 @@ function mergeSeedCatalog(agents, seedAgents) {
 function initialData(seedAgents) {
   const now = new Date().toISOString();
   return {
-    version: 11,
+    version: 12,
     created_at: now,
     users: [],
     billingAccounts: [],
@@ -51,6 +51,7 @@ function initialData(seedAgents) {
     billingFundingEvents: [],
     identityAuditEvents: [],
     identityDeletionTombstones: [],
+    workspaceModelSettings: [],
     sessions: [],
     messages: [],
     runs: [],
@@ -350,6 +351,7 @@ function normalizeData(value, seedAgents) {
     "billingFundingEvents",
     "identityAuditEvents",
     "identityDeletionTombstones",
+    "workspaceModelSettings",
     "mcpConnections",
     "mcpOauthClients",
     "mcpOauthStates",

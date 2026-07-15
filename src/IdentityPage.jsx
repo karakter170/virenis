@@ -3,6 +3,7 @@ import {
   ArrowLeft,
   Check,
   Download,
+  Gauge,
   KeyRound,
   LoaderCircle,
   RefreshCw,
@@ -210,6 +211,8 @@ export function AdminUsersPanel() {
   const [pricing, setPricing] = useState(null);
   const [pricingDraft, setPricingDraft] = useState(() => pricingDraftFrom(null));
   const [pricingMutationKey, setPricingMutationKey] = useState("");
+  const [outputSettings, setOutputSettings] = useState(null);
+  const [outputDraft, setOutputDraft] = useState(() => outputSettingsDraftFrom(null));
   const [adjustments, setAdjustments] = useState({});
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
@@ -219,15 +222,18 @@ export function AdminUsersPanel() {
 
   async function refresh() {
     try {
-      const [userResult, accountResult, pricingResult] = await Promise.all([
+      const [userResult, accountResult, pricingResult, outputResult] = await Promise.all([
         identityRequest("/api/admin/users"),
         identityRequest("/api/admin/billing/accounts"),
-        identityRequest("/api/admin/billing/pricing")
+        identityRequest("/api/admin/billing/pricing"),
+        identityRequest("/api/admin/model-output-settings")
       ]);
       setUsers(userResult.users || []);
       setAccounts(Object.fromEntries((accountResult.accounts || []).map((account) => [account.user_id, account])));
       setPricing(pricingResult.pricing || null);
       setPricingDraft(pricingDraftFrom(pricingResult.pricing));
+      setOutputSettings(outputResult.settings || null);
+      setOutputDraft(outputSettingsDraftFrom(outputResult.settings));
       setPricingMutationKey("");
     } catch (requestError) {
       setError(requestError.message);
@@ -320,11 +326,77 @@ export function AdminUsersPanel() {
     }
   }
 
+  async function saveOutputSettings(event) {
+    event.preventDefault();
+    setBusy("output-settings");
+    setError("");
+    setNotice("");
+    try {
+      const result = await identityRequest("/api/admin/model-output-settings", {
+        method: "PATCH",
+        body: {
+          agent_output_tokens: Number(outputDraft.agent),
+          final_output_tokens: Number(outputDraft.final),
+          reason: outputDraft.reason
+        }
+      });
+      setOutputSettings(result.settings);
+      setOutputDraft(outputSettingsDraftFrom(result.settings));
+      setNotice("Model output limits were updated for this workspace. New answers will use them immediately.");
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setBusy("");
+    }
+  }
+
   return (
     <section className="admin-users" aria-labelledby="admin-users-heading">
       <div className="account-card-heading"><div><h4 id="admin-users-heading">Registered users</h4><p>Assign product roles, suspend access, or revoke Clerk sessions. Clerk manages identity verification.</p></div><button className="icon-button compact" type="button" aria-label="Refresh registered users" onClick={refresh}><RefreshCw size={15} /></button></div>
       {error && <div className="identity-message error" role="alert"><AlertCircle size={15} />{error}</div>}
       {notice && <div className="identity-message success" role="status"><Check size={15} />{notice}</div>}
+      <form className="admin-output-form" onSubmit={saveOutputSettings}>
+        <div className="admin-form-intro">
+          <span><Gauge size={16} aria-hidden="true" /></span>
+          <div><strong>Model output limits</strong><small>Maximum generated tokens per agent and for the final answer. These workspace limits apply to new requests.</small></div>
+        </div>
+        <label>
+          <span>Each agent</span>
+          <input
+            type="number"
+            inputMode="numeric"
+            min={outputSettings?.bounds?.agent_output_tokens?.min || 128}
+            max={outputSettings?.bounds?.agent_output_tokens?.max || 4096}
+            step="1"
+            value={outputDraft.agent}
+            onChange={(event) => setOutputDraft({ ...outputDraft, agent: event.target.value })}
+            required
+          />
+          <small>tokens</small>
+        </label>
+        <label>
+          <span>Final answer</span>
+          <input
+            type="number"
+            inputMode="numeric"
+            min={outputSettings?.bounds?.final_output_tokens?.min || 256}
+            max={outputSettings?.bounds?.final_output_tokens?.max || 8192}
+            step="1"
+            value={outputDraft.final}
+            onChange={(event) => setOutputDraft({ ...outputDraft, final: event.target.value })}
+            required
+          />
+          <small>tokens</small>
+        </label>
+        <label className="output-reason">
+          <span>Change reason</span>
+          <input value={outputDraft.reason} maxLength={500} onChange={(event) => setOutputDraft({ ...outputDraft, reason: event.target.value })} required />
+        </label>
+        <button type="submit" disabled={busy === "output-settings"}>
+          {busy === "output-settings" ? <LoaderCircle className="spin" size={14} /> : <Check size={14} />}Save limits
+        </button>
+        <small className="admin-form-revision">Revision {outputSettings?.revision || 0}</small>
+      </form>
       {pricingDraft && (
         <form className="admin-pricing-form" onSubmit={savePricing}>
           <div><strong>Token pricing</strong><span>Credits per 1,000 provider-reported tokens. New rates apply only to new reservations.</span></div>
@@ -449,6 +521,14 @@ function pricingDraftFrom(pricing) {
     cached: rule.cached_credits_per_1k ?? "0.02",
     minimum: pricing?.minimum_reservation_credits ?? "0.1",
     reason: "Administrator pricing update"
+  };
+}
+
+function outputSettingsDraftFrom(settings) {
+  return {
+    agent: String(settings?.agent_output_tokens ?? 1024),
+    final: String(settings?.final_output_tokens ?? 2048),
+    reason: "Administrator output-limit update"
   };
 }
 
