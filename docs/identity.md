@@ -78,6 +78,9 @@ APP_CLERK_ADMIN_USER_IDS=
 `VITE_CLERK_PUBLISHABLE_KEY` is present; defining both explicitly is clearer in
 split build/runtime environments. For secrets, an inline value takes precedence
 over its `_FILE` variant. Keep secret files readable only by the web service.
+When both publishable-key variables are defined, they must be identical. The
+frontend key is embedded at build time, so hosted builds must be created with
+the same environment used by the backend.
 
 Production startup fails closed when Clerk keys are missing, malformed, or
 development keys; the webhook signing secret is missing; the public origin is
@@ -85,6 +88,58 @@ not authorized; or no initial administrator is configured. Use
 `APP_AUTH_ADMIN_EMAILS` before the first administrator signs in, or pin a Clerk
 user ID with `APP_CLERK_ADMIN_USER_IDS`. This bootstrap allowlist does not turn
 email into a session credential: Clerk must still authenticate the account.
+
+## Hosted sign-in troubleshooting
+
+`Your session could not be verified` for every account is a deployment problem,
+not a user-role problem. If the recovery screen reports that the site address
+is not authorized, the Clerk token's `azp` origin does not match the backend's
+authorized parties. An administrator email cannot bypass this check.
+
+Choose one canonical HTTPS origin, with no path or trailing slash, and use it
+consistently on the web host. For example:
+
+```dotenv
+NODE_ENV=production
+APP_PUBLIC_ORIGIN=https://app.your-domain.example
+CLERK_AUTHORIZED_PARTIES=https://app.your-domain.example
+APP_MCP_OAUTH_REDIRECT_ORIGIN=https://app.your-domain.example
+VITE_CLERK_PUBLISHABLE_KEY=pk_live_same-production-application
+CLERK_PUBLISHABLE_KEY=pk_live_same-production-application
+APP_AUTH_ADMIN_EMAILS=meteyesil@virenis.com
+```
+
+Use the matching `sk_live_` backend key and webhook signing secret from the same
+Clerk production application. Configure that production application's domain
+and DNS in Clerk, then build and start from the remote environment:
+
+```bash
+cp .env.remote.example .env.remote.local
+npm run preflight:auth:remote -- https://app.your-domain.example
+npm run build:remote
+npm run preflight:remote
+npm run start:remote
+```
+
+Do not use `npm run dev` for the public deployment. Do not build the hosted
+bundle from `.env.local`; that file is intended for loopback development and can
+embed a `pk_test_` key. Production startup checks that the built browser bundle
+contains the same publishable key as the backend and refuses a stale bundle.
+
+When Node runs behind Nginx, Caddy, a load balancer, or a tunnel, the proxy must
+preserve the public host and HTTPS scheme. The equivalent Nginx settings are:
+
+```nginx
+proxy_set_header Host $host;
+proxy_set_header X-Forwarded-Host $host;
+proxy_set_header X-Forwarded-Proto https;
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+```
+
+Keep `APP_TRUST_PROXY=loopback` when the reverse proxy connects to Node over
+loopback. After changing the origin or Clerk application, restart the server,
+open only the canonical URL, sign out, and clear old Clerk cookies once before
+testing again.
 
 ## Browser routes and controls
 

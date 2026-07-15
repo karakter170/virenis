@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-/* global console, process */
+/* global console, process, URL */
 import {
   clerkAuthorizedParties,
   clerkIdentityEnabled,
@@ -21,6 +21,12 @@ validateClerkEnvironment(process.env);
 const browserOrigin = requireAuthorizedClerkBrowserOrigin(requestedOrigin, process.env);
 const publicOrigin = String(process.env.APP_PUBLIC_ORIGIN || "").trim().replace(/\/+$/, "");
 const oauthOrigin = String(process.env.APP_MCP_OAUTH_REDIRECT_ORIGIN || "").trim().replace(/\/+$/, "");
+if (!publicOrigin || browserOrigin !== publicOrigin) {
+  throw new Error("The tested browser origin must exactly match APP_PUBLIC_ORIGIN.");
+}
+if (process.env.NODE_ENV === "production" && new URL(browserOrigin).protocol !== "https:") {
+  throw new Error("A production Clerk browser origin must use HTTPS.");
+}
 if (oauthOrigin && publicOrigin && oauthOrigin !== publicOrigin) {
   throw new Error("APP_MCP_OAUTH_REDIRECT_ORIGIN must match APP_PUBLIC_ORIGIN.");
 }

@@ -5,7 +5,11 @@ import request from "supertest";
 import { buildPublishableKey } from "@clerk/shared/keys";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createApp } from "../server/app.js";
-import { clerkAuthorizedParties, validateClerkEnvironment } from "../server/clerkIdentity.js";
+import {
+  clerkAuthorizedParties,
+  requireAuthorizedClerkBrowserOrigin,
+  validateClerkEnvironment
+} from "../server/clerkIdentity.js";
 
 const ENV_KEYS = [
   "APP_IDENTITY_PROVIDER",
@@ -81,6 +85,37 @@ describe("Clerk identity integration", () => {
       "http://localhost:5181",
       "http://127.0.0.1:5181"
     ]);
+  });
+
+  it("fails an origin preflight when the browser address is not an authorized Clerk party", () => {
+    const env = {
+      NODE_ENV: "development",
+      PORT: "5173",
+      APP_PUBLIC_ORIGIN: "http://localhost:5173"
+    };
+    expect(requireAuthorizedClerkBrowserOrigin("http://localhost:5173", env)).toBe("http://localhost:5173");
+    expect(() => requireAuthorizedClerkBrowserOrigin("https://preview.example.test", env))
+      .toThrow(/Clerk will reject sessions/);
+  });
+
+  it("returns the safe configured origin when Clerk rejects a token's authorized party", async () => {
+    process.env.APP_PUBLIC_ORIGIN = "https://app.example.test";
+    const rejectingAdapter = {
+      ...fake.adapter,
+      middleware(req, res, next) {
+        res.setHeader("x-clerk-auth-reason", "token-invalid-authorized-parties");
+        fake.adapter.middleware(req, res, next);
+      }
+    };
+    await startApp(rejectingAdapter);
+    const response = await request(app).get("/api/auth/me").expect(401);
+    expect(response.body).toMatchObject({
+      error: "authentication_required",
+      details: {
+        auth_reason: "token-invalid-authorized-parties",
+        configured_origin: "https://app.example.test"
+      }
+    });
   });
 
   it("links a legacy profile without changing its workspace and scrubs retired credentials", async () => {
@@ -406,6 +441,12 @@ describe("Clerk identity integration", () => {
       CLERK_PUBLISHABLE_KEY: livePublishableKey,
       CLERK_SECRET_KEY: fixtureSecretKey("live")
     })).not.toThrow();
+    expect(() => validateClerkEnvironment({
+      ...base,
+      CLERK_PUBLISHABLE_KEY: livePublishableKey,
+      VITE_CLERK_PUBLISHABLE_KEY: buildPublishableKey("different-clerk.example.com"),
+      CLERK_SECRET_KEY: fixtureSecretKey("live")
+    })).toThrow(/same Clerk application/);
   });
 });
 
