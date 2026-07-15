@@ -380,13 +380,22 @@ function agentMetadataScore(agent, lowerQuery) {
   return score;
 }
 
-export function scopedRoutingContext({ session, agents = [], documents = [] }) {
+export function scopedRoutingContext({ session, agents = [], documents = [], agentWorkspace = null }) {
   const inactiveAgentIds = new Set(Array.isArray(session?.inactive_agent_ids) ? session.inactive_agent_ids : []);
+  const workspaceAgentIds = agentWorkspace
+    ? new Set(Array.isArray(agentWorkspace.agent_ids) ? agentWorkspace.agent_ids : [])
+    : null;
   const visibleAgents = agents.filter((agent) =>
     agent.enabled !== false &&
     agent.mounted !== false &&
     agent.runtime_sync_pending !== true &&
     !inactiveAgentIds.has(agent.id) &&
+    (
+      !workspaceAgentIds
+      || workspaceAgentIds.has(agent.id)
+      || agent.document
+      || agent.resource_for_agent_id
+    ) &&
     resourceVisibleToSession(agent, session)
   );
   const visibleDocuments = documents.filter((document) =>
@@ -479,7 +488,7 @@ function throwDagError(code, message) {
 
 export function sanitizeToolCalls(rawText, allowedTools = []) {
   const violations = [];
-  const sanitized = rawText.replace(/<tool_call>([\s\S]*?)<\/tool_call>/g, (_match, payload) => {
+  const sanitized = String(rawText || "").replace(/<tool_call>([\s\S]*?)<\/tool_call>/g, (_match, payload) => {
     try {
       const parsed = JSON.parse(payload);
       const toolName = parsed?.name || parsed?.tool || parsed?.tool_name;
@@ -499,9 +508,60 @@ export function sanitizeToolCalls(rawText, allowedTools = []) {
   });
 
   return {
-    text: sanitized.replace(/<think>[\s\S]*?<\/think>/gi, "").trim(),
+    text: stripHiddenReasoningMarkup(sanitized).trim(),
     violations
   };
+}
+
+export function stripHiddenReasoningMarkup(rawText) {
+  let text = String(rawText || "");
+  text = text.replace(/<(think|analysis|reasoning)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, " ");
+
+  const orphanClosings = [...text.matchAll(/<\/(?:think|analysis|reasoning)\s*>/gi)];
+  if (orphanClosings.length > 0) {
+    const last = orphanClosings.at(-1);
+    text = text.slice((last.index || 0) + last[0].length);
+  }
+
+  const orphanOpening = text.search(/<(?:think|analysis|reasoning)\b[^>]*>/i);
+  if (orphanOpening >= 0) {
+    text = text.slice(0, orphanOpening);
+  }
+  return text.replace(/<\/?(?:think|analysis|reasoning)\b[^>]*>/gi, " ");
+}
+
+const INTERNAL_SYNTHESIS_NARRATION = [
+  /\bvalidated\s+(?:route|agent)\s+results?\b/i,
+  /\b(?:step|route)\s+s\d+\b/i,
+  /\bomitted\b[\s\S]{0,100}\b(?:budget|context|validation)\b/i,
+  /\b(?:handoff|routing)\s+(?:artifact|contract|pipeline)\b/i,
+  /\bpolicy[_\s-]*violations?\b/i,
+  /\bAGENT[_\s-]*REASON\w*\b/i
+];
+
+export function containsInternalSynthesisNarration(text) {
+  const value = String(text || "");
+  return INTERNAL_SYNTHESIS_NARRATION.some((pattern) => pattern.test(value));
+}
+
+function publicAnswerText(rawText) {
+  let text = stripHiddenReasoningMarkup(rawText).trim();
+  const domainAnswer = parseRouteSections(text).domain_answer;
+  if (domainAnswer) {
+    text = domainAnswer;
+  } else if (/\bAGENT[_\s-]*REASON\w*\b\s*[:：]/i.test(text)) {
+    return "";
+  }
+  return text.replace(/^\s*(?:#\s*)?Final Answer\s*[:：]?\s*/i, "").trim();
+}
+
+export function sanitizeRuntimeFinalAnswer(result = {}) {
+  const primary = publicAnswerText(result.finalAnswer || "");
+  const fallback = publicAnswerText(result.fallbackFinalAnswer || "");
+  if ((!primary || containsInternalSynthesisNarration(primary)) && fallback) {
+    return fallback;
+  }
+  return primary || fallback;
 }
 
 export function parseRouteSections(text) {
@@ -569,6 +629,7 @@ async function processLocalChatRun({ store, bus, run_id, options = {} }) {
       session: data.sessions.find((item) => item.session_id === data.runs.find((run) => run.run_id === run_id)?.session_id),
       agents: data.agents,
       documents: data.documents,
+      agentWorkspaces: data.agentWorkspaces || [],
       messages: data.messages,
       outcomeContracts: data.outcomeContracts || [],
       executionRecords: data.executionRecords || []
@@ -578,10 +639,16 @@ async function processLocalChatRun({ store, bus, run_id, options = {} }) {
     }
 
     const query = snapshot.run.query;
+    const agentWorkspace = (snapshot.agentWorkspaces || []).find((workspace) => (
+      workspace.agent_workspace_id === snapshot.run.agent_workspace_id
+      && String(workspace.workspace_id || "") === String(snapshot.session?.workspace_id || "")
+      && workspace.created_by === snapshot.session?.created_by
+    )) || null;
     const scoped = scopedRoutingContext({
       session: snapshot.session,
       agents: snapshot.agents,
-      documents: snapshot.documents
+      documents: snapshot.documents,
+      agentWorkspace
     });
     const agentRankings = realityRankMap(snapshot, {
       agents: scoped.agents,
@@ -794,6 +861,7 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
       session: data.sessions.find((item) => item.session_id === data.runs.find((run) => run.run_id === run_id)?.session_id),
       agents: data.agents,
       documents: data.documents,
+      agentWorkspaces: data.agentWorkspaces || [],
       outcomeContracts: data.outcomeContracts || [],
       executionRecords: data.executionRecords || []
     }));
@@ -802,10 +870,16 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
     }
 
     const query = snapshot.run.query;
+    const agentWorkspace = (snapshot.agentWorkspaces || []).find((workspace) => (
+      workspace.agent_workspace_id === snapshot.run.agent_workspace_id
+      && String(workspace.workspace_id || "") === String(snapshot.session?.workspace_id || "")
+      && workspace.created_by === snapshot.session?.created_by
+    )) || null;
     const scoped = scopedRoutingContext({
       session: snapshot.session,
       agents: snapshot.agents,
-      documents: snapshot.documents
+      documents: snapshot.documents,
+      agentWorkspace
     });
     const agentRankings = realityRankMap(snapshot, {
       agents: scoped.agents,
@@ -888,7 +962,7 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
     const policyEvents = outputs.flatMap((output) =>
       (output.policy_violations || []).map((violation) => ({ step_id: output.id, adapter: output.adapter, violation }))
     );
-    const finalAnswer = result.finalAnswer || result.fallbackFinalAnswer || "";
+    const finalAnswer = sanitizeRuntimeFinalAnswer(result);
     const assistantMessageId = makeId("msg");
     const completedAt = nowIso();
     const elapsedSec = Number(((Date.now() - started) / 1000).toFixed(3));

@@ -5,6 +5,10 @@ inside Virenis. Every Clerk user receives one stable, private Virenis workspace.
 This design deliberately does not create organizations, invitations, shared
 workspace membership, or organization switching.
 
+This identity workspace is the tenant/security boundary (`workspace_id`). Agent
+Studio teams are a separate nested concept identified by `agent_workspace_id`;
+see [Agent workspaces](agent-workspaces.md).
+
 ## Responsibility boundary
 
 Clerk owns:

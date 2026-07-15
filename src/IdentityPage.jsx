@@ -160,7 +160,11 @@ export function AccountPanel({ auth, billing, onRefreshBilling, onSignedOut }) {
         method: "DELETE",
         body: { confirmation: deletion }
       });
-      window.localStorage.removeItem(`virenis:agent-graph:${auth?.workspace_id || "workspace"}`);
+      const graphPrefix = `virenis:agent-graph:${auth?.workspace_id || "workspace"}`;
+      for (let index = window.localStorage.length - 1; index >= 0; index -= 1) {
+        const key = window.localStorage.key(index);
+        if (key?.startsWith(graphPrefix)) window.localStorage.removeItem(key);
+      }
       try {
         await signOut({ redirectUrl: "/" });
       } catch {

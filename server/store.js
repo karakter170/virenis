@@ -5,6 +5,7 @@ import pg from "pg";
 import { verifyBillingState } from "./billing.js";
 import { normalizedBillingAvailable, syncNormalizedBilling } from "./normalizedBilling.js";
 import { normalizedLedgerAvailable, syncNormalizedLedger } from "./normalizedLedger.js";
+import { ensureGeneralAgentWorkspace, normalizeAgentWorkspaceCollections } from "./agentWorkspaces.js";
 
 const { Pool } = pg;
 
@@ -40,7 +41,7 @@ function mergeSeedCatalog(agents, seedAgents) {
 function initialData(seedAgents) {
   const now = new Date().toISOString();
   return {
-    version: 12,
+    version: 13,
     created_at: now,
     users: [],
     billingAccounts: [],
@@ -61,6 +62,8 @@ function initialData(seedAgents) {
     agentEvents: [],
     runtimeLifecycleIntents: [],
     marketplaceRatings: [],
+    agentWorkspaces: [],
+    agentWorkspaceRatings: [],
     mcpConnections: [],
     mcpOauthClients: [],
     mcpOauthStates: [],
@@ -421,7 +424,16 @@ function normalizeData(value, seedAgents) {
       && String(rating.workspace_id || "") === String(agent.workspace_id || "");
     return !samePublisher && !sameSourceOwner;
   });
+  normalizeAgentWorkspaceCollections(data);
   mergeSeedCatalog(data.agents, seedAgents);
+  for (const user of data.users || []) {
+    if (!user?.user_id || !user?.workspace_id || user.status === "deleted") continue;
+    ensureGeneralAgentWorkspace(data, {
+      user_id: user.user_id,
+      workspace_id: user.workspace_id,
+      role: user.role || "user"
+    });
+  }
   return data;
 }
 

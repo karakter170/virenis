@@ -123,6 +123,22 @@ import {
   createClerkAdapter,
   createClerkIdentityManager
 } from "./clerkIdentity.js";
+import {
+  AGENT_WORKSPACE_MAX_AGENTS,
+  activeAgentWorkspaceForSession,
+  commitAgentWorkspaceReservation,
+  createAgentWorkspace,
+  deleteAgentWorkspace,
+  ensureGeneralAgentWorkspace,
+  findAgentWorkspace,
+  listAgentWorkspaces,
+  publicAgentWorkspace,
+  releaseAgentWorkspaceReservation,
+  removeAgentFromAllWorkspaces,
+  reserveAgentWorkspaceCapacity,
+  setAgentWorkspaceMembers,
+  updateAgentWorkspace
+} from "./agentWorkspaces.js";
 
 const VALIDATION_SUITES = new Set(["manifest", "parallel_scheduler", "document_rag", "mock_smoke", "live_smoke"]);
 
@@ -537,6 +553,7 @@ export async function createApp({
       if (req.auth.auth_type === "clerk") {
         req.auth = await identityManager.refreshAuthenticated(req.auth);
       }
+      await store.mutate((data) => ensureGeneralAgentWorkspace(data, req.auth));
       res.json({
         user_id: req.auth.user_id,
         workspace_id: req.auth.workspace_id,
@@ -552,6 +569,81 @@ export async function createApp({
         self_service_enabled: resolvedClerkAdapter.enabled,
         is_admin: isAdmin(req),
         is_viewer: isViewer(req)
+      });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/api/agent-workspaces", async (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      const workspaces = await store.mutate((data) => listAgentWorkspaces(data, req.auth)
+        .map((workspace) => publicAgentWorkspace(workspace, data)));
+      res.json({ workspaces, max_agents: AGENT_WORKSPACE_MAX_AGENTS });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/agent-workspaces", async (req, res, next) => {
+    try {
+      const workspace = await store.mutate((data) => {
+        const created = createAgentWorkspace(data, req.auth, { ...req.body, agent_ids: [] });
+        if (Array.isArray(req.body?.agent_ids) && req.body.agent_ids.length) {
+          setAgentWorkspaceMembers(data, created.agent_workspace_id, req.auth, req.body.agent_ids);
+        }
+        return publicAgentWorkspace(created, data);
+      });
+      res.status(201).json(workspace);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/api/agent-workspaces/:agent_workspace_id", (req, res, next) => {
+    try {
+      const data = store.read();
+      const workspace = findAgentWorkspace(data, req.params.agent_workspace_id, req.auth);
+      const agentsById = new Map(data.agents.map((agent) => [agent.id, agent]));
+      res.json({
+        ...publicAgentWorkspace(workspace, data),
+        agents: (workspace.agent_ids || [])
+          .map((id) => agentsById.get(id))
+          .filter((agent) => agent && agentVisibleToRequest(agent, req))
+          .map((agent) => redactAgentForRequest(agent, req))
+      });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.patch("/api/agent-workspaces/:agent_workspace_id", async (req, res, next) => {
+    try {
+      const workspace = await store.mutate((data) => {
+        const updated = updateAgentWorkspace(data, req.params.agent_workspace_id, req.auth, req.body || {});
+        if ("agent_ids" in (req.body || {})) {
+          setAgentWorkspaceMembers(data, updated.agent_workspace_id, req.auth, req.body.agent_ids);
+        }
+        return publicAgentWorkspace(updated, data);
+      });
+      res.json(workspace);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.delete("/api/agent-workspaces/:agent_workspace_id", async (req, res, next) => {
+    try {
+      const result = await store.mutate((data) => deleteAgentWorkspace(
+        data,
+        req.params.agent_workspace_id,
+        req.auth
+      ));
+      res.json({
+        ok: true,
+        deleted_agent_workspace_id: result.deleted.agent_workspace_id,
+        fallback_agent_workspace_id: result.fallback.agent_workspace_id
       });
     } catch (error) {
       next(error);
@@ -1025,21 +1117,27 @@ export async function createApp({
   app.post("/api/chat/sessions", async (req, res, next) => {
     try {
       const now = nowIso();
-      const session = {
-        session_id: makeId("sess"),
-        title: cleanTitle(req.body.title) || "New chat",
-        workspace_id: requestWorkspaceId(req, req.body.workspace_id),
-        visibility: ["private", "team", "global"].includes(req.body.visibility) ? req.body.visibility : "private",
-        created_by: req.auth.user_id,
-        created_at: now,
-        updated_at: now,
-        last_message_at: now,
-        shared_memory: [],
-        inactive_agent_ids: []
-      };
-      await store.mutate((data) => {
-        data.sessions.unshift(session);
-        return session;
+      const session = await store.mutate((data) => {
+        ensureGeneralAgentWorkspace(data, req.auth);
+        const requestedAgentWorkspaceId = String(req.body?.agent_workspace_id || "").trim();
+        const agentWorkspace = requestedAgentWorkspaceId
+          ? findAgentWorkspace(data, requestedAgentWorkspaceId, req.auth)
+          : null;
+        const created = {
+          session_id: makeId("sess"),
+          title: cleanTitle(req.body.title) || "New chat",
+          workspace_id: requestWorkspaceId(req, req.body.workspace_id),
+          agent_workspace_id: agentWorkspace?.agent_workspace_id || null,
+          visibility: ["private", "team", "global"].includes(req.body.visibility) ? req.body.visibility : "private",
+          created_by: req.auth.user_id,
+          created_at: now,
+          updated_at: now,
+          last_message_at: now,
+          shared_memory: [],
+          inactive_agent_ids: []
+        };
+        data.sessions.unshift(created);
+        return created;
       });
       res.status(201).json(session);
     } catch (error) {
@@ -1063,9 +1161,38 @@ export async function createApp({
         title: session.title,
         last_message_at: session.last_message_at,
         message_count: data.messages.filter((message) => message.session_id === session.session_id).length,
-        visibility: session.visibility
+        visibility: session.visibility,
+        agent_workspace_id: isAdmin(req) || session.created_by === req.auth.user_id
+          ? session.agent_workspace_id || null
+          : null
       }));
     res.json({ sessions, total: visibleSessions.length, limit, offset });
+  });
+
+  app.patch("/api/chat/sessions/:session_id/agent-workspace", async (req, res, next) => {
+    try {
+      const workspaceId = String(req.body?.agent_workspace_id || "").trim();
+      if (!workspaceId) throwStatus(400, "agent_workspace_id is required.");
+      const updated = await store.mutate((data) => {
+        const session = findAccessibleSession(data, req.params.session_id, req);
+        assertSessionMutationAccess(session, req);
+        const workspace = findAgentWorkspace(data, workspaceId, req.auth);
+        if (["copying", "cleanup_required"].includes(workspace.copy_status)) {
+          throwStatus(409, workspace.copy_error || "This workspace is still being prepared.");
+        }
+        session.agent_workspace_id = workspace.agent_workspace_id;
+        session.updated_at = nowIso();
+        return {
+          session_id: session.session_id,
+          agent_workspace_id: workspace.agent_workspace_id,
+          agent_workspace: publicAgentWorkspace(workspace, data),
+          inactive_agent_ids: session.inactive_agent_ids || []
+        };
+      });
+      res.json(updated);
+    } catch (error) {
+      next(error);
+    }
   });
 
   app.patch("/api/chat/sessions/:session_id/agents/:agent_id", async (req, res, next) => {
@@ -1107,8 +1234,12 @@ export async function createApp({
     try {
       const data = store.read();
       const session = findAccessibleSession(data, req.params.session_id, req);
+      const canExposeAgentWorkspace = isAdmin(req) || session.created_by === req.auth.user_id;
+      const agentWorkspace = canExposeAgentWorkspace ? activeAgentWorkspaceForSession(data, session) : null;
       res.json({
         ...session,
+        agent_workspace_id: canExposeAgentWorkspace ? session.agent_workspace_id || null : null,
+        agent_workspace: agentWorkspace ? publicAgentWorkspace(agentWorkspace, data) : null,
         messages: data.messages.filter((message) => message.session_id === session.session_id),
         chat_documents: data.documents
           .filter((document) =>
@@ -1277,7 +1408,8 @@ export async function createApp({
       const submissionDigest = crypto.createHash("sha256").update(JSON.stringify({
         content: req.body.content.trim(),
         attachments,
-        options: runOptions
+        options: runOptions,
+        agent_workspace_id: session.agent_workspace_id || null
       }), "utf8").digest("hex");
       const now = nowIso();
       const message = {
@@ -1293,6 +1425,7 @@ export async function createApp({
         run_id: makeId("run"),
         session_id: session.session_id,
         workspace_id: session.workspace_id,
+        agent_workspace_id: session.agent_workspace_id || null,
         created_by: req.auth.user_id,
         actor_role: req.auth.role,
         kind: workflowCommand ? "workflow_composition" : "chat",
@@ -1764,6 +1897,11 @@ export async function createApp({
       const requestedSession = requestedSessionId
         ? findAccessibleSession(data, requestedSessionId, req)
         : null;
+      const requestedAgentWorkspace = requestedSession
+        && (isAdmin(req) || requestedSession.created_by === req.auth.user_id)
+        ? activeAgentWorkspaceForSession(data, requestedSession)
+        : null;
+      const requestedAgentWorkspaceIds = new Set(requestedAgentWorkspace?.agent_ids || []);
       const runtimeAgents = realRuntimeEnabled() ? (await fetchRuntimeAgents()).agents || [] : data.agents;
       const localById = new Map(data.agents.map((agent) => [agent.id, agent]));
       const q = String(req.query.q || "").toLowerCase();
@@ -1799,6 +1937,9 @@ export async function createApp({
       .map((agent) => ({
         ...agent,
         item_type: agentItemType(agent),
+        agent_workspace_member: requestedAgentWorkspace
+          ? requestedAgentWorkspaceIds.has(agent.id)
+          : null,
         session_active: requestedSession
           ? !new Set(requestedSession.inactive_agent_ids || []).has(agent.id)
           : agent.enabled !== false && agent.mounted !== false,
@@ -1817,7 +1958,13 @@ export async function createApp({
         last_edited_at: agent.last_edited_at || null
       }))
       .map((agent) => redactAgentForRequest(agent, req));
-      res.json({ agents, total: visibleAgents.length, limit, offset });
+      res.json({
+        agents,
+        total: visibleAgents.length,
+        limit,
+        offset,
+        agent_workspace: requestedAgentWorkspace ? publicAgentWorkspace(requestedAgentWorkspace, data) : null
+      });
     } catch (error) {
       next(error);
     }
@@ -1828,14 +1975,18 @@ export async function createApp({
       const data = store.read();
       const q = String(req.query.q || "").trim().toLowerCase();
       const itemType = String(req.query.type || "").trim().toLowerCase();
-      if (itemType && itemType !== "agent") {
-        throwStatus(400, "type must be agent.");
+      if (itemType && !["agent", "workspace"].includes(itemType)) {
+        throwStatus(400, "type must be agent or workspace.");
       }
-      const items = data.agents
+      const agentItems = itemType === "workspace" ? [] : data.agents
         .filter((agent) => agent.enabled !== false && agent.marketplace?.published === true)
-        .filter((agent) => !itemType || agentItemType(agent) === itemType)
         .filter((agent) => !q || marketplaceSearchText(agent).includes(q))
-        .map((agent) => marketplaceItemSummary(data, agent, req))
+        .map((agent) => marketplaceItemSummary(data, agent, req));
+      const workspaceItems = itemType === "agent" ? [] : (data.agentWorkspaces || [])
+        .filter((workspace) => workspace.marketplace?.published === true)
+        .map((workspace) => agentWorkspaceMarketplaceSummary(data, workspace, req))
+        .filter((item) => !q || `${item.title} ${item.description} ${item.publisher_display_name || ""}`.toLowerCase().includes(q));
+      const items = [...agentItems, ...workspaceItems]
         .sort((left, right) => right.rating_average - left.rating_average
           || right.rating_count - left.rating_count
           || String(right.published_at || "").localeCompare(String(left.published_at || "")));
@@ -1848,6 +1999,14 @@ export async function createApp({
   app.get("/api/marketplace/items/:agent_id", (req, res, next) => {
     try {
       const data = store.read();
+      const workspace = (data.agentWorkspaces || []).find((candidate) => (
+        candidate.agent_workspace_id === req.params.agent_id
+        && candidate.marketplace?.published === true
+      ));
+      if (workspace) {
+        res.json(agentWorkspaceMarketplaceDetail(data, workspace, req));
+        return;
+      }
       const item = data.agents.find((agent) =>
         agent.id === req.params.agent_id
         && agent.enabled !== false
@@ -1862,6 +2021,20 @@ export async function createApp({
 
   app.post("/api/marketplace/items/:agent_id", async (req, res, next) => {
     try {
+      const workspaceSnapshot = store.read((data) => (data.agentWorkspaces || [])
+        .find((workspace) => workspace.agent_workspace_id === req.params.agent_id));
+      if (workspaceSnapshot || req.body?.item_type === "workspace") {
+        if (!workspaceSnapshot) throwStatus(404, "Workspace not found.");
+        const wasPublished = workspaceSnapshot.marketplace?.published === true;
+        const updated = await store.mutate((data) => publishAgentWorkspace(
+          data,
+          req.params.agent_id,
+          req.auth,
+          req.body
+        ));
+        res.status(wasPublished ? 200 : 201).json(agentWorkspaceMarketplaceSummary(store.read(), updated, req));
+        return;
+      }
       const current = store.read().agents.find((agent) => agent.id === req.params.agent_id);
       assertAgentMutationAccess(current, req);
       if (!current || current.enabled === false) throwStatus(404, "Agent not found.");
@@ -1893,6 +2066,26 @@ export async function createApp({
 
   app.delete("/api/marketplace/items/:agent_id", async (req, res, next) => {
     try {
+      const workspaceSnapshot = store.read((data) => (data.agentWorkspaces || [])
+        .find((workspace) => workspace.agent_workspace_id === req.params.agent_id));
+      if (workspaceSnapshot) {
+        const unpublished = await store.mutate((data) => {
+          const workspace = findAgentWorkspace(data, req.params.agent_id, req.auth, { mutable: true });
+          if (!workspace.marketplace?.published) throwStatus(404, "Marketplace item not found.");
+          const now = nowIso();
+          workspace.marketplace = {
+            ...workspace.marketplace,
+            published: false,
+            unpublished_at: now,
+            updated_by: req.auth.user_id,
+            updated_at: now
+          };
+          workspace.updated_at = now;
+          return workspace;
+        });
+        res.json({ ok: true, agent_workspace_id: unpublished.agent_workspace_id, published: false });
+        return;
+      }
       const current = store.read().agents.find((agent) => agent.id === req.params.agent_id);
       assertAgentMutationAccess(current, req);
       if (!current?.marketplace?.published) throwStatus(404, "Marketplace item not found.");
@@ -1935,6 +2128,50 @@ export async function createApp({
         throwStatus(400, "score must be an integer from 1 to 5.");
       }
       const snapshot = store.read();
+      const workspaceItem = (snapshot.agentWorkspaces || []).find((workspace) => (
+        workspace.agent_workspace_id === req.params.agent_id
+        && workspace.marketplace?.published === true
+      ));
+      if (workspaceItem) {
+        if (agentWorkspaceMarketplaceIsSelfPublished(workspaceItem, req)) {
+          throwStatus(403, "You cannot rate a workspace you published.");
+        }
+        const result = await store.mutate((data) => {
+          const current = (data.agentWorkspaces || []).find((workspace) => (
+            workspace.agent_workspace_id === req.params.agent_id
+            && workspace.marketplace?.published === true
+          ));
+          if (!current) throwStatus(404, "Marketplace item not found.");
+          if (agentWorkspaceMarketplaceIsSelfPublished(current, req)) {
+            throwStatus(403, "You cannot rate a workspace you published.");
+          }
+          const listingId = agentWorkspaceListingId(current);
+          data.agentWorkspaceRatings ||= [];
+          let rating = data.agentWorkspaceRatings.find((candidate) => (
+            candidate.listing_id === listingId
+            && candidate.created_by === req.auth.user_id
+            && String(candidate.workspace_id || "") === String(req.auth.workspace_id || "")
+          ));
+          const now = nowIso();
+          const created = !rating;
+          if (!rating) {
+            rating = {
+              rating_id: makeId("rating"),
+              listing_id: listingId,
+              agent_workspace_id: current.agent_workspace_id,
+              workspace_id: req.auth.workspace_id,
+              created_by: req.auth.user_id,
+              created_at: now
+            };
+            data.agentWorkspaceRatings.push(rating);
+          }
+          rating.score = score;
+          rating.updated_at = now;
+          return { created, workspace: current };
+        });
+        res.status(result.created ? 201 : 200).json(agentWorkspaceMarketplaceSummary(store.read(), result.workspace, req));
+        return;
+      }
       const item = snapshot.agents.find((agent) => agent.id === req.params.agent_id && agent.enabled !== false && agent.marketplace?.published === true);
       if (!item) throwStatus(404, "Marketplace item not found.");
       if (marketplaceIsSelfPublished(item, req)) {
@@ -1992,6 +2229,25 @@ export async function createApp({
   app.post("/api/marketplace/items/:agent_id/copy", async (req, res, next) => {
     try {
       const snapshot = store.read();
+      const workspaceItem = (snapshot.agentWorkspaces || []).find((workspace) => (
+        workspace.agent_workspace_id === req.params.agent_id
+        && workspace.marketplace?.published === true
+      ));
+      if (workspaceItem) {
+        const copiedWorkspace = await copyMarketplaceWorkspaceToUser({
+          store,
+          req,
+          sourceWorkspace: workspaceItem
+        });
+        res.status(201).json({
+          ok: true,
+          status: "copied",
+          listing_id: agentWorkspaceListingId(workspaceItem),
+          source_agent_workspace_id: workspaceItem.agent_workspace_id,
+          agent_workspace: publicAgentWorkspace(copiedWorkspace, store.read())
+        });
+        return;
+      }
       const item = snapshot.agents.find((agent) =>
         agent.id === req.params.agent_id
         && agent.enabled !== false
@@ -2002,13 +2258,15 @@ export async function createApp({
         store,
         req,
         sourceAgent: item,
-        requestedId: req.body?.id
+        requestedId: req.body?.id,
+        targetAgentWorkspaceId: req.body?.agent_workspace_id
       });
       res.status(201).json({
         ok: true,
         status: "copied",
         listing_id: marketplaceListingId(item),
         source_agent_id: item.id,
+        agent_workspace_id: req.body?.agent_workspace_id || null,
         agent: redactAgentForRequest(copied, req)
       });
     } catch (error) {
@@ -2192,6 +2450,7 @@ export async function createApp({
 
   app.post("/api/agents", async (req, res, next) => {
     let runtimeRegistrationCleanup = null;
+    let agentWorkspaceReservation = null;
     try {
       const agent = normalizeAgentPayload(req.body);
       const sourceText = normalizeSourceText(req.body.source_text);
@@ -2211,6 +2470,23 @@ export async function createApp({
         throwStatus(400, "Invalid source path.");
       }
       assertOwnedAgentSources(req, agent.id, agent.sources);
+      const requestedAgentWorkspaceId = String(req.body?.agent_workspace_id || "").trim();
+      const reservationId = requestedAgentWorkspaceId
+        ? `agent-create:${agent.id}:${makeId("reservation")}`
+        : null;
+      const targetAgentWorkspace = requestedAgentWorkspaceId
+        ? await store.mutate((data) => {
+            const workspace = findAgentWorkspace(data, requestedAgentWorkspaceId, req.auth, { mutable: true });
+            reserveAgentWorkspaceCapacity(data, workspace.agent_workspace_id, req.auth, 1, reservationId);
+            return publicAgentWorkspace(workspace, data);
+          })
+        : null;
+      if (targetAgentWorkspace) {
+        agentWorkspaceReservation = {
+          workspaceId: targetAgentWorkspace.agent_workspace_id,
+          reservationId
+        };
+      }
       if (realRuntimeEnabled()) {
         const auditContext = runtimeAuditContext(req);
         const registrationId = `registration_${crypto.randomBytes(24).toString("hex")}`;
@@ -2261,6 +2537,15 @@ export async function createApp({
             } : {})
           };
           data.agents.push(created);
+          if (targetAgentWorkspace) {
+            commitAgentWorkspaceReservation(
+              data,
+              targetAgentWorkspace.agent_workspace_id,
+              req.auth,
+              reservationId,
+              [created.id]
+            );
+          }
           appendAgentEvent(data, {
             eventType: "agent.created",
             agent: created,
@@ -2270,12 +2555,14 @@ export async function createApp({
           return created;
         });
         runtimeRegistrationCleanup = null;
+        agentWorkspaceReservation = null;
         res.status(201).json(redactAgentRegistrationForRequest({
           status: runtimeResult.status || "added",
           id: agent.id,
           workspace_id: agent.workspace_id,
           visibility: agent.visibility,
           created_by: agent.created_by,
+          agent_workspace_id: targetAgentWorkspace?.agent_workspace_id || null,
           manifest: runtimeResult.result?.manifest,
           skill_path: runtimeResult.result?.skill_path || agent.skill_path,
           ready,
@@ -2292,6 +2579,15 @@ export async function createApp({
         }
         agent.ready = true;
         data.agents.push(agent);
+        if (targetAgentWorkspace) {
+          commitAgentWorkspaceReservation(
+            data,
+            targetAgentWorkspace.agent_workspace_id,
+            req.auth,
+            reservationId,
+            [agent.id]
+          );
+        }
         appendAgentEvent(data, {
           eventType: "agent.created",
           agent,
@@ -2300,12 +2596,14 @@ export async function createApp({
         });
         return agent;
       });
+      agentWorkspaceReservation = null;
       res.status(201).json(redactAgentRegistrationForRequest({
         status: "added",
         id: agent.id,
         workspace_id: agent.workspace_id,
         visibility: agent.visibility,
         created_by: agent.created_by,
+        agent_workspace_id: targetAgentWorkspace?.agent_workspace_id || null,
         manifest: "configs/router_agent_library.json",
         skill_path: agent.skill_path,
         ready: true
@@ -2343,6 +2641,14 @@ export async function createApp({
             }
           }
         }
+      }
+      if (agentWorkspaceReservation) {
+        await store.mutate((data) => releaseAgentWorkspaceReservation(
+          data,
+          agentWorkspaceReservation.workspaceId,
+          req.auth,
+          agentWorkspaceReservation.reservationId
+        )).catch(() => undefined);
       }
       next(error);
     }
@@ -4367,6 +4673,7 @@ function applyArchivedAgentDeletionState(data, agentId, { actor, deletedAt }) {
     occurredAt: deletedAt
   });
   data.agents.splice(index, 1);
+  removeAgentFromAllWorkspaces(data, agentId);
   data.marketplaceRatings = (data.marketplaceRatings || []).filter((rating) =>
     String(rating.listing_id || "") !== listingId
     && String(rating.agent_id || "") !== agentId
@@ -5935,6 +6242,17 @@ async function activateWorkflowDraft({ store, workflowId, actor }) {
   const activationClaimId = makeId("activation");
   const claim = await store.mutate((data) => {
     const current = assertWorkflowAccess(data, workflowId, actor, { mutable: true });
+    if (!current.agent_workspace_id) {
+      const suffix = String(current.workflow_id || "workflow").replace(/^workflow_/, "").slice(-6);
+      const name = `Workflow · ${String(current.title || "Agent team").slice(0, 54)} · ${suffix}`.slice(0, 80);
+      const createdWorkspace = createAgentWorkspace(data, actor, {
+        name,
+        description: `Agent team created for ${current.title || "this workflow"}.`,
+        agent_ids: []
+      });
+      current.agent_workspace_id = createdWorkspace.agent_workspace_id;
+    }
+    findAgentWorkspace(data, current.agent_workspace_id, actor, { mutable: true });
     if (current.status === "active") return { workflow: current, claimed: false };
     if (!current.approved_at) throwStatus(409, "Confirm the workflow before creating it.");
     const previousSignature = workflowConnectionStateSignature(current);
@@ -5976,11 +6294,24 @@ async function activateWorkflowDraft({ store, workflowId, actor }) {
   if (!claim.claimed) return workflow;
   if (workflow.status === "awaiting_connections" || workflow.status === "active") return workflow;
 
+  const capacityReservationId = `workflow:${workflow.workflow_id}:${activationClaimId}`;
+  let capacityReserved = false;
   try {
     const nodeAgents = new Map();
     const assignedAgentIds = new Set();
     const initialSnapshot = store.read();
     preflightWorkflowActivation({ workflow, snapshot: initialSnapshot, actor });
+    const additionalSlots = workflowWorkspaceAdditionalSlots({ workflow, snapshot: initialSnapshot, actor });
+    if (additionalSlots > 0) {
+      await store.mutate((data) => reserveAgentWorkspaceCapacity(
+        data,
+        workflow.agent_workspace_id,
+        actor,
+        additionalSlots,
+        capacityReservationId
+      ));
+      capacityReserved = true;
+    }
     for (const node of workflow.nodes.filter((item) => item.type === "agent")) {
       const existingActivation = workflow.activation?.node_agents?.find((item) => item.node_id === node.id);
       const existingAgent = existingActivation
@@ -6160,6 +6491,16 @@ async function activateWorkflowDraft({ store, workflowId, actor }) {
       })),
       edges: workflowActivationEdges(workflow, nodeAgents)
     };
+    if (capacityReserved) {
+      await store.mutate((data) => commitAgentWorkspaceReservation(
+        data,
+        workflow.agent_workspace_id,
+        actor,
+        capacityReservationId,
+        activation.node_agents.map((item) => item.agent_id)
+      ));
+      capacityReserved = false;
+    }
     workflow = await markWorkflowActivation({
       store,
       workflowId: workflow.workflow_id,
@@ -6170,6 +6511,14 @@ async function activateWorkflowDraft({ store, workflowId, actor }) {
     });
     return workflow;
   } catch (error) {
+    if (capacityReserved) {
+      await store.mutate((data) => releaseAgentWorkspaceReservation(
+        data,
+        workflow.agent_workspace_id,
+        actor,
+        capacityReservationId
+      )).catch(() => undefined);
+    }
     await markWorkflowActivation({
       store,
       workflowId: workflow.workflow_id,
@@ -6180,6 +6529,29 @@ async function activateWorkflowDraft({ store, workflowId, actor }) {
     }).catch(() => undefined);
     throw error;
   }
+}
+
+function workflowWorkspaceAdditionalSlots({ workflow, snapshot, actor }) {
+  const workspace = findAgentWorkspace(snapshot, workflow.agent_workspace_id, actor);
+  const existingIds = new Set(workspace.agent_ids || []);
+  const additions = new Set();
+  for (const node of workflow.nodes.filter((item) => item.type === "agent")) {
+    const existingActivation = workflow.activation?.node_agents?.find((item) => item.node_id === node.id);
+    let agentId = existingActivation?.agent_id || null;
+    if (!agentId && node.source === "workspace") {
+      const source = (snapshot.agents || []).find((agent) => agent.id === node.agent_id);
+      const requiresCopy = source && (
+        !workflowAgentMutable(source, actor)
+        || workflowNodeRequiresScopedCopy(workflow, node, source)
+      );
+      agentId = requiresCopy ? workflowAgentId(workflow, node) : source?.id || null;
+    }
+    if (!agentId && ["marketplace", "generated"].includes(node.source)) {
+      agentId = workflowAgentId(workflow, node);
+    }
+    if (agentId && !existingIds.has(agentId)) additions.add(agentId);
+  }
+  return additions.size;
 }
 
 function workflowConnectionStateSignature(workflow) {
@@ -6948,6 +7320,322 @@ function marketplaceItemDetail(data, agent, req) {
   };
 }
 
+function agentWorkspaceListingId(workspace = {}) {
+  const stored = String(workspace.marketplace?.listing_id || "").trim();
+  if (/^listing_[a-z0-9]+$/i.test(stored)) return stored;
+  const digest = crypto.createHash("sha256")
+    .update(`${workspace.agent_workspace_id || "workspace"}:${workspace.marketplace?.published_at || "legacy"}`, "utf8")
+    .digest("hex")
+    .slice(0, 16);
+  return `listing_${digest}`;
+}
+
+function agentWorkspaceMarketplaceSnapshot(data, workspace) {
+  const members = new Set(workspace.agent_ids || []);
+  const agents = (workspace.agent_ids || []).flatMap((agentId) => {
+    const agent = (data.agents || []).find((candidate) => candidate.id === agentId && candidate.enabled !== false);
+    return agent ? [{ source_agent_id: agent.id, agent: marketplaceAgentSnapshot(agent) }] : [];
+  }).slice(0, AGENT_WORKSPACE_MAX_AGENTS);
+  const edges = [];
+  for (const target of data.agents || []) {
+    if (!members.has(target.id)) continue;
+    for (const input of target.consumes || []) {
+      const sourceId = String(input).match(/^agent:([a-z0-9_]+):output$/)?.[1];
+      if (sourceId && members.has(sourceId) && sourceId !== target.id) {
+        edges.push({ from: sourceId, to: target.id, label: "handoff" });
+      }
+    }
+  }
+  return {
+    schema_version: "virenis-marketplace-workspace-v1",
+    name: workspace.name,
+    description: workspace.description || "",
+    agents,
+    edges: edges.slice(0, 120),
+    exclusions: {
+      private_knowledge: true,
+      mcp_credentials_and_bindings: true
+    }
+  };
+}
+
+function publishedAgentWorkspaceSnapshot(data, workspace) {
+  const stored = workspace.marketplace?.snapshot;
+  if (!stored || stored.schema_version !== "virenis-marketplace-workspace-v1" || !Array.isArray(stored.agents)) {
+    return agentWorkspaceMarketplaceSnapshot(data, workspace);
+  }
+  return {
+    schema_version: "virenis-marketplace-workspace-v1",
+    name: cleanTitle(stored.name) || workspace.name,
+    description: String(stored.description || "").replaceAll("\0", "").trim().slice(0, 1200),
+    agents: stored.agents.slice(0, AGENT_WORKSPACE_MAX_AGENTS).flatMap((entry) => {
+      if (!entry?.source_agent_id || !entry.agent) return [];
+      return [{
+        source_agent_id: String(entry.source_agent_id).slice(0, 120),
+        agent: marketplaceAgentSnapshot(entry.agent)
+      }];
+    }),
+    edges: (Array.isArray(stored.edges) ? stored.edges : []).slice(0, 120).flatMap((edge) => (
+      edge?.from && edge?.to && edge.from !== edge.to
+        ? [{ from: String(edge.from).slice(0, 120), to: String(edge.to).slice(0, 120), label: "handoff" }]
+        : []
+    )),
+    exclusions: { private_knowledge: true, mcp_credentials_and_bindings: true }
+  };
+}
+
+function agentWorkspaceMarketplaceIsSelfPublished(workspace, req) {
+  return Boolean(
+    workspace
+    && workspace.marketplace?.published_by === req.auth?.user_id
+    && String(workspace.marketplace?.publisher_workspace_id || "") === String(req.auth?.workspace_id || "")
+  );
+}
+
+function agentWorkspaceMarketplaceCanManage(workspace, req) {
+  return Boolean(
+    workspace
+    && workspace.created_by === req.auth?.user_id
+    && String(workspace.workspace_id || "") === String(req.auth?.workspace_id || "")
+  );
+}
+
+function agentWorkspaceMarketplaceSummary(data, workspace, req) {
+  const listingId = agentWorkspaceListingId(workspace);
+  const ratings = (data.agentWorkspaceRatings || [])
+    .filter((rating) => rating.listing_id === listingId)
+    .filter((rating) => !(
+      rating.created_by === workspace.marketplace?.published_by
+      && String(rating.workspace_id || "") === String(workspace.marketplace?.publisher_workspace_id || "")
+    ))
+    .filter((rating) => Number.isInteger(Number(rating.score)) && Number(rating.score) >= 1 && Number(rating.score) <= 5);
+  const ratingTotal = ratings.reduce((total, rating) => total + Number(rating.score), 0);
+  const publisherUser = (data.users || []).find((user) => user.user_id === workspace.marketplace?.published_by);
+  const copied = (data.agentWorkspaces || []).find((candidate) => (
+    candidate.marketplace_origin?.listing_id === listingId
+    && candidate.created_by === req.auth?.user_id
+    && String(candidate.workspace_id || "") === String(req.auth?.workspace_id || "")
+  ));
+  const snapshot = publishedAgentWorkspaceSnapshot(data, workspace);
+  const myRating = ratings.find((rating) => (
+    rating.created_by === req.auth?.user_id
+    && String(rating.workspace_id || "") === String(req.auth?.workspace_id || "")
+  ));
+  return {
+    id: workspace.agent_workspace_id,
+    listing_id: listingId,
+    source_agent_workspace_id: workspace.agent_workspace_id,
+    title: snapshot.name,
+    capability: snapshot.description || `${snapshot.agents.length} agent team`,
+    description: workspace.marketplace?.description || snapshot.description,
+    item_type: "workspace",
+    agent_count: snapshot.agents.length,
+    publisher: { user_id: workspace.marketplace?.published_by },
+    published_by: workspace.marketplace?.published_by,
+    publisher_display_name: publisherUser?.display_name
+      || workspace.marketplace?.publisher_display_name
+      || workspace.marketplace?.published_by,
+    published_at: workspace.marketplace?.published_at || null,
+    updated_at: workspace.marketplace?.updated_at || null,
+    rating_average: ratings.length ? Number((ratingTotal / ratings.length).toFixed(2)) : 0,
+    rating_count: ratings.length,
+    my_rating: myRating ? { score: Number(myRating.score) } : null,
+    workspace_copy: copied ? { agent_workspace_id: copied.agent_workspace_id, name: copied.name } : null,
+    can_copy: !isViewer(req),
+    can_manage: agentWorkspaceMarketplaceCanManage(workspace, req),
+    is_self_published: agentWorkspaceMarketplaceIsSelfPublished(workspace, req),
+    is_owner: agentWorkspaceMarketplaceCanManage(workspace, req)
+  };
+}
+
+function agentWorkspaceMarketplaceDetail(data, workspace, req) {
+  return {
+    ...agentWorkspaceMarketplaceSummary(data, workspace, req),
+    workspace: publishedAgentWorkspaceSnapshot(data, workspace)
+  };
+}
+
+function publishAgentWorkspace(data, workspaceId, actor, body = {}) {
+  const workspace = findAgentWorkspace(data, workspaceId, actor, { mutable: true });
+  if (workspace.reservations?.length) {
+    throwStatus(409, "Wait for agent setup to finish before publishing this workspace.");
+  }
+  if (workspace.copy_status === "copying" || workspace.copy_status === "cleanup_required") {
+    throwStatus(409, "This copied workspace must finish setup before it can be published.");
+  }
+  const snapshot = agentWorkspaceMarketplaceSnapshot(data, workspace);
+  if (!snapshot.agents.length) throwStatus(409, "Add at least one available agent before publishing this workspace.");
+  const description = String(body.description || workspace.description || "")
+    .replaceAll("\0", "").trim().slice(0, 1200);
+  if (!description) throwStatus(400, "Workspace description is required.");
+  const now = nowIso();
+  workspace.marketplace = {
+    published: true,
+    listing_id: workspace.marketplace?.listing_id || makeId("listing"),
+    item_type: "workspace",
+    description,
+    snapshot,
+    published_by: workspace.marketplace?.published_by || actor.user_id,
+    publisher_display_name: workspace.marketplace?.publisher_display_name || actor.display_name || actor.user_id,
+    publisher_workspace_id: workspace.marketplace?.publisher_workspace_id ?? actor.workspace_id,
+    updated_by: actor.user_id,
+    published_at: workspace.marketplace?.published_at || now,
+    updated_at: now
+  };
+  workspace.updated_at = now;
+  data.agentWorkspaceRatings = (data.agentWorkspaceRatings || []).filter((rating) => !(
+    rating.listing_id === workspace.marketplace.listing_id
+    && rating.created_by === workspace.marketplace.published_by
+    && String(rating.workspace_id || "") === String(workspace.marketplace.publisher_workspace_id || "")
+  ));
+  return workspace;
+}
+
+function marketplaceWorkspaceCopyName(data, actor, sourceName) {
+  const existing = new Set((data.agentWorkspaces || [])
+    .filter((workspace) => (
+      workspace.created_by === actor.user_id
+      && String(workspace.workspace_id || "") === String(actor.workspace_id || "")
+    ))
+    .map((workspace) => String(workspace.name || "").toLowerCase()));
+  const base = `${cleanTitle(sourceName) || "Shared workspace"} copy`.slice(0, 72);
+  if (!existing.has(base.toLowerCase())) return base;
+  for (let index = 2; index <= 99; index += 1) {
+    const candidate = `${base.slice(0, 75 - String(index).length)} ${index}`;
+    if (!existing.has(candidate.toLowerCase())) return candidate;
+  }
+  return `${base.slice(0, 64)} ${crypto.randomBytes(3).toString("hex")}`;
+}
+
+async function copyMarketplaceWorkspaceToUser({ store, req, sourceWorkspace }) {
+  const sourceData = store.read();
+  const snapshot = publishedAgentWorkspaceSnapshot(sourceData, sourceWorkspace);
+  if (!snapshot.agents.length) throwStatus(409, "This Marketplace workspace has no copyable agents.");
+  if (snapshot.agents.length > AGENT_WORKSPACE_MAX_AGENTS) {
+    throwStatus(409, `Marketplace workspaces can contain at most ${AGENT_WORKSPACE_MAX_AGENTS} agents.`);
+  }
+  const listingId = agentWorkspaceListingId(sourceWorkspace);
+  const createdWorkspace = await store.mutate((data) => {
+    const created = createAgentWorkspace(data, req.auth, {
+      name: marketplaceWorkspaceCopyName(data, req.auth, snapshot.name),
+      description: snapshot.description || sourceWorkspace.marketplace?.description,
+      agent_ids: []
+    });
+    created.marketplace_origin = {
+      listing_id: listingId,
+      source_agent_workspace_id: sourceWorkspace.agent_workspace_id,
+      publisher_user_id: sourceWorkspace.marketplace?.published_by,
+      copied_at: nowIso()
+    };
+    created.copy_status = "copying";
+    return created;
+  });
+  const copiedAgents = [];
+  const sourceToCopied = new Map();
+  try {
+    for (const entry of snapshot.agents) {
+      const nestedListingId = `listing_${crypto.createHash("sha256")
+        .update(`${listingId}:${entry.source_agent_id}`, "utf8")
+        .digest("hex").slice(0, 16)}`;
+      const pseudoSource = {
+        id: entry.source_agent_id,
+        title: entry.agent.title,
+        capability: entry.agent.capability,
+        created_by: sourceWorkspace.marketplace?.published_by,
+        workspace_id: sourceWorkspace.workspace_id,
+        marketplace: {
+          published: true,
+          listing_id: nestedListingId,
+          published_by: sourceWorkspace.marketplace?.published_by,
+          publisher_workspace_id: sourceWorkspace.marketplace?.publisher_workspace_id,
+          published_at: sourceWorkspace.marketplace?.published_at,
+          snapshot: entry.agent
+        }
+      };
+      const copied = await copyMarketplaceAgentToWorkspace({
+        store,
+        req,
+        sourceAgent: pseudoSource,
+        targetAgentWorkspaceId: createdWorkspace.agent_workspace_id
+      });
+      copiedAgents.push(copied);
+      sourceToCopied.set(entry.source_agent_id, copied.id);
+    }
+
+    const handoffsByTarget = new Map();
+    for (const edge of snapshot.edges || []) {
+      const from = sourceToCopied.get(edge.from);
+      const to = sourceToCopied.get(edge.to);
+      if (!from || !to || from === to) continue;
+      if (!handoffsByTarget.has(to)) handoffsByTarget.set(to, new Set());
+      handoffsByTarget.get(to).add(`agent:${from}:output`);
+    }
+    for (const [targetId, handoffs] of handoffsByTarget) {
+      const target = copiedAgents.find((agent) => agent.id === targetId);
+      const consumes = [...new Set([...(target?.consumes || ["user_request"]), ...handoffs])];
+      if (realRuntimeEnabled()) {
+        await updateRuntimeAgent(targetId, {
+          consumes,
+          audit_context: runtimeAuditContext(req)
+        });
+      }
+      await store.mutate((data) => {
+        const stored = data.agents.find((agent) => agent.id === targetId);
+        if (!stored) throwStatus(409, "A copied workspace agent disappeared during setup.");
+        stored.consumes = consumes;
+        stored.last_edited_by = req.auth.user_id;
+        stored.last_edited_at = nowIso();
+        return stored;
+      });
+    }
+    const completed = await store.mutate((data) => {
+      const workspace = findAgentWorkspace(data, createdWorkspace.agent_workspace_id, req.auth, { mutable: true });
+      workspace.copy_status = "ready";
+      workspace.updated_at = nowIso();
+      return workspace;
+    });
+    return completed;
+  } catch (error) {
+    let cleanupFailed = false;
+    if (realRuntimeEnabled()) {
+      for (const agent of [...copiedAgents].reverse()) {
+        try {
+          await archiveRuntimeAgent(agent.id, runtimeAuditContext(req)).catch((archiveError) => {
+            if (![404, 409].includes(Number(archiveError?.status))) throw archiveError;
+          });
+          await deleteArchivedRuntimeAgent(agent.id, runtimeAuditContext(req)).catch((deleteError) => {
+            if (Number(deleteError?.status) !== 404) throw deleteError;
+          });
+        } catch {
+          cleanupFailed = true;
+        }
+      }
+    }
+    await store.mutate((data) => {
+      const workspace = (data.agentWorkspaces || []).find((candidate) => (
+        candidate.agent_workspace_id === createdWorkspace.agent_workspace_id
+      ));
+      if (cleanupFailed && workspace) {
+        workspace.copy_status = "cleanup_required";
+        workspace.copy_error = "Workspace copy did not finish. Contact support before using these agents.";
+        workspace.updated_at = nowIso();
+        return workspace;
+      }
+      const copiedIds = new Set(copiedAgents.map((agent) => agent.id));
+      data.agents = (data.agents || []).filter((agent) => !copiedIds.has(agent.id));
+      data.agentWorkspaces = (data.agentWorkspaces || []).filter((candidate) => (
+        candidate.agent_workspace_id !== createdWorkspace.agent_workspace_id
+      ));
+      return null;
+    });
+    if (cleanupFailed) {
+      error.message = `${error.message} A recovery workspace was retained so support can safely reconcile the external agents.`;
+      error.code ||= "marketplace_workspace_copy_cleanup_required";
+    }
+    throw error;
+  }
+}
+
 function marketplaceCopyAgentId(data, sourceAgent, requestedId) {
   if (requestedId !== undefined && requestedId !== null && String(requestedId).trim()) {
     const requested = String(requestedId).trim();
@@ -6964,7 +7652,13 @@ function marketplaceCopyAgentId(data, sourceAgent, requestedId) {
   throwStatus(409, "A unique copied-agent id could not be allocated. Try again.");
 }
 
-async function copyMarketplaceAgentToWorkspace({ store, req, sourceAgent, requestedId }) {
+async function copyMarketplaceAgentToWorkspace({
+  store,
+  req,
+  sourceAgent,
+  requestedId,
+  targetAgentWorkspaceId = null
+}) {
   const snapshot = publishedMarketplaceSnapshot(sourceAgent);
   const listingId = marketplaceListingId(sourceAgent);
   const agentId = marketplaceCopyAgentId(store.read(), sourceAgent, requestedId);
@@ -7000,7 +7694,17 @@ async function copyMarketplaceAgentToWorkspace({ store, req, sourceAgent, reques
   });
 
   let runtimeCleanup = null;
+  let workspaceReservation = null;
   try {
+    const selectedWorkspaceId = String(targetAgentWorkspaceId || "").trim();
+    if (selectedWorkspaceId) {
+      const reservationId = `marketplace-copy:${listingId}:${agentId}:${makeId("reservation")}`;
+      await store.mutate((data) => {
+        findAgentWorkspace(data, selectedWorkspaceId, req.auth, { mutable: true });
+        reserveAgentWorkspaceCapacity(data, selectedWorkspaceId, req.auth, 1, reservationId);
+      });
+      workspaceReservation = { workspaceId: selectedWorkspaceId, reservationId };
+    }
     if (realRuntimeEnabled()) {
       const auditContext = runtimeAuditContext(req);
       const registrationId = `registration_${crypto.randomBytes(24).toString("hex")}`;
@@ -7045,6 +7749,15 @@ async function copyMarketplaceAgentToWorkspace({ store, req, sourceAgent, reques
           } : {})
         };
         data.agents.push(stored);
+        if (workspaceReservation) {
+          commitAgentWorkspaceReservation(
+            data,
+            workspaceReservation.workspaceId,
+            req.auth,
+            workspaceReservation.reservationId,
+            [stored.id]
+          );
+        }
         appendAgentEvent(data, {
           eventType: "agent.marketplace_copied",
           agent: stored,
@@ -7054,6 +7767,7 @@ async function copyMarketplaceAgentToWorkspace({ store, req, sourceAgent, reques
         return stored;
       });
       runtimeCleanup = null;
+      workspaceReservation = null;
       return created;
     }
 
@@ -7063,6 +7777,15 @@ async function copyMarketplaceAgentToWorkspace({ store, req, sourceAgent, reques
       }
       copied.ready = true;
       data.agents.push(copied);
+      if (workspaceReservation) {
+        commitAgentWorkspaceReservation(
+          data,
+          workspaceReservation.workspaceId,
+          req.auth,
+          workspaceReservation.reservationId,
+          [copied.id]
+        );
+      }
       appendAgentEvent(data, {
         eventType: "agent.marketplace_copied",
         agent: copied,
@@ -7098,6 +7821,14 @@ async function copyMarketplaceAgentToWorkspace({ store, req, sourceAgent, reques
           }
         }
       }
+    }
+    if (workspaceReservation) {
+      await store.mutate((data) => releaseAgentWorkspaceReservation(
+        data,
+        workspaceReservation.workspaceId,
+        req.auth,
+        workspaceReservation.reservationId
+      )).catch(() => undefined);
     }
     throw error;
   }

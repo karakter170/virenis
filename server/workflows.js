@@ -74,8 +74,8 @@ export function workflowCommandHelp(command = "workflow") {
   return `Add a goal after **/${normalized}**. For example:\n\n\`/${normalized} Read new support emails, check relevant inventory, and prepare a reply draft.\``;
 }
 
-export function buildWorkflowCompositionInput({ data, session, actor, command }) {
-  const candidates = workflowCandidates(data, session, actor, command.intent);
+export function buildWorkflowCompositionInput({ data, session, actor, command, agentWorkspaceId = null }) {
+  const candidates = workflowCandidates(data, session, actor, command.intent, agentWorkspaceId);
   const connections = workflowConnections(data, actor, command.intent);
   return {
     schema_version: WORKFLOW_SCHEMA_VERSION,
@@ -129,7 +129,8 @@ export async function processWorkflowCompositionRun({ store, bus, run_id, compos
     data: snapshot.data,
     session: snapshot.session,
     actor,
-    command
+    command,
+    agentWorkspaceId: snapshot.run.agent_workspace_id || snapshot.session.agent_workspace_id || null
   });
   compositionInput.execution_context = {
     run_id,
@@ -403,6 +404,7 @@ export function publicWorkflow(workflow) {
   return {
     workflow_id: workflow.workflow_id,
     session_id: workflow.session_id,
+    agent_workspace_id: workflow.agent_workspace_id || null,
     schema_version: workflow.schema_version,
     mode: workflow.mode,
     command: workflow.command,
@@ -591,6 +593,11 @@ export async function markWorkflowActivation({
         ) {
           delete agent.runtime_sync_pending;
         }
+      }
+      const session = data.sessions.find((item) => item.session_id === workflow.session_id);
+      if (session && workflow.agent_workspace_id) {
+        session.agent_workspace_id = workflow.agent_workspace_id;
+        session.updated_at = now;
       }
       const checkpoint = (data.conversationCheckpoints || []).find((item) => item.workflow_id === workflow.workflow_id && item.type === "workflow_confirmation");
       if (checkpoint) {
@@ -1093,6 +1100,7 @@ function normalizeWorkflowProposal(raw, context) {
     permissions,
     safety,
     workspace_id: context.actor.workspace_id,
+    agent_workspace_id: context.run.agent_workspace_id || context.session.agent_workspace_id || null,
     created_by: context.actor.user_id,
     session_id: context.session.session_id,
     source_run_id: context.run.run_id,
@@ -1108,9 +1116,17 @@ function normalizeWorkflowProposal(raw, context) {
   };
 }
 
-function workflowCandidates(data, session, actor, intent) {
+function workflowCandidates(data, session, actor, intent, agentWorkspaceId = null) {
   const workspace = [];
   const marketplace = [];
+  const selectedAgentWorkspace = (data.agentWorkspaces || []).find((candidate) => (
+    candidate.agent_workspace_id === agentWorkspaceId
+    && String(candidate.workspace_id || "") === String(actor.workspace_id || "")
+    && candidate.created_by === actor.user_id
+  ));
+  const selectedAgentIds = selectedAgentWorkspace
+    ? new Set(selectedAgentWorkspace.agent_ids || [])
+    : null;
   const inactiveAgentIds = new Set(Array.isArray(session.inactive_agent_ids) ? session.inactive_agent_ids : []);
   const ratingsByListing = new Map();
   for (const rating of data.marketplaceRatings || []) {
@@ -1143,7 +1159,10 @@ function workflowCandidates(data, session, actor, intent) {
         && (agent.visibility !== "private" || agent.created_by === actor.user_id)
       )
     ) && (agent.scope !== "chat" || agent.session_id === session.session_id);
-    if (accessibleWorkspaceAgent) {
+    const selectedForWorkspace = !selectedAgentIds
+      || selectedAgentIds.has(agent.id)
+      || sessionDocument;
+    if (accessibleWorkspaceAgent && selectedForWorkspace) {
       workspace.push(candidateFromWorkspaceAgent(agent, intent));
     }
     if (!agent.document && agent.marketplace?.published === true && agent.marketplace?.snapshot) {
@@ -1348,7 +1367,20 @@ function workflowRoleCapability(rawNode, candidate, candidates, task) {
     canonicalCapabilityText(catalogCandidate.capability) === canonicalProposed
     && candidateCompatibilityScore({ ...rawNode, capability: "" }, catalogCandidate) === 0
   ));
-  return copiedFromUnrelatedCandidate ? bounded(task, 1200) : proposed;
+  // A session-scoped workspace can intentionally hide the catalog record from
+  // which a controller copied stale text. Do not depend on that record being
+  // present to detect contamination: when candidate resolution rejected the
+  // requested agent and the proposed capability shares no role identity with
+  // the visible title/cues, the task is the safer role-specific source.
+  const roleIdentity = semanticTokenSet(rawNode?.title, ...(rawNode?.routing_cues || []));
+  const proposedIdentity = semanticTokenSet(proposed);
+  const rejectedCandidateContamination = !candidate
+    && roleIdentity.size > 0
+    && proposedIdentity.size > 0
+    && tokenOverlap(roleIdentity, proposedIdentity) === 0;
+  return copiedFromUnrelatedCandidate || rejectedCandidateContamination
+    ? bounded(task, 1200)
+    : proposed;
 }
 
 function canonicalCapabilityText(value) {

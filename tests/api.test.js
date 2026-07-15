@@ -6,7 +6,7 @@ import request from "supertest";
 import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createApp } from "../server/app.js";
 import { requireRuntimeConfigured, setRuntimeFetchForTests } from "../server/runtimeClient.js";
-import { buildParallelBatches, enrichRuntimeRoutingTrace, normalizeRuntimeRouting, normalizeSharedMemory, planRoutes, sanitizeToolCalls, scopedRoutingContext } from "../server/tcarEngine.js";
+import { buildParallelBatches, enrichRuntimeRoutingTrace, normalizeRuntimeRouting, normalizeSharedMemory, planRoutes, sanitizeRuntimeFinalAnswer, sanitizeToolCalls, scopedRoutingContext } from "../server/tcarEngine.js";
 import { chunkDocument, runtimeDocumentRevision } from "../server/documents.js";
 
 let tmpDir;
@@ -5115,5 +5115,26 @@ describe("DAG and policy guards", () => {
     );
     expect(result.text).not.toContain("hidden");
     expect(result.violations).toEqual(["unauthorized_tool:repo_inspector", "malformed_tool_call"]);
+  });
+
+  it("never exposes provider reasoning or internal synthesis narration as the chat answer", () => {
+    const poem = "The Weight of Silence\n\nAt dusk the empty doorway keeps your name.";
+    const critique = "The restrained imagery creates a coherent elegiac atmosphere.";
+    const fallback = `### Poem\n\n${poem}\n\n### Critique\n\n${critique}`;
+
+    expect(sanitizeRuntimeFinalAnswer({
+      finalAnswer: "<think>private scratch without a completed public answer",
+      fallbackFinalAnswer: fallback
+    })).toBe(fallback);
+
+    expect(sanitizeRuntimeFinalAnswer({
+      finalAnswer: "AGENT_REASONING:\nPrivate rationale.\nDOMAIN_ANSWER:\nPublic answer only.\nHANDOFFS:\nInternal.",
+      fallbackFinalAnswer: fallback
+    })).toBe("Public answer only.");
+
+    expect(sanitizeRuntimeFinalAnswer({
+      finalAnswer: "The provided validated route results contain only the critique (Step s2). Step s1 was omitted due to budget constraints.",
+      fallbackFinalAnswer: fallback
+    })).toBe(fallback);
   });
 });

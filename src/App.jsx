@@ -436,6 +436,7 @@ function Workspace({ onHome, onSignedOut }) {
   const [workflows, setWorkflows] = useState([]);
   const [checkpoints, setCheckpoints] = useState([]);
   const [agents, setAgents] = useState([]);
+  const [agentWorkspaces, setAgentWorkspaces] = useState([]);
   const [documents, setDocuments] = useState([]);
   const [chatDocuments, setChatDocuments] = useState([]);
   const [runtime, setRuntime] = useState(null);
@@ -478,12 +479,17 @@ function Workspace({ onHome, onSignedOut }) {
   const [workflowBusy, setWorkflowBusy] = useState("");
   const [checkpointBusy, setCheckpointBusy] = useState("");
   const [connectionResumeWorkflowId, setConnectionResumeWorkflowId] = useState("");
+  const [workspaceEditor, setWorkspaceEditor] = useState(undefined);
+  const [workspaceMembersTarget, setWorkspaceMembersTarget] = useState(null);
+  const [workspaceDeleteTarget, setWorkspaceDeleteTarget] = useState(null);
+  const [workflowWorkspacePrompt, setWorkflowWorkspacePrompt] = useState(null);
   const threadRef = useRef(null);
   const nearBottomRef = useRef(true);
   const eventSourceRef = useRef(null);
   const sendInFlightRef = useRef(false);
   const sendRetryRef = useRef(null);
   const progressivelyRenderedRunIdsRef = useRef(new Set());
+  const workflowWorkspaceConfirmedRef = useRef(false);
   const oauthReturnRef = useRef((() => {
     const parameters = new URLSearchParams(window.location.search);
     return {
@@ -496,6 +502,9 @@ function Workspace({ onHome, onSignedOut }) {
 
   const canWrite = Boolean(auth && !auth.is_viewer);
   const detailsRun = detailsRunId ? runsById[detailsRunId] : null;
+  const activeAgentWorkspace = agentWorkspaces.find((workspace) => (
+    workspace.agent_workspace_id === session?.agent_workspace_id
+  )) || agentWorkspaces.find((workspace) => workspace.is_general) || agentWorkspaces[0] || null;
 
   useEffect(() => {
     bootstrap();
@@ -565,7 +574,8 @@ function Workspace({ onHome, onSignedOut }) {
         "/api/mcp/connections",
         "/api/mcp/templates",
         "/api/mcp/approvals",
-        "/api/billing/account"
+        "/api/billing/account",
+        "/api/agent-workspaces"
       ]);
       resetAuthenticationNotification();
       const required = (index) => {
@@ -584,6 +594,7 @@ function Workspace({ onHome, onSignedOut }) {
       const templateList = optional(6, { templates: [] });
       const approvalList = optional(7, { approvals: [] });
       const billingData = required(8);
+      const agentWorkspaceList = required(9);
       let optionalLoadFailed = results.slice(1, 8).some((result) => result.status === "rejected");
       let metricData = emptyMetrics();
       if (me.is_admin) {
@@ -602,13 +613,30 @@ function Workspace({ onHome, onSignedOut }) {
       setMcpTemplates(templateList.templates || []);
       setMcpApprovals(approvalList.approvals || []);
       setBilling(billingData);
+      setAgentWorkspaces(agentWorkspaceList.workspaces || []);
       setMetrics(metricData);
       const oauthSessionId = oauthReturnRef.current.sessionId;
       let nextSession = oauthSessionId
         ? sessionList.sessions?.find((item) => item.session_id === oauthSessionId) || { session_id: oauthSessionId }
         : sessionList.sessions?.[0] || null;
       if (!nextSession && !me.is_viewer) {
-        nextSession = await api.post("/api/chat/sessions", { title: "New chat", visibility: "private" });
+        const generalWorkspace = (agentWorkspaceList.workspaces || []).find((workspace) => workspace.is_general)
+          || agentWorkspaceList.workspaces?.[0];
+        nextSession = await api.post("/api/chat/sessions", {
+          title: "New chat",
+          visibility: "private",
+          ...(generalWorkspace ? { agent_workspace_id: generalWorkspace.agent_workspace_id } : {})
+        });
+      } else if (nextSession && !nextSession.agent_workspace_id && !me.is_viewer) {
+        const generalWorkspace = (agentWorkspaceList.workspaces || []).find((workspace) => workspace.is_general)
+          || agentWorkspaceList.workspaces?.[0];
+        if (generalWorkspace) {
+          const switched = await api.patch(
+            `/api/chat/sessions/${encodeURIComponent(nextSession.session_id)}/agent-workspace`,
+            { agent_workspace_id: generalWorkspace.agent_workspace_id }
+          );
+          nextSession = { ...nextSession, agent_workspace_id: switched.agent_workspace_id };
+        }
       }
       setSessions(sessionList.sessions?.length ? sessionList.sessions : nextSession ? [nextSession] : []);
       if (nextSession) await openSession(nextSession.session_id);
@@ -639,7 +667,8 @@ function Workspace({ onHome, onSignedOut }) {
       "/api/mcp/connections",
       "/api/mcp/templates",
       "/api/mcp/approvals",
-      "/api/billing/account"
+      "/api/billing/account",
+      "/api/agent-workspaces"
     ]);
     resetAuthenticationNotification();
     const required = (index) => {
@@ -656,6 +685,7 @@ function Workspace({ onHome, onSignedOut }) {
     const templateList = fulfilled(6);
     const approvalList = fulfilled(7);
     const billingData = required(8);
+    const agentWorkspaceList = required(9);
     let optionalLoadFailed = results.slice(1, 8).some((result) => result.status === "rejected");
     let metricData = me.is_admin ? null : emptyMetrics();
     if (me.is_admin) {
@@ -675,6 +705,7 @@ function Workspace({ onHome, onSignedOut }) {
     if (templateList) setMcpTemplates(templateList.templates || []);
     if (approvalList) setMcpApprovals(approvalList.approvals || []);
     setBilling(billingData);
+    setAgentWorkspaces(agentWorkspaceList.workspaces || []);
     if (metricData) setMetrics(metricData);
     if (optionalLoadFailed) {
       setError("Some Studio resources could not be refreshed. Your current chat data was preserved.");
@@ -695,6 +726,7 @@ function Workspace({ onHome, onSignedOut }) {
       connections: ["/api/mcp/connections", (payload) => setMcpConnections(payload.connections || [])],
       templates: ["/api/mcp/templates", (payload) => setMcpTemplates(payload.templates || [])],
       approvals: ["/api/mcp/approvals", (payload) => setMcpApprovals(payload.approvals || [])],
+      agentWorkspaces: ["/api/agent-workspaces", (payload) => setAgentWorkspaces(payload.workspaces || [])],
       billing: ["/api/billing/account", setBilling],
       metrics: ["/api/admin/metrics", setMetrics]
     };
@@ -770,6 +802,14 @@ function Workspace({ onHome, onSignedOut }) {
       api.get(`/api/agents?session_id=${encodeURIComponent(sessionId)}`)
     ]);
     setSession(payload);
+    if (payload.agent_workspace) {
+      setAgentWorkspaces((items) => {
+        const exists = items.some((workspace) => workspace.agent_workspace_id === payload.agent_workspace.agent_workspace_id);
+        return exists
+          ? items.map((workspace) => workspace.agent_workspace_id === payload.agent_workspace.agent_workspace_id ? payload.agent_workspace : workspace)
+          : [...items, payload.agent_workspace];
+      });
+    }
     setMessages(payload.messages || []);
     for (const message of payload.messages || []) applyRunBilling(message.billing);
     setWorkflows(payload.workflows || []);
@@ -801,7 +841,11 @@ function Workspace({ onHome, onSignedOut }) {
     setError("");
     try {
       eventSourceRef.current?.close();
-      const created = await api.post("/api/chat/sessions", { title: "New chat", visibility: "private" });
+      const created = await api.post("/api/chat/sessions", {
+        title: "New chat",
+        visibility: "private",
+        ...(activeAgentWorkspace ? { agent_workspace_id: activeAgentWorkspace.agent_workspace_id } : {})
+      });
       setSessions((current) => [created, ...current.filter((item) => item.session_id !== created.session_id)]);
       await openSession(created.session_id);
       setDraft("");
@@ -812,10 +856,34 @@ function Workspace({ onHome, onSignedOut }) {
     }
   }
 
+  async function switchAgentWorkspace(agentWorkspaceId, { refresh = true } = {}) {
+    if (!session?.session_id || !agentWorkspaceId || !canWrite) return null;
+    const result = await api.patch(
+      `/api/chat/sessions/${encodeURIComponent(session.session_id)}/agent-workspace`,
+      { agent_workspace_id: agentWorkspaceId }
+    );
+    setSession((current) => current ? {
+      ...current,
+      agent_workspace_id: result.agent_workspace_id,
+      agent_workspace: result.agent_workspace
+    } : current);
+    setSessions((items) => items.map((item) => item.session_id === session.session_id
+      ? { ...item, agent_workspace_id: result.agent_workspace_id }
+      : item));
+    if (refresh) await openSession(session.session_id, { hydrateRuns: false });
+    return result;
+  }
+
   async function sendMessage(event) {
     event?.preventDefault();
     const content = draft.trim();
     if (!content || !session || !canWrite || sendInFlightRef.current) return;
+    const workflowCommand = /^\/(workflow|agent)\s+\S/i.test(content);
+    if (workflowCommand && !workflowWorkspaceConfirmedRef.current) {
+      setWorkflowWorkspacePrompt({ content });
+      return;
+    }
+    workflowWorkspaceConfirmedRef.current = false;
     const previousSubmission = sendRetryRef.current;
     const submission = previousSubmission?.content === content
       && previousSubmission?.sessionId === session.session_id
@@ -1039,7 +1107,15 @@ function Workspace({ onHome, onSignedOut }) {
     setResourcesOpen(true);
   }
 
-  function runWorkflow(workflow) {
+  async function runWorkflow(workflow) {
+    try {
+      if (workflow.agent_workspace_id && workflow.agent_workspace_id !== session?.agent_workspace_id) {
+        await switchAgentWorkspace(workflow.agent_workspace_id, { refresh: false });
+      }
+    } catch (workspaceError) {
+      setError(friendlyError(workspaceError));
+      return;
+    }
     const agentIds = (workflow.activation?.node_agents || []).map((item) => item.agent_id).filter(Boolean);
     const mentions = agentIds.map((agentId) => `@${agentId}`).join(" ");
     setDraft(`${mentions}${mentions ? " " : ""}${workflow.intent}`.trim());
@@ -1079,7 +1155,7 @@ function Workspace({ onHome, onSignedOut }) {
     setError("");
     await api.delete(`/api/agents/${encodeURIComponent(agent.id)}`);
     setArchiveTarget(null);
-    await refreshStudioResources(["agents", "marketplace"]);
+    await refreshStudioResources(["agents", "agentWorkspaces", "marketplace"]);
     setResourcesOpen(true);
     setResourceView("agents");
   }
@@ -1088,7 +1164,7 @@ function Workspace({ onHome, onSignedOut }) {
     setError("");
     await api.delete(`/api/agents/${encodeURIComponent(agent.id)}/permanent`);
     setDeleteAgentTarget(null);
-    await refreshStudioResources(["agents", "marketplace"]);
+    await refreshStudioResources(["agents", "agentWorkspaces", "marketplace"]);
     setResourcesOpen(true);
     setResourceView("agents");
   }
@@ -1099,7 +1175,7 @@ function Workspace({ onHome, onSignedOut }) {
     setError("");
     await api.delete(`/api/marketplace/items/${encodeURIComponent(item.id)}`);
     setUnpublishTarget(null);
-    await refreshStudioResources(["agents", "marketplace"]);
+    await refreshStudioResources(["agents", "agentWorkspaces", "marketplace"]);
     setResourcesOpen(true);
     setResourceView(returnView);
   }
@@ -1151,6 +1227,18 @@ function Workspace({ onHome, onSignedOut }) {
       setError(friendlyError(connectionError));
       throw connectionError;
     }
+  }
+
+  async function deleteAgentWorkspaceSelection(workspace) {
+    setError("");
+    const result = await api.delete(`/api/agent-workspaces/${encodeURIComponent(workspace.agent_workspace_id)}`);
+    setWorkspaceDeleteTarget(null);
+    await refreshStudioResources(["agentWorkspaces", "agents", "marketplace"]);
+    if (session?.agent_workspace_id === workspace.agent_workspace_id && result.fallback_agent_workspace_id) {
+      await openSession(session.session_id, { hydrateRuns: false });
+    }
+    setResourcesOpen(true);
+    setResourceView("agents");
   }
 
   function openAgentEditor(agent = null) {
@@ -1404,6 +1492,8 @@ function Workspace({ onHome, onSignedOut }) {
           auth={auth}
           billing={billing}
           agents={agents}
+          agentWorkspaces={agentWorkspaces}
+          activeAgentWorkspace={activeAgentWorkspace}
           documents={documents}
           runtime={runtime}
           metrics={metrics}
@@ -1418,6 +1508,27 @@ function Workspace({ onHome, onSignedOut }) {
           onViewChange={setResourceView}
           onClose={() => setResourcesOpen(false)}
           onCreateAgent={() => openAgentEditor(null)}
+          onSelectAgentWorkspace={(workspaceId) => switchAgentWorkspace(workspaceId).catch((workspaceError) => setError(friendlyError(workspaceError)))}
+          onCreateAgentWorkspace={() => {
+            setResourcesOpen(false);
+            setWorkspaceEditor({ workspace: null });
+          }}
+          onEditAgentWorkspace={(workspace) => {
+            setResourcesOpen(false);
+            setWorkspaceEditor({ workspace });
+          }}
+          onManageAgentWorkspace={(workspace) => {
+            setResourcesOpen(false);
+            setWorkspaceMembersTarget(workspace);
+          }}
+          onDeleteAgentWorkspace={(workspace) => {
+            setResourcesOpen(false);
+            setWorkspaceDeleteTarget(workspace);
+          }}
+          onPublishAgentWorkspace={(workspace) => {
+            setResourcesOpen(false);
+            setPublishTarget({ ...workspace, title: workspace.name, item_type: "workspace", id: workspace.agent_workspace_id });
+          }}
           onEditAgent={openAgentEditor}
           onAdoptAgent={openAgentAdoption}
           onArchiveAgent={(agent) => {
@@ -1513,12 +1624,71 @@ function Workspace({ onHome, onSignedOut }) {
           agents={agents}
           documents={documents}
           mcpConnections={mcpConnections}
+          agentWorkspaceId={activeAgentWorkspace?.agent_workspace_id || null}
           onClose={() => setAgentEditor(undefined)}
           onSaved={async () => {
             setAgentEditor(undefined);
-            await refreshStudioResources(["agents", "documents"]);
+            await refreshStudioResources(["agents", "documents", "agentWorkspaces"]);
             setResourcesOpen(true);
             setResourceView("agents");
+          }}
+        />
+      )}
+
+      {workspaceEditor !== undefined && (
+        <AgentWorkspaceDialog
+          workspace={workspaceEditor.workspace}
+          onClose={() => {
+            setWorkspaceEditor(undefined);
+            setResourcesOpen(true);
+            setResourceView("agents");
+          }}
+          onSaved={async (saved) => {
+            setWorkspaceEditor(undefined);
+            await refreshStudioResources(["agentWorkspaces", "agents"]);
+            await switchAgentWorkspace(saved.agent_workspace_id, { refresh: true });
+            setResourcesOpen(true);
+            setResourceView("agents");
+          }}
+        />
+      )}
+
+      {workspaceMembersTarget && (
+        <AgentWorkspaceMembersDialog
+          workspace={workspaceMembersTarget}
+          agents={agents}
+          onClose={() => {
+            setWorkspaceMembersTarget(null);
+            setResourcesOpen(true);
+            setResourceView("agents");
+          }}
+          onSaved={async () => {
+            setWorkspaceMembersTarget(null);
+            await refreshStudioResources(["agentWorkspaces", "agents"]);
+            if (session?.session_id) await openSession(session.session_id, { hydrateRuns: false });
+            setResourcesOpen(true);
+            setResourceView("agents");
+          }}
+        />
+      )}
+
+      {workflowWorkspacePrompt && (
+        <WorkflowWorkspaceDialog
+          workspaces={agentWorkspaces}
+          activeWorkspaceId={activeAgentWorkspace?.agent_workspace_id || ""}
+          onClose={() => setWorkflowWorkspacePrompt(null)}
+          onConfirm={async (workspaceId) => {
+            await switchAgentWorkspace(workspaceId, { refresh: false });
+            workflowWorkspaceConfirmedRef.current = true;
+            setWorkflowWorkspacePrompt(null);
+            await sendMessage();
+          }}
+          onCreated={async (workspace) => {
+            setAgentWorkspaces((items) => [...items, workspace]);
+            await switchAgentWorkspace(workspace.agent_workspace_id, { refresh: false });
+            workflowWorkspaceConfirmedRef.current = true;
+            setWorkflowWorkspacePrompt(null);
+            await sendMessage();
           }}
         />
       )}
@@ -1533,7 +1703,7 @@ function Workspace({ onHome, onSignedOut }) {
           }}
           onSaved={async () => {
             setPublishTarget(null);
-            await refreshStudioResources(["agents", "marketplace"]);
+            await refreshStudioResources(["agents", "agentWorkspaces", "marketplace"]);
             setResourcesOpen(true);
             setResourceView("agents");
           }}
@@ -1555,6 +1725,29 @@ function Workspace({ onHome, onSignedOut }) {
             setRatingTarget(item);
           }}
           onEditDescription={(item) => {
+            if (item.item_type === "workspace") {
+              const sourceWorkspace = agentWorkspaces.find((workspace) => workspace.agent_workspace_id === item.id);
+              if (!sourceWorkspace) {
+                setMarketplaceTarget(null);
+                setError("The source workspace is no longer available.");
+                setResourcesOpen(true);
+                setResourceView("marketplace");
+                return;
+              }
+              setMarketplaceTarget(null);
+              setPublishTarget({
+                ...sourceWorkspace,
+                id: sourceWorkspace.agent_workspace_id,
+                title: sourceWorkspace.name,
+                item_type: "workspace",
+                marketplace: {
+                  ...(sourceWorkspace.marketplace || {}),
+                  published: true,
+                  description: item.description || sourceWorkspace.description
+                }
+              });
+              return;
+            }
             const sourceAgent = agents.find((agent) => agent.id === item.id);
             if (!sourceAgent) {
               setMarketplaceTarget(null);
@@ -1577,9 +1770,14 @@ function Workspace({ onHome, onSignedOut }) {
             setMarketplaceTarget(null);
             setUnpublishTarget({ item, returnView: "marketplace" });
           }}
-          onCopied={async () => {
+          agentWorkspaces={agentWorkspaces}
+          activeAgentWorkspaceId={activeAgentWorkspace?.agent_workspace_id || ""}
+          onCopied={async (result) => {
             setMarketplaceTarget(null);
-            await refreshStudioResources(["agents", "marketplace"]);
+            await refreshStudioResources(["agents", "agentWorkspaces", "marketplace"]);
+            if (result?.agent_workspace?.agent_workspace_id) {
+              await switchAgentWorkspace(result.agent_workspace.agent_workspace_id, { refresh: true });
+            }
             setResourcesOpen(true);
             setResourceView("agents");
           }}
@@ -1666,6 +1864,22 @@ function Workspace({ onHome, onSignedOut }) {
             setResourceView(returnView);
           }}
           onConfirm={() => unpublishAgent(unpublishTarget)}
+        />
+      )}
+
+      {workspaceDeleteTarget && (
+        <ConfirmDialog
+          title="Delete workspace?"
+          message={`${workspaceDeleteTarget.name} will be removed. Its agents remain available and chats using it will switch to General.`}
+          confirmLabel="Delete workspace"
+          destructive
+          icon={Trash2}
+          onClose={() => {
+            setWorkspaceDeleteTarget(null);
+            setResourcesOpen(true);
+            setResourceView("agents");
+          }}
+          onConfirm={() => deleteAgentWorkspaceSelection(workspaceDeleteTarget)}
         />
       )}
 
@@ -2683,6 +2897,8 @@ function ResourcesSheet({
   auth,
   billing,
   agents,
+  agentWorkspaces,
+  activeAgentWorkspace,
   documents,
   runtime,
   metrics,
@@ -2697,6 +2913,12 @@ function ResourcesSheet({
   onViewChange,
   onClose,
   onCreateAgent,
+  onSelectAgentWorkspace,
+  onCreateAgentWorkspace,
+  onEditAgentWorkspace,
+  onManageAgentWorkspace,
+  onDeleteAgentWorkspace,
+  onPublishAgentWorkspace,
   onEditAgent,
   onAdoptAgent,
   onArchiveAgent,
@@ -2718,6 +2940,8 @@ function ResourcesSheet({
 }) {
   const [view, setView] = useState(initialView || "agents");
   const canWrite = !auth?.is_viewer;
+  const activeWorkspaceAgentIds = new Set(activeAgentWorkspace?.agent_ids || []);
+  const activeWorkspaceAgents = agents.filter((agent) => activeWorkspaceAgentIds.has(agent.id));
   function changeView(next) {
     setView(next);
     onViewChange(next);
@@ -2738,9 +2962,17 @@ function ResourcesSheet({
 
         {view === "agents" && (
           <AgentCatalog
-            agents={agents}
+            agents={activeWorkspaceAgents}
+            workspaces={agentWorkspaces}
+            activeWorkspace={activeAgentWorkspace}
             auth={auth}
             onCreate={onCreateAgent}
+            onSelectWorkspace={onSelectAgentWorkspace}
+            onCreateWorkspace={onCreateAgentWorkspace}
+            onEditWorkspace={onEditAgentWorkspace}
+            onManageWorkspace={onManageAgentWorkspace}
+            onDeleteWorkspace={onDeleteAgentWorkspace}
+            onPublishWorkspace={onPublishAgentWorkspace}
             onEdit={onEditAgent}
             onAdopt={onAdoptAgent}
             onArchive={onArchiveAgent}
@@ -2755,9 +2987,9 @@ function ResourcesSheet({
 
         {view === "graph" && (
           <AgentGraph
-            agents={agents}
+            agents={activeWorkspaceAgents}
             auth={auth}
-            storageKey={`virenis:agent-graph:${auth?.workspace_id || "workspace"}`}
+            storageKey={`virenis:agent-graph:${auth?.workspace_id || "workspace"}:${activeAgentWorkspace?.agent_workspace_id || "general"}`}
             onConnect={onConnectAgents}
             onDisconnect={onDisconnectAgents}
           />
@@ -3111,6 +3343,8 @@ function RealityRank({ rank }) {
 
 export function AgentCatalog({
   agents,
+  workspaces = [],
+  activeWorkspace = null,
   auth,
   togglingAgentId,
   sessionId,
@@ -3121,7 +3355,13 @@ export function AgentCatalog({
   onDelete,
   onToggle,
   onPublish,
-  onUnpublish
+  onUnpublish,
+  onSelectWorkspace = () => undefined,
+  onCreateWorkspace = () => undefined,
+  onEditWorkspace = () => undefined,
+  onManageWorkspace = () => undefined,
+  onDeleteWorkspace = () => undefined,
+  onPublishWorkspace = () => undefined
 }) {
   const [query, setQuery] = useState("");
   const canWrite = !auth?.is_viewer;
@@ -3132,12 +3372,56 @@ export function AgentCatalog({
       || String(left.title || left.id).localeCompare(String(right.title || right.id)));
   return (
     <section className="resource-section" aria-labelledby="agents-heading">
+      {activeWorkspace && (
+        <div className="agent-workspace-toolbar">
+          <label>
+            <span>Active workspace</span>
+            <select
+              value={activeWorkspace.agent_workspace_id}
+              onChange={(event) => onSelectWorkspace(event.target.value)}
+              disabled={!canWrite}
+            >
+              {workspaces.map((workspace) => (
+                <option value={workspace.agent_workspace_id} key={workspace.agent_workspace_id}>
+                  {workspace.name} · {workspace.agent_count}/{workspace.max_agents || 16}
+                </option>
+              ))}
+            </select>
+          </label>
+          <div>
+            <button type="button" onClick={onCreateWorkspace} disabled={!canWrite}><Plus size={14} />New</button>
+            <button type="button" onClick={() => onManageWorkspace(activeWorkspace)} disabled={!canWrite}><Layers3 size={14} />Agents</button>
+            <button type="button" onClick={() => onEditWorkspace(activeWorkspace)} disabled={!canWrite}><Pencil size={14} />Details</button>
+            <button type="button" onClick={() => onPublishWorkspace(activeWorkspace)} disabled={!canWrite || !activeWorkspace.agent_count}>
+              {activeWorkspace.marketplace?.published ? <Pencil size={14} /> : <Upload size={14} />}
+              {activeWorkspace.marketplace?.published ? "Listing" : "Publish team"}
+            </button>
+            {activeWorkspace.marketplace?.published && (
+              <button
+                type="button"
+                onClick={() => onUnpublish({
+                  ...activeWorkspace,
+                  id: activeWorkspace.agent_workspace_id,
+                  title: activeWorkspace.name,
+                  item_type: "workspace"
+                })}
+                disabled={!canWrite}
+              ><Globe2 size={14} />Unpublish</button>
+            )}
+            {!activeWorkspace.is_general && (
+              <button type="button" className="danger" onClick={() => onDeleteWorkspace(activeWorkspace)} disabled={!canWrite}><Trash2 size={14} />Delete</button>
+            )}
+          </div>
+          <p>{activeWorkspace.description || "Group the agents that should work together in this chat."}</p>
+          {activeWorkspace.setup_error && <div className="agent-workspace-error" role="alert"><AlertCircle size={14} />{activeWorkspace.setup_error}</div>}
+        </div>
+      )}
       <div className="section-heading">
         <div>
           <h3 id="agents-heading">Agents</h3>
           <p>Build specialists, choose them with @, or let the Router assemble a team.</p>
         </div>
-        <IconButton label="Create agent" onClick={onCreate} disabled={!canWrite}>
+        <IconButton label="Create agent" onClick={onCreate} disabled={!canWrite || (activeWorkspace?.agent_count || 0) >= (activeWorkspace?.max_agents || 16)}>
           <Plus size={18} />
         </IconButton>
       </div>
@@ -3220,7 +3504,7 @@ export function AgentCatalog({
             </div>
           );
         })}
-        {filtered.length === 0 && <p className="muted-empty">No agents found.</p>}
+        {filtered.length === 0 && <p className="muted-empty">No agents in this workspace yet. Use Agents to add one, or create a new specialist.</p>}
       </div>
     </section>
   );
@@ -3371,8 +3655,13 @@ export function AgentGraph({ agents, auth, storageKey, onConnect, onDisconnect }
     : [];
 
   useEffect(() => {
-    setPositions((current) => ({ ...initialGraphPositions(graphAgents), ...current }));
-  }, [agents.length]);
+    setPositions({
+      ...initialGraphPositions(graphAgents),
+      ...storedGraphPositions(storageKey)
+    });
+    setFocusedId(null);
+    setConnectFromId(null);
+  }, [graphAgentIds, storageKey]);
 
   useEffect(() => {
     if (typeof window === "undefined" || !storageKey) return;
@@ -3616,8 +3905,8 @@ export function MarketplacePanel({ items, auth, onOpen = () => undefined, onRate
     <section className="resource-section marketplace-section" aria-labelledby="marketplace-heading">
       <div className="marketplace-hero">
         <span><Sparkles size={15} /> COMMUNITY LIBRARY</span>
-        <h3 id="marketplace-heading">Shared agents, ready to make your own.</h3>
-        <p>Inspect how an agent works, see who published it, rate it, or copy an independent version into your workspace.</p>
+        <h3 id="marketplace-heading">Shared agents and teams, ready to make your own.</h3>
+        <p>Inspect how an agent or workspace works, see who published it, rate it, or copy an independent version.</p>
       </div>
       <div className="marketplace-toolbar">
         <label className="search-field full-width"><Search size={16} /><span className="sr-only">Search marketplace</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search agents or publishers" /></label>
@@ -3626,11 +3915,14 @@ export function MarketplacePanel({ items, auth, onOpen = () => undefined, onRate
         {filtered.map((item) => (
           <article className="market-card" key={item.listing_id || item.id}>
             <button type="button" className="market-card-open" onClick={() => onOpen(item)} aria-label={`View ${agentFacingText(item.title, "community agent")}`}>
-              <header><span className="market-type agent"><Bot size={13} />agent</span><ChevronRight size={15} /></header>
+              <header><span className={`market-type ${item.item_type}`}>
+                {item.item_type === "workspace" ? <Network size={13} /> : <Bot size={13} />}
+                {item.item_type === "workspace" ? "workspace" : "agent"}
+              </span><ChevronRight size={15} /></header>
               <h4>{agentFacingText(item.title, "Community agent")}</h4>
               <p>{agentFacingText(item.description || item.capability)}</p>
               <small className="market-author">Published by {item.publisher_display_name || item.publisher?.user_id || item.published_by || "Virenis"}</small>
-              {item.workspace_copy && <span className="market-copy-state"><Check size={12} />Copied as {item.workspace_copy.title}</span>}
+              {item.workspace_copy && <span className="market-copy-state"><Check size={12} />Copied as {item.workspace_copy.title || item.workspace_copy.name}</span>}
             </button>
             <footer>
               <span className="market-rating"><Star size={14} fill="currentColor" />{item.rating_count ? item.rating_average.toFixed(1) : "New"}<small>{item.rating_count ? `(${item.rating_count})` : ""}</small></span>
@@ -3640,7 +3932,7 @@ export function MarketplacePanel({ items, auth, onOpen = () => undefined, onRate
             </footer>
           </article>
         ))}
-        {filtered.length === 0 && <div className="market-empty"><Sparkles size={22} /><strong>No matches yet</strong><span>Try a broader search or publish an agent from the Agents tab.</span></div>}
+        {filtered.length === 0 && <div className="market-empty"><Sparkles size={22} /><strong>No matches yet</strong><span>Try a broader search or publish an agent or workspace from the Agents tab.</span></div>}
       </div>
     </section>
   );
@@ -3648,6 +3940,7 @@ export function MarketplacePanel({ items, auth, onOpen = () => undefined, onRate
 
 export function PublishDialog({ agent, onClose, onSaved }) {
   const existing = agent.marketplace || {};
+  const workspaceListing = agent.item_type === "workspace";
   const [description, setDescription] = useState(agentFacingText(existing.description || existing.summary || agent.capability));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -3657,7 +3950,7 @@ export function PublishDialog({ agent, onClose, onSaved }) {
     setError("");
     try {
       await api.post(`/api/marketplace/items/${encodeURIComponent(agent.id)}`, {
-        item_type: "agent",
+        item_type: workspaceListing ? "workspace" : "agent",
         description
       });
       await onSaved();
@@ -3668,12 +3961,12 @@ export function PublishDialog({ agent, onClose, onSaved }) {
     }
   }
   return (
-    <ModalSurface title={existing.published ? "Edit Marketplace description" : "Publish to Marketplace"} description="Share a clear description. People can inspect the agent before copying it." onClose={onClose} className="form-dialog">
+    <ModalSurface title={existing.published ? "Edit Marketplace description" : "Publish to Marketplace"} description={`Share a clear description. People can inspect the ${workspaceListing ? "workspace" : "agent"} before copying it.`} onClose={onClose} className="form-dialog">
       <form className="dialog-form publish-form" onSubmit={submit}>
         {error && <div className="form-error" role="alert">{error}</div>}
-        <div className="publish-subject"><span className="market-type agent"><Bot size={13} />agent</span><strong>{formatAgentName(agent.id, [agent])}</strong></div>
-        <label><span>Agent description</span><textarea data-autofocus value={description} onChange={(event) => setDescription(event.target.value)} required maxLength={1200} placeholder="Explain what this agent helps with and when someone should use it." /></label>
-        <div className="publish-note"><Bot size={16} /><span><strong>Safe sharing</strong><small>Private notes, uploaded knowledge, and workspace-only agent connections are not included.</small></span></div>
+        <div className="publish-subject"><span className={`market-type ${workspaceListing ? "workspace" : "agent"}`}>{workspaceListing ? <Network size={13} /> : <Bot size={13} />}{workspaceListing ? "workspace" : "agent"}</span><strong>{workspaceListing ? agent.name || agent.title : formatAgentName(agent.id, [agent])}</strong></div>
+        <label><span>{workspaceListing ? "Workspace" : "Agent"} description</span><textarea data-autofocus value={description} onChange={(event) => setDescription(event.target.value)} required maxLength={1200} placeholder={`Explain what this ${workspaceListing ? "team" : "agent"} helps with and when someone should use it.`} /></label>
+        <div className="publish-note">{workspaceListing ? <Network size={16} /> : <Bot size={16} />}<span><strong>Safe sharing</strong><small>Private notes, uploaded knowledge, credentials, and live MCP bindings are not included.</small></span></div>
         <div className="dialog-actions"><button type="button" className="text-button ghost" onClick={onClose} disabled={busy}>Cancel</button><button type="submit" className="text-button primary" disabled={busy}>{busy ? <LoaderCircle className="spin" size={16} /> : existing.published ? <Pencil size={16} /> : <Upload size={16} />}{existing.published ? "Save description" : "Publish"}</button></div>
       </form>
     </ModalSurface>
@@ -3698,7 +3991,7 @@ export function RatingDialog({ item, onClose, onSaved }) {
     }
   }
   return (
-    <ModalSurface title={`Rate ${agentFacingText(item.title, "agent")}`} description="Select a star rating from 1 to 5." onClose={onClose} className="small-dialog">
+    <ModalSurface title={`Rate ${agentFacingText(item.title, item.item_type === "workspace" ? "workspace" : "agent")}`} description="Select a star rating from 1 to 5." onClose={onClose} className="small-dialog">
       <form className="dialog-form" onSubmit={submit}>
         {error && <div className="form-error" role="alert">{error}</div>}
         <fieldset className="star-picker"><legend>Your rating</legend>{[1, 2, 3, 4, 5].map((value) => <button type="button" key={value} aria-label={`${value} star${value === 1 ? "" : "s"}`} aria-pressed={score === value} onClick={() => setScore(value)}><Star size={25} fill={value <= score ? "currentColor" : "none"} /></button>)}</fieldset>
@@ -3708,11 +4001,22 @@ export function RatingDialog({ item, onClose, onSaved }) {
   );
 }
 
-export function MarketplaceAgentDialog({ item, auth, onClose, onRate, onCopied, onEditDescription = () => undefined, onUnpublish = () => undefined }) {
+export function MarketplaceAgentDialog({
+  item,
+  auth,
+  agentWorkspaces = [],
+  activeAgentWorkspaceId = "",
+  onClose,
+  onRate,
+  onCopied,
+  onEditDescription = () => undefined,
+  onUnpublish = () => undefined
+}) {
   const [detail, setDetail] = useState(item);
   const [loading, setLoading] = useState(true);
   const [copying, setCopying] = useState(false);
   const [error, setError] = useState("");
+  const [targetWorkspaceId, setTargetWorkspaceId] = useState(activeAgentWorkspaceId);
 
   useEffect(() => {
     let active = true;
@@ -3735,8 +4039,10 @@ export function MarketplaceAgentDialog({ item, auth, onClose, onRate, onCopied, 
     setCopying(true);
     setError("");
     try {
-      const result = await api.post(`/api/marketplace/items/${encodeURIComponent(item.id)}/copy`, {});
-      await onCopied(result.agent);
+      const result = await api.post(`/api/marketplace/items/${encodeURIComponent(item.id)}/copy`, {
+        ...(detail.item_type === "agent" && targetWorkspaceId ? { agent_workspace_id: targetWorkspaceId } : {})
+      });
+      await onCopied(result);
     } catch (copyError) {
       setError(friendlyError(copyError));
     } finally {
@@ -3745,6 +4051,8 @@ export function MarketplaceAgentDialog({ item, auth, onClose, onRate, onCopied, 
   }
 
   const agent = detail.agent || {};
+  const sharedWorkspace = detail.workspace || {};
+  const workspaceListing = detail.item_type === "workspace";
   const publisher = detail.publisher_display_name || detail.publisher?.user_id || detail.published_by || "Virenis";
   const exclusions = agent.exclusions || {};
   const tools = agent.tools || [];
@@ -3752,6 +4060,60 @@ export function MarketplaceAgentDialog({ item, auth, onClose, onRate, onCopied, 
   const produces = agent.produces || [];
   const cues = agent.routing_cues || [];
   const connectorRequirements = agent.connector_requirements || [];
+  const targetWorkspace = agentWorkspaces.find((workspace) => workspace.agent_workspace_id === targetWorkspaceId);
+  const targetWorkspaceFull = Boolean(
+    targetWorkspace
+    && targetWorkspace.agent_count >= (targetWorkspace.max_agents || 16)
+  );
+  if (workspaceListing) {
+    const workspaceAgents = sharedWorkspace.agents || [];
+    const workspaceEdges = sharedWorkspace.edges || [];
+    return (
+      <ModalSurface
+        title={agentFacingText(detail.title, "Marketplace workspace")}
+        description={`Published by ${publisher}`}
+        onClose={onClose}
+        className="agent-builder-dialog marketplace-agent-dialog"
+      >
+        <div className="marketplace-detail-body workspace-marketplace-detail">
+          {error && <div className="form-error" role="alert">{error}</div>}
+          {loading && <div className="marketplace-detail-loading"><LoaderCircle className="spin" size={18} />Loading workspace details</div>}
+          <section className="builder-panel marketplace-detail-intro">
+            <div className="builder-heading"><span>SHARED AGENT WORKSPACE</span><h3>{detail.description || sharedWorkspace.description}</h3><p>{workspaceAgents.length} coordinated agent{workspaceAgents.length === 1 ? "" : "s"} · Published by <strong>{publisher}</strong>.</p></div>
+          </section>
+          <div className="workspace-marketplace-agents">
+            {workspaceAgents.map((entry, index) => (
+              <article key={entry.source_agent_id || index}>
+                <span>{index + 1}</span>
+                <div><strong>{entry.agent?.title || "Agent"}</strong><p>{entry.agent?.capability}</p><small>{(entry.agent?.produces || []).join(" · ") || "Domain output"}</small></div>
+              </article>
+            ))}
+          </div>
+          {workspaceEdges.length > 0 && (
+            <section className="workspace-marketplace-handoffs">
+              <h4>Team handoffs</h4>
+              {workspaceEdges.map((edge, index) => {
+                const from = workspaceAgents.find((entry) => entry.source_agent_id === edge.from)?.agent?.title || edge.from;
+                const to = workspaceAgents.find((entry) => entry.source_agent_id === edge.to)?.agent?.title || edge.to;
+                return <span key={`${edge.from}:${edge.to}:${index}`}><b>{from}</b><ArrowRight size={14} /><b>{to}</b></span>;
+              })}
+            </section>
+          )}
+          <div className="marketplace-sharing-boundary"><AlertCircle size={16} /><span><strong>Independent, safe copy</strong><small>The team structure and sanitized agent instructions are copied. Private knowledge, credentials, and live connections are not.</small></span></div>
+          <footer className="builder-actions marketplace-detail-actions">
+            <button type="button" className="text-button ghost" onClick={onClose}>Close</button>
+            <span><Star size={14} fill="currentColor" /> {detail.rating_count ? `${detail.rating_average.toFixed(1)} (${detail.rating_count})` : "New"}</span>
+            <div>
+              {detail.can_manage && <button type="button" className="text-button ghost" onClick={() => onEditDescription(detail)}><Pencil size={15} />Edit description</button>}
+              {detail.can_manage && <button type="button" className="text-button danger" onClick={() => onUnpublish(detail)}><Globe2 size={15} />Unpublish</button>}
+              {!detail.is_self_published && <button type="button" className="text-button ghost" onClick={() => onRate(detail)} disabled={auth?.is_viewer}><Star size={15} />{detail.my_rating ? "Update rating" : "Rate"}</button>}
+              <button type="button" className="text-button primary" onClick={copyToWorkspace} disabled={auth?.is_viewer || loading || copying}>{copying ? <LoaderCircle className="spin" size={16} /> : <Copy size={16} />}{copying ? "Copying team" : "Copy workspace"}</button>
+            </div>
+          </footer>
+        </div>
+      </ModalSurface>
+    );
+  }
   return (
     <ModalSurface
       title={agentFacingText(detail.title, "Marketplace agent")}
@@ -3823,10 +4185,162 @@ export function MarketplaceAgentDialog({ item, auth, onClose, onRate, onCopied, 
             {detail.can_manage && <button type="button" className="text-button danger marketplace-unpublish-action" onClick={() => onUnpublish(detail)} disabled={loading}><Globe2 size={15} />Unpublish</button>}
             {!detail.is_self_published && <button type="button" className="text-button ghost marketplace-rate-action" onClick={() => onRate(detail)} disabled={auth?.is_viewer || loading}><Star size={15} />{detail.my_rating ? "Update rating" : "Rate"}</button>}
             {detail.is_self_published && <span className="market-own-listing"><Check size={12} />Your listing</span>}
-            <button type="button" className="text-button primary" onClick={copyToWorkspace} disabled={auth?.is_viewer || loading || copying}>{copying ? <LoaderCircle className="spin" size={16} /> : <Copy size={16} />}{copying ? "Copying" : detail.workspace_copy ? "Copy another" : "Copy to my workspace"}</button>
+            {!detail.is_self_published && agentWorkspaces.length > 0 && (
+              <label className="marketplace-copy-target"><span>Copy into</span><select value={targetWorkspaceId} onChange={(event) => setTargetWorkspaceId(event.target.value)}>{agentWorkspaces.map((workspace) => <option value={workspace.agent_workspace_id} key={workspace.agent_workspace_id}>{workspace.name} · {workspace.agent_count}/{workspace.max_agents || 16}</option>)}</select></label>
+            )}
+            <button type="button" className="text-button primary" onClick={copyToWorkspace} disabled={auth?.is_viewer || loading || copying || targetWorkspaceFull}>{copying ? <LoaderCircle className="spin" size={16} /> : <Copy size={16} />}{targetWorkspaceFull ? "Workspace full" : copying ? "Copying" : detail.workspace_copy ? "Copy another" : "Copy to my workspace"}</button>
           </div>
         </footer>
       </div>
+    </ModalSurface>
+  );
+}
+
+export function AgentWorkspaceDialog({ workspace, onClose, onSaved }) {
+  const editing = Boolean(workspace);
+  const [name, setName] = useState(workspace?.name || "");
+  const [description, setDescription] = useState(workspace?.description || "");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  async function submit(event) {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      const saved = editing
+        ? await api.patch(`/api/agent-workspaces/${encodeURIComponent(workspace.agent_workspace_id)}`, {
+            ...(!workspace.is_general ? { name } : {}),
+            description
+          })
+        : await api.post("/api/agent-workspaces", { name, description });
+      await onSaved(saved);
+    } catch (saveError) {
+      setError(friendlyError(saveError));
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <ModalSurface title={editing ? "Workspace details" : "Create workspace"} description="A workspace is an agent team you can switch into any chat." onClose={onClose} className="form-dialog">
+      <form className="dialog-form" onSubmit={submit}>
+        {error && <div className="form-error" role="alert">{error}</div>}
+        <label><span>Workspace name</span><input data-autofocus value={name} onChange={(event) => setName(event.target.value)} disabled={workspace?.is_general} required maxLength={80} placeholder="Customer launch team" /></label>
+        <label><span>Description</span><textarea value={description} onChange={(event) => setDescription(event.target.value)} maxLength={1200} placeholder="Describe when this team should be active and what its agents accomplish together." /></label>
+        <div className="dialog-actions"><button type="button" className="text-button ghost" onClick={onClose} disabled={busy}>Cancel</button><button type="submit" className="text-button primary" disabled={busy || !name.trim()}>{busy ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}{editing ? "Save details" : "Create workspace"}</button></div>
+      </form>
+    </ModalSurface>
+  );
+}
+
+export function AgentWorkspaceMembersDialog({ workspace, agents, onClose, onSaved }) {
+  const [selected, setSelected] = useState(() => new Set(workspace.agent_ids || []));
+  const [query, setQuery] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const candidates = agents
+    .filter((agent) => !agent.document && !agent.resource_for_agent_id)
+    .filter((agent) => agent.enabled !== false || selected.has(agent.id))
+    .filter((agent) => !query || `${agent.title || ""} ${agent.capability || ""}`.toLowerCase().includes(query.toLowerCase()))
+    .sort((left, right) => Number(selected.has(right.id)) - Number(selected.has(left.id))
+      || String(left.title || left.id).localeCompare(String(right.title || right.id)));
+  function toggle(agentId, checked) {
+    setError("");
+    setSelected((current) => {
+      const next = new Set(current);
+      if (checked) {
+        if (next.size >= (workspace.max_agents || 16)) {
+          setError(`A workspace can contain at most ${workspace.max_agents || 16} agents.`);
+          return current;
+        }
+        next.add(agentId);
+      } else {
+        next.delete(agentId);
+      }
+      return next;
+    });
+  }
+  async function submit(event) {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      await api.patch(`/api/agent-workspaces/${encodeURIComponent(workspace.agent_workspace_id)}`, {
+        agent_ids: [...selected]
+      });
+      await onSaved();
+    } catch (saveError) {
+      setError(friendlyError(saveError));
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <ModalSurface title={`Agents in ${workspace.name}`} description={`Choose up to ${workspace.max_agents || 16} agents. This selection controls the graph and the Router for this team.`} onClose={onClose} className="form-dialog workspace-members-dialog">
+      <form className="dialog-form" onSubmit={submit}>
+        {error && <div className="form-error" role="alert">{error}</div>}
+        <div className="workspace-member-count"><strong>{selected.size} / {workspace.max_agents || 16}</strong><span>agents selected</span></div>
+        <label className="search-field full-width"><Search size={16} /><span className="sr-only">Search available agents</span><input data-autofocus value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search available agents" /></label>
+        <div className="workspace-member-list">
+          {candidates.map((agent) => (
+            <label className={selected.has(agent.id) ? "selected" : ""} key={agent.id}>
+              <input type="checkbox" checked={selected.has(agent.id)} onChange={(event) => toggle(agent.id, event.target.checked)} />
+              <span><strong>{formatAgentName(agent.id, agents)}</strong><small>{agentFacingText(agent.capability, "Custom agent")}</small></span>
+              <i>{agent.enabled === false ? "Archived" : agent.system_managed ? "Built-in" : "Your agent"}</i>
+            </label>
+          ))}
+          {!candidates.length && <p className="muted-empty">No agents match this search.</p>}
+        </div>
+        <div className="dialog-actions"><button type="button" className="text-button ghost" onClick={onClose} disabled={busy}>Cancel</button><button type="submit" className="text-button primary" disabled={busy}>{busy ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}Save agents</button></div>
+      </form>
+    </ModalSurface>
+  );
+}
+
+export function WorkflowWorkspaceDialog({ workspaces, activeWorkspaceId, onClose, onConfirm, onCreated }) {
+  const [selection, setSelection] = useState(activeWorkspaceId || workspaces[0]?.agent_workspace_id || "");
+  const [creating, setCreating] = useState(false);
+  const [name, setName] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  async function submit(event) {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      if (creating) {
+        const created = await api.post("/api/agent-workspaces", {
+          name,
+          description: "Created for an agent workflow from chat."
+        });
+        await onCreated(created);
+      } else {
+        if (!selection) throw new Error("Choose a workspace first.");
+        await onConfirm(selection);
+      }
+    } catch (submitError) {
+      setError(friendlyError(submitError));
+      setBusy(false);
+    }
+  }
+  return (
+    <ModalSurface title="Choose a workspace for this workflow" description="Created or reused agents will join this team, and the chat will switch to it before composition starts." onClose={onClose} className="form-dialog workflow-workspace-dialog">
+      <form className="dialog-form" onSubmit={submit}>
+        {error && <div className="form-error" role="alert">{error}</div>}
+        <div className="workflow-workspace-options">
+          {workspaces.map((workspace) => (
+            <label className={!creating && selection === workspace.agent_workspace_id ? "selected" : ""} key={workspace.agent_workspace_id}>
+              <input type="radio" name="workflow-workspace" checked={!creating && selection === workspace.agent_workspace_id} onChange={() => { setCreating(false); setSelection(workspace.agent_workspace_id); }} />
+              <span><strong>{workspace.name}</strong><small>{workspace.agent_count}/{workspace.max_agents || 16} agents · {workspace.description || "Agent workspace"}</small></span>
+            </label>
+          ))}
+          <label className={creating ? "selected" : ""}>
+            <input type="radio" name="workflow-workspace" checked={creating} onChange={() => setCreating(true)} />
+            <span><strong>Create a new workspace</strong><small>Start an empty team for this workflow.</small></span>
+          </label>
+        </div>
+        {creating && <label><span>New workspace name</span><input value={name} onChange={(event) => setName(event.target.value)} required maxLength={80} placeholder="Support automation" /></label>}
+        <div className="dialog-actions"><button type="button" className="text-button ghost" onClick={onClose} disabled={busy}>Cancel</button><button type="submit" className="text-button primary" disabled={busy || (creating ? !name.trim() : !selection)}>{busy ? <LoaderCircle className="spin" size={16} /> : <WandSparkles size={16} />}Continue</button></div>
+      </form>
     </ModalSurface>
   );
 }
@@ -4390,7 +4904,7 @@ function createAgentForm(agent) {
   };
 }
 
-function AgentDialog({ auth, runtime, agent, agents, documents, mcpConnections = [], onClose, onSaved }) {
+function AgentDialog({ auth, runtime, agent, agents, documents, mcpConnections = [], agentWorkspaceId = null, onClose, onSaved }) {
   const editing = Boolean(agent);
   const [form, setForm] = useState(() => createAgentForm(agent));
   const [step, setStep] = useState(0);
@@ -4516,7 +5030,11 @@ function AgentDialog({ auth, runtime, agent, agents, documents, mcpConnections =
         if (!payload.source_text) delete payload.source_text;
         await api.patch(`/api/agents/${encodeURIComponent(activeAgentId)}`, payload);
       } else {
-        await api.post("/api/agents", { id: form.id, ...payload });
+        await api.post("/api/agents", {
+          id: form.id,
+          ...payload,
+          ...(agentWorkspaceId ? { agent_workspace_id: agentWorkspaceId } : {})
+        });
         setCreatedAgentId(form.id);
         newAgentPersisted = true;
       }

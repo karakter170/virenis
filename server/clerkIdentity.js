@@ -11,6 +11,7 @@ import {
 } from "@clerk/shared/keys";
 import { makeId, nowIso } from "./store.js";
 import { readConfiguredSecret } from "./secretConfig.js";
+import { ensureGeneralAgentWorkspace } from "./agentWorkspaces.js";
 
 const MAX_IDENTITY_AUDIT_EVENTS = 10_000;
 const MAX_IDENTITY_DELETION_TOMBSTONES = 50_000;
@@ -252,6 +253,16 @@ export function createClerkIdentityManager({
           agent.marketplace.publisher_display_name = user.display_name;
         }
       }
+      for (const workspace of data.agentWorkspaces || []) {
+        if (workspace.marketplace?.published_by === user.user_id) {
+          workspace.marketplace.publisher_display_name = user.display_name;
+        }
+      }
+      ensureGeneralAgentWorkspace(data, {
+        user_id: user.user_id,
+        workspace_id: user.workspace_id,
+        role: user.role
+      });
       if (changed) {
         appendIdentityAudit(data, {
           action: isNew ? "identity.clerk_account_linked" : event,
@@ -609,11 +620,13 @@ function buildAccountExport(data, user) {
     agents,
     agent_events: data.agentEvents.filter((item) => agentIds.has(item.agent_id) || (item.actor_user_id === userId && item.workspace_id === workspaceId)),
     documents,
+    agent_workspaces: (data.agentWorkspaces || []).filter((item) => ownsWorkspaceItem(item, user)),
     workflows,
     conversation_checkpoints: data.conversationCheckpoints.filter((item) => workflowIds.has(item.workflow_id) || sessionIds.has(item.session_id)),
     executions: data.executionRecords.filter((item) => runIds.has(item.run_id) || ownsWorkspaceItem(item, user)),
     outcome_contracts: data.outcomeContracts.filter((item) => runIds.has(item.run_id) || ownsWorkspaceItem(item, user)),
     marketplace_ratings: data.marketplaceRatings.filter((item) => item.created_by === userId && item.workspace_id === workspaceId),
+    agent_workspace_ratings: (data.agentWorkspaceRatings || []).filter((item) => item.created_by === userId && item.workspace_id === workspaceId),
     mcp: {
       connections: data.mcpConnections.filter((item) => ownsWorkspaceItem(item, user)),
       approvals: data.mcpApprovals.filter((item) => ownsWorkspaceItem(item, user)),
@@ -633,6 +646,8 @@ function deleteAccountData(data, user) {
   const listingIds = new Set(agents.map((item) => item.marketplace?.listing_id).filter(Boolean));
   const documents = data.documents.filter((item) => ownsWorkspaceItem(item, user));
   const documentIds = new Set(documents.map((item) => item.document_id));
+  const agentWorkspaces = (data.agentWorkspaces || []).filter((item) => ownsWorkspaceItem(item, user));
+  const agentWorkspaceListingIds = new Set(agentWorkspaces.map((item) => item.marketplace?.listing_id).filter(Boolean));
   const workflows = data.workflows.filter((item) => ownsWorkspaceItem(item, user) || sessionIds.has(item.session_id));
   const workflowIds = new Set(workflows.map((item) => item.workflow_id));
   const connections = data.mcpConnections.filter((item) => ownsWorkspaceItem(item, user));
@@ -658,6 +673,11 @@ function deleteAccountData(data, user) {
   data.marketplaceRatings = data.marketplaceRatings.filter((item) =>
     !(item.created_by === userId && item.workspace_id === workspaceId) && !listingIds.has(item.listing_id)
   );
+  data.agentWorkspaceRatings = (data.agentWorkspaceRatings || []).filter((item) =>
+    !(item.created_by === userId && item.workspace_id === workspaceId)
+    && !agentWorkspaceListingIds.has(item.listing_id)
+  );
+  data.agentWorkspaces = (data.agentWorkspaces || []).filter((item) => !ownsWorkspaceItem(item, user));
   data.mcpConnections = data.mcpConnections.filter((item) => !connectionIds.has(item.connection_id));
   data.mcpOauthClients = data.mcpOauthClients.filter((item) => !ownsWorkspaceItem(item, user));
   data.mcpOauthStates = data.mcpOauthStates.filter((item) => !connectionIds.has(item.connection_id) && !ownsWorkspaceItem(item, user));
@@ -681,6 +701,7 @@ function deleteAccountData(data, user) {
       runs: runIds.size,
       agents: agentIds.size,
       documents: documentIds.size,
+      agent_workspaces: agentWorkspaces.length,
       workflows: workflowIds.size,
       mcp_connections: connectionIds.size
     }
@@ -691,6 +712,7 @@ function accountOwnedResources(data, user) {
   return {
     agents: data.agents.filter((item) => ownsWorkspaceItem(item, user)),
     documents: data.documents.filter((item) => ownsWorkspaceItem(item, user)),
+    agent_workspaces: (data.agentWorkspaces || []).filter((item) => ownsWorkspaceItem(item, user)),
     mcp_connections: data.mcpConnections.filter((item) => ownsWorkspaceItem(item, user))
   };
 }
