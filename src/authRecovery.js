@@ -5,15 +5,19 @@ let authenticationNotificationPending = false;
 export function authenticationFailureDetails(error = {}, origin = currentOrigin()) {
   const reason = String(error?.authReason || error?.reason || "").trim();
   const originMismatch = reason === "token-invalid-authorized-parties";
+  const configuredOrigin = normalizedOrigin(error?.details?.configured_origin);
   return {
     status: Number(error?.status || 401),
     code: String(error?.code || "authentication_required"),
     reason,
     request_id: String(error?.requestId || error?.request_id || ""),
     origin: String(origin || ""),
+    configured_origin: configuredOrigin,
     title: originMismatch ? "This site address is not authorized" : "Your session could not be verified",
     message: originMismatch
-      ? "Clerk signed you in, but this server does not recognize the address used to open Virenis. Open the configured Virenis URL or ask the administrator to add this address to the authorized Clerk origins."
+      ? configuredOrigin
+        ? `Clerk signed you in, but this server expects ${configuredOrigin}. Open that address, or update the hosted Clerk origin configuration to match this site.`
+        : "Clerk signed you in, but this server does not recognize the address used to open Virenis. Open the configured Virenis URL or ask the administrator to add this address to the authorized Clerk origins."
       : "Clerk signed you in, but the Virenis server could not verify that session. Refresh the session and try again, or sign out and start a new sign-in."
   };
 }
@@ -40,4 +44,17 @@ export function shouldOpenWorkspaceFromIdentity({ isSignedIn, authenticationFail
 
 function currentOrigin() {
   return typeof window === "undefined" ? "" : window.location?.origin || "";
+}
+
+function normalizedOrigin(value) {
+  const candidate = String(value || "").trim();
+  if (!candidate) return "";
+  try {
+    const parsed = new URL(candidate);
+    return ["http:", "https:"].includes(parsed.protocol) && parsed.origin === candidate.replace(/\/+$/, "")
+      ? parsed.origin
+      : "";
+  } catch {
+    return "";
+  }
 }

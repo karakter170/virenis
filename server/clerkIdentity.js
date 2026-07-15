@@ -63,6 +63,15 @@ export function validateClerkEnvironment(env = process.env) {
   if (!clerkIdentityEnabled(env)) return;
   const publishableKey = clerkPublishableKey(env);
   const secretKey = clerkSecretKey(env);
+  const explicitBackendPublishableKey = String(env.CLERK_PUBLISHABLE_KEY || "").trim();
+  const frontendPublishableKey = String(env.VITE_CLERK_PUBLISHABLE_KEY || "").trim();
+  if (
+    explicitBackendPublishableKey
+    && frontendPublishableKey
+    && explicitBackendPublishableKey !== frontendPublishableKey
+  ) {
+    throw new Error("CLERK_PUBLISHABLE_KEY and VITE_CLERK_PUBLISHABLE_KEY must identify the same Clerk application.");
+  }
   if (!isPublishableKey(publishableKey)) {
     throw new Error("Clerk identity requires a valid CLERK_PUBLISHABLE_KEY or VITE_CLERK_PUBLISHABLE_KEY.");
   }
@@ -92,6 +101,17 @@ export function validateClerkEnvironment(env = process.env) {
   if (configuredAdminEmails(env).size === 0 && configuredAdminUserIds(env).size === 0) {
     throw new Error("Production Clerk identity requires APP_AUTH_ADMIN_EMAILS or APP_CLERK_ADMIN_USER_IDS for administrator bootstrap.");
   }
+}
+
+export function requireAuthorizedClerkBrowserOrigin(value, env = process.env) {
+  const browserOrigin = validateAuthorizedParty(String(value || "").trim());
+  const authorizedParties = clerkAuthorizedParties(env);
+  if (!authorizedParties.includes(browserOrigin)) {
+    throw new Error(
+      `Clerk will reject sessions from ${browserOrigin}. Set APP_PUBLIC_ORIGIN and CLERK_AUTHORIZED_PARTIES to this exact origin, then restart the server.`
+    );
+  }
+  return browserOrigin;
 }
 
 export function createClerkAdapter({ env = process.env, client = null } = {}) {

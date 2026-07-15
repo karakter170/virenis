@@ -23,16 +23,18 @@ describe("authentication recovery", () => {
       status: 401,
       code: "authentication_required",
       authReason: "token-invalid-authorized-parties",
-      requestId: "req_auth_test"
+      requestId: "req_auth_test",
+      details: { configured_origin: "https://app.example.test" }
     }, "https://preview.example.test");
     expect(failure).toMatchObject({
       status: 401,
       reason: "token-invalid-authorized-parties",
       request_id: "req_auth_test",
       origin: "https://preview.example.test",
+      configured_origin: "https://app.example.test",
       title: "This site address is not authorized"
     });
-    expect(failure.message).toContain("authorized Clerk origins");
+    expect(failure.message).toContain("https://app.example.test");
   });
 
   it("coalesces a burst of parallel 401 responses into one route transition", () => {

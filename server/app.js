@@ -3959,10 +3959,19 @@ function authenticationRequired(req, res, { basicConfigured, identityConfigured 
     res.setHeader("WWW-Authenticate", 'Basic realm="virenis"');
   }
   if (req.path.startsWith("/api/")) {
+    const clerkAuthReason = String(res.getHeader("x-clerk-auth-reason") || "").trim();
+    const configuredOrigin = String(process.env.APP_PUBLIC_ORIGIN || "").trim().replace(/\/+$/, "");
+    const details = clerkAuthReason === "token-invalid-authorized-parties"
+      ? {
+          auth_reason: clerkAuthReason,
+          configured_origin: configuredOrigin || null
+        }
+      : null;
     res.status(401).json({
       error: "authentication_required",
       message: "Sign in to continue.",
-      request_id: req.id
+      request_id: req.id,
+      ...(details ? { details } : {})
     });
     return;
   }

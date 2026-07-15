@@ -95,6 +95,12 @@ export function SessionRecoveryPage({ failure, busy = "", error = "", onRetry, o
               <code>{failure.origin}</code>
             </div>
           )}
+          {failure?.configured_origin && failure.configured_origin !== failure.origin && (
+            <div className="session-recovery-origin">
+              <span>Server-configured address</span>
+              <code>{failure.configured_origin}</code>
+            </div>
+          )}
           {error && <div className="identity-message error" role="alert"><AlertCircle size={15} />{error}</div>}
           <div className="session-recovery-actions">
             <button className="text-button primary" type="button" onClick={onRetry} disabled={Boolean(busy)}>

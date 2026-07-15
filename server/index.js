@@ -4,6 +4,11 @@ import { fileURLToPath } from "node:url";
 import express from "express";
 import { createServer as createViteServer } from "vite";
 import { createApp, resolveLifecycleTimeouts } from "./app.js";
+import {
+  clerkIdentityEnabled,
+  clerkPublishableKey
+} from "./clerkIdentity.js";
+import { assertFrontendClerkPublishableKey } from "./productionBuild.js";
 import { requireRuntimeConfigured } from "./runtimeClient.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -18,6 +23,9 @@ requireRuntimeConfigured();
 
 if (isProduction) {
   await assertProductionBuild(distRoot);
+  if (clerkIdentityEnabled()) {
+    await assertFrontendClerkPublishableKey(distRoot, clerkPublishableKey());
+  }
 }
 
 const app = await createApp({

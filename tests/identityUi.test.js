@@ -34,6 +34,7 @@ describe("Clerk identity UI", () => {
         title: "This site address is not authorized",
         message: "Open the configured Virenis URL.",
         origin: "https://preview.example.test",
+        configured_origin: "https://app.example.test",
         request_id: "req_auth_test"
       },
       onRetry: () => undefined,
@@ -43,6 +44,8 @@ describe("Clerk identity UI", () => {
     expect(markup).toContain("Sign-in succeeded. Server verification did not.");
     expect(markup).toContain("No repeated workspace reloads");
     expect(markup).toContain("https://preview.example.test");
+    expect(markup).toContain("Server-configured address");
+    expect(markup).toContain("https://app.example.test");
     expect(markup).toContain("Refresh session and retry");
     expect(markup).toContain("Sign out");
     expect(markup).toContain("req_auth_test");
