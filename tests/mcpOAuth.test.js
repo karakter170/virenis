@@ -181,6 +181,58 @@ describe("managed MCP OAuth connections", () => {
     expect(provider.tokenRequests).toHaveLength(1);
   });
 
+  it("keeps a workflow cancelled when its OAuth callback returns late", async () => {
+    const workflowId = "workflow_cancelled_during_oauth";
+    const sessionId = "session_cancelled_during_oauth";
+    await app.locals.store.mutate((data) => {
+      data.workflows ||= [];
+      data.workflows.push({
+        workflow_id: workflowId,
+        session_id: sessionId,
+        workspace_id: "oauth_workspace",
+        created_by: "oauth_owner",
+        status: "awaiting_connections",
+        approved_at: new Date().toISOString(),
+        revision: 2,
+        connection_requirements: [{
+          provider_id: "gmail",
+          name: "Gmail",
+          connection_mode: "managed",
+          status: "missing",
+          connection_id: null
+        }]
+      });
+      return true;
+    });
+    const response = await request(app)
+      .post("/api/mcp/oauth/start")
+      .set(owner())
+      .send({ provider_id: "gmail", workflow_id: workflowId })
+      .expect(200);
+    const cookie = response.headers["set-cookie"][0].split(";", 1)[0];
+    const state = new URL(response.body.authorization_url).searchParams.get("state");
+    await app.locals.store.mutate((data) => {
+      const workflow = data.workflows.find((item) => item.workflow_id === workflowId);
+      workflow.status = "declined";
+      workflow.declined_at = new Date().toISOString();
+      workflow.revision += 1;
+      return workflow;
+    });
+    const callback = await request(app)
+      .get("/api/mcp/oauth/callback/gmail")
+      .set("Cookie", cookie)
+      .query({ state, code: "code-late-workflow" })
+      .expect(303);
+    expect(callback.headers.location).toBe(
+      `/app?mcp_oauth=connected&provider=gmail&workflow=${workflowId}&session=${sessionId}`
+    );
+    expect(app.locals.store.read((data) => data.workflows.find((item) => item.workflow_id === workflowId).status)).toBe("declined");
+    const listed = await request(app).get("/api/mcp/connections").set(owner()).expect(200);
+    expect(listed.body.connections).toEqual([
+      expect.objectContaining({ provider_id: "gmail", status: "ready" })
+    ]);
+  });
+
   it("supersedes an older browser flow so concurrent starts cannot create duplicate accounts", async () => {
     const first = await startOAuth();
     const second = await startOAuth();

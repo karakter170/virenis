@@ -639,6 +639,8 @@ summary:focus-visible,
 .workflow-connections small { margin-top: 2px; overflow: hidden; color: var(--text-soft); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .workflow-connections button { flex: 0 0 auto; border: 1px solid #a7bcb1; border-radius: 7px; padding: 6px 9px; color: var(--accent); background: #fff; font-size: 9px; font-weight: 750; }
 .workflow-connections em.connected { display: inline-flex; align-items: center; gap: 4px; color: var(--accent); font-size: 9px; font-style: normal; font-weight: 750; }
+.workflow-connections em.pending { color: var(--text-soft); font-size: 9px; font-style: normal; font-weight: 700; }
+.workflow-connections .workflow-connection-actions { min-width: 0; justify-content: flex-end; flex-wrap: wrap; gap: 5px; }
 
 .workflow-review-details {
   border-bottom: 1px solid var(--line);

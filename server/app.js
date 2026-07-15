@@ -75,6 +75,7 @@ import {
   processWorkflowCompositionRun,
   publicConversationCheckpoint,
   publicWorkflow,
+  recoverInterruptedWorkflowActivations,
   refreshConnectionRequirements,
   resumeMcpApprovalConversation
 } from "./workflows.js";
@@ -189,6 +190,9 @@ export async function createApp({
   });
   const store = createStore({ dbPath, seedAgents: configuredSeedAgents });
   await store.init();
+  const workflowStartupRecovery = autoRun
+    ? await recoverInterruptedWorkflowActivations({ store })
+    : { recovered: 0, workflow_ids: [] };
   const resolvedClerkAdapter = clerkAdapter || createClerkAdapter();
   const identityManager = createClerkIdentityManager({
     store,
@@ -437,16 +441,24 @@ export async function createApp({
           workspace_id: completed.connection.workspace_id,
           role: "user"
         };
-        const workflow = await markWorkflowConnectionOutcome({
-          store,
-          workflowId: resume.workflow_id,
-          actor,
-          providerId: completed.connection.provider_id,
-          outcome: "connected",
-          connectionId: completed.connection.connection_id
-        });
-        if (workflow.status === "ready_to_activate" && workflow.approved_at) {
-          scheduleBackgroundTask(() => activateWorkflow({ workflowId: workflow.workflow_id, actor }));
+        try {
+          const workflow = await markWorkflowConnectionOutcome({
+            store,
+            workflowId: resume.workflow_id,
+            actor,
+            providerId: completed.connection.provider_id,
+            outcome: "connected",
+            connectionId: completed.connection.connection_id
+          });
+          if (workflow.status === "ready_to_activate" && workflow.approved_at) {
+            scheduleBackgroundTask(() => activateWorkflow({ workflowId: workflow.workflow_id, actor }));
+          }
+        } catch (error) {
+          // OAuth authorization itself succeeded, so keep the new workspace
+          // connection. A workflow that was cancelled while the user was at
+          // the provider must remain cancelled and should not turn the OAuth
+          // callback into an error page.
+          if (!["workflow_connection_state_conflict", "workflow_not_found"].includes(error?.code)) throw error;
         }
       }
       const resumeQuery = resume?.workflow_id
@@ -706,13 +718,20 @@ export async function createApp({
       }
       let approval;
       if (current.status === "pending") {
-        approval = await decideMcpApproval({
-          store,
-          approvalId: req.params.approval_id,
-          actor: req.auth,
-          decision,
-          key: mcpCredentialKey
-        });
+        try {
+          approval = await decideMcpApproval({
+            store,
+            approvalId: req.params.approval_id,
+            actor: req.auth,
+            decision,
+            key: mcpCredentialKey
+          });
+        } catch (error) {
+          const failed = store.read((data) => (data.mcpApprovals || [])
+            .find((item) => item.approval_id === req.params.approval_id));
+          if (failed?.status !== "failed") throw error;
+          approval = publicMcpApproval(failed, mcpCredentialKey);
+        }
       } else {
         const sameDecision = (decision === "approve" && ["executed", "failed"].includes(current.status))
           || (decision === "deny" && current.status === "denied");
@@ -720,6 +739,7 @@ export async function createApp({
         approval = publicMcpApproval(current, mcpCredentialKey);
       }
       let continuation;
+      const continuationDecision = approval.status === "failed" ? "failed" : decision;
       try {
         continuation = await resumeMcpApprovalConversation({
           store,
@@ -728,7 +748,7 @@ export async function createApp({
             workspace_id: current.workspace_id,
             created_by: current.created_by
           },
-          decision,
+          decision: continuationDecision,
           actor: req.auth,
           continueConversation
         });
@@ -951,6 +971,13 @@ export async function createApp({
         decision: req.body?.decision,
         expectedRevision: req.body?.revision
       });
+      if (workflow.status === "declined") {
+        workflow = await cleanupDeclinedWorkflowAgents({
+          store,
+          workflowId: workflow.workflow_id,
+          actor: req.auth
+        });
+      }
       if (workflow.status === "ready_to_activate") {
         workflow = await activateWorkflow({ workflowId: workflow.workflow_id, actor: req.auth });
       }
@@ -966,13 +993,40 @@ export async function createApp({
         const current = assertWorkflowAccess(data, req.params.workflow_id, req.auth, { mutable: true });
         if (!current.approved_at) throwStatus(409, "Confirm the workflow before connecting its tools.");
         if (current.status === "active" || current.status === "activating") return current;
+        const previousSignature = workflowConnectionStateSignature(current);
+        const previousStatus = current.status;
         const missing = refreshConnectionRequirements(current, data, req.auth);
-        current.status = missing.length ? "awaiting_connections" : "ready_to_activate";
-        current.updated_at = nowIso();
-        current.revision += 1;
+        const nextStatus = missing.length ? "awaiting_connections" : "ready_to_activate";
+        const changed = previousStatus !== nextStatus
+          || previousSignature !== workflowConnectionStateSignature(current);
+        current.status = nextStatus;
+        if (changed) {
+          current.updated_at = nowIso();
+          current.revision += 1;
+        }
         return current;
       });
       if (workflow.status === "ready_to_activate") {
+        workflow = await activateWorkflow({ workflowId: workflow.workflow_id, actor: req.auth });
+      }
+      res.json(publicWorkflow(workflow));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/workflows/:workflow_id/connections/:provider_id", async (req, res, next) => {
+    try {
+      let workflow = await markWorkflowConnectionOutcome({
+        store,
+        workflowId: req.params.workflow_id,
+        actor: req.auth,
+        providerId: req.params.provider_id,
+        outcome: "connected",
+        connectionId: req.body?.connection_id,
+        expectedRevision: req.body?.revision
+      });
+      if (workflow.status === "ready_to_activate" && workflow.approved_at) {
         workflow = await activateWorkflow({ workflowId: workflow.workflow_id, actor: req.auth });
       }
       res.json(publicWorkflow(workflow));
@@ -996,6 +1050,7 @@ export async function createApp({
       const storedApproval = (snapshot.mcpApprovals || []).find((item) => item.approval_id === checkpoint.approval_id);
       if (!storedApproval) throwStatus(404, "MCP approval not found.");
       const decision = storedApproval.status === "denied" ? "deny" : "approve";
+      const continuationDecision = storedApproval.status === "failed" ? "failed" : decision;
       if (!["denied", "executed", "failed"].includes(storedApproval.status)) {
         throwStatus(409, "This tool decision is not ready to resume.");
       }
@@ -1007,7 +1062,7 @@ export async function createApp({
       const resumed = await resumeMcpApprovalConversation({
         store,
         approval,
-        decision,
+        decision: continuationDecision,
         actor: req.auth,
         continueConversation,
         force: true
@@ -1025,13 +1080,23 @@ export async function createApp({
       const session = findAccessibleSession(data, req.params.session_id, req);
       const runOptions = normalizeChatOptions(req.body.options);
       const workflowCommand = parseWorkflowCommand(req.body.content);
+      const attachments = normalizeMessageAttachments(req.body.attachments);
+      const idempotencyKey = normalizeIdempotencyKey(req.headers["idempotency-key"]);
+      const submissionKeyDigest = idempotencyKey
+        ? crypto.createHash("sha256").update(idempotencyKey, "utf8").digest("hex")
+        : null;
+      const submissionDigest = crypto.createHash("sha256").update(JSON.stringify({
+        content: req.body.content.trim(),
+        attachments,
+        options: runOptions
+      }), "utf8").digest("hex");
       const now = nowIso();
       const message = {
         message_id: makeId("msg"),
         session_id: session.session_id,
         role: "user",
         content: req.body.content.trim(),
-        attachments: normalizeMessageAttachments(req.body.attachments),
+        attachments,
         run_id: null,
         created_at: now
       };
@@ -1063,29 +1128,51 @@ export async function createApp({
         completed_at: null,
         elapsed_sec: null
       };
+      if (submissionKeyDigest) {
+        run.submission_key_digest = submissionKeyDigest;
+        run.submission_digest = submissionDigest;
+      }
       message.run_id = run.run_id;
 
-      await store.mutate((mutable) => {
+      const persisted = await store.mutate((mutable) => {
+        if (submissionKeyDigest) {
+          const existingRun = (mutable.runs || []).find((item) => (
+            item.session_id === session.session_id
+            && item.workspace_id === session.workspace_id
+            && item.created_by === req.auth.user_id
+            && item.submission_key_digest === submissionKeyDigest
+          ));
+          if (existingRun) {
+            if (existingRun.submission_digest !== submissionDigest) {
+              throwStatus(409, "This message submission key was already used for different content.");
+            }
+            const existingMessage = (mutable.messages || []).find((item) => item.message_id === existingRun.user_message_id);
+            if (!existingMessage) throwStatus(409, "The previous message submission is incomplete. Start a new request.");
+            return { message: existingMessage, run: existingRun, created: false };
+          }
+        }
         mutable.messages.push(message);
         mutable.runs.push(run);
         const mutableSession = mutable.sessions.find((item) => item.session_id === session.session_id);
+        if (!mutableSession) throwStatus(404, "Chat session not found.");
         mutableSession.updated_at = now;
         mutableSession.last_message_at = now;
         if (mutableSession.title === "New chat") {
           mutableSession.title = cleanTitle(message.content);
         }
-        return { message, run };
+        return { message, run, created: true };
       });
 
-      if (autoRun) {
-        scheduleChatRun(run.run_id, runOptions);
+      if (autoRun && persisted.run.status === "queued") {
+        scheduleChatRun(persisted.run.run_id, persisted.run.execution_options || runOptions);
       }
 
       res.status(202).json({
-        message_id: message.message_id,
-        run_id: run.run_id,
-        status: "queued",
-        kind: run.kind
+        message_id: persisted.message.message_id,
+        run_id: persisted.run.run_id,
+        status: persisted.run.status,
+        kind: persisted.run.kind,
+        duplicate: !persisted.created
       });
     } catch (error) {
       next(error);
@@ -3010,6 +3097,7 @@ export async function createApp({
       validations_interrupted: 0
     };
   app.locals.startupRecovery = startupRecovery;
+  app.locals.workflowStartupRecovery = workflowStartupRecovery;
 
   return app;
 }
@@ -5593,10 +5681,18 @@ async function activateWorkflowDraft({ store, workflowId, actor }) {
     const current = assertWorkflowAccess(data, workflowId, actor, { mutable: true });
     if (current.status === "active") return { workflow: current, claimed: false };
     if (!current.approved_at) throwStatus(409, "Confirm the workflow before creating it.");
+    const previousSignature = workflowConnectionStateSignature(current);
+    const previousStatus = current.status;
     const missing = refreshConnectionRequirements(current, data, actor);
     if (missing.length) {
       current.status = "awaiting_connections";
-      current.updated_at = nowIso();
+      if (
+        previousStatus !== current.status
+        || previousSignature !== workflowConnectionStateSignature(current)
+      ) {
+        current.updated_at = nowIso();
+        current.revision += 1;
+      }
       return { workflow: current, claimed: false };
     }
     if (!["ready_to_activate", "activation_failed", "activating"].includes(current.status)) {
@@ -5616,6 +5712,7 @@ async function activateWorkflowDraft({ store, workflowId, actor }) {
     current.activation_claimed_at = nowIso();
     current.activation_attempts = Number(current.activation_attempts || 0) + 1;
     current.updated_at = nowIso();
+    current.revision += 1;
     delete current.error;
     return { workflow: current, claimed: true };
   });
@@ -5627,10 +5724,17 @@ async function activateWorkflowDraft({ store, workflowId, actor }) {
     const nodeAgents = new Map();
     const assignedAgentIds = new Set();
     const initialSnapshot = store.read();
+    preflightWorkflowActivation({ workflow, snapshot: initialSnapshot, actor });
     for (const node of workflow.nodes.filter((item) => item.type === "agent")) {
       const existingActivation = workflow.activation?.node_agents?.find((item) => item.node_id === node.id);
       const existingAgent = existingActivation
-        ? initialSnapshot.agents.find((item) => item.id === existingActivation.agent_id && item.enabled !== false)
+        ? store.read((data) => data.agents.find((item) => (
+          item.id === existingActivation.agent_id
+          && item.enabled !== false
+          && item.ready !== false
+          && item.mounted !== false
+          && item.runtime_sync_pending !== true
+        )))
         : null;
       if (
         existingAgent
@@ -5643,11 +5747,18 @@ async function activateWorkflowDraft({ store, workflowId, actor }) {
       }
 
       if (node.source === "workspace") {
-        const source = initialSnapshot.agents.find((item) => item.id === node.agent_id && item.enabled !== false);
+        const source = store.read((data) => data.agents.find((item) => (
+          item.id === node.agent_id
+          && item.enabled !== false
+          && item.ready !== false
+          && item.mounted !== false
+          && item.runtime_sync_pending !== true
+        )));
         if (!source || !workflowAgentAccessible(source, actor)) {
           throwStatus(409, `The selected workspace agent is no longer available: ${node.title}.`);
         }
-        if (workflowAgentMutable(source, actor) && !assignedAgentIds.has(source.id)) {
+        const requiresScopedCopy = workflowNodeRequiresScopedCopy(workflow, node, source);
+        if (workflowAgentMutable(source, actor) && !assignedAgentIds.has(source.id) && !requiresScopedCopy) {
           nodeAgents.set(node.id, source);
         } else {
           nodeAgents.set(node.id, await createWorkflowGeneratedAgent({
@@ -5667,7 +5778,8 @@ async function activateWorkflowDraft({ store, workflowId, actor }) {
 
       if (node.source === "marketplace") {
         const sourceAgent = store.read((data) => data.agents.find((item) =>
-          item.marketplace?.published === true
+          item.enabled !== false
+          && item.marketplace?.published === true
           && item.marketplace?.listing_id === node.listing_id
         ));
         if (!sourceAgent) throwStatus(409, `The Marketplace agent is no longer available: ${node.title}.`);
@@ -5692,6 +5804,7 @@ async function activateWorkflowDraft({ store, workflowId, actor }) {
             source: "marketplace",
             listing_id: node.listing_id
           };
+          stored.runtime_sync_pending = true;
           return stored;
         });
         nodeAgents.set(node.id, copied);
@@ -5729,13 +5842,17 @@ async function activateWorkflowDraft({ store, workflowId, actor }) {
           throwStatus(409, `${requirement.name} must be reconnected before activation.`);
         }
         const keywords = [...new Set([...(node.tool_keywords || []), ...(requirement.tool_keywords || [])])];
-        const toolNames = selectWorkflowTools(connection.tools || [], keywords);
+        const toolNames = selectWorkflowTools(connection.tools || [], keywords, {
+          allowWrite: workflowNodeAllowsWriteTools(node)
+        });
         if (!toolNames.length) {
           throwStatus(409, `${requirement.name} is connected, but none of its current tools match ${node.title}. Refresh the connection or review the agent manually.`);
         }
         rawBindings.push({ connection_id: connection.connection_id, tool_names: toolNames });
       }
-      const resolvedBindings = resolveAgentMcpBindings(rawBindings, currentSnapshot, actor) || [];
+      const resolvedBindings = rawBindings.length
+        ? resolveAgentMcpBindings(rawBindings, currentSnapshot, actor) || []
+        : agent.mcp_bindings || [];
       const patched = applyAgentMcpBindings({
         ...agent,
         consumes,
@@ -5751,9 +5868,11 @@ async function activateWorkflowDraft({ store, workflowId, actor }) {
           role: actor.role || "user"
         }
       };
-      if (realRuntimeEnabled()) {
+      const contractChanged = workflowAgentExecutionContractChanged(agent, patched);
+      if (realRuntimeEnabled() && contractChanged) {
         await updateRuntimeAgent(agent.id, runtimePatch);
       }
+      if (!contractChanged && !(agent.connector_requirements_pending || []).length) continue;
       await store.mutate((data) => {
         const stored = data.agents.find((item) => item.id === agent.id);
         if (!stored || !workflowAgentMutable(stored, actor)) {
@@ -5776,17 +5895,14 @@ async function activateWorkflowDraft({ store, workflowId, actor }) {
       });
     }
 
+    preflightWorkflowActivation({ workflow, snapshot: store.read(), actor });
     const activation = {
       node_agents: [...nodeAgents.entries()].map(([nodeId, agent]) => ({
         node_id: nodeId,
         agent_id: agent.id,
         source: workflow.nodes.find((item) => item.id === nodeId)?.source || "generated"
       })),
-      edges: workflow.edges.flatMap((edge) => {
-        const from = nodeAgents.get(edge.source);
-        const to = nodeAgents.get(edge.target);
-        return from && to && from.id !== to.id ? [{ from: from.id, to: to.id, label: edge.label }] : [];
-      })
+      edges: workflowActivationEdges(workflow, nodeAgents)
     };
     workflow = await markWorkflowActivation({
       store,
@@ -5810,6 +5926,188 @@ async function activateWorkflowDraft({ store, workflowId, actor }) {
   }
 }
 
+function workflowConnectionStateSignature(workflow) {
+  return JSON.stringify((workflow.connection_requirements || []).map((item) => [
+    item.provider_id,
+    item.status,
+    item.connection_id || null
+  ]));
+}
+
+async function cleanupDeclinedWorkflowAgents({ store, workflowId, actor }) {
+  const pendingAgents = store.read((data) => (data.agents || []).filter((agent) => (
+    agent.workflow_origin?.workflow_id === workflowId
+    && agent.runtime_sync_pending === true
+    && workflowAgentMutable(agent, actor)
+  )));
+  const removed = [];
+  const failed = [];
+  for (const agent of pendingAgents) {
+    try {
+      if (realRuntimeEnabled()) {
+        try {
+          await archiveRuntimeAgent(agent.id, {
+            user_id: actor.user_id,
+            workspace_id: actor.workspace_id,
+            role: actor.role || "user"
+          });
+        } catch (error) {
+          if (![404, 409].includes(Number(error?.status))) throw error;
+        }
+        try {
+          await deleteArchivedRuntimeAgent(agent.id, {
+            user_id: actor.user_id,
+            workspace_id: actor.workspace_id,
+            role: actor.role || "user"
+          });
+        } catch (error) {
+          if (Number(error?.status) !== 404) throw error;
+        }
+      }
+      removed.push(agent.id);
+    } catch {
+      failed.push(agent.id);
+    }
+  }
+  return store.mutate((data) => {
+    const workflow = assertWorkflowAccess(data, workflowId, actor, { mutable: true });
+    if (removed.length) {
+      const removedIds = new Set(removed);
+      data.agents = (data.agents || []).filter((agent) => !removedIds.has(agent.id));
+    }
+    if (failed.length) {
+      workflow.error = "The draft was closed, but cleanup of a partially created agent will be retried by an administrator.";
+      workflow.cleanup_pending_agent_ids = failed;
+    } else {
+      delete workflow.cleanup_pending_agent_ids;
+      if (workflow.status === "declined") delete workflow.error;
+    }
+    return workflow;
+  });
+}
+
+function preflightWorkflowActivation({ workflow, snapshot, actor }) {
+  const agentsById = new Map((snapshot.agents || []).map((agent) => [agent.id, agent]));
+  const connectionsById = new Map((snapshot.mcpConnections || []).map((connection) => [connection.connection_id, connection]));
+  for (const node of workflow.nodes.filter((item) => item.type === "agent")) {
+    let requiresCreatedAgent = node.source === "generated" || node.source === "marketplace";
+    if (node.source === "workspace") {
+      const source = agentsById.get(node.agent_id);
+      if (
+        !source
+        || source.enabled === false
+        || source.ready === false
+        || source.mounted === false
+        || source.runtime_sync_pending === true
+        || !workflowAgentAccessible(source, actor)
+      ) {
+        throwStatus(409, `The selected workspace agent is no longer available: ${node.title}.`);
+      }
+      if (source.scope === "chat" && source.session_id !== workflow.session_id) {
+        throwStatus(409, `The selected chat resource is no longer available in this conversation: ${node.title}.`);
+      }
+      requiresCreatedAgent = !workflowAgentMutable(source, actor)
+        || workflowNodeRequiresScopedCopy(workflow, node, source);
+    }
+    if (node.source === "marketplace") {
+      const source = (snapshot.agents || []).find((agent) => (
+        agent.enabled !== false
+        && agent.marketplace?.published === true
+        && agent.marketplace?.listing_id === node.listing_id
+      ));
+      if (!source) throwStatus(409, `The Marketplace agent is no longer available: ${node.title}.`);
+    }
+    if (requiresCreatedAgent) {
+      const requestedId = workflowAgentId(workflow, node);
+      const existing = agentsById.get(requestedId);
+      if (existing && !(
+        existing.workflow_origin?.workflow_id === workflow.workflow_id
+        && existing.workflow_origin?.node_id === node.id
+        && workflowAgentMutable(existing, actor)
+      )) {
+        throwStatus(409, `The workflow agent id is already in use: ${requestedId}.`);
+      }
+    }
+    for (const providerId of inferredNodeProviders(workflow, node.id)) {
+      const requirement = (workflow.connection_requirements || []).find((item) => item.provider_id === providerId);
+      if (!requirement?.connection_id) throwStatus(409, `${requirement?.name || providerId} is not connected.`);
+      const connection = connectionsById.get(requirement.connection_id);
+      if (!connection || connection.status !== "ready" || !workflowConnectionAccessible(connection, actor)) {
+        throwStatus(409, `${requirement.name} must be reconnected before activation.`);
+      }
+      const keywords = [...new Set([...(node.tool_keywords || []), ...(requirement.tool_keywords || [])])];
+      if (!selectWorkflowTools(connection.tools || [], keywords, {
+        allowWrite: workflowNodeAllowsWriteTools(node)
+      }).length) {
+        throwStatus(409, `${requirement.name} is connected, but none of its current tools match ${node.title}. Refresh the connection or review the agent manually.`);
+      }
+    }
+  }
+}
+
+function workflowNodeRequiresScopedCopy(workflow, node, source) {
+  // A chat-scoped document agent already is an isolated resource owned by this
+  // conversation. Copying it would discard its retrieval index.
+  if (source.document && source.scope === "chat" && source.session_id === workflow.session_id) return false;
+  if (source.workflow_origin?.workflow_id && source.workflow_origin.workflow_id !== workflow.workflow_id) return true;
+  if (nearestUpstreamAgentNodes(workflow, node.id).length > 0) return true;
+  if (inferredNodeProviders(workflow, node.id).length > 0) return true;
+  const sourceTools = new Set(source.tools || []);
+  if ((node.tools || []).some((tool) => !sourceTools.has(tool))) return true;
+  const sourceProduces = new Set(source.produces || []);
+  if ((node.produces || []).some((output) => !sourceProduces.has(output))) return true;
+  const nodeCapability = normalizeWorkflowRoleText(node.capability);
+  const sourceCapability = normalizeWorkflowRoleText(source.capability);
+  return Boolean(nodeCapability && sourceCapability && nodeCapability !== sourceCapability);
+}
+
+function workflowAgentExecutionContractChanged(agent, patched) {
+  return JSON.stringify({
+    consumes: agent.consumes || [],
+    tools: agent.tools || [],
+    tool_contracts: agent.tool_contracts || {},
+    mcp_bindings: agent.mcp_bindings || []
+  }) !== JSON.stringify({
+    consumes: patched.consumes || [],
+    tools: patched.tools || [],
+    tool_contracts: patched.tool_contracts || {},
+    mcp_bindings: patched.mcp_bindings || []
+  });
+}
+
+function sourceRequiresKnowledgeBridge(source) {
+  return Boolean(
+    source.document
+    || source.retrieval
+    || source.private_knowledge_digest
+    || (source.resources || []).length
+    || (source.sources || []).length
+  );
+}
+
+function normalizeWorkflowRoleText(value) {
+  return String(value || "").toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+function workflowActivationEdges(workflow, nodeAgents) {
+  const edges = [];
+  const seen = new Set();
+  for (const targetNode of workflow.nodes.filter((node) => node.type === "agent")) {
+    const to = nodeAgents.get(targetNode.id);
+    if (!to) continue;
+    for (const sourceNodeId of nearestUpstreamAgentNodes(workflow, targetNode.id)) {
+      const from = nodeAgents.get(sourceNodeId);
+      if (!from || from.id === to.id) continue;
+      const key = `${from.id}:${to.id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const direct = (workflow.edges || []).find((edge) => edge.source === sourceNodeId && edge.target === targetNode.id);
+      edges.push({ from: from.id, to: to.id, label: direct?.label || "handoff" });
+    }
+  }
+  return edges;
+}
+
 async function createWorkflowGeneratedAgent({ store, workflow, node, actor, derivedFrom = null }) {
   const agentId = workflowAgentId(workflow, node);
   const existing = store.read((data) => data.agents.find((item) => item.id === agentId));
@@ -5830,7 +6128,7 @@ async function createWorkflowGeneratedAgent({ store, workflow, node, actor, deri
     consumes: spec.consumes || ["user_request"],
     produces: spec.produces || node.produces || ["domain_outputs"],
     routing_cues: spec.routing_cues || [node.title],
-    resources: [],
+    resources: spec.resources || [],
     tools: spec.tools || node.tools || []
   });
   Object.assign(agent, {
@@ -5839,6 +6137,7 @@ async function createWorkflowGeneratedAgent({ store, workflow, node, actor, deri
     created_by: actor.user_id,
     last_edited_by: actor.user_id,
     last_edited_at: nowIso(),
+    runtime_sync_pending: true,
     workflow_origin: {
       workflow_id: workflow.workflow_id,
       node_id: node.id,
@@ -5846,52 +6145,90 @@ async function createWorkflowGeneratedAgent({ store, workflow, node, actor, deri
       ...(derivedFrom ? { source_agent_id: derivedFrom } : {})
     }
   });
-  if (realRuntimeEnabled()) {
-    const auditContext = {
-      user_id: actor.user_id,
-      workspace_id: actor.workspace_id,
-      role: actor.role || "user"
-    };
-    const registrationId = `registration_${crypto.randomBytes(24).toString("hex")}`;
-    const runtimeResult = await registerRuntimeAgent({
-      ...agent,
-      registration_id: registrationId,
-      audit_context: auditContext
-    });
-    if (!runtimeAgentRegistrationWasCreated(runtimeResult)) {
-      throwStatus(502, "Runtime did not create the proposed workflow agent.");
+  let runtimeCleanup = null;
+  try {
+    if (realRuntimeEnabled()) {
+      const auditContext = {
+        user_id: actor.user_id,
+        workspace_id: actor.workspace_id,
+        role: actor.role || "user"
+      };
+      const registrationId = `registration_${crypto.randomBytes(24).toString("hex")}`;
+      runtimeCleanup = {
+        agentId,
+        registrationId,
+        auditContext,
+        phase: "pending"
+      };
+      const runtimeResult = await registerRuntimeAgent({
+        ...agent,
+        registration_id: registrationId,
+        audit_context: auditContext
+      });
+      if (!runtimeAgentRegistrationWasCreated(runtimeResult)) {
+        throwStatus(502, "Runtime did not create the proposed workflow agent.");
+      }
+      runtimeCleanup.phase = "committed";
+      const runtimeAgent = stripRuntimeRegistrationMetadata(runtimeResult.agent || {});
+      const runtimeAudit = validateRuntimeAgentRegistrationAudit(runtimeResult, {
+        agentId,
+        sourceText: "",
+        auditContext
+      });
+      Object.assign(agent, runtimeAgent, {
+        workspace_id: actor.workspace_id,
+        visibility: "private",
+        created_by: actor.user_id,
+        workflow_origin: agent.workflow_origin,
+        runtime_sync_pending: true,
+        ...(runtimeAudit ? {
+          runtime_registration_audit_binding: runtimeAudit.binding,
+          runtime_registration_agent_spec: runtimeAudit.agentSpec
+        } : {})
+      });
     }
-    const runtimeAgent = stripRuntimeRegistrationMetadata(runtimeResult.agent || {});
-    const runtimeAudit = validateRuntimeAgentRegistrationAudit(runtimeResult, {
-      agentId,
-      sourceText: "",
-      auditContext
+    const created = await store.mutate((data) => {
+      if (data.agents.some((item) => item.id === agent.id)) {
+        throwStatus(409, `Generated agent id is already in use: ${agent.id}.`);
+      }
+      agent.ready = true;
+      data.agents.push(agent);
+      appendAgentEvent(data, {
+        eventType: "agent.workflow_created",
+        agent,
+        actor,
+        details: { workflow_id: workflow.workflow_id, workflow_node_id: node.id }
+      });
+      return agent;
     });
-    Object.assign(agent, runtimeAgent, {
-      workspace_id: actor.workspace_id,
-      visibility: "private",
-      created_by: actor.user_id,
-      workflow_origin: agent.workflow_origin,
-      ...(runtimeAudit ? {
-        runtime_registration_audit_binding: runtimeAudit.binding,
-        runtime_registration_agent_spec: runtimeAudit.agentSpec
-      } : {})
-    });
+    runtimeCleanup = null;
+    return created;
+  } catch (error) {
+    if (runtimeCleanup) {
+      const shouldCompensate = runtimeCleanup.phase === "committed"
+        || Number(error?.status || 0) >= 500
+        || !Number(error?.status || 0);
+      if (shouldCompensate) {
+        try {
+          const cleanup = await purgeRuntimeAgentRegistration(
+            runtimeCleanup.agentId,
+            runtimeCleanup.registrationId,
+            runtimeCleanup.auditContext
+          );
+          if (!runtimeAgentRegistrationWasPurged(cleanup)) {
+            throw new Error("Runtime did not prove workflow-agent cleanup.");
+          }
+          error.runtime_agent_compensated = true;
+        } catch (cleanupError) {
+          const safeAbsent = runtimeCleanup.phase === "pending"
+            && [404, 409].includes(Number(cleanupError?.status));
+          if (safeAbsent) error.runtime_agent_compensated = true;
+          else error.runtime_agent_compensation_failed = true;
+        }
+      }
+    }
+    throw error;
   }
-  return store.mutate((data) => {
-    if (data.agents.some((item) => item.id === agent.id)) {
-      throwStatus(409, `Generated agent id is already in use: ${agent.id}.`);
-    }
-    agent.ready = true;
-    data.agents.push(agent);
-    appendAgentEvent(data, {
-      eventType: "agent.workflow_created",
-      agent,
-      actor,
-      details: { workflow_id: workflow.workflow_id, workflow_node_id: node.id }
-    });
-    return agent;
-  });
 }
 
 function workflowGeneratedSpec(workflow, node, source = null) {
@@ -5902,6 +6239,7 @@ function workflowGeneratedSpec(workflow, node, source = null) {
     consumes: ["user_request"],
     produces: node.produces?.length ? node.produces : [`${node.id}_output`],
     routing_cues: [...new Set([node.title, ...(source?.routing_cues || []), workflow.title])].slice(0, 20),
+    resources: source && sourceRequiresKnowledgeBridge(source) ? [`agent:${source.id}`] : [],
     tools: [...new Set(node.tools || [])]
   };
 }
@@ -5976,14 +6314,24 @@ function nearestUpstreamAgentNodes(workflow, targetId) {
   return [...result];
 }
 
-function selectWorkflowTools(tools, keywords) {
+function workflowNodeAllowsWriteTools(node) {
+  if (node?.side_effect === true) return true;
+  return /\b(draft|create|update|modify|delete|remove|send|publish|post|submit|cancel|purchase|buy|charge|refund)\b/i
+    .test(String(node?.task || ""));
+}
+
+function selectWorkflowTools(tools, keywords, { allowWrite = false } = {}) {
   const normalizedKeywords = [...new Set(keywords.map((item) => String(item).toLowerCase()).filter((item) => item.length >= 2))];
   const scored = tools.map((tool) => {
     const text = `${tool.name} ${tool.title || ""} ${tool.description || ""}`.toLowerCase();
     const score = normalizedKeywords.reduce((total, keyword) => total + (text.includes(keyword) ? 1 : 0), 0);
     return { tool, score };
-  }).filter((item) => item.score > 0)
-    .sort((left, right) => right.score - left.score || String(left.tool.name).localeCompare(String(right.tool.name)));
+  }).filter((item) => item.score > 0 && (allowWrite || item.tool.risk === "read"))
+    .sort((left, right) => (
+      Number(left.tool.risk !== "read") - Number(right.tool.risk !== "read")
+      || right.score - left.score
+      || String(left.tool.name).localeCompare(String(right.tool.name))
+    ));
   return scored.slice(0, 8).map((item) => item.tool.name);
 }
 

@@ -19,6 +19,7 @@ let toolCalls;
 let observedAuthorization;
 let continuationCalls;
 let continuationFailures;
+let toolExecutionFailures;
 const priorEnvironment = {};
 const ENV_KEYS = ["WEB_STORE_DRIVER", "APP_MCP_ALLOW_TEST_HTTP", "APP_MCP_GATEWAY_KEY"];
 const executeFile = promisify(execFile);
@@ -34,6 +35,7 @@ beforeEach(async () => {
   observedAuthorization = [];
   continuationCalls = [];
   continuationFailures = 0;
+  toolExecutionFailures = 0;
   server = await startSyntheticMcpServer();
   tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "virenis-mcp-"));
   app = await createApp({
@@ -299,6 +301,65 @@ describe("governed MCP phase 1", () => {
     expect(continuationCalls).toHaveLength(2);
   });
 
+  it("resumes a failed approved action as failed without claiming completion or executing twice", async () => {
+    const connection = await request(app)
+      .post("/api/mcp/connections")
+      .send({ name: "Failed action proof", endpoint_url: server.url, auth: { type: "none" } })
+      .expect(201);
+    await request(app).post("/api/agents").send({
+      id: "failed_action_agent",
+      title: "Failed action agent",
+      capability: "Create a note after explicit approval.",
+      boundary: "Use only the assigned write tool.",
+      mcp_bindings: [{ connection_id: connection.body.connection_id, tool_names: ["create_note"] }]
+    }).expect(201);
+    const agent = (await request(app).get("/api/agents").expect(200)).body.agents
+      .find((item) => item.id === "failed_action_agent");
+    const alias = agent.mcp_bindings[0].tools[0].alias;
+    const queued = await request(app)
+      .post("/api/internal/mcp/tools/call")
+      .set("X-Virenis-MCP-Gateway-Key", process.env.APP_MCP_GATEWAY_KEY)
+      .send({
+        agent_id: agent.id,
+        tool_alias: alias,
+        arguments: { text: "This synthetic action will fail" },
+        execution_context: {
+          run_id: "run_failed_action",
+          session_id: "session_failed_action",
+          workspace_id: "workspace_default",
+          user_id: "user_local",
+          role: "user"
+        }
+      })
+      .expect(200);
+    toolExecutionFailures = 1;
+    const failed = await request(app)
+      .post(`/api/mcp/approvals/${queued.body.approval_id}`)
+      .send({ decision: "approve" })
+      .expect(200);
+    expect(failed.body).toMatchObject({
+      status: "failed",
+      result: { error: "The approved MCP action failed." },
+      continuation: {
+        status: "resumed",
+        resume_message_id: expect.stringMatching(/^msg_/)
+      }
+    });
+    expect(continuationCalls.at(-1)).toMatchObject({ decision: "failed" });
+    expect(toolCalls.filter((call) => call.name === "create_note")).toHaveLength(1);
+    const continuationMessage = app.locals.store.read((data) => data.messages
+      .find((message) => message.message_id === failed.body.continuation.resume_message_id));
+    expect(continuationMessage.content).toContain("after failed");
+
+    const repeated = await request(app)
+      .post(`/api/mcp/approvals/${queued.body.approval_id}`)
+      .send({ decision: "approve" })
+      .expect(200);
+    expect(repeated.body.continuation.resume_message_id).toBe(failed.body.continuation.resume_message_id);
+    expect(toolCalls.filter((call) => call.name === "create_note")).toHaveLength(1);
+    expect(continuationCalls).toHaveLength(1);
+  });
+
   it("pins schemas and rejects a changed tool contract until the agent is rebound", async () => {
     const connection = await request(app)
       .post("/api/mcp/connections")
@@ -476,6 +537,16 @@ async function startSyntheticMcpServer() {
       };
     } else if (payload.method === "tools/call") {
       toolCalls.push(payload.params);
+      if (toolExecutionFailures > 0) {
+        toolExecutionFailures -= 1;
+        response.setHeader("Content-Type", "application/json");
+        response.end(JSON.stringify({
+          jsonrpc: "2.0",
+          id: payload.id,
+          error: { code: -32001, message: "Synthetic tool failure" }
+        }));
+        return;
+      }
       result = payload.params.name === "search_notes"
         ? { content: [{ type: "text", text: `Current note for ${payload.params.arguments.query}` }] }
         : { content: [{ type: "text", text: "Note created" }], isError: false };

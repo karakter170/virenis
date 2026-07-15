@@ -140,7 +140,42 @@ function friendlyError(error) {
 export function availableSessionAgents(agents = []) {
   return agents
     .filter((agent) => agent.enabled !== false)
+    .filter((agent) => agent.runtime_only !== true)
+    .filter((agent) => agent.runtime_sync_pending !== true)
     .filter((agent) => !agent.document && !agent.resource_for_agent_id);
+}
+
+function workflowRequirementConnectionCandidates(requirement, connections = []) {
+  const aliases = {
+    email: "gmail",
+    mail: "gmail",
+    mailbox: "gmail",
+    inbox: "gmail",
+    drive: "google_drive",
+    calendar: "google_calendar",
+    gchat: "google_chat",
+    contacts: "google_contacts",
+    people: "google_contacts"
+  };
+  const providerKey = (value) => {
+    const normalized = String(value || "").trim().toLowerCase().replace(/[^a-z0-9_-]+/g, "_").replace(/^_+|_+$/g, "");
+    return aliases[normalized] || normalized;
+  };
+  const expected = providerKey(requirement?.provider_id);
+  const expectedTokens = expected.split(/[_-]+/).filter((token) => token.length >= 3);
+  return connections
+    .filter((connection) => {
+      if ([connection.provider_id, connection.template_id].some((value) => providerKey(value) === expected)) return true;
+      if (requirement?.connection_mode !== "custom" || connection.connection_mode !== "custom" || !expectedTokens.length) return false;
+      const nameTokens = providerKey(connection.name).split(/[_-]+/).filter(Boolean);
+      return expectedTokens.every((token) => nameTokens.includes(token));
+    })
+    .sort((left, right) => String(left.name || left.connection_id).localeCompare(String(right.name || right.connection_id)));
+}
+
+export function workflowRequirementConnections(requirement, connections = []) {
+  return workflowRequirementConnectionCandidates(requirement, connections)
+    .filter((connection) => connection.status === "ready");
 }
 
 function canManageAgent(agent, auth) {
@@ -359,6 +394,8 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
   const threadRef = useRef(null);
   const nearBottomRef = useRef(true);
   const eventSourceRef = useRef(null);
+  const sendInFlightRef = useRef(false);
+  const sendRetryRef = useRef(null);
   const oauthReturnRef = useRef((() => {
     const parameters = new URLSearchParams(window.location.search);
     return {
@@ -405,6 +442,27 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
       threadRef.current.scrollTo({ top: threadRef.current.scrollHeight, behavior: loading ? "auto" : "smooth" });
     }
   }, [messages, activeRun?.status, loading]);
+
+  const activatingWorkflowSignature = workflows
+    .filter((workflow) => workflow.status === "activating")
+    .map((workflow) => workflow.workflow_id)
+    .sort()
+    .join(":");
+
+  useEffect(() => {
+    if (!activatingWorkflowSignature || !session?.session_id) return undefined;
+    let refreshInFlight = false;
+    const timer = window.setInterval(() => {
+      if (refreshInFlight) return;
+      refreshInFlight = true;
+      openSession(session.session_id, { hydrateRuns: false })
+        .catch(() => undefined)
+        .finally(() => {
+          refreshInFlight = false;
+        });
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [activatingWorkflowSignature, session?.session_id]);
 
   async function bootstrap() {
     setLoading(true);
@@ -630,7 +688,18 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
   async function sendMessage(event) {
     event?.preventDefault();
     const content = draft.trim();
-    if (!content || !session || !canWrite) return;
+    if (!content || !session || !canWrite || sendInFlightRef.current) return;
+    const previousSubmission = sendRetryRef.current;
+    const submission = previousSubmission?.content === content
+      && previousSubmission?.sessionId === session.session_id
+      ? previousSubmission
+      : {
+          content,
+          sessionId: session.session_id,
+          idempotencyKey: mutationIdempotencyKey("message")
+        };
+    sendInFlightRef.current = true;
+    sendRetryRef.current = submission;
     const optimisticId = `local_${Date.now()}`;
     nearBottomRef.current = true;
     setDraft("");
@@ -646,7 +715,8 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
         content,
         attachments: [],
         options: { show_route_details: true }
-      });
+      }, { idempotencyKey: submission.idempotencyKey });
+      sendRetryRef.current = null;
       setMessages((items) => items.map((message) => message.message_id === optimisticId
         ? { ...message, message_id: queued.message_id, run_id: queued.run_id }
         : message));
@@ -667,6 +737,8 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
       setMessages((items) => items.filter((message) => message.message_id !== optimisticId));
       setDraft(content);
       setError(friendlyError(sendError));
+    } finally {
+      sendInFlightRef.current = false;
     }
   }
 
@@ -778,10 +850,34 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
     }
   }
 
-  async function connectWorkflowRequirement(workflow, requirement) {
+  async function connectWorkflowRequirement(workflow, requirement, connectionId = null) {
     if (!workflow || !requirement || workflowBusy) return;
     if (requirement.status === "connected") {
       await resumeWorkflow(workflow);
+      return;
+    }
+    const selectedConnection = connectionId
+      ? mcpConnections.find((connection) => connection.connection_id === connectionId)
+      : null;
+    const reconnectManaged = selectedConnection
+      && selectedConnection.status !== "ready"
+      && selectedConnection.connection_mode === "managed";
+    if (connectionId && !reconnectManaged) {
+      setWorkflowBusy(workflow.workflow_id);
+      setError("");
+      try {
+        const updated = await api.post(
+          `/api/workflows/${encodeURIComponent(workflow.workflow_id)}/connections/${encodeURIComponent(requirement.provider_id)}`,
+          { connection_id: connectionId, revision: workflow.revision }
+        );
+        await waitForWorkflowActivation(updated);
+        await openSession(workflow.session_id || session.session_id);
+      } catch (connectionError) {
+        setError(friendlyError(connectionError));
+        await openSession(session.session_id).catch(() => undefined);
+      } finally {
+        setWorkflowBusy("");
+      }
       return;
     }
     const template = mcpTemplates.find((item) => item.id === requirement.provider_id);
@@ -795,7 +891,8 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
       try {
         const started = await api.post("/api/mcp/oauth/start", {
           provider_id: requirement.provider_id,
-          workflow_id: workflow.workflow_id
+          workflow_id: workflow.workflow_id,
+          ...(reconnectManaged ? { connection_id: selectedConnection.connection_id } : {})
         });
         const authorization = new URL(started.authorization_url);
         if (!/^https?:$/.test(authorization.protocol)) throw new Error("The provider returned an invalid authorization address.");
@@ -1051,6 +1148,7 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
                 message={message}
                 run={message.run_id ? runsById[message.run_id] : null}
                 agents={agents}
+                connections={mcpConnections}
                 canWrite={canWrite}
                 previousUser={findPreviousUser(messages, index)}
                 workflow={message.workflow_id ? workflowsById[message.workflow_id] : null}
@@ -1631,6 +1729,7 @@ function ChatMessage({
   message,
   run,
   agents,
+  connections,
   canWrite,
   previousUser,
   workflow,
@@ -1653,6 +1752,7 @@ function ChatMessage({
         {message.kind === "workflow_draft" && workflow && (
           <WorkflowDraftCard
             workflow={workflow}
+            connections={connections}
             busy={workflowBusy}
             canWrite={canWrite}
             onDecision={onWorkflowDecision}
@@ -1697,6 +1797,7 @@ function ChatMessage({
 
 export function WorkflowDraftCard({
   workflow,
+  connections = [],
   busy = false,
   canWrite = true,
   onDecision = () => undefined,
@@ -1735,14 +1836,49 @@ export function WorkflowDraftCard({
       {(workflow.connection_requirements || []).length > 0 && (
         <div className="workflow-connections" aria-label="Required connections">
           <strong>Connections</strong>
-          {(workflow.connection_requirements || []).map((requirement) => (
-            <div key={requirement.provider_id}>
-              <span><Plug size={14} /><i><b>{requirement.name}</b><small>{requirement.reason}</small></i></span>
-              {requirement.status === "connected"
-                ? <em className="connected"><Check size={12} />Connected</em>
-                : <button type="button" disabled={!canWrite || busy} onClick={() => onConnect(workflow, requirement)}>{requirement.connection_mode === "managed" ? `Connect ${requirement.name}` : `Add ${requirement.name} MCP`}</button>}
-            </div>
-          ))}
+          {(workflow.connection_requirements || []).map((requirement) => {
+            const matchingConnections = workflowRequirementConnectionCandidates(requirement, connections);
+            const readyConnections = matchingConnections.filter((connection) => connection.status === "ready").slice(0, 4);
+            const reconnectableConnections = requirement.connection_mode === "managed"
+              ? matchingConnections.filter((connection) => connection.status !== "ready").slice(0, 4)
+              : [];
+            const connectionSetupEnabled = Boolean(workflow.approved_at)
+              && ["awaiting_connections", "ready_to_activate", "activation_failed"].includes(workflow.status);
+            return (
+              <div key={requirement.provider_id}>
+                <span><Plug size={14} /><i><b>{requirement.name}</b><small>{requirement.reason}</small></i></span>
+                {requirement.status === "connected"
+                  ? <em className="connected"><Check size={12} />Connected</em>
+                  : !connectionSetupEnabled
+                    ? <em className="pending">{workflow.status === "declined" ? "Draft closed" : "Approve plan first"}</em>
+                  : <span className="workflow-connection-actions">
+                    {readyConnections.map((connection) => (
+                      <button
+                        type="button"
+                        key={connection.connection_id}
+                        disabled={!canWrite || busy}
+                        onClick={() => onConnect(workflow, requirement, connection.connection_id)}
+                      >Use {connection.name || requirement.name}</button>
+                    ))}
+                    {reconnectableConnections.map((connection) => (
+                      <button
+                        type="button"
+                        key={connection.connection_id}
+                        disabled={!canWrite || busy}
+                        onClick={() => onConnect(workflow, requirement, connection.connection_id)}
+                      >Reconnect {connection.name || requirement.name}</button>
+                    ))}
+                    {(requirement.connection_mode !== "managed" || (!readyConnections.length && !reconnectableConnections.length)) && (
+                      <button type="button" disabled={!canWrite || busy} onClick={() => onConnect(workflow, requirement)}>
+                        {requirement.connection_mode === "managed"
+                          ? `Connect ${requirement.name}`
+                          : readyConnections.length ? "Add another MCP" : `Add ${requirement.name} MCP`}
+                      </button>
+                    )}
+                  </span>}
+              </div>
+            );
+          })}
         </div>
       )}
 
@@ -1773,7 +1909,7 @@ export function WorkflowDraftCard({
           <button type="button" className="text-button primary" disabled={!canWrite} onClick={() => onRun(workflow)}><ArrowRight size={14} />Run in chat</button>
         </>}
         {workflow.status === "activating" && <span><LoaderCircle className="spin" size={14} />Creating private agents and validated handoffs…</span>}
-        {workflow.status === "declined" && <span>Draft closed. No agents or connections were changed.</span>}
+        {workflow.status === "declined" && <span>Draft closed. Partially created workflow agents were cleaned up; connected accounts remain available in your workspace.</span>}
       </footer>
       {workflow.error && <div className="workflow-card-error" role="alert"><AlertCircle size={14} />{workflow.error}</div>}
     </section>
@@ -2007,6 +2143,8 @@ function Composer({
     const query = mention.query.toLowerCase();
     return agents
       .filter((agent) => agent.enabled !== false)
+      .filter((agent) => agent.runtime_only !== true)
+      .filter((agent) => agent.runtime_sync_pending !== true)
       .filter((agent) => !agent.document && !agent.resource_for_agent_id)
       .filter((agent) => agent.scope !== "chat" || agent.session_id === sessionId)
       .map((agent) => ({ agent, score: mentionMatchScore(agent, query) }))

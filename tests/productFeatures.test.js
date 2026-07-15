@@ -21,7 +21,8 @@ import {
   graphEdgePath,
   graphPositionFromPointer,
   initialGraphPositions,
-  storedGraphPositions
+  storedGraphPositions,
+  workflowRequirementConnections
 } from "../src/App.jsx";
 import LandingPage from "../src/LandingPage.jsx";
 
@@ -129,7 +130,22 @@ describe("Agent Studio product surfaces", () => {
         }],
         permissions: ["Read relevant email and create drafts; do not send automatically."],
         safety: ["Require human review before sending."]
-      }
+      },
+      connections: [{
+        connection_id: "mcpconn_personal_gmail",
+        name: "Personal Gmail",
+        provider_id: "gmail",
+        template_id: "gmail",
+        connection_mode: "managed",
+        status: "ready"
+      }, {
+        connection_id: "mcpconn_old_gmail",
+        name: "Old Gmail",
+        provider_id: "gmail",
+        template_id: "gmail",
+        connection_mode: "managed",
+        status: "reauthorization_required"
+      }]
     }));
 
     expect(markup).toContain("AUTO-COMPOSER");
@@ -138,10 +154,64 @@ describe("Agent Studio product surfaces", () => {
     expect(markup).toContain("Marketplace · maker");
     expect(markup).toContain("New private agent");
     expect(markup).toContain("Tools: Web search");
-    expect(markup).toContain("Connect Gmail");
+    expect(markup).toContain("Approve plan first");
+    expect(markup).not.toContain("Use Personal Gmail");
+    expect(markup).not.toContain("Reconnect Old Gmail");
+    expect(markup).not.toContain("Connect another");
     expect(markup).toContain("Review permissions and safety");
     expect(markup).toContain("Approve plan");
     expect(markup).not.toContain("Send automatically");
+
+    const approvedMarkup = renderToStaticMarkup(createElement(WorkflowDraftCard, {
+      workflow: {
+        workflow_id: "workflow_ui_approved",
+        mode: "workflow",
+        title: "Approved connection selection",
+        status: "awaiting_connections",
+        approved_at: "2026-07-15T00:00:00.000Z",
+        nodes: [{ id: "mail", type: "agent", title: "Mail Reader", source: "generated", status: "blocked_connection" }],
+        edges: [],
+        connection_requirements: [{
+          provider_id: "gmail",
+          name: "Gmail",
+          reason: "Read relevant messages.",
+          connection_mode: "managed",
+          status: "missing"
+        }],
+        permissions: [],
+        safety: []
+      },
+      connections: [{
+        connection_id: "mcpconn_personal_gmail",
+        name: "Personal Gmail",
+        provider_id: "gmail",
+        template_id: "gmail",
+        connection_mode: "managed",
+        status: "ready"
+      }, {
+        connection_id: "mcpconn_old_gmail",
+        name: "Old Gmail",
+        provider_id: "gmail",
+        template_id: "gmail",
+        connection_mode: "managed",
+        status: "reauthorization_required"
+      }]
+    }));
+    expect(approvedMarkup).toContain("Use Personal Gmail");
+    expect(approvedMarkup).toContain("Reconnect Old Gmail");
+  });
+
+  it("offers only compatible ready accounts for a workflow connection requirement", () => {
+    const connections = [
+      { connection_id: "gmail_ready", name: "Work Gmail", provider_id: "gmail", template_id: "gmail", connection_mode: "managed", status: "ready" },
+      { connection_id: "gmail_stale", name: "Old Gmail", provider_id: "gmail", template_id: "gmail", connection_mode: "managed", status: "error" },
+      { connection_id: "custom_salesforce", name: "Salesforce production", provider_id: "custom", template_id: "custom", connection_mode: "custom", status: "ready" },
+      { connection_id: "custom_fake_gmail", name: "Gmail exporter", provider_id: "custom", template_id: "custom", connection_mode: "custom", status: "ready" }
+    ];
+    expect(workflowRequirementConnections({ provider_id: "gmail", connection_mode: "managed" }, connections)
+      .map((connection) => connection.connection_id)).toEqual(["gmail_ready"]);
+    expect(workflowRequirementConnections({ provider_id: "salesforce", connection_mode: "custom" }, connections)
+      .map((connection) => connection.connection_id)).toEqual(["custom_salesforce"]);
   });
 
   it("keeps an interrupted tool continuation visibly recoverable", () => {
@@ -261,6 +331,8 @@ describe("Agent Studio product surfaces", () => {
       { id: "ordinary_agent", item_type: "agent", enabled: true, mounted: true },
       { id: "archived_agent", item_type: "agent", enabled: false, mounted: true },
       { id: "api_agent_with_legacy_mount_flag", item_type: "agent", enabled: true, mounted: false },
+      { id: "runtime_adoption_only", item_type: "agent", enabled: true, mounted: true, runtime_only: true },
+      { id: "workflow_setup_pending", item_type: "agent", enabled: true, mounted: true, runtime_sync_pending: true },
       { id: "document_agent", item_type: "agent", enabled: true, mounted: true, document: { source: "fixture" } }
     ]);
 
