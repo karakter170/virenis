@@ -5209,6 +5209,8 @@ function redactRunStepForRequest(step, req) {
   const {
     raw_text_admin_only: _rawText,
     prompt_preview_admin_only: _promptPreview,
+    model_calls_admin_only: _modelCalls,
+    agent_reasoning: _agentReasoning,
     approved_sources: _approvedSources,
     ...safeStep
   } = step;

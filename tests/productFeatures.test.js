@@ -223,7 +223,7 @@ describe("Agent Studio product surfaces", () => {
     expect(markup).toContain("Agents and model usage");
     expect(markup).toContain("Router");
     expect(markup).toContain("Final answer");
-    expect(markup).toContain("Full output");
+    expect(markup).toContain("Agent result");
     expect(markup).toContain("Opening evidence");
     expect(markup).toContain("Closing evidence");
   });

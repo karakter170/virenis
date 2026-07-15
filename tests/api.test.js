@@ -2868,6 +2868,8 @@ describe("chat execution", () => {
       expect(run.status).toBe("completed");
       expect(run.expert_outputs[0].raw_text_admin_only).toBeUndefined();
       expect(run.expert_outputs[0].prompt_preview_admin_only).toBeUndefined();
+      expect(run.expert_outputs[0].model_calls_admin_only).toBeUndefined();
+      expect(run.expert_outputs[0].agent_reasoning).toBeUndefined();
 
       const route = await request(app)
         .get(`/api/chat/runs/${queued.body.run_id}/routes/${run.expert_outputs[0].step_id}`)
@@ -2875,6 +2877,8 @@ describe("chat execution", () => {
         .expect(200);
       expect(route.body.raw_text_admin_only).toBeUndefined();
       expect(route.body.prompt_preview_admin_only).toBeUndefined();
+      expect(route.body.model_calls_admin_only).toBeUndefined();
+      expect(route.body.agent_reasoning).toBeUndefined();
 
       const adminRoute = await request(app)
         .get(`/api/chat/runs/${queued.body.run_id}/routes/${run.expert_outputs[0].step_id}`)
@@ -2882,6 +2886,7 @@ describe("chat execution", () => {
         .expect(200);
       expect(adminRoute.body.raw_text_admin_only).toContain("AGENT_REASONING");
       expect(adminRoute.body.prompt_preview_admin_only).toContain("Adapter");
+      expect(adminRoute.body.agent_reasoning).toBeTruthy();
     } finally {
       if (previousTokens === undefined) {
         delete process.env.APP_API_TOKENS_JSON;

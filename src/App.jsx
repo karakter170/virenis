@@ -3977,7 +3977,7 @@ export function RunDetailsSheet({
             {view === "agents" && (
               <section className="detail-section" aria-labelledby="used-agents-heading">
                 <div className="section-heading compact-heading">
-                  <div><h3 id="used-agents-heading">Agents and model usage</h3><p>{run.expert_outputs?.length || 0} contributors. Expand any agent to read its complete output.</p></div>
+                  <div><h3 id="used-agents-heading">Agents and model usage</h3><p>{run.expert_outputs?.length || 0} contributors. Expand any agent to read its complete result.</p></div>
                 </div>
                 <UsageReceipt
                   receipt={run.usage_receipt}
@@ -4009,7 +4009,7 @@ export function RunDetailsSheet({
                           {route.task && <p><strong>Task</strong>{route.task}</p>}
                           {route.domain_answer && (
                             <div className="agent-full-output">
-                              <strong>Full output</strong>
+                              <strong>Agent result</strong>
                               <FormattedText text={route.domain_answer} />
                             </div>
                           )}
