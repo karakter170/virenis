@@ -17,8 +17,20 @@ describe("workspace model output settings", () => {
       agent_output_tokens: 1024,
       final_output_tokens: 2048,
       bounds: {
-        agent_output_tokens: { min: 128, max: 4096 },
-        final_output_tokens: { min: 256, max: 8192 }
+        agent_output_tokens: {
+          min: 128,
+          max: 2304,
+          context_tokens: 4096,
+          reserved_input_tokens: 1500,
+          safety_margin_tokens: 128
+        },
+        final_output_tokens: {
+          min: 256,
+          max: 3072,
+          context_tokens: 4096,
+          reserved_input_tokens: 768,
+          safety_margin_tokens: 192
+        }
       },
       revision: 0
     });
@@ -79,10 +91,23 @@ describe("workspace model output settings", () => {
     expect(() => updateModelOutputSettings({ workspaceModelSettings: [] }, {
       ...base,
       finalOutputTokens: 9000
-    })).toThrow("final_output_tokens must be between 256 and 8192");
+    })).toThrow("final_output_tokens must be between 256 and 3072");
     expect(() => updateModelOutputSettings({ workspaceModelSettings: [] }, {
       ...base,
       reason: ""
     })).toThrow("change reason");
+  });
+
+  it("derives safe output ceilings from worker and session context windows", () => {
+    expect(modelOutputSettingsForWorkspace({}, "workspace_a", {
+      TCAR_PLANNER_MODE: "session",
+      TCAR_MODEL_CONTEXT_TOKENS: "8192",
+      ROUTER_SESSION_CONTEXT_TOKENS: "16384",
+      TCAR_CLIENT_MAX_TOKENS: "8192",
+      TCAR_CLIENT_MAX_REFINER_TOKENS: "16384"
+    }).bounds).toMatchObject({
+      agent_output_tokens: { max: 6400, context_tokens: 8192 },
+      final_output_tokens: { max: 15360, context_tokens: 16384 }
+    });
   });
 });

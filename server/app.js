@@ -5060,7 +5060,7 @@ function publicRunFailureDetails(code = null) {
       action: "retry"
     },
     model_context_limit: {
-      message: "This request contains more context than the selected model can process. Shorten it or attach fewer sources, then retry.",
+      message: "The request and output limit exceed the selected model's context window. Lower the output limit, shorten the request, or attach fewer sources, then retry.",
       retryable: false,
       action: "reduce_context"
     },

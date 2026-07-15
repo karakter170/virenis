@@ -411,7 +411,7 @@ export function AdminUsersPanel() {
       <form className="admin-output-form" onSubmit={saveOutputSettings}>
         <div className="admin-form-intro">
           <span><Gauge size={16} aria-hidden="true" /></span>
-          <div><strong>Model output limits</strong><small>Maximum generated tokens per agent and for the final answer. These workspace limits apply to new requests.</small></div>
+          <div><strong>Model output limits</strong><small>Maximum generated tokens per agent and for the final answer. Safe limits automatically reserve room for prompts, handoffs, and tool results.</small></div>
         </div>
         <label>
           <span>Each agent</span>
@@ -419,7 +419,7 @@ export function AdminUsersPanel() {
             type="number"
             inputMode="numeric"
             min={outputSettings?.bounds?.agent_output_tokens?.min || 128}
-            max={outputSettings?.bounds?.agent_output_tokens?.max || 4096}
+            max={outputSettings?.bounds?.agent_output_tokens?.max || 2304}
             step="1"
             value={outputDraft.agent}
             onChange={(event) => setOutputDraft({ ...outputDraft, agent: event.target.value })}
@@ -433,7 +433,7 @@ export function AdminUsersPanel() {
             type="number"
             inputMode="numeric"
             min={outputSettings?.bounds?.final_output_tokens?.min || 256}
-            max={outputSettings?.bounds?.final_output_tokens?.max || 8192}
+            max={outputSettings?.bounds?.final_output_tokens?.max || 3072}
             step="1"
             value={outputDraft.final}
             onChange={(event) => setOutputDraft({ ...outputDraft, final: event.target.value })}

@@ -446,9 +446,11 @@ function boundedHttpRequest(urlValue, {
       incoming.once("aborted", () => {
         const error = new Error("TCAR runtime closed the response before it completed.");
         error.status = 502;
+        error.code = "runtime_response_incomplete";
+        error.retryable = true;
         finish(error);
       });
-      incoming.once("error", (error) => finish(error));
+      incoming.once("error", (error) => finish(normalizeRuntimeTransportError(error)));
       incoming.once("end", () => {
         clearTimer(totalTimer);
         clearTimer(bodyTimer);
@@ -460,10 +462,25 @@ function boundedHttpRequest(urlValue, {
         });
       });
     });
-    request.once("error", (error) => finish(error));
+    request.once("error", (error) => finish(normalizeRuntimeTransportError(error)));
     if (body) request.write(body);
     request.end();
   });
+}
+
+function normalizeRuntimeTransportError(error) {
+  if (Number(error?.status) > 0) return error;
+  const code = String(error?.code || "").toUpperCase();
+  const message = String(error?.message || "").toLowerCase();
+  if (code === "ECONNRESET" || message.includes("socket hang up") || message.includes("connection reset")) {
+    const normalized = new Error("TCAR runtime connection closed unexpectedly.");
+    normalized.status = 502;
+    normalized.code = "runtime_connection_reset";
+    normalized.retryable = true;
+    normalized.cause = error;
+    return normalized;
+  }
+  return error;
 }
 
 function runtimeTimeoutError(timeoutMs) {

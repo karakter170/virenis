@@ -17,7 +17,13 @@ const ENV_NAMES = [
   "TCAR_MAX_TOKENS",
   "TCAR_REFINER_MAX_TOKENS",
   "TCAR_CLIENT_MAX_TOKENS",
-  "TCAR_CLIENT_MAX_REFINER_TOKENS"
+  "TCAR_CLIENT_MAX_REFINER_TOKENS",
+  "TCAR_MODEL_CONTEXT_TOKENS",
+  "ROUTER_SESSION_CONTEXT_TOKENS",
+  "TCAR_ROUTE_MIN_INPUT_TOKENS",
+  "TCAR_REFINER_MIN_INPUT_TOKENS",
+  "TCAR_ROUTE_TOKEN_SAFETY_MARGIN",
+  "TCAR_COMPLETION_TOKEN_SAFETY_MARGIN"
 ];
 
 let app;
@@ -124,6 +130,13 @@ describe("administrator model output settings API", () => {
       .set(authorization(TOKENS.adminA))
       .send({ agent_output_tokens: 127, final_output_tokens: 2048, reason: "Too low" })
       .expect(400);
+    const unsafeContextSplit = await request(app)
+      .patch("/api/admin/model-output-settings")
+      .set(authorization(TOKENS.adminA))
+      .send({ agent_output_tokens: 2048, final_output_tokens: 4096, reason: "Consumes the full context" })
+      .expect(400);
+    expect(unsafeContextSplit.body).toMatchObject({ error: "invalid_model_output_settings" });
+    expect(unsafeContextSplit.body.message).toMatch(/final_output_tokens/i);
     const unchanged = await request(app)
       .get("/api/admin/model-output-settings")
       .set(authorization(TOKENS.adminA))

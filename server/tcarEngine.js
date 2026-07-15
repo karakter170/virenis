@@ -1044,7 +1044,7 @@ function classifyRunFailure(error, fallbackCode = "run_failed") {
   if (status === 413 || matches("context_length", "context window", "input requires", "too large")) {
     return {
       code: "model_context_limit",
-      message: "This request contains more context than the selected model can process. Shorten it or attach fewer sources, then retry.",
+      message: "The request and output limit exceed the selected model's context window. Lower the output limit, shorten the request, or attach fewer sources, then retry.",
       retryable: false,
       action: "reduce_context"
     };
@@ -1065,7 +1065,20 @@ function classifyRunFailure(error, fallbackCode = "run_failed") {
       action: "retry"
     };
   }
-  if ([502, 503].includes(status) || matches("econnrefused", "enotfound", "service unavailable")) {
+  if (
+    [502, 503].includes(status)
+    || matches(
+      "econnrefused",
+      "enotfound",
+      "service unavailable",
+      "socket hang up",
+      "econnreset",
+      "connection reset",
+      "runtime_connection_reset",
+      "runtime_response_incomplete",
+      "closed unexpectedly"
+    )
+  ) {
     return {
       code: "model_service_unavailable",
       message: "The selected model service is temporarily unavailable. Try again shortly.",

@@ -4,23 +4,83 @@ const MIN_AGENT_OUTPUT_TOKENS = 128;
 const MIN_FINAL_OUTPUT_TOKENS = 256;
 const DEFAULT_MAX_AGENT_OUTPUT_TOKENS = 4096;
 const DEFAULT_MAX_FINAL_OUTPUT_TOKENS = 8192;
+const DEFAULT_MODEL_CONTEXT_TOKENS = 4096;
+const DEFAULT_ROUTE_INPUT_RESERVE_TOKENS = 1500;
+const DEFAULT_REFINER_INPUT_RESERVE_TOKENS = 768;
+const DEFAULT_ROUTE_SAFETY_MARGIN_TOKENS = 128;
+const DEFAULT_COMPLETION_SAFETY_MARGIN_TOKENS = 192;
+const OUTPUT_TOKEN_STEP = 256;
 
 export function modelOutputBounds(env = process.env) {
-  const maxAgent = boundedEnvironmentInteger(
+  const configuredMaxAgent = boundedEnvironmentInteger(
     env.TCAR_CLIENT_MAX_TOKENS,
     DEFAULT_MAX_AGENT_OUTPUT_TOKENS,
     MIN_AGENT_OUTPUT_TOKENS,
     32768
   );
-  const maxFinal = boundedEnvironmentInteger(
+  const configuredMaxFinal = boundedEnvironmentInteger(
     env.TCAR_CLIENT_MAX_REFINER_TOKENS,
     DEFAULT_MAX_FINAL_OUTPUT_TOKENS,
     MIN_FINAL_OUTPUT_TOKENS,
     32768
   );
+  const workerContext = boundedEnvironmentInteger(
+    env.TCAR_MODEL_CONTEXT_TOKENS,
+    DEFAULT_MODEL_CONTEXT_TOKENS,
+    2048,
+    2_000_000
+  );
+  const plannerMode = String(env.TCAR_PLANNER_MODE || "session").trim().toLowerCase();
+  const finalContext = plannerMode === "session"
+    ? boundedEnvironmentInteger(env.ROUTER_SESSION_CONTEXT_TOKENS, workerContext, 2048, 2_000_000)
+    : workerContext;
+  const routeInputReserve = boundedEnvironmentInteger(
+    env.TCAR_ROUTE_MIN_INPUT_TOKENS,
+    DEFAULT_ROUTE_INPUT_RESERVE_TOKENS,
+    768,
+    65_536
+  );
+  const refinerInputReserve = boundedEnvironmentInteger(
+    env.TCAR_REFINER_MIN_INPUT_TOKENS,
+    DEFAULT_REFINER_INPUT_RESERVE_TOKENS,
+    640,
+    65_536
+  );
+  const routeSafetyMargin = boundedEnvironmentInteger(
+    env.TCAR_ROUTE_TOKEN_SAFETY_MARGIN,
+    DEFAULT_ROUTE_SAFETY_MARGIN_TOKENS,
+    64,
+    16_384
+  );
+  const completionSafetyMargin = boundedEnvironmentInteger(
+    env.TCAR_COMPLETION_TOKEN_SAFETY_MARGIN,
+    DEFAULT_COMPLETION_SAFETY_MARGIN_TOKENS,
+    64,
+    16_384
+  );
+  const maxAgent = Math.min(
+    configuredMaxAgent,
+    steppedContextMaximum(workerContext - routeInputReserve - routeSafetyMargin, MIN_AGENT_OUTPUT_TOKENS)
+  );
+  const maxFinal = Math.min(
+    configuredMaxFinal,
+    steppedContextMaximum(finalContext - refinerInputReserve - completionSafetyMargin, MIN_FINAL_OUTPUT_TOKENS)
+  );
   return {
-    agent: { min: MIN_AGENT_OUTPUT_TOKENS, max: maxAgent },
-    final: { min: MIN_FINAL_OUTPUT_TOKENS, max: maxFinal }
+    agent: {
+      min: MIN_AGENT_OUTPUT_TOKENS,
+      max: maxAgent,
+      context_tokens: workerContext,
+      reserved_input_tokens: routeInputReserve,
+      safety_margin_tokens: routeSafetyMargin
+    },
+    final: {
+      min: MIN_FINAL_OUTPUT_TOKENS,
+      max: maxFinal,
+      context_tokens: finalContext,
+      reserved_input_tokens: refinerInputReserve,
+      safety_margin_tokens: completionSafetyMargin
+    }
   };
 }
 
@@ -124,6 +184,10 @@ function boundedEnvironmentInteger(value, fallback, minimum, maximum) {
   const number = Number(value);
   if (!Number.isSafeInteger(number)) return Math.max(minimum, Math.min(maximum, fallback));
   return Math.max(minimum, Math.min(maximum, number));
+}
+
+function steppedContextMaximum(value, minimum) {
+  return Math.max(minimum, Math.floor(Math.max(0, value) / OUTPUT_TOKEN_STEP) * OUTPUT_TOKEN_STEP);
 }
 
 function modelSettingsError(status, message) {

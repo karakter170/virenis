@@ -318,6 +318,21 @@ describe("TCAR runtime HTTP transport", () => {
     await waitForSocketsToClose(runtime.sockets);
   });
 
+  it("normalizes an upstream socket reset into a retryable runtime failure", async () => {
+    const runtime = await startHttpServer((request) => {
+      request.socket.destroy();
+    });
+    configureRuntime(runtime.url);
+
+    await expect(runtimeRequest("/reset", { timeoutMs: 500 })).rejects.toMatchObject({
+      status: 502,
+      code: "runtime_connection_reset",
+      retryable: true,
+      message: "TCAR runtime connection closed unexpectedly."
+    });
+    await waitForSocketsToClose(runtime.sockets);
+  });
+
   it("preserves structured runtime HTTP errors", async () => {
     const runtime = await startHttpServer((_request, response) => {
       response.writeHead(409, { "Content-Type": "application/json" });
