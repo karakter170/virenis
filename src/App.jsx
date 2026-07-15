@@ -68,6 +68,7 @@ import {
 } from "./outcomeEvidence.js";
 import {
   canManageDocument,
+  missingOutcomeContractIds,
   outcomeLifecycleState,
   realityRankHistory,
   realityRankSummary,
@@ -409,7 +410,7 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
     setLoading(true);
     setError("");
     try {
-      const [me, sessionList, health, agentList, docList, marketplaceList, connectionList, templateList, approvalList] = await Promise.all([
+      const results = await Promise.allSettled([
         api.get("/api/auth/me"),
         api.get("/api/chat/sessions"),
         api.get("/api/runtime/health"),
@@ -420,7 +421,31 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
         api.get("/api/mcp/templates"),
         api.get("/api/mcp/approvals")
       ]);
-      const metricData = me.is_admin ? await api.get("/api/admin/metrics") : emptyMetrics();
+      const required = (index) => {
+        if (results[index].status === "rejected") throw results[index].reason;
+        return results[index].value;
+      };
+      const optional = (index, fallback) => results[index].status === "fulfilled"
+        ? results[index].value
+        : fallback;
+      const me = required(0);
+      const sessionList = required(1);
+      const health = optional(2, { ok: false, ready: false });
+      const agentList = optional(3, { agents: [] });
+      const docList = optional(4, { documents: [] });
+      const marketplaceList = optional(5, { items: [] });
+      const connectionList = optional(6, { connections: [] });
+      const templateList = optional(7, { templates: [] });
+      const approvalList = optional(8, { approvals: [] });
+      let optionalLoadFailed = results.slice(2).some((result) => result.status === "rejected");
+      let metricData = emptyMetrics();
+      if (me.is_admin) {
+        try {
+          metricData = await api.get("/api/admin/metrics");
+        } catch {
+          optionalLoadFailed = true;
+        }
+      }
       setAuth(me);
       setRuntime(health);
       setAgents(agentList.agents || []);
@@ -439,6 +464,9 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
       }
       setSessions(sessionList.sessions?.length ? sessionList.sessions : nextSession ? [nextSession] : []);
       if (nextSession) await openSession(nextSession.session_id);
+      if (optionalLoadFailed) {
+        setError("Chat is available, but some Studio resources could not be loaded. Refresh to try those resources again.");
+      }
     } catch (bootstrapError) {
       if (bootstrapError?.status === 401) {
         onAuthenticationRequired();
@@ -454,7 +482,7 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
     const agentPath = session?.session_id
       ? `/api/agents?session_id=${encodeURIComponent(session.session_id)}`
       : "/api/agents";
-    const [me, sessionList, agentList, docList, health, marketplaceList, connectionList, templateList, approvalList] = await Promise.all([
+    const results = await Promise.allSettled([
       api.get("/api/auth/me"),
       api.get("/api/chat/sessions"),
       api.get(agentPath),
@@ -465,26 +493,82 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
       api.get("/api/mcp/templates"),
       api.get("/api/mcp/approvals")
     ]);
-    const metricData = me.is_admin ? await api.get("/api/admin/metrics") : emptyMetrics();
+    const required = (index) => {
+      if (results[index].status === "rejected") throw results[index].reason;
+      return results[index].value;
+    };
+    const fulfilled = (index) => results[index].status === "fulfilled" ? results[index].value : null;
+    const me = required(0);
+    const sessionList = required(1);
+    const agentList = fulfilled(2);
+    const docList = fulfilled(3);
+    const health = fulfilled(4);
+    const marketplaceList = fulfilled(5);
+    const connectionList = fulfilled(6);
+    const templateList = fulfilled(7);
+    const approvalList = fulfilled(8);
+    let optionalLoadFailed = results.slice(2).some((result) => result.status === "rejected");
+    let metricData = me.is_admin ? null : emptyMetrics();
+    if (me.is_admin) {
+      try {
+        metricData = await api.get("/api/admin/metrics");
+      } catch {
+        optionalLoadFailed = true;
+      }
+    }
     setAuth(me);
     setSessions(sessionList.sessions || []);
-    setAgents(agentList.agents || []);
-    setDocuments(docList.documents || []);
-    setRuntime(health);
-    setMarketplace(marketplaceList.items || []);
-    setMcpConnections(connectionList.connections || []);
-    setMcpTemplates(templateList.templates || []);
-    setMcpApprovals(approvalList.approvals || []);
-    setMetrics(metricData);
+    if (agentList) setAgents(agentList.agents || []);
+    if (docList) setDocuments(docList.documents || []);
+    if (health) setRuntime(health);
+    if (marketplaceList) setMarketplace(marketplaceList.items || []);
+    if (connectionList) setMcpConnections(connectionList.connections || []);
+    if (templateList) setMcpTemplates(templateList.templates || []);
+    if (approvalList) setMcpApprovals(approvalList.approvals || []);
+    if (metricData) setMetrics(metricData);
+    if (optionalLoadFailed) {
+      setError("Some Studio resources could not be refreshed. Your current chat data was preserved.");
+    }
   }
 
-  async function fetchRun(runId, { makeActive = false } = {}) {
+  async function refreshStudioResources(scopes = []) {
+    const requested = [...new Set(scopes)];
+    if (!requested.length) return;
+    const agentPath = session?.session_id
+      ? `/api/agents?session_id=${encodeURIComponent(session.session_id)}`
+      : "/api/agents";
+    const loaders = {
+      agents: [agentPath, (payload) => setAgents(payload.agents || [])],
+      documents: ["/api/documents", (payload) => setDocuments(payload.documents || [])],
+      health: ["/api/runtime/health", setRuntime],
+      marketplace: ["/api/marketplace", (payload) => setMarketplace(payload.items || [])],
+      connections: ["/api/mcp/connections", (payload) => setMcpConnections(payload.connections || [])],
+      templates: ["/api/mcp/templates", (payload) => setMcpTemplates(payload.templates || [])],
+      approvals: ["/api/mcp/approvals", (payload) => setMcpApprovals(payload.approvals || [])],
+      metrics: ["/api/admin/metrics", setMetrics]
+    };
+    const selected = requested
+      .filter((scope) => loaders[scope])
+      .filter((scope) => scope !== "metrics" || auth?.is_admin)
+      .map((scope) => ({ scope, path: loaders[scope][0], apply: loaders[scope][1] }));
+    const results = await Promise.allSettled(selected.map((item) => api.get(item.path)));
+    results.forEach((result, index) => {
+      if (result.status === "fulfilled") selected[index].apply(result.value);
+    });
+    if (results.some((result) => result.status === "rejected")) {
+      setError("Some Studio resources could not be refreshed. Existing data was preserved.");
+    }
+  }
+
+  async function fetchRun(runId, { makeActive = false, hydrateContracts = false } = {}) {
     if (!runId) return null;
     const run = await api.get(`/api/chat/runs/${encodeURIComponent(runId)}`);
     setRunsById((current) => ({ ...current, [runId]: run }));
     if (makeActive) setActiveRun(run);
-    for (const contract of run.outcome_contracts || []) {
-      fetchContract(contract.contract_id).catch(() => undefined);
+    if (hydrateContracts) {
+      await Promise.allSettled(
+        missingOutcomeContractIds(run, contractsById).map((contractId) => fetchContract(contractId))
+      );
     }
     return run;
   }
@@ -495,7 +579,7 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
     return contract;
   }
 
-  async function openSession(sessionId) {
+  async function openSession(sessionId, { hydrateRuns = true } = {}) {
     setError("");
     const [payload, agentList] = await Promise.all([
       api.get(`/api/chat/sessions/${encodeURIComponent(sessionId)}`),
@@ -515,14 +599,16 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
         .map((message) => message.run_id)
     )];
     const latestRunId = [...(payload.messages || [])].reverse().find((message) => message.run_id)?.run_id;
-    if (latestRunId) {
+    if (latestRunId && hydrateRuns) {
       await fetchRun(latestRunId, { makeActive: true });
-    } else {
+    } else if (!latestRunId) {
       setActiveRun(null);
     }
-    assistantRunIds.slice(-12).filter((runId) => runId !== latestRunId).forEach((runId) => {
-      fetchRun(runId).catch(() => undefined);
-    });
+    if (hydrateRuns) {
+      assistantRunIds.slice(-12).filter((runId) => runId !== latestRunId).forEach((runId) => {
+        fetchRun(runId).catch(() => undefined);
+      });
+    }
   }
 
   async function newChat() {
@@ -531,7 +617,7 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
     try {
       eventSourceRef.current?.close();
       const created = await api.post("/api/chat/sessions", { title: "New chat", visibility: "private" });
-      await refreshResources();
+      setSessions((current) => [created, ...current.filter((item) => item.session_id !== created.session_id)]);
       await openSession(created.session_id);
       setDraft("");
       setHistoryOpen(false);
@@ -608,19 +694,18 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
           [runId]: { ...(current[runId] || { run_id: runId }), status: nextStatus }
         }));
       }
-      if (["planner.completed", "route.completed", "synthesis.started", "final.completed", "run.failed"].includes(event.type)) {
+      if (["final.completed", "run.failed"].includes(event.type)) {
         await fetchRun(runId, { makeActive: true }).catch(() => undefined);
       }
       if (event.type === "final.completed" || event.type === "run.failed") {
         source.close();
         if (eventSourceRef.current === source) eventSourceRef.current = null;
-        await openSession(sessionId).catch((sessionError) => setError(friendlyError(sessionError)));
-        await refreshResources().catch(() => undefined);
+        await openSession(sessionId, { hydrateRuns: false }).catch((sessionError) => setError(friendlyError(sessionError)));
       }
     };
     source.onerror = () => {
-      source.close();
-      if (eventSourceRef.current === source) eventSourceRef.current = null;
+      // Native EventSource retries transient disconnects. Keep it alive and
+      // refresh once so the visible state progresses while reconnection occurs.
       fetchRun(runId, { makeActive: true }).catch(() => undefined);
     };
   }
@@ -628,9 +713,9 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
   async function openRunDetails(runId) {
     setDetailsRunId(runId);
     if (!runsById[runId]?.expert_outputs) {
-      await fetchRun(runId).catch((detailsError) => setError(friendlyError(detailsError)));
+      await fetchRun(runId, { hydrateContracts: true }).catch((detailsError) => setError(friendlyError(detailsError)));
     } else {
-      fetchRun(runId).catch(() => undefined);
+      fetchRun(runId, { hydrateContracts: true }).catch(() => undefined);
     }
   }
 
@@ -669,7 +754,6 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
       });
       await waitForWorkflowActivation(updated);
       await openSession(workflow.session_id || session.session_id);
-      await refreshResources();
     } catch (workflowError) {
       setError(friendlyError(workflowError));
       await openSession(session.session_id).catch(() => undefined);
@@ -686,7 +770,6 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
       const updated = await api.post(`/api/workflows/${encodeURIComponent(workflow.workflow_id)}/resume`, {});
       await waitForWorkflowActivation(updated);
       await openSession(workflow.session_id || session.session_id);
-      await refreshResources();
     } catch (workflowError) {
       setError(friendlyError(workflowError));
       await openSession(session.session_id).catch(() => undefined);
@@ -742,7 +825,7 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
     try {
       await api.post(`/api/mcp/approvals/${encodeURIComponent(approval.approval_id)}`, { decision });
       await openSession(checkpoint.session_id || session.session_id);
-      await refreshResources();
+      await refreshStudioResources(["approvals", "connections"]);
     } catch (approvalError) {
       setError(friendlyError(approvalError));
     } finally {
@@ -768,7 +851,7 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
     setError("");
     await api.delete(`/api/agents/${encodeURIComponent(agent.id)}`);
     setArchiveTarget(null);
-    await refreshResources();
+    await refreshStudioResources(["agents", "marketplace"]);
     setResourcesOpen(true);
     setResourceView("agents");
   }
@@ -777,7 +860,7 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
     setError("");
     await api.delete(`/api/agents/${encodeURIComponent(agent.id)}/permanent`);
     setDeleteAgentTarget(null);
-    await refreshResources();
+    await refreshStudioResources(["agents", "marketplace"]);
     setResourcesOpen(true);
     setResourceView("agents");
   }
@@ -788,7 +871,7 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
     setError("");
     await api.delete(`/api/marketplace/items/${encodeURIComponent(item.id)}`);
     setUnpublishTarget(null);
-    await refreshResources();
+    await refreshStudioResources(["agents", "marketplace"]);
     setResourcesOpen(true);
     setResourceView(returnView);
   }
@@ -797,7 +880,7 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
     setError("");
     await api.delete(`/api/documents/${encodeURIComponent(document.document_id)}`);
     setDeleteDocumentTarget(null);
-    await refreshResources();
+    await refreshStudioResources(["agents", "documents"]);
     if (document.scope === "chat") {
       setChatDocuments((items) => items.filter((item) => item.document_id !== document.document_id));
       setResourcesOpen(false);
@@ -832,10 +915,10 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
     if (!target) throw new Error("The destination agent is no longer available.");
     setError("");
     try {
-      await api.patch(`/api/agents/${encodeURIComponent(toId)}`, {
+      const updated = await api.patch(`/api/agents/${encodeURIComponent(toId)}`, {
         consumes: graphConnectionInputs(target.consumes, fromId, connected)
       });
-      await refreshResources();
+      setAgents((items) => items.map((item) => item.id === toId ? { ...item, ...updated } : item));
     } catch (connectionError) {
       setError(friendlyError(connectionError));
       throw connectionError;
@@ -869,8 +952,11 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
     setSettlementContract(null);
     setDisputeContract(null);
     setCorrectionContract(null);
-    await fetchRun(runId, { makeActive: activeRun?.run_id === runId });
-    await refreshResources();
+    await fetchRun(runId, {
+      makeActive: activeRun?.run_id === runId,
+      hydrateContracts: true
+    });
+    await refreshStudioResources(["metrics"]);
     setDetailsRunId(runId);
   }
 
@@ -1000,8 +1086,16 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
             {activeRun?.status === "failed" && !messages.some((message) => message.role === "assistant" && message.run_id === activeRun.run_id) && (
               <div className="inline-error" role="alert">
                 <AlertCircle size={17} />
-                <span>{activeRun.error?.message || "This answer could not be completed."}</span>
-                {canWrite && <button type="button" onClick={() => retryAnswer(activeRun)}>Try again</button>}
+                <span>
+                  {activeRun.error?.message || "This answer could not be completed."}
+                  <small>Run {activeRun.run_id}</small>
+                </span>
+                <button type="button" onClick={() => openRunDetails(activeRun.run_id)}>Details</button>
+                {canWrite && activeRun.error?.action !== "contact_support" && (
+                  <button type="button" onClick={() => retryAnswer(activeRun)}>
+                    {activeRun.error?.action === "reduce_context" ? "Edit request" : "Try again"}
+                  </button>
+                )}
               </div>
             )}
           </div>
@@ -1105,6 +1199,7 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
           onConnectAgents={(fromId, toId) => setGraphConnection(fromId, toId, true)}
           onDisconnectAgents={(fromId, toId) => setGraphConnection(fromId, toId, false)}
           onRefresh={refreshResources}
+          onRefreshConnections={() => refreshStudioResources(["connections", "templates", "approvals", "agents"])}
           onSignedOut={onSignedOut}
           onConnectionChanged={async () => {
             if (!connectionResumeWorkflowId) return;
@@ -1139,7 +1234,7 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
           onClose={() => setUploadOpen(false)}
           onUploaded={async (uploaded) => {
             setUploadOpen(false);
-            await refreshResources();
+            await refreshStudioResources(["agents", "documents"]);
             if (uploadScope === "chat") {
               setChatDocuments((items) => [
                 ...items.filter((item) => item.document_id !== uploaded.document_id),
@@ -1157,6 +1252,7 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
       {agentEditor !== undefined && (
         <AgentDialog
           auth={auth}
+          runtime={runtime}
           agent={agentEditor.agent || null}
           agents={agents}
           documents={documents}
@@ -1164,7 +1260,7 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
           onClose={() => setAgentEditor(undefined)}
           onSaved={async () => {
             setAgentEditor(undefined);
-            await refreshResources();
+            await refreshStudioResources(["agents", "documents"]);
             setResourcesOpen(true);
             setResourceView("agents");
           }}
@@ -1181,7 +1277,7 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
           }}
           onSaved={async () => {
             setPublishTarget(null);
-            await refreshResources();
+            await refreshStudioResources(["agents", "marketplace"]);
             setResourcesOpen(true);
             setResourceView("agents");
           }}
@@ -1227,7 +1323,7 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
           }}
           onCopied={async () => {
             setMarketplaceTarget(null);
-            await refreshResources();
+            await refreshStudioResources(["agents", "marketplace"]);
             setResourcesOpen(true);
             setResourceView("agents");
           }}
@@ -1244,7 +1340,7 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
           }}
           onSaved={async () => {
             setRatingTarget(null);
-            await refreshResources();
+            await refreshStudioResources(["marketplace"]);
             setResourcesOpen(true);
             setResourceView("marketplace");
           }}
@@ -1262,7 +1358,7 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
           }}
           onSaved={async () => {
             setAdoptionTarget(null);
-            await refreshResources();
+            await refreshStudioResources(["agents"]);
             setResourcesOpen(true);
             setResourceView("agents");
           }}
@@ -2147,6 +2243,7 @@ function ResourcesSheet({
   onConnectAgents,
   onDisconnectAgents,
   onRefresh,
+  onRefreshConnections,
   onSignedOut,
   onConnectionChanged
 }) {
@@ -2222,7 +2319,7 @@ function ResourcesSheet({
             templates={mcpTemplates}
             approvals={mcpApprovals}
             canWrite={canWrite}
-            onRefresh={onRefresh}
+            onRefresh={onRefreshConnections}
             resumeWorkflowId={resumeWorkflowId}
             onConnectionChanged={onConnectionChanged}
           />
@@ -3416,6 +3513,9 @@ function RunDetailsSheet({
                   {(run.expert_outputs || []).map((route) => {
                     const selection = routeSelections.get(route.adapter);
                     const tieBreak = realityRankTieBreak(run?.plan?.routing, route.adapter);
+                    const resolvedInputs = route.consumption_validation?.resolved_contract_inputs || [];
+                    const producedOutputs = route.artifact_validation?.produced
+                      || (route.handoff_artifacts || []).map((artifact) => artifact.name || artifact.artifact).filter(Boolean);
                     return (
                       <details className="detail-row" key={route.step_id || route.adapter}>
                         <summary>
@@ -3432,6 +3532,20 @@ function RunDetailsSheet({
                           {tieBreak && <RankTieBreakNote tieBreak={tieBreak} adapter={route.adapter} agents={agents} />}
                           {route.task && <p><strong>Task</strong>{route.task}</p>}
                           {route.domain_answer && <p><strong>Contribution</strong>{route.domain_answer}</p>}
+                          {resolvedInputs.length > 0 && (
+                            <p><strong>Context received</strong>{resolvedInputs.map((value) => contractFieldLabel(value, agents)).join(", ")}</p>
+                          )}
+                          {producedOutputs.length > 0 && (
+                            <p><strong>Outputs produced</strong>{producedOutputs.map((value) => contractFieldLabel(value, agents)).join(", ")}</p>
+                          )}
+                          {route.tool_executions?.length > 0 ? (
+                            <p><strong>Tools used</strong>{route.tool_executions.map((execution) => workflowToolLabel(execution.name)).join(", ")}</p>
+                          ) : route.allowed_tools?.length > 0 && (
+                            <p><strong>Tools available</strong>{route.allowed_tools.map(workflowToolLabel).join(", ")}</p>
+                          )}
+                          {route.consumption_validation?.valid === false && (
+                            <p><strong>Missing context</strong>{(route.consumption_validation.missing_from_upstream || []).map((value) => contractFieldLabel(value, agents)).join(", ") || "A required verified handoff was unavailable."}</p>
+                          )}
                           {route.boundary_check && <p><strong>Checks</strong>{route.boundary_check}</p>}
                         </div>
                       </details>
@@ -3567,6 +3681,17 @@ function RunDetailsSheet({
                     </dl>
                   </details>
                 )}
+                {run.token_accounting?.provider_reported === true && (
+                  <details className="provenance-details">
+                    <summary>Model usage</summary>
+                    <dl>
+                      <div><dt>Calls</dt><dd>{run.token_accounting.call_count}</dd></div>
+                      <div><dt>Input tokens</dt><dd>{run.token_accounting.totals?.prompt_tokens || 0}</dd></div>
+                      <div><dt>Output tokens</dt><dd>{run.token_accounting.totals?.completion_tokens || 0}</dd></div>
+                      <div><dt>Accounting</dt><dd>{run.token_accounting.complete ? "Complete" : "Partial"}</dd></div>
+                    </dl>
+                  </details>
+                )}
               </section>
             )}
           </>
@@ -3589,6 +3714,21 @@ function eventLabel(type) {
     "run.failed": "Answer failed"
   };
   return labels[type] || String(type || "Update").replaceAll(".", " ");
+}
+
+function contractFieldLabel(value, agents = []) {
+  const text = String(value || "");
+  const agentMatch = text.match(/^agent:([a-z0-9_-]+):output$/i);
+  if (agentMatch) return `${formatAgentName(agentMatch[1], agents)} output`;
+  const labels = {
+    domain_outputs: "All verified agent outputs",
+    upstream_route_outputs: "Other agents’ verified work",
+    document_context: "Attached document context",
+    table_context: "Structured data",
+    shared_memory: "Conversation context",
+    user_request: "User request"
+  };
+  return labels[text] || text.replaceAll("_", " ");
 }
 
 const AGENT_TEMPLATES = [
@@ -3692,6 +3832,31 @@ function collaboratorToken(agentId) {
   return `agent:${agentId}:output`;
 }
 
+export function agentPayloadFromForm(form, { isAdmin = false, hasDocumentResources = false } = {}) {
+  const responseStyle = RESPONSE_STYLES.find((style) => style.id === form.response_style);
+  return {
+    item_type: form.item_type,
+    title: form.title.trim(),
+    capability: form.capability.trim(),
+    boundary: form.boundary.trim() || responseStyle?.boundary || RESPONSE_STYLES[0].boundary,
+    routing_cues: form.routing_cues || `${form.title}, ${form.capability}`,
+    consumes: [...new Set([
+      "user_request",
+      ...(form.consumes || []),
+      ...(hasDocumentResources ? ["document_context"] : [])
+    ])],
+    produces: form.produces?.length ? [...form.produces] : ["domain_outputs"],
+    tools: [...new Set([
+      ...(form.tools || []),
+      ...(hasDocumentResources ? ["document_search", "document_read"] : [])
+    ])],
+    mcp_bindings: form.mcp_bindings || [],
+    resources: form.resources || [],
+    source_text: form.source_text || "",
+    ...(isAdmin ? { sources: form.sources } : {})
+  };
+}
+
 function createAgentForm(agent) {
   if (agent) {
     return {
@@ -3733,7 +3898,7 @@ function createAgentForm(agent) {
   };
 }
 
-function AgentDialog({ auth, agent, agents, documents, mcpConnections = [], onClose, onSaved }) {
+function AgentDialog({ auth, runtime, agent, agents, documents, mcpConnections = [], onClose, onSaved }) {
   const editing = Boolean(agent);
   const [form, setForm] = useState(() => createAgentForm(agent));
   const [step, setStep] = useState(0);
@@ -3849,20 +4014,10 @@ function AgentDialog({ auth, agent, agents, documents, mcpConnections = [], onCl
     setError("");
     const activeAgentId = agent?.id || createdAgentId || form.id;
     const hasDocumentResources = form.resources.some((value) => value.startsWith("agent:")) || newFiles.length > 0;
-    const payload = {
-      item_type: form.item_type,
-      title: form.title.trim(),
-      capability: form.capability.trim(),
-      boundary: form.boundary.trim() || RESPONSE_STYLES.find((style) => style.id === form.response_style)?.boundary || RESPONSE_STYLES[0].boundary,
-      routing_cues: form.routing_cues || `${form.title}, ${form.capability}`,
-      consumes: [...new Set(["user_request", ...form.consumes, ...(hasDocumentResources ? ["document_context"] : [])])],
-      produces: form.produces.length ? form.produces : ["domain_outputs"],
-      tools: [...new Set([...form.tools, ...(hasDocumentResources ? ["document_search", "document_read"] : [])])],
-      mcp_bindings: form.mcp_bindings || [],
-      resources: form.resources,
-      source_text: form.source_text,
-      ...(auth?.is_admin ? { sources: form.sources } : {})
-    };
+    const payload = agentPayloadFromForm(form, {
+      isAdmin: Boolean(auth?.is_admin),
+      hasDocumentResources
+    });
     let newAgentPersisted = Boolean(createdAgentId);
     try {
       if (editing || createdAgentId) {
@@ -3995,11 +4150,15 @@ function AgentDialog({ auth, agent, agents, documents, mcpConnections = [], onCl
                     {TOOL_OPTIONS.map((option) => {
                       const Icon = option.icon;
                       const selected = option.values.every((value) => form.tools.includes(value));
+                      const readiness = option.values.map((value) => runtime?.tool_readiness?.[value]).filter(Boolean);
+                      const unavailable = readiness.find((item) => item.available === false);
+                      const setupRequired = readiness.find((item) => item.setup_required);
+                      const detail = unavailable?.message || setupRequired?.message || option.detail;
                       return (
-                        <label className={selected ? "selected" : ""} key={option.id}>
+                        <label className={[selected ? "selected" : "", unavailable ? "setup-needed" : ""].filter(Boolean).join(" ")} key={option.id}>
                           <input type="checkbox" checked={selected} onChange={() => toggleTool(option)} />
                           <Icon size={18} />
-                          <span><strong>{option.title}</strong><small>{option.detail}</small></span>
+                          <span><strong>{option.title}</strong><small>{detail}</small></span>
                           <i>{selected && <Check size={13} />}</i>
                         </label>
                       );
@@ -4072,6 +4231,7 @@ function AgentDialog({ auth, agent, agents, documents, mcpConnections = [], onCl
                 )}
                 <fieldset className="choice-fieldset output-fieldset">
                   <legend>What should it produce?</legend>
+                  <p>These become validated handoff outputs for later agents and are shown in Answer details. The final response still follows the style you chose.</p>
                   <div className="output-chips">
                     {OUTPUT_OPTIONS.map((option) => {
                       const selected = form.produces.includes(option.value);
@@ -4149,7 +4309,7 @@ function AgentDialog({ auth, agent, agents, documents, mcpConnections = [], onCl
               <div><dt>Style</dt><dd>{RESPONSE_STYLES.find((style) => style.id === form.response_style)?.title || "Custom"}</dd></div>
               <div><dt>Tools</dt><dd>{form.tools.length + (form.mcp_bindings || []).reduce((total, binding) => total + binding.tool_names.length, 0) || "None"}</dd></div>
               <div><dt>Agent links</dt><dd>{form.consumes.filter((value) => /^agent:.+:output$/.test(value)).length || "None"}</dd></div>
-              <div><dt>Knowledge</dt><dd>{selectedDocumentCount + newFiles.length || "None"}</dd></div>
+              <div><dt>Knowledge</dt><dd>{selectedDocumentCount + newFiles.length + (form.source_text.trim() ? 1 : 0) || "None"}</dd></div>
             </dl>
             <div className="preview-status"><span /><div><strong>Private workspace</strong><small>Ready after setup completes</small></div></div>
           </aside>

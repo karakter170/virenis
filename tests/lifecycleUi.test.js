@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   canManageDocument,
+  missingOutcomeContractIds,
   outcomeLifecycleState,
   realityRankHistory,
   realityRankSummary,
@@ -77,6 +78,23 @@ describe("resource lifecycle UI helpers", () => {
 });
 
 describe("routing and outcome lifecycle UI helpers", () => {
+  it("hydrates outcome details only on demand and skips contracts already in memory", () => {
+    const run = {
+      outcome_contracts: [
+        { contract_id: "contract_a" },
+        { contract_id: "contract_b" },
+        { contract_id: "contract_a" },
+        {},
+        null
+      ]
+    };
+    expect(missingOutcomeContractIds(run, { contract_a: { status: "pending" } })).toEqual(["contract_b"]);
+    expect(missingOutcomeContractIds(run, {
+      contract_a: { status: "pending" },
+      contract_b: { status: "settled" }
+    })).toEqual([]);
+  });
+
   it("explains only an actual RealityRank capability tie-break and preserves its comparison set", () => {
     const routing = {
       selected: [{

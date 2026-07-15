@@ -109,3 +109,12 @@ export function outcomeLifecycleState(contract, canWrite, now = Date.now()) {
     can_correct: Boolean(canWrite && (status === "settled" || status === "disputed") && due)
   };
 }
+
+export function missingOutcomeContractIds(run, contractsById = {}) {
+  const known = contractsById && typeof contractsById === "object" ? contractsById : {};
+  return [...new Set(
+    (Array.isArray(run?.outcome_contracts) ? run.outcome_contracts : [])
+      .map((contract) => String(contract?.contract_id || "").trim())
+      .filter((contractId) => contractId && !known[contractId])
+  )];
+}

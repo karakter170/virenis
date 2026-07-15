@@ -8,6 +8,34 @@ const MAX_MESSAGE_CHARS = 12000;
 const DEFAULT_MEMORY_ENTRIES = 40;
 const DEFAULT_MEMORY_ENTRY_CHARS = 2000;
 const DEFAULT_MEMORY_TOTAL_CHARS = 20000;
+const AGGREGATE_CONTEXT_INPUTS = new Set(["domain_outputs", "upstream_route_outputs"]);
+const INTRINSIC_CONTEXT_INPUTS = new Set([
+  "user_request",
+  "question",
+  "query",
+  "topic",
+  "shared_memory",
+  "conversation_context"
+]);
+const DOCUMENT_CONTEXT_ARTIFACTS = new Set([
+  "document_context",
+  "retrieved_context",
+  "cited_passages",
+  "document_constraints",
+  "source_confidence",
+  "source_context",
+  "approved_sources",
+  "evidence_summary"
+]);
+const STRUCTURED_CONTEXT_ARTIFACTS = new Set([
+  "table_context",
+  "structured_data",
+  "table_schema",
+  "inline_tables",
+  "raw_numbers",
+  "metric_definitions",
+  "calculation_trace"
+]);
 
 export function validateUserMessage(content) {
   if (typeof content !== "string" || content.trim().length === 0) {
@@ -20,6 +48,43 @@ export function validateUserMessage(content) {
     error.status = 413;
     throw error;
   }
+}
+
+function producedContractSupportsContext(produces = [], consumes = []) {
+  const produced = new Set(produces.map((value) => String(value || "").trim()).filter(Boolean));
+  const consumed = new Set(consumes.map((value) => String(value || "").trim()).filter(Boolean));
+  if ([...produced].some((name) => consumed.has(name))) return true;
+  if (consumed.has("document_context") && [...produced].some((name) =>
+    DOCUMENT_CONTEXT_ARTIFACTS.has(name)
+    || /^(document_|retrieved_|cited_|source_)/.test(name)
+  )) return true;
+  if (consumed.has("table_context") && [...produced].some((name) =>
+    STRUCTURED_CONTEXT_ARTIFACTS.has(name)
+    || /(table|structured|record|schema|metric|number|calculation)/.test(name)
+  )) return true;
+  return false;
+}
+
+function agentOwnsSemanticContext(agent = {}) {
+  const retrieval = agent?.retrieval;
+  return Boolean(
+    agent?.document
+    || (retrieval && typeof retrieval === "object" && Object.keys(retrieval).length > 0)
+  );
+}
+
+function producedContractSupportsInferredEdge(sourceAgent = {}, destinationAgent = {}) {
+  const produces = (sourceAgent?.produces || []).map((value) => String(value || "").trim()).filter(Boolean);
+  const consumes = (destinationAgent?.consumes || []).map((value) => String(value || "").trim()).filter(Boolean);
+  const consumed = new Set(consumes);
+
+  // A named artifact is an intentional contract and can safely compile to an
+  // edge. Semantic aliases are different: for a document-backed agent,
+  // `document_context` describes its own retrieval input, not another selected
+  // document agent's output.
+  if (produces.some((name) => consumed.has(name))) return true;
+  if (agentOwnsSemanticContext(destinationAgent)) return false;
+  return producedContractSupportsContext(produces, consumes);
 }
 
 export function planRoutes({ query, agents, documents = [], agentRankings = {}, maxRoutingAdapters = 12 }) {
@@ -206,6 +271,25 @@ export function planRoutes({ query, agents, documents = [], agentRankings = {}, 
       "finance_risk_lora",
       "refund_policy_lora"
     ]);
+  }
+
+  // Compile the same semantic input contracts used by the Qwen executor.
+  // Explicit graph/resource connections were already added above; this adds
+  // safe inferred edges for aggregate, structured, and exact artifact inputs.
+  for (const [destinationIndex, destinationStep] of [...steps].entries()) {
+    const destinationAgent = enabled.find((agent) => agent.id === destinationStep.adapter);
+    const consumes = destinationAgent?.consumes || [];
+    const consumesAggregate = consumes.some((value) => AGGREGATE_CONTEXT_INPUTS.has(value));
+    const inferredDependencies = steps
+      .slice(0, destinationIndex)
+      .filter((sourceStep) => {
+        const sourceAgent = enabled.find((agent) => agent.id === sourceStep.adapter);
+        return consumesAggregate || producedContractSupportsInferredEdge(sourceAgent, destinationAgent);
+      })
+      .map((sourceStep) => sourceStep.adapter);
+    if (inferredDependencies.length > 0) {
+      addStep(destinationStep.adapter, destinationStep.task, inferredDependencies);
+    }
   }
 
   if (steps.length === 0) {
@@ -542,7 +626,8 @@ async function processLocalChatRun({ store, bus, run_id, options = {} }) {
           query,
           agents: scoped.agents,
           documents: scoped.documents,
-          upstream: routeOutputs
+          upstream: routeOutputs,
+          sharedMemory: normalizeSharedMemory(snapshot.session?.shared_memory || [])
         });
         const elapsed = Number(((Date.now() - routeStarted) / 1000 + 0.015).toFixed(3));
         routeOutputs.push({ ...result, elapsed_sec: elapsed, parallel_batch: batch.batch, parallel_width: batch.width });
@@ -573,8 +658,13 @@ async function processLocalChatRun({ store, bus, run_id, options = {} }) {
             domain_answer: result.domain_answer,
             handoffs: result.handoffs,
             handoff_artifacts: result.handoff_artifacts,
+            artifact_validation: result.artifact_validation,
+            consumed_artifacts: result.consumed_artifacts,
+            consumption_validation: result.consumption_validation,
+            used_memory: result.used_memory,
             boundary_check: result.boundary_check,
             allowed_tools: result.allowed_tools,
+            tool_executions: result.tool_executions,
             approved_sources: result.approved_sources,
             policy_violations: result.policy_violations,
             retrieved_context: result.retrieved_context,
@@ -607,6 +697,15 @@ async function processLocalChatRun({ store, bus, run_id, options = {} }) {
       run.expert_outputs = routeOutputs;
       run.sources = citations;
       run.policy_events = policyEvents;
+      run.token_accounting = {
+        schema_version: "router-token-accounting-v1",
+        provider_reported: false,
+        complete: false,
+        call_count: 0,
+        calls: [],
+        totals: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+        missing_usage: ["local_simulator_does_not_call_a_model"]
+      };
       run.assistant_message_id = assistantMessageId;
       run.completed_at = completedAt;
       run.elapsed_sec = elapsedSec;
@@ -653,7 +752,14 @@ async function processLocalChatRun({ store, bus, run_id, options = {} }) {
         run.error = failure.public;
         run.error_admin_only = failure.admin;
         run.completed_at = nowIso();
-        run.events.push({ type: "run.failed", message: failure.public.message, at: nowIso() });
+        run.events.push({
+          type: "run.failed",
+          code: failure.public.code,
+          message: failure.public.message,
+          retryable: failure.public.retryable,
+          action: failure.public.action,
+          at: nowIso()
+        });
         const session = data.sessions.find((item) => item.session_id === run.session_id);
         recordExecution(data, {
           run,
@@ -665,7 +771,13 @@ async function processLocalChatRun({ store, bus, run_id, options = {} }) {
       }
       return run;
     });
-    bus.publish(run_id, { type: "run.failed", message: failure.public.message });
+    bus.publish(run_id, {
+      type: "run.failed",
+      code: failure.public.code,
+      message: failure.public.message,
+      retryable: failure.public.retryable,
+      action: failure.public.action
+    });
   }
 }
 
@@ -784,6 +896,7 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
       run.expert_outputs = outputs;
       run.sources = citations;
       run.policy_events = policyEvents;
+      run.token_accounting = normalizeArtifactValue(result.tokenAccounting || null);
       run.assistant_message_id = assistantMessageId;
       run.completed_at = completedAt;
       run.elapsed_sec = elapsedSec;
@@ -797,6 +910,7 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
         baseModel: result.baseModel,
         apiElapsedSec: result.apiElapsedSec,
         executorElapsedSec: result.elapsedSec,
+        tokenAccounting: normalizeArtifactValue(result.tokenAccounting || null),
         componentProvenance: result.componentProvenance || null
       };
       data.messages.push({
@@ -844,7 +958,14 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
         run.error = failure.public;
         run.error_admin_only = failure.admin;
         run.completed_at = nowIso();
-        run.events.push({ type: "run.failed", message: failure.public.message, at: nowIso() });
+        run.events.push({
+          type: "run.failed",
+          code: failure.public.code,
+          message: failure.public.message,
+          retryable: failure.public.retryable,
+          action: failure.public.action,
+          at: nowIso()
+        });
         const session = data.sessions.find((item) => item.session_id === run.session_id);
         recordExecution(data, {
           run,
@@ -856,25 +977,106 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
       }
       return run;
     });
-    bus.publish(run_id, { type: "run.failed", message: failure.public.message });
+    bus.publish(run_id, {
+      type: "run.failed",
+      code: failure.public.code,
+      message: failure.public.message,
+      retryable: failure.public.retryable,
+      action: failure.public.action
+    });
   }
 }
 
 function normalizeRunFailure(error, fallbackCode) {
-  const code = String(error?.code || fallbackCode || "run_failed");
+  const classified = classifyRunFailure(error, fallbackCode);
+  const code = classified.code;
   const message = String(error?.message || "Run failed.");
   return {
     public: {
       code,
-      message: "The run failed before completion. Try again or contact support with the run id."
+      message: classified.message,
+      retryable: classified.retryable,
+      action: classified.action
     },
     admin: {
       code,
       message,
       status: error?.status || null,
       payload: error?.payload || null,
+      provider_status: error?.providerStatus || null,
+      provider_request_id: error?.requestId || null,
       stack: error?.stack || null
     }
+  };
+}
+
+function classifyRunFailure(error, fallbackCode = "run_failed") {
+  const status = Number(error?.status || error?.providerStatus || 0);
+  const rawCode = String(error?.code || "").toLowerCase();
+  const rawMessage = String(error?.message || "").toLowerCase();
+  const matches = (...values) => values.some((value) => rawCode.includes(value) || rawMessage.includes(value));
+
+  if (status === 429 || matches("rate_limit", "rate-limited", "too_many_requests")) {
+    return {
+      code: "model_rate_limited",
+      message: "The selected model is temporarily rate-limited. Wait a moment, then try again.",
+      retryable: true,
+      action: "retry_later"
+    };
+  }
+  if ([408, 504].includes(status) || matches("timeout", "timed_out", "aborterror", "etimedout")) {
+    return {
+      code: "model_timeout",
+      message: "The model took too long to respond. Your message is still available—try again.",
+      retryable: true,
+      action: "retry"
+    };
+  }
+  if (status === 413 || matches("context_length", "context window", "input requires", "too large")) {
+    return {
+      code: "model_context_limit",
+      message: "This request contains more context than the selected model can process. Shorten it or attach fewer sources, then retry.",
+      retryable: false,
+      action: "reduce_context"
+    };
+  }
+  if (status === 409 || matches("manifestrevisionchanged", "agents changed repeatedly")) {
+    return {
+      code: "agent_configuration_changed",
+      message: "The agent configuration changed while this answer was starting. Try again with the updated agents.",
+      retryable: true,
+      action: "retry"
+    };
+  }
+  if (matches("model_invalid_response")) {
+    return {
+      code: "model_invalid_response",
+      message: "The selected model returned a response that could not be processed safely. Try again.",
+      retryable: true,
+      action: "retry"
+    };
+  }
+  if ([502, 503].includes(status) || matches("econnrefused", "enotfound", "service unavailable")) {
+    return {
+      code: "model_service_unavailable",
+      message: "The selected model service is temporarily unavailable. Try again shortly.",
+      retryable: true,
+      action: "retry_later"
+    };
+  }
+  if (status === 401 || status === 403 || matches("authentication", "invalid api key")) {
+    return {
+      code: "model_configuration_error",
+      message: "The selected model connection needs administrator attention. Try another model or contact support with the run id.",
+      retryable: false,
+      action: "contact_support"
+    };
+  }
+  return {
+    code: String(error?.code || fallbackCode || "run_failed"),
+    message: "The run failed before completion. Try again or contact support with the run id.",
+    retryable: error?.retryable === true,
+    action: error?.retryable === true ? "retry" : "contact_support"
   };
 }
 
@@ -1013,9 +1215,12 @@ function runtimeOutputToRunStep({ run_id, output, parallel }) {
     handoffs: typeof output.handoffs === "string" ? output.handoffs : sections.handoffs,
     handoff_artifacts: normalizeHandoffArtifacts(output.handoff_artifacts || output.handoffs, output),
     artifact_validation: normalizeArtifactValue(output.artifact_validation || {}),
+    consumed_artifacts: normalizeArtifactValue(output.consumed_artifacts || []),
     consumption_validation: normalizeArtifactValue(output.consumption_validation || {}),
+    used_memory: normalizeArtifactValue(output.used_memory || []),
     boundary_check: output.boundary_check || sections.boundary_check,
     allowed_tools: output.allowed_tools || [],
+    tool_executions: normalizeArtifactValue(output.tool_executions || []),
     approved_sources: output.approved_sources || [],
     policy_violations: output.policy_violations || [],
     retrieved_context: output.retrieved_context || sections.retrieved_context,
@@ -1267,20 +1472,177 @@ async function persistCompletedRunRoute({ store, bus, runId, startedEvent, compl
   bus.publish(runId, completedEvent);
 }
 
-function buildRouteOutput({ step, query, agents, documents }) {
+function contextArtifactName(row = {}) {
+  return boundedText(row.name || row.artifact || row.type, 160);
+}
+
+function contextArtifactProducer(row = {}, output = {}) {
+  return boundedText(
+    output.adapter || row.producer || row.producer_agent_id,
+    160
+  );
+}
+
+function isDocumentContextArtifact(row = {}) {
+  const name = contextArtifactName(row);
+  return DOCUMENT_CONTEXT_ARTIFACTS.has(name)
+    || /^(document_|retrieved_|cited_|source_)/.test(name);
+}
+
+function isStructuredContextArtifact(row = {}) {
+  const name = contextArtifactName(row);
+  if (isDocumentContextArtifact(row) && !STRUCTURED_CONTEXT_ARTIFACTS.has(name)) {
+    return false;
+  }
+  return STRUCTURED_CONTEXT_ARTIFACTS.has(name)
+    || /(table|structured|record|schema|metric|number|calculation)/.test(name)
+    || Array.isArray(row.value)
+    || (row.value && typeof row.value === "object")
+    || String(row.content_type || "").toLowerCase().includes("json");
+}
+
+export function resolveAgentContext({ agent = {}, step = {}, upstream = [], sharedMemory = [] }) {
+  const consumes = [...new Set((agent.consumes || []).map((value) => String(value || "").trim()).filter(Boolean))];
+  const consumeSet = new Set(consumes);
+  const aggregateInputs = new Set(consumes.filter((value) => AGGREGATE_CONTEXT_INPUTS.has(value)));
+  const scopedProducers = new Set(consumes.flatMap((value) => {
+    const match = value.match(/^agent:([a-z0-9][a-z0-9_-]*):output$/i);
+    return match ? [match[1]] : [];
+  }));
+  const dependencyIds = new Set(Array.isArray(step.depends_on) ? step.depends_on : []);
+  const scopedUpstream = (Array.isArray(upstream) ? upstream : []).filter((output) =>
+    dependencyIds.has(output?.step_id || output?.id)
+    || dependencyIds.has(output?.adapter)
+  );
+  const resolved = new Set();
+  const rejected = [];
+  const availableNames = new Set();
+  const declaredUpstreamNames = new Set();
+  const consumedArtifacts = [];
+  const seen = new Set();
+
+  const matchingContracts = (row, output) => {
+    const matches = new Set(aggregateInputs);
+    const name = contextArtifactName(row);
+    const producer = contextArtifactProducer(row, output);
+    if (consumeSet.has(name)) matches.add(name);
+    if (consumeSet.has("document_context") && isDocumentContextArtifact(row)) matches.add("document_context");
+    if (consumeSet.has("table_context") && isStructuredContextArtifact(row)) matches.add("table_context");
+    if (producer && scopedProducers.has(producer)) matches.add(`agent:${producer}:output`);
+    return matches;
+  };
+
+  for (const output of scopedUpstream) {
+    for (const name of output?.artifact_validation?.declared_produces || []) {
+      if (String(name || "").trim()) declaredUpstreamNames.add(String(name).trim());
+    }
+    for (const row of Array.isArray(output?.handoff_artifacts) ? output.handoff_artifacts : []) {
+      if (!row || typeof row !== "object" || Array.isArray(row)) {
+        rejected.push("malformed_upstream_artifact");
+        continue;
+      }
+      const name = contextArtifactName(row);
+      availableNames.add(name);
+      const matches = matchingContracts(row, output);
+      if (matches.size === 0) continue;
+      const claimedProducer = boundedText(row.producer || row.producer_agent_id, 160);
+      const outputProducer = boundedText(output.adapter, 160);
+      if (claimedProducer && outputProducer && claimedProducer !== outputProducer) {
+        rejected.push(`upstream_producer_mismatch:${name}`);
+        continue;
+      }
+      if (row.verified === false || row.value === undefined || row.value === null || row.value === "") {
+        rejected.push(`invalid_upstream_artifact:${name}`);
+        continue;
+      }
+      const suppliedDigest = String(row.content_digest || "").trim();
+      const normalizedDigest = normalizeSha256Digest(suppliedDigest);
+      if (suppliedDigest && (!normalizedDigest || normalizedDigest !== digestValue(normalizeArtifactValue(row.value)))) {
+        rejected.push(`upstream_digest_mismatch:${name}`);
+        continue;
+      }
+      const producer = contextArtifactProducer(row, output);
+      const key = [row.artifact_id || "", producer, name, row.content_digest || digestValue(row.value)].join("|");
+      for (const match of matches) resolved.add(match);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      consumedArtifacts.push({
+        artifact_id: boundedText(row.artifact_id, 240),
+        schema_version: boundedText(row.schema_version || "tcar-handoff-artifact-v1", 120),
+        name,
+        value: normalizeArtifactValue(row.value),
+        content_digest: normalizeSha256Digest(row.content_digest) || digestValue(normalizeArtifactValue(row.value)),
+        producer,
+        producer_step_id: boundedText(row.producer_step_id || output.step_id || output.id, 160),
+        evidence: boundedStringList(row.evidence, 50, 240),
+        confidence: finiteProbabilityOrNull(row.confidence)
+      });
+    }
+  }
+
+  const required = new Set();
+  for (const value of consumes) {
+    if (declaredUpstreamNames.has(value)) required.add(value);
+  }
+  for (const producer of scopedProducers) required.add(`agent:${producer}:output`);
+  if (scopedUpstream.length > 0) {
+    for (const value of aggregateInputs) required.add(value);
+    const declaredOutputs = [...declaredUpstreamNames];
+    if (
+      consumeSet.has("document_context")
+      && producedContractSupportsContext(declaredOutputs, ["document_context"])
+    ) required.add("document_context");
+    if (
+      consumeSet.has("table_context")
+      && producedContractSupportsContext(declaredOutputs, ["table_context"])
+    ) required.add("table_context");
+  }
+  const missing = [...required].filter((value) => !resolved.has(value));
+  const unresolved = consumes.filter((value) => !INTRINSIC_CONTEXT_INPUTS.has(value) && !resolved.has(value));
+  const consumedNames = new Set(consumedArtifacts.map((row) => row.name));
+  const acceptsMemory = consumeSet.has("shared_memory") || consumeSet.has("conversation_context");
+  const usedMemory = acceptsMemory ? normalizeSharedMemory(sharedMemory) : [];
+
+  return {
+    consumed_artifacts: consumedArtifacts,
+    used_memory: usedMemory,
+    validation: {
+      contract_version: "tcar-handoff-v1",
+      consumer: agent.id || step.adapter || "",
+      declared_consumes: consumes,
+      aggregate_consumes: [...aggregateInputs].sort(),
+      resolved_contract_inputs: [...resolved].sort(),
+      resolved_from_upstream: [...consumedNames].sort(),
+      required_from_upstream: [...required].sort(),
+      missing_from_upstream: missing.sort(),
+      unresolved: unresolved.sort(),
+      available_but_not_consumed: aggregateInputs.size > 0
+        ? []
+        : [...availableNames].filter((name) => !consumedNames.has(name)).sort(),
+      rejected: [...new Set(rejected)],
+      valid: missing.length === 0 && rejected.length === 0
+    }
+  };
+}
+
+function buildRouteOutput({ step, query, agents, documents, upstream = [], sharedMemory = [] }) {
   const agent = agents.find((item) => item.id === step.adapter);
   const citations = gatherCitations({ step, agent, query, documents });
   const retrievedContext = citations
     .map((citation) => `${citation.chunk_id || citation.path}:${citation.title} - ${citation.excerpt}`)
     .join("\n");
-  const domainAnswer = domainAnswerFor(step.adapter, query, citations, agent);
-  const handoffArtifacts = buildLocalHandoffArtifacts({
+  const context = resolveAgentContext({ agent, step, upstream, sharedMemory });
+  const missingContext = context.validation.missing_from_upstream;
+  const domainAnswer = context.validation.valid
+    ? domainAnswerFor(step.adapter, query, citations, agent, context.consumed_artifacts, context.used_memory)
+    : `Required verified context was unavailable: ${missingContext.join(", ") || context.validation.rejected.join(", ")}.`;
+  const handoffArtifacts = context.validation.valid ? buildLocalHandoffArtifacts({
     step,
     agent,
     domainAnswer,
     citations,
     retrievedContext
-  });
+  }) : [];
   const rawText = [
     "AGENT_REASONING:",
     `- Selected because the request matched ${agent?.title || step.adapter}.`,
@@ -1298,6 +1660,9 @@ function buildRouteOutput({ step, query, agents, documents }) {
     retrievedContext ? `\nEXECUTOR_RETRIEVED_CONTEXT:\n${retrievedContext}` : ""
   ].join("\n");
   const sanitized = sanitizeToolCalls(rawText, agent?.tools || []);
+  if (!context.validation.valid) {
+    sanitized.violations.push(...missingContext.map((name) => `invalid_upstream_contract:${name}`));
+  }
   const sections = parseRouteSections(sanitized.text);
 
   return {
@@ -1308,9 +1673,22 @@ function buildRouteOutput({ step, query, agents, documents }) {
     domain_answer: sections.domain_answer,
     handoffs: sections.handoffs,
     handoff_artifacts: handoffArtifacts,
+    artifact_validation: {
+      contract_version: "tcar-handoff-v1",
+      declared_produces: [...new Set(agent?.produces || [])],
+      produced: handoffArtifacts.map((artifact) => artifact.name),
+      missing: [...new Set(agent?.produces || [])].filter((name) => !handoffArtifacts.some((artifact) => artifact.name === name)),
+      errors: context.validation.valid ? [] : missingContext.map((name) => `blocked_by_input_contract:${name}`),
+      warnings: [],
+      valid: context.validation.valid
+    },
+    consumed_artifacts: context.consumed_artifacts,
+    consumption_validation: context.validation,
+    used_memory: context.used_memory.map(({ tag, source }) => ({ tag, source })),
     boundary_check: sections.boundary_check,
     retrieved_context: sections.retrieved_context,
     allowed_tools: agent?.tools || [],
+    tool_executions: [],
     approved_sources: agent?.sources || [],
     policy_violations: sanitized.violations,
     citations,
@@ -1427,6 +1805,9 @@ function buildLocalHandoffArtifacts({ step, agent, domainAnswer, citations, retr
     } else if (artifact === "source_confidence") {
       value = citations.length > 0 ? 1 : 0;
       contentType = "application/json";
+    } else if (artifact === "structured_data") {
+      value = { summary: domainAnswer };
+      contentType = "application/json";
     }
     if (value === "" || value === null || value === undefined || (Array.isArray(value) && value.length === 0)) {
       return [];
@@ -1451,7 +1832,7 @@ function buildLocalHandoffArtifacts({ step, agent, domainAnswer, citations, retr
   });
 }
 
-function domainAnswerFor(adapter, query, citations, agent) {
+function domainAnswerFor(adapter, query, citations, agent, consumedArtifacts = [], usedMemory = []) {
   if (adapter === "legal_privacy_lora") {
     return "Require clear opt-in consent, explain what messages the user will receive, avoid collecting unnecessary protected details, and keep records of consent state, timestamp, source, and withdrawal. Treat this as general legal/privacy guidance and route jurisdiction-specific review to counsel.";
   }
@@ -1494,8 +1875,20 @@ function domainAnswerFor(adapter, query, citations, agent) {
   if (adapter === "writing_synthesis_lora") {
     return "Merge upstream route outputs into one clear answer, preserving legal, health, finance, source, and policy caveats where relevant.";
   }
+  if (consumedArtifacts.length > 0) {
+    const contextSummary = consumedArtifacts.slice(0, 8).map((artifact) => {
+      const value = typeof artifact.value === "string"
+        ? artifact.value
+        : JSON.stringify(artifact.value);
+      return `${artifact.name} from ${artifact.producer || "upstream"}: ${boundedText(value, 900)}`;
+    }).join(" ");
+    return `Using verified upstream context: ${contextSummary}`;
+  }
   if (citations.length > 0) {
     return `Based on the agent's approved knowledge: ${citations.map((citation) => citation.excerpt).join(" ")}`;
+  }
+  if (usedMemory.length > 0) {
+    return `Using the conversation context this agent is allowed to receive: ${usedMemory.slice(-4).map((item) => boundedText(item.content, 500)).join(" ")}`;
   }
   return `Apply ${agent?.title || adapter} to the request and return concise domain-specific guidance.`;
 }
@@ -1595,7 +1988,20 @@ export function runtimeHealth(data) {
       active_agents: data.agents.filter((agent) => agent.enabled !== false).length,
       archived_agents: data.agents.filter((agent) => agent.enabled === false).length,
       valid: data.agents.every((agent) => /^[a-z0-9][a-z0-9_]{0,119}$/.test(agent.id) && agent.title && agent.capability)
-    }
+    },
+    tool_readiness: Object.fromEntries([
+      "web_search",
+      "calculator",
+      "data_table",
+      "document_search",
+      "document_read",
+      "repo_inspector",
+      "sql_runner"
+    ].map((name) => [name, {
+      available: false,
+      mode: "simulator",
+      message: "Tool execution requires the configured Qwen runtime."
+    }]))
   };
 }
 

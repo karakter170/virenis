@@ -2458,6 +2458,92 @@ describe("chat execution", () => {
     }
   });
 
+  it("executes every Agent Studio contract field through a verified handoff", async () => {
+    await request(app)
+      .post("/api/agents")
+      .send({
+        id: "contract_source_agent",
+        title: "Contract source agent",
+        capability: "Returns approved catalog facts as structured context.",
+        boundary: "Use only the attached catalog note.",
+        consumes: ["user_request"],
+        produces: ["structured_data"],
+        routing_cues: ["approved catalog color"],
+        source_text: "The approved catalog color is amber."
+      })
+      .expect(201);
+    await request(app)
+      .post("/api/agents")
+      .send({
+        id: "contract_analysis_agent",
+        title: "Contract analysis agent",
+        capability: "Turns verified structured upstream context into recommendations.",
+        boundary: "Do not invent context that was not handed off.",
+        consumes: [
+          "user_request",
+          "upstream_route_outputs",
+          "table_context",
+          "agent:contract_source_agent:output"
+        ],
+        produces: ["recommendations", "structured_data"],
+        routing_cues: ["analyze approved catalog color"],
+        tools: ["calculator", "data_table"]
+      })
+      .expect(201);
+    await app.locals.store.mutate((data) => {
+      for (const id of ["contract_source_agent", "contract_analysis_agent"]) {
+        const agent = data.agents.find((item) => item.id === id);
+        agent.ready = true;
+        agent.mounted = true;
+        agent.runtime_sync_pending = false;
+      }
+      return true;
+    });
+
+    const session = await createSession("Agent contract proof");
+    const queued = await request(app)
+      .post(`/api/chat/sessions/${session.session_id}/messages`)
+      .send({ content: "Ask @contract_analysis_agent to analyze the approved catalog color." })
+      .expect(202);
+    const run = await waitForRun(queued.body.run_id);
+
+    expect(run.status).toBe("completed");
+    const source = run.expert_outputs.find((route) => route.adapter === "contract_source_agent");
+    const analysis = run.expert_outputs.find((route) => route.adapter === "contract_analysis_agent");
+    expect(source.domain_answer).toContain("amber");
+    expect(source.citations).toEqual([
+      expect.objectContaining({ chunk_id: "contract_source_agent_source_0001", verified: true })
+    ]);
+    expect(analysis.allowed_tools).toEqual(["calculator", "data_table"]);
+    expect(analysis.consumption_validation).toMatchObject({
+      valid: true,
+      resolved_contract_inputs: [
+        "agent:contract_source_agent:output",
+        "table_context",
+        "upstream_route_outputs"
+      ]
+    });
+    expect(analysis.domain_answer).toContain("amber");
+    expect(analysis.handoff_artifacts.map((artifact) => artifact.name)).toEqual([
+      "recommendations",
+      "structured_data"
+    ]);
+    expect(analysis.handoff_artifacts.find((artifact) => artifact.name === "structured_data")).toMatchObject({
+      content_type: "application/json",
+      value: { summary: expect.stringContaining("amber") }
+    });
+    expect(analysis.artifact_validation).toMatchObject({
+      valid: true,
+      produced: ["recommendations", "structured_data"]
+    });
+    expect(analysis.used_memory).toEqual([]);
+    expect(run.token_accounting).toMatchObject({
+      provider_reported: false,
+      complete: false,
+      missing_usage: ["local_simulator_does_not_call_a_model"]
+    });
+  });
+
   it("drains queued chat and validation background tasks", async () => {
     const session = await createSession("Drain");
     const queued = await request(app)
@@ -2861,7 +2947,12 @@ describe("chat execution", () => {
       }
       expect(userRun).toBeTruthy();
       expect(userRun.status).toBe("failed");
-      expect(userRun.error.message).toBe("The run failed before completion. Try again or contact support with the run id.");
+      expect(userRun.error).toMatchObject({
+        code: "model_service_unavailable",
+        message: "The selected model service is temporarily unavailable. Try again shortly.",
+        retryable: true,
+        action: "retry_later"
+      });
       expect(userRun.error_admin_only).toBeUndefined();
       expect(JSON.stringify(userRun)).not.toContain("super-secret-value");
       expect(userRun.events.find((event) => event.type === "run.failed").message).toBe(userRun.error.message);
@@ -3426,8 +3517,35 @@ describe("documents and sources", () => {
     expect(upload.body.resource_for_agent_id).toBe("launch_risk_lora");
     await request(app)
       .patch("/api/agents/launch_risk_lora")
-      .send({ resources: [`agent:${upload.body.agent_id}`] })
+      .send({
+        resources: [`agent:${upload.body.agent_id}`],
+        consumes: ["user_request", "document_context"],
+        tools: ["document_search", "document_read"]
+      })
       .expect(200);
+
+    await app.locals.store.mutate((data) => {
+      for (const id of ["launch_risk_lora", upload.body.agent_id]) {
+        const agent = data.agents.find((item) => item.id === id);
+        agent.ready = true;
+        agent.mounted = true;
+        agent.runtime_sync_pending = false;
+      }
+      return true;
+    });
+
+    const session = await createSession("Attached knowledge handoff");
+    const queued = await request(app)
+      .post(`/api/chat/sessions/${session.session_id}/messages`)
+      .send({ content: "Ask @launch_risk_lora what material risk is in the attached launch brief." })
+      .expect(202);
+    const run = await waitForRun(queued.body.run_id);
+    const parentRoute = run.expert_outputs.find((route) => route.adapter === "launch_risk_lora");
+    expect(parentRoute.consumption_validation).toMatchObject({
+      valid: true,
+      resolved_contract_inputs: ["document_context"]
+    });
+    expect(parentRoute.domain_answer).toContain("supplier concentration");
 
     const documents = await request(app).get("/api/documents").expect(200);
     expect(documents.body.documents).toEqual(expect.arrayContaining([

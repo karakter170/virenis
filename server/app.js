@@ -4530,7 +4530,10 @@ function redactRuntimeHealthForRequest(payload = {}, req) {
       base_model: modelApi.base_model,
       models_endpoint_ok: modelApi.models_endpoint_ok,
       mode: modelApi.mode
-    }
+    },
+    tool_readiness: payload.tool_readiness && typeof payload.tool_readiness === "object"
+      ? payload.tool_readiness
+      : undefined
   };
   if (router) {
     response.router = {
@@ -4690,6 +4693,7 @@ function readRunResult(store, runId, req) {
       .map((step) => redactRunStepForRequest(step, req)),
     sources: (run.sources || []).map((source) => redactSourceForRequest(source, req)),
     policy_events: run.policy_events || [],
+    token_accounting: run.token_accounting || null,
     execution: execution ? {
       execution_id: execution.execution_id,
       record_hash: execution.record_hash,
@@ -4711,7 +4715,52 @@ function publicRunFailureMessage(code = null) {
   if (code === "run_interrupted") {
     return interruptedRunMessage();
   }
-  return "The run failed before completion. Try again or contact support with the run id.";
+  return publicRunFailureDetails(code).message;
+}
+
+function publicRunFailureDetails(code = null) {
+  const failures = {
+    model_rate_limited: {
+      message: "The selected model is temporarily rate-limited. Wait a moment, then try again.",
+      retryable: true,
+      action: "retry_later"
+    },
+    model_timeout: {
+      message: "The model took too long to respond. Your message is still available—try again.",
+      retryable: true,
+      action: "retry"
+    },
+    model_context_limit: {
+      message: "This request contains more context than the selected model can process. Shorten it or attach fewer sources, then retry.",
+      retryable: false,
+      action: "reduce_context"
+    },
+    agent_configuration_changed: {
+      message: "The agent configuration changed while this answer was starting. Try again with the updated agents.",
+      retryable: true,
+      action: "retry"
+    },
+    model_service_unavailable: {
+      message: "The selected model service is temporarily unavailable. Try again shortly.",
+      retryable: true,
+      action: "retry_later"
+    },
+    model_invalid_response: {
+      message: "The selected model returned a response that could not be processed safely. Try again.",
+      retryable: true,
+      action: "retry"
+    },
+    model_configuration_error: {
+      message: "The selected model connection needs administrator attention. Try another model or contact support with the run id.",
+      retryable: false,
+      action: "contact_support"
+    }
+  };
+  return failures[code] || {
+    message: "The run failed before completion. Try again or contact support with the run id.",
+    retryable: false,
+    action: "contact_support"
+  };
 }
 
 async function recordBackgroundChatFailure({ store, bus, run_id, error, attemptId = null }) {
@@ -4726,11 +4775,14 @@ async function recordBackgroundChatFailure({ store, bus, run_id, error, attemptI
       return null;
     }
     const code = String(error?.code || "background_run_failed");
+    const publicFailure = publicRunFailureDetails(code);
     run.status = "failed";
     run.completed_at = completedAt;
     run.error = {
       code,
-      message: publicRunFailureMessage(code)
+      message: publicFailure.message,
+      retryable: publicFailure.retryable,
+      action: publicFailure.action
     };
     run.error_admin_only = {
       code,
@@ -4766,9 +4818,18 @@ function redactRunErrorForRequest(run, req) {
     return run.error;
   }
   if (run.error_admin_only || run.status === "failed") {
+    if (run.error.code === "run_interrupted") {
+      return {
+        code: "run_interrupted",
+        message: interruptedRunMessage()
+      };
+    }
+    const publicFailure = publicRunFailureDetails(run.error.code);
     return {
       code: run.error.code || "run_failed",
-      message: publicRunFailureMessage(run.error.code)
+      message: publicFailure.message,
+      retryable: run.error.retryable === true || publicFailure.retryable,
+      action: run.error.action || publicFailure.action
     };
   }
   return run.error;

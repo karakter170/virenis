@@ -78,6 +78,45 @@ function completeValidationProcessor(spy) {
 }
 
 describe("durable background recovery", () => {
+  it("preserves safe actionable model failures while keeping diagnostics private", async () => {
+    const dbPath = path.join(tmpDir, "actionable-errors.json");
+    const failingProcessor = async () => {
+      const error = new Error("private provider timeout diagnostics");
+      error.code = "model_timeout";
+      error.status = 504;
+      throw error;
+    };
+    process.env.APP_API_TOKENS_JSON = JSON.stringify({
+      actionableusertoken: { user_id: "action_user", workspace_id: "workspace_default", role: "user" }
+    });
+    app = await createApp({ dbPath, uploadRoot: tmpDir, chatProcessor: failingProcessor });
+    const session = await request(app)
+      .post("/api/chat/sessions")
+      .set("Authorization", "Bearer actionableusertoken")
+      .send({ title: "Actionable failure" })
+      .expect(201);
+    const queued = await request(app)
+      .post(`/api/chat/sessions/${session.body.session_id}/messages`)
+      .set("Authorization", "Bearer actionableusertoken")
+      .send({ content: "Test the model timeout." })
+      .expect(202);
+    await app.locals.drainBackgroundTasks({ timeoutMs: 5000 });
+
+    const response = await request(app)
+      .get(`/api/chat/runs/${queued.body.run_id}`)
+      .set("Authorization", "Bearer actionableusertoken")
+      .expect(200);
+    expect(response.body.status).toBe("failed");
+    expect(response.body.error).toEqual({
+      code: "model_timeout",
+      message: "The model took too long to respond. Your message is still available—try again.",
+      retryable: true,
+      action: "retry"
+    });
+    expect(response.body).not.toHaveProperty("error_admin_only");
+    expect(JSON.stringify(response.body)).not.toContain("private provider timeout diagnostics");
+  });
+
   it("resumes unclaimed queued chat and validation work exactly once", async () => {
     const dbPath = path.join(tmpDir, "db.json");
     app = await createApp({ dbPath, uploadRoot: tmpDir, autoRun: false });

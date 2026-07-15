@@ -4,6 +4,7 @@ coverage/
 .vite/
 .env.local
 .env.remote.local
+.env.runtime.local
 data/app-db.json
 data/*.mcp-key
 uploads/

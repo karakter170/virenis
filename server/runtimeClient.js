@@ -299,6 +299,18 @@ export async function runtimeRequest(path, { method = "GET", body, timeoutMs = D
     const error = new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
     error.status = response.status;
     error.payload = payload;
+    if (detail && typeof detail === "object" && !Array.isArray(detail)) {
+      error.code = typeof detail.code === "string" ? detail.code : undefined;
+      error.retryable = detail.retryable === true;
+      error.providerStatus = Number.isFinite(Number(detail.provider_status))
+        ? Number(detail.provider_status)
+        : undefined;
+      error.requestId = typeof detail.request_id === "string"
+        ? detail.request_id.slice(0, 240)
+        : undefined;
+    } else if (typeof payload.code === "string") {
+      error.code = payload.code;
+    }
     throw error;
   }
   return payload;

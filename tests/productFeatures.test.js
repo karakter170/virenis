@@ -13,6 +13,7 @@ import {
   RatingDialog,
   ToolApprovalCheckpoint,
   WorkflowDraftCard,
+  agentPayloadFromForm,
   availableSessionAgents,
   graphConnectionInputs,
   graphConnectionWouldCycle,
@@ -31,6 +32,46 @@ afterEach(() => {
 
 
 describe("Agent Studio product surfaces", () => {
+  it("compiles every agent-builder ability into the persisted execution contract", () => {
+    const payload = agentPayloadFromForm({
+      item_type: "agent",
+      title: "  Packaging analyst  ",
+      capability: "  Combine approved context into packaging guidance.  ",
+      boundary: "",
+      response_style: "careful",
+      routing_cues: "packaging, catalog",
+      consumes: ["shared_memory", "table_context", "agent:catalog_source:output"],
+      produces: ["recommendations", "structured_data"],
+      tools: ["calculator"],
+      mcp_bindings: [],
+      resources: ["agent:catalog_document"],
+      source_text: "The approved packaging color is amber.",
+      sources: "sources/router_agents/packaging/source.md"
+    }, {
+      isAdmin: false,
+      hasDocumentResources: true
+    });
+
+    expect(payload).toMatchObject({
+      title: "Packaging analyst",
+      capability: "Combine approved context into packaging guidance.",
+      routing_cues: "packaging, catalog",
+      consumes: [
+        "user_request",
+        "shared_memory",
+        "table_context",
+        "agent:catalog_source:output",
+        "document_context"
+      ],
+      produces: ["recommendations", "structured_data"],
+      tools: ["calculator", "document_search", "document_read"],
+      resources: ["agent:catalog_document"],
+      source_text: "The approved packaging color is amber."
+    });
+    expect(payload.boundary).toContain("Prioritize verified evidence");
+    expect(payload).not.toHaveProperty("sources");
+  });
+
   it("renders safe GitHub Markdown and KaTeX without executing raw HTML or loading images", () => {
     const markup = renderToStaticMarkup(createElement(FormattedText, {
       text: [

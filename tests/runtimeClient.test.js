@@ -335,6 +335,30 @@ describe("TCAR runtime HTTP transport", () => {
     });
   });
 
+  it("preserves safe provider failure metadata for user-facing recovery", async () => {
+    const runtime = await startHttpServer((_request, response) => {
+      response.writeHead(429, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({
+        detail: {
+          code: "model_rate_limited",
+          message: "The provider is busy.",
+          retryable: true,
+          provider_status: 429,
+          request_id: "provider_request_123"
+        }
+      }));
+    });
+    configureRuntime(runtime.url);
+
+    await expect(runtimeRequest("/rate-limit", { timeoutMs: 500 })).rejects.toMatchObject({
+      status: 429,
+      code: "model_rate_limited",
+      retryable: true,
+      providerStatus: 429,
+      requestId: "provider_request_123"
+    });
+  });
+
   it("sends only fields accepted by the live agent lifecycle contract", async () => {
     const requests = [];
     const runtime = await startHttpServer(async (request, response) => {
