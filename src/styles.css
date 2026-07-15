@@ -5410,6 +5410,73 @@ summary:focus-visible,
   width: 100%;
 }
 
+.session-recovery-stage {
+  grid-template-columns: minmax(0, 1fr) minmax(360px, 460px);
+}
+
+.session-recovery-card {
+  min-height: 0;
+  display: grid;
+  gap: 20px;
+}
+
+.session-recovery-card h2,
+.session-recovery-card p {
+  margin: 0;
+}
+
+.session-recovery-card h2 {
+  font-size: 22px;
+  letter-spacing: -0.025em;
+}
+
+.session-recovery-card p {
+  margin-top: 8px;
+  color: var(--text-soft);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.session-recovery-icon {
+  width: 44px;
+  height: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 12px;
+  color: #9a5a18;
+  background: #fff2df;
+}
+
+.session-recovery-origin {
+  min-width: 0;
+  display: grid;
+  gap: 6px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 11px 12px;
+  background: var(--surface-subtle);
+}
+
+.session-recovery-origin span,
+.session-recovery-card > small {
+  color: var(--text-faint);
+  font-size: 10px;
+}
+
+.session-recovery-origin code,
+.session-recovery-card > small code {
+  overflow-wrap: anywhere;
+  color: var(--text);
+  font-size: 11px;
+}
+
+.session-recovery-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
 .account-form label {
   display: grid;
   gap: 7px;

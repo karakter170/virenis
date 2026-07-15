@@ -13,6 +13,7 @@ import {
 } from "lucide-react";
 import { SignIn, SignUp, useClerk, useUser } from "@clerk/react";
 import { useEffect, useState } from "react";
+import { notifyAuthenticationRequired } from "./authRecovery.js";
 
 export function IdentityPage({ mode = "login", onHome }) {
   const registering = mode === "register";
@@ -59,6 +60,52 @@ export function IdentityPage({ mode = "login", onHome }) {
             />
           )}
         </div>
+      </section>
+    </main>
+  );
+}
+
+export function SessionRecoveryPage({ failure, busy = "", error = "", onRetry, onSignOut, onHome }) {
+  return (
+    <main className="identity-page">
+      <header className="identity-header">
+        <button className="identity-wordmark" type="button" onClick={onHome}>Virenis</button>
+        <button className="identity-back" type="button" onClick={onHome}><ArrowLeft size={15} />Back to home</button>
+      </header>
+      <section className="identity-stage session-recovery-stage" aria-labelledby="session-recovery-title">
+        <div className="identity-intro">
+          <span className="identity-kicker"><ShieldCheck size={14} /> Session protected</span>
+          <h1 id="session-recovery-title">Sign-in succeeded. Server verification did not.</h1>
+          <p>Virenis stopped the workspace from retrying automatically, so your browser will remain stable while the session is recovered.</p>
+          <ul aria-label="Session recovery protections">
+            <li><Check size={14} />No repeated workspace reloads</li>
+            <li><Check size={14} />No background API request storm</li>
+            <li><Check size={14} />No security checks bypassed</li>
+          </ul>
+        </div>
+        <section className="identity-card session-recovery-card" aria-label="Session recovery">
+          <span className="session-recovery-icon" aria-hidden="true"><AlertCircle size={22} /></span>
+          <div>
+            <h2>{failure?.title || "Your session could not be verified"}</h2>
+            <p>{failure?.message || "Refresh the session and try again, or sign out and start a new sign-in."}</p>
+          </div>
+          {failure?.origin && (
+            <div className="session-recovery-origin">
+              <span>Current site address</span>
+              <code>{failure.origin}</code>
+            </div>
+          )}
+          {error && <div className="identity-message error" role="alert"><AlertCircle size={15} />{error}</div>}
+          <div className="session-recovery-actions">
+            <button className="text-button primary" type="button" onClick={onRetry} disabled={Boolean(busy)}>
+              {busy === "retry" ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}Refresh session and retry
+            </button>
+            <button className="text-button secondary" type="button" onClick={onSignOut} disabled={Boolean(busy)}>
+              {busy === "signout" ? <LoaderCircle className="spin" size={15} /> : <KeyRound size={15} />}Sign out
+            </button>
+          </div>
+          {failure?.request_id && <small>Support request ID: <code>{failure.request_id}</code></small>}
+        </section>
       </section>
     </main>
   );
@@ -456,9 +503,9 @@ async function identityRequest(path, { method = "GET", body, idempotencyKey } = 
     const error = new Error(payload.message || "The request could not be completed.");
     error.status = response.status;
     error.code = payload.error;
-    if (response.status === 401 && typeof window !== "undefined") {
-      window.dispatchEvent(new Event("virenis:authentication-required"));
-    }
+    error.requestId = payload.request_id;
+    error.authReason = response.headers.get("x-clerk-auth-reason") || "";
+    if (response.status === 401) notifyAuthenticationRequired(error);
     throw error;
   }
   return payload;

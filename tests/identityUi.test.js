@@ -3,7 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { ClerkProvider } from "@clerk/react";
 import { buildPublishableKey } from "@clerk/shared/keys";
 import { describe, expect, it } from "vitest";
-import { AccountPanel, AdminUsersPanel, IdentityPage } from "../src/IdentityPage.jsx";
+import { AccountPanel, AdminUsersPanel, IdentityPage, SessionRecoveryPage } from "../src/IdentityPage.jsx";
 
 const publishableKey = buildPublishableKey("happy-clerk-13.clerk.accounts.dev");
 
@@ -26,6 +26,26 @@ describe("Clerk identity UI", () => {
     expect(signIn).toContain("Verified identity powered by Clerk");
     expect(signUp).toContain("Build your own team of agents");
     expect(signUp).toContain("clerk-identity-card");
+  });
+
+  it("renders a stable recovery surface when Clerk and server authentication disagree", () => {
+    const markup = renderToStaticMarkup(React.createElement(SessionRecoveryPage, {
+      failure: {
+        title: "This site address is not authorized",
+        message: "Open the configured Virenis URL.",
+        origin: "https://preview.example.test",
+        request_id: "req_auth_test"
+      },
+      onRetry: () => undefined,
+      onSignOut: () => undefined,
+      onHome: () => undefined
+    }));
+    expect(markup).toContain("Sign-in succeeded. Server verification did not.");
+    expect(markup).toContain("No repeated workspace reloads");
+    expect(markup).toContain("https://preview.example.test");
+    expect(markup).toContain("Refresh session and retry");
+    expect(markup).toContain("Sign out");
+    expect(markup).toContain("req_auth_test");
   });
 
   it("keeps product export and deletion controls beside Clerk-managed security", () => {

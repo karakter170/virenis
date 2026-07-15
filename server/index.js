@@ -50,7 +50,10 @@ if (isProduction) {
 }
 
 const server = app.listen(port, host, () => {
-  console.log(`virenis listening on http://${host}:${port}`);
+  const boundUrl = `http://${host}:${port}`;
+  const browserUrl = String(process.env.APP_PUBLIC_ORIGIN || "").trim().replace(/\/+$/, "")
+    || `http://${["0.0.0.0", "::"].includes(host) ? "localhost" : host}:${port}`;
+  console.log(`virenis listening on ${browserUrl}${browserUrl === boundUrl ? "" : ` (bound to ${boundUrl})`}`);
 });
 
 let shuttingDown = false;

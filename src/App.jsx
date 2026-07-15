@@ -51,7 +51,7 @@ import {
   ListTodo,
   X
 } from "lucide-react";
-import { UserButton, useAuth } from "@clerk/react";
+import { UserButton, useAuth, useClerk } from "@clerk/react";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import rehypeKatex from "rehype-katex";
@@ -59,7 +59,14 @@ import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import "katex/dist/katex.min.css";
 import LandingPage from "./LandingPage.jsx";
-import { AccountPanel, AdminUsersPanel, IdentityPage } from "./IdentityPage.jsx";
+import { AccountPanel, AdminUsersPanel, IdentityPage, SessionRecoveryPage } from "./IdentityPage.jsx";
+import {
+  AUTHENTICATION_REQUIRED_EVENT,
+  authenticationFailureDetails,
+  notifyAuthenticationRequired,
+  resetAuthenticationNotification,
+  shouldOpenWorkspaceFromIdentity
+} from "./authRecovery.js";
 import {
   evidenceQuoteIsValid,
   extractBinaryPrediction,
@@ -76,6 +83,7 @@ import {
   realityRankTieBreak,
   shortRevision
 } from "./lifecycleUi.js";
+import { loadAuthenticatedResourceBatch } from "./workspaceBootstrap.js";
 
 const api = {
   async get(path) {
@@ -106,7 +114,7 @@ const api = {
 };
 
 async function request(path, options) {
-  const response = await fetch(path, options);
+  const response = await fetch(path, { credentials: "same-origin", ...options });
   const text = await response.text();
   let payload = {};
   if (text) {
@@ -121,9 +129,9 @@ async function request(path, options) {
     error.status = response.status;
     error.code = payload.error;
     error.details = payload.details;
-    if (response.status === 401 && typeof window !== "undefined") {
-      window.dispatchEvent(new Event("virenis:authentication-required"));
-    }
+    error.requestId = payload.request_id;
+    error.authReason = response.headers.get("x-clerk-auth-reason") || "";
+    if (response.status === 401) notifyAuthenticationRequired(error);
     throw error;
   }
   return payload;
@@ -268,22 +276,35 @@ function initialsFor(auth) {
 }
 
 export default function App() {
-  const { isLoaded: clerkLoaded, isSignedIn } = useAuth();
+  const { getToken, isLoaded: clerkLoaded, isSignedIn } = useAuth();
+  const { signOut } = useClerk();
   const [route, setRoute] = useState(() => applicationRoute(window.location.pathname));
+  const [authenticationFailure, setAuthenticationFailure] = useState(null);
+  const [authenticationBusy, setAuthenticationBusy] = useState("");
+  const [authenticationError, setAuthenticationError] = useState("");
 
   useEffect(() => {
     const handlePopState = () => setRoute(applicationRoute(window.location.pathname));
-    const handleAuthenticationRequired = () => {
-      window.history.pushState({}, "", "/login");
+    const handleAuthenticationRequired = (event) => {
+      setAuthenticationFailure(event?.detail || authenticationFailureDetails());
+      setAuthenticationError("");
+      if (window.location.pathname !== "/login") window.history.replaceState({}, "", "/login");
       setRoute(applicationRoute("/login"));
     };
     window.addEventListener("popstate", handlePopState);
-    window.addEventListener("virenis:authentication-required", handleAuthenticationRequired);
+    window.addEventListener(AUTHENTICATION_REQUIRED_EVENT, handleAuthenticationRequired);
     return () => {
       window.removeEventListener("popstate", handlePopState);
-      window.removeEventListener("virenis:authentication-required", handleAuthenticationRequired);
+      window.removeEventListener(AUTHENTICATION_REQUIRED_EVENT, handleAuthenticationRequired);
     };
   }, []);
+
+  useEffect(() => {
+    if (!clerkLoaded || isSignedIn) return;
+    setAuthenticationFailure(null);
+    setAuthenticationError("");
+    resetAuthenticationNotification();
+  }, [clerkLoaded, isSignedIn]);
 
   useEffect(() => {
     if (!clerkLoaded) return;
@@ -293,12 +314,16 @@ export default function App() {
       return;
     }
     const needsSignIn = route.surface === "workspace" && !isSignedIn;
-    const needsWorkspace = route.surface === "identity" && isSignedIn;
-    if (!needsSignIn && !needsWorkspace) return;
-    const path = needsSignIn ? "/login" : "/app";
+    const needsRecovery = route.surface === "workspace" && isSignedIn && authenticationFailure;
+    const needsWorkspace = route.surface === "identity" && shouldOpenWorkspaceFromIdentity({
+      isSignedIn,
+      authenticationFailure
+    });
+    if (!needsSignIn && !needsRecovery && !needsWorkspace) return;
+    const path = needsSignIn || needsRecovery ? "/login" : "/app";
     window.history.replaceState({}, "", path);
     setRoute(applicationRoute(path));
-  }, [clerkLoaded, isSignedIn, route.legacyIdentity, route.surface]);
+  }, [authenticationFailure, clerkLoaded, isSignedIn, route.legacyIdentity, route.surface]);
 
   function navigate(next) {
     const path = applicationPath(next);
@@ -306,6 +331,50 @@ export default function App() {
     setRoute(applicationRoute(path));
     window.scrollTo?.({ top: 0, behavior: "auto" });
   }
+
+  async function retryAuthentication() {
+    setAuthenticationBusy("retry");
+    setAuthenticationError("");
+    try {
+      const token = await getToken({ skipCache: true });
+      if (!token) throw new Error("Clerk did not return a refreshed session. Sign out and sign in again.");
+      resetAuthenticationNotification();
+      setAuthenticationFailure(null);
+      const path = applicationPath("workspace");
+      window.history.replaceState({}, "", path);
+      setRoute(applicationRoute(path));
+    } catch (error) {
+      setAuthenticationError(friendlyError(error));
+    } finally {
+      setAuthenticationBusy("");
+    }
+  }
+
+  async function signOutAfterAuthenticationFailure() {
+    setAuthenticationBusy("signout");
+    setAuthenticationError("");
+    try {
+      await signOut({ redirectUrl: "/login" });
+      resetAuthenticationNotification();
+      setAuthenticationFailure(null);
+      setRoute(applicationRoute("/login"));
+    } catch (error) {
+      setAuthenticationError(friendlyError(error));
+    } finally {
+      setAuthenticationBusy("");
+    }
+  }
+
+  const recoveryPage = authenticationFailure ? (
+    <SessionRecoveryPage
+      failure={authenticationFailure}
+      busy={authenticationBusy}
+      error={authenticationError}
+      onRetry={retryAuthentication}
+      onSignOut={signOutAfterAuthenticationFailure}
+      onHome={() => navigate("home")}
+    />
+  ) : null;
 
   if (!clerkLoaded) {
     return <div className="center-state app-auth-loading" role="status"><LoaderCircle className="spin" size={20} /><span>Opening Virenis</span></div>;
@@ -321,6 +390,7 @@ export default function App() {
     );
   }
   if (route.surface === "identity") {
+    if (isSignedIn && recoveryPage) return recoveryPage;
     if (isSignedIn) return <div className="center-state app-auth-loading" role="status"><LoaderCircle className="spin" size={20} /><span>Opening your workspace</span></div>;
     return (
       <IdentityPage
@@ -330,10 +400,10 @@ export default function App() {
     );
   }
   if (!isSignedIn) return <div className="center-state app-auth-loading" role="status"><LoaderCircle className="spin" size={20} /><span>Preparing sign in</span></div>;
+  if (recoveryPage) return recoveryPage;
   return (
     <Workspace
       onHome={() => navigate("home")}
-      onAuthenticationRequired={() => navigate("login")}
       onSignedOut={() => navigate("home")}
     />
   );
@@ -359,7 +429,7 @@ function applicationPath(destination) {
   return paths[destination] || "/";
 }
 
-function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
+function Workspace({ onHome, onSignedOut }) {
   const [sessions, setSessions] = useState([]);
   const [session, setSession] = useState(null);
   const [messages, setMessages] = useState([]);
@@ -486,18 +556,18 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
     setLoading(true);
     setError("");
     try {
-      const results = await Promise.allSettled([
-        api.get("/api/auth/me"),
-        api.get("/api/chat/sessions"),
-        api.get("/api/runtime/health"),
-        api.get("/api/agents"),
-        api.get("/api/documents"),
-        api.get("/api/marketplace"),
-        api.get("/api/mcp/connections"),
-        api.get("/api/mcp/templates"),
-        api.get("/api/mcp/approvals"),
-        api.get("/api/billing/account")
+      const { identity: me, resources: results } = await loadAuthenticatedResourceBatch(api, [
+        "/api/chat/sessions",
+        "/api/runtime/health",
+        "/api/agents",
+        "/api/documents",
+        "/api/marketplace",
+        "/api/mcp/connections",
+        "/api/mcp/templates",
+        "/api/mcp/approvals",
+        "/api/billing/account"
       ]);
+      resetAuthenticationNotification();
       const required = (index) => {
         if (results[index].status === "rejected") throw results[index].reason;
         return results[index].value;
@@ -505,17 +575,16 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
       const optional = (index, fallback) => results[index].status === "fulfilled"
         ? results[index].value
         : fallback;
-      const me = required(0);
-      const sessionList = required(1);
-      const health = optional(2, { ok: false, ready: false });
-      const agentList = optional(3, { agents: [] });
-      const docList = optional(4, { documents: [] });
-      const marketplaceList = optional(5, { items: [] });
-      const connectionList = optional(6, { connections: [] });
-      const templateList = optional(7, { templates: [] });
-      const approvalList = optional(8, { approvals: [] });
-      const billingData = required(9);
-      let optionalLoadFailed = results.slice(2, 9).some((result) => result.status === "rejected");
+      const sessionList = required(0);
+      const health = optional(1, { ok: false, ready: false });
+      const agentList = optional(2, { agents: [] });
+      const docList = optional(3, { documents: [] });
+      const marketplaceList = optional(4, { items: [] });
+      const connectionList = optional(5, { connections: [] });
+      const templateList = optional(6, { templates: [] });
+      const approvalList = optional(7, { approvals: [] });
+      const billingData = required(8);
+      let optionalLoadFailed = results.slice(1, 8).some((result) => result.status === "rejected");
       let metricData = emptyMetrics();
       if (me.is_admin) {
         try {
@@ -548,7 +617,7 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
       }
     } catch (bootstrapError) {
       if (bootstrapError?.status === 401) {
-        onAuthenticationRequired();
+        notifyAuthenticationRequired(bootstrapError);
         return;
       }
       setError(friendlyError(bootstrapError));
@@ -561,34 +630,33 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
     const agentPath = session?.session_id
       ? `/api/agents?session_id=${encodeURIComponent(session.session_id)}`
       : "/api/agents";
-    const results = await Promise.allSettled([
-      api.get("/api/auth/me"),
-      api.get("/api/chat/sessions"),
-      api.get(agentPath),
-      api.get("/api/documents"),
-      api.get("/api/runtime/health"),
-      api.get("/api/marketplace"),
-      api.get("/api/mcp/connections"),
-      api.get("/api/mcp/templates"),
-      api.get("/api/mcp/approvals"),
-      api.get("/api/billing/account")
+    const { identity: me, resources: results } = await loadAuthenticatedResourceBatch(api, [
+      "/api/chat/sessions",
+      agentPath,
+      "/api/documents",
+      "/api/runtime/health",
+      "/api/marketplace",
+      "/api/mcp/connections",
+      "/api/mcp/templates",
+      "/api/mcp/approvals",
+      "/api/billing/account"
     ]);
+    resetAuthenticationNotification();
     const required = (index) => {
       if (results[index].status === "rejected") throw results[index].reason;
       return results[index].value;
     };
     const fulfilled = (index) => results[index].status === "fulfilled" ? results[index].value : null;
-    const me = required(0);
-    const sessionList = required(1);
-    const agentList = fulfilled(2);
-    const docList = fulfilled(3);
-    const health = fulfilled(4);
-    const marketplaceList = fulfilled(5);
-    const connectionList = fulfilled(6);
-    const templateList = fulfilled(7);
-    const approvalList = fulfilled(8);
-    const billingData = required(9);
-    let optionalLoadFailed = results.slice(2, 9).some((result) => result.status === "rejected");
+    const sessionList = required(0);
+    const agentList = fulfilled(1);
+    const docList = fulfilled(2);
+    const health = fulfilled(3);
+    const marketplaceList = fulfilled(4);
+    const connectionList = fulfilled(5);
+    const templateList = fulfilled(6);
+    const approvalList = fulfilled(7);
+    const billingData = required(8);
+    let optionalLoadFailed = results.slice(1, 8).some((result) => result.status === "rejected");
     let metricData = me.is_admin ? null : emptyMetrics();
     if (me.is_admin) {
       try {

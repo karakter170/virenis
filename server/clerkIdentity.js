@@ -50,7 +50,11 @@ export function clerkAuthorizedParties(env = process.env) {
   const publicOrigin = String(env.APP_PUBLIC_ORIGIN || "").trim().replace(/\/+$/, "");
   if (publicOrigin) values.push(publicOrigin);
   if (env.NODE_ENV !== "production") {
-    values.push("http://localhost:5173", "http://127.0.0.1:5173");
+    const configuredPort = Number(env.PORT || 5173);
+    const port = Number.isInteger(configuredPort) && configuredPort > 0 && configuredPort <= 65535
+      ? configuredPort
+      : 5173;
+    values.push(`http://localhost:${port}`, `http://127.0.0.1:${port}`);
   }
   return [...new Set(values.map(validateAuthorizedParty))];
 }

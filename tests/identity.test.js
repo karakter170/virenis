@@ -5,7 +5,7 @@ import request from "supertest";
 import { buildPublishableKey } from "@clerk/shared/keys";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createApp } from "../server/app.js";
-import { validateClerkEnvironment } from "../server/clerkIdentity.js";
+import { clerkAuthorizedParties, validateClerkEnvironment } from "../server/clerkIdentity.js";
 
 const ENV_KEYS = [
   "APP_IDENTITY_PROVIDER",
@@ -17,6 +17,7 @@ const ENV_KEYS = [
   "APP_BASIC_AUTH_PASSWORD",
   "APP_PUBLIC_ORIGIN",
   "CLERK_AUTHORIZED_PARTIES",
+  "PORT",
   "WEB_STORE_DRIVER",
   "TCAR_ENGINE_MODE"
 ];
@@ -39,7 +40,8 @@ beforeEach(async () => {
     "APP_BASIC_AUTH_USER",
     "APP_BASIC_AUTH_PASSWORD",
     "APP_PUBLIC_ORIGIN",
-    "CLERK_AUTHORIZED_PARTIES"
+    "CLERK_AUTHORIZED_PARTIES",
+    "PORT"
   ]) delete process.env[key];
   tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "virenis-clerk-"));
   fake = createFakeClerk();
@@ -74,6 +76,13 @@ function asUser(userId, sessionId = `sess_${userId}`) {
 }
 
 describe("Clerk identity integration", () => {
+  it("authorizes both loopback browser addresses on the configured development port", () => {
+    expect(clerkAuthorizedParties({ NODE_ENV: "development", PORT: "5181" })).toEqual([
+      "http://localhost:5181",
+      "http://127.0.0.1:5181"
+    ]);
+  });
+
   it("links a legacy profile without changing its workspace and scrubs retired credentials", async () => {
     process.env.APP_AUTH_ADMIN_EMAILS = "legacy@example.com";
     await fs.writeFile(path.join(tmpDir, "db.json"), JSON.stringify({
