@@ -1,4 +1,5 @@
 import { approvedSourceSnippets, BASE_MODEL, DEFAULT_VLLM_BASE_URL } from "./catalog.js";
+import { releaseRunReservation, settleRunCredits } from "./billing.js";
 import { makeId, nowIso } from "./store.js";
 import { assertStoredDocumentIntegrity, scoreChunks, slugify } from "./documents.js";
 import { executeRuntimeChat, realRuntimeEnabled } from "./runtimeClient.js";
@@ -706,6 +707,7 @@ async function processLocalChatRun({ store, bus, run_id, options = {} }) {
         totals: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
         missing_usage: ["local_simulator_does_not_call_a_model"]
       };
+      settleRunCredits(data, run, run.token_accounting);
       run.assistant_message_id = assistantMessageId;
       run.completed_at = completedAt;
       run.elapsed_sec = elapsedSec;
@@ -717,6 +719,8 @@ async function processLocalChatRun({ store, bus, run_id, options = {} }) {
         content: finalAnswer,
         attachments: [],
         run_id,
+        usage_receipt: run.usage_receipt,
+        billing: run.billing,
         created_at: completedAt
       });
       if (session) {
@@ -752,6 +756,7 @@ async function processLocalChatRun({ store, bus, run_id, options = {} }) {
         run.error = failure.public;
         run.error_admin_only = failure.admin;
         run.completed_at = nowIso();
+        releaseRunReservation(data, run, { reason: failure.public.code || "run_failed" });
         run.events.push({
           type: "run.failed",
           code: failure.public.code,
@@ -897,6 +902,7 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
       run.sources = citations;
       run.policy_events = policyEvents;
       run.token_accounting = normalizeArtifactValue(result.tokenAccounting || null);
+      settleRunCredits(data, run, run.token_accounting);
       run.assistant_message_id = assistantMessageId;
       run.completed_at = completedAt;
       run.elapsed_sec = elapsedSec;
@@ -920,6 +926,8 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
         content: finalAnswer,
         attachments: [],
         run_id,
+        usage_receipt: run.usage_receipt,
+        billing: run.billing,
         created_at: completedAt
       });
       if (session) {
@@ -958,6 +966,7 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
         run.error = failure.public;
         run.error_admin_only = failure.admin;
         run.completed_at = nowIso();
+        releaseRunReservation(data, run, { reason: failure.public.code || "runtime_failed" });
         run.events.push({
           type: "run.failed",
           code: failure.public.code,

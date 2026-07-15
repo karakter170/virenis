@@ -7,6 +7,21 @@ import multer from "multer";
 import { basicAuthPassword, parseConfiguredApiTokens, secretConfigured } from "./authConfig.js";
 import { readConfiguredSecret } from "./secretConfig.js";
 import { seedAgentsForMode, withoutLegacySeedAgents, BASE_MODEL } from "./catalog.js";
+import {
+  activePricingVersion,
+  billingAccountSnapshot,
+  createAdminAdjustment,
+  createPricingVersion,
+  ensureBillingAccount,
+  listBillingAccounts,
+  listBillingLedger,
+  publicPricingVersion,
+  recordFundingEvent,
+  releaseRunReservation,
+  reserveRunCredits,
+  usageForRunStep,
+  verifyBillingState
+} from "./billing.js";
 import { createStore, makeId, nowIso } from "./store.js";
 import {
   assertSafeSourcePath,
@@ -76,6 +91,7 @@ import {
   publicConversationCheckpoint,
   publicWorkflow,
   recoverInterruptedWorkflowActivations,
+  recoverStaleContinuationReservations,
   refreshConnectionRequirements,
   resumeMcpApprovalConversation
 } from "./workflows.js";
@@ -190,9 +206,13 @@ export async function createApp({
   });
   const store = createStore({ dbPath, seedAgents: configuredSeedAgents });
   await store.init();
+  await store.mutate((data) => activePricingVersion(data));
   const workflowStartupRecovery = autoRun
     ? await recoverInterruptedWorkflowActivations({ store })
     : { recovered: 0, workflow_ids: [] };
+  const continuationBillingStartupRecovery = autoRun
+    ? await recoverStaleContinuationReservations({ store })
+    : { recovered: 0, checkpoint_ids: [] };
   const resolvedClerkAdapter = clerkAdapter || createClerkAdapter();
   const identityManager = createClerkIdentityManager({
     store,
@@ -529,6 +549,121 @@ export async function createApp({
         is_admin: isAdmin(req),
         is_viewer: isViewer(req)
       });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/api/billing/account", async (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      await recoverStaleContinuationReservations({ store, actor: req.auth });
+      const result = await store.mutate((data) => billingAccountSnapshot(data, req.auth, { recentLimit: 12 }));
+      res.json(result);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/api/billing/ledger", async (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      await recoverStaleContinuationReservations({ store, actor: req.auth });
+      const result = await store.mutate((data) => listBillingLedger(data, req.auth, {
+        limit: req.query.limit,
+        offset: req.query.offset
+      }));
+      res.json(result);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/api/admin/billing/accounts", async (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      requireAdmin(req);
+      const result = await store.mutate((data) => {
+        for (const user of data.users || []) {
+          ensureBillingAccount(data, user);
+        }
+        return {
+          accounts: listBillingAccounts(data),
+          integrity_valid: verifyBillingState(data).valid
+        };
+      });
+      res.json(result);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/api/admin/billing/pricing", async (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      requireAdmin(req);
+      const pricing = await store.mutate((data) => publicPricingVersion(activePricingVersion(data), { includeAudit: true }));
+      res.json({ pricing });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/admin/billing/pricing", async (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      requireAdmin(req);
+      const result = await store.mutate((data) => createPricingVersion(data, {
+        actor: req.auth,
+        body: req.body,
+        idempotencyKey: req.headers["idempotency-key"]
+      }));
+      res.status(result.duplicate ? 200 : 201).json(result);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/admin/billing/accounts/:user_id/adjustments", async (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      requireAdmin(req);
+      const result = await store.mutate((data) => {
+        const target = billingTargetIdentity(data, req.params.user_id, req.body?.workspace_id);
+        return createAdminAdjustment(data, {
+          actor: req.auth,
+          targetUserId: target.user_id,
+          targetWorkspaceId: target.workspace_id,
+          amountCredits: req.body?.amount_credits,
+          reason: req.body?.reason,
+          idempotencyKey: req.headers["idempotency-key"]
+        });
+      });
+      res.status(result.duplicate ? 200 : 201).json(result);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/admin/billing/funding-events", async (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      requireAdmin(req);
+      const result = await store.mutate((data) => {
+        const target = billingTargetIdentity(data, req.body?.user_id, req.body?.workspace_id);
+        return recordFundingEvent(data, {
+          actor: req.auth,
+          targetUserId: target.user_id,
+          targetWorkspaceId: target.workspace_id,
+          provider: req.body?.provider,
+          externalReference: req.body?.external_reference,
+          providerEventId: req.body?.provider_event_id,
+          status: req.body?.status,
+          amountCredits: req.body?.amount_credits,
+          idempotencyKey: req.headers["idempotency-key"]
+        });
+      });
+      res.status(result.duplicate ? 200 : 201).json(result);
     } catch (error) {
       next(error);
     }
@@ -1076,6 +1211,7 @@ export async function createApp({
   app.post("/api/chat/sessions/:session_id/messages", async (req, res, next) => {
     try {
       validateUserMessage(req.body.content);
+      await recoverStaleContinuationReservations({ store, actor: req.auth });
       const data = store.read();
       const session = findAccessibleSession(data, req.params.session_id, req);
       const runOptions = normalizeChatOptions(req.body.options);
@@ -1152,6 +1288,12 @@ export async function createApp({
           }
         }
         mutable.messages.push(message);
+        reserveRunCredits(mutable, {
+          run,
+          actor: req.auth,
+          options: runOptions,
+          kind: workflowCommand ? "workflow_composition" : "chat"
+        });
         mutable.runs.push(run);
         const mutableSession = mutable.sessions.find((item) => item.session_id === session.session_id);
         if (!mutableSession) throwStatus(404, "Chat session not found.");
@@ -3070,11 +3212,18 @@ export async function createApp({
         stack: error.stack
       });
     }
-    res.status(status).json({
+    const payload = {
       error: code,
       message: status >= 500 && process.env.NODE_ENV === "production" ? "Unexpected server error." : error.message || "Unexpected error.",
       request_id: req.id
-    });
+    };
+    if (status === 402 && code === "insufficient_balance" && error.details) {
+      payload.details = {
+        available_micros: Number(error.details.available_micros) || 0,
+        required_micros: Number(error.details.required_micros) || 0
+      };
+    }
+    res.status(status).json(payload);
   });
 
   const runtimeLifecycleRecovery = realRuntimeEnabled()
@@ -3098,6 +3247,7 @@ export async function createApp({
     };
   app.locals.startupRecovery = startupRecovery;
   app.locals.workflowStartupRecovery = workflowStartupRecovery;
+  app.locals.continuationBillingStartupRecovery = continuationBillingStartupRecovery;
 
   return app;
 }
@@ -3219,6 +3369,7 @@ function interruptPersistedChatRun(data, run, recoveredAt) {
     at: recoveredAt
   });
   run.events.push({ type: "run.failed", code: "run_interrupted", message: interruptedRunMessage(), at: recoveredAt });
+  releaseRunReservation(data, run, { reason: "run_interrupted" });
   const session = (data.sessions || []).find((item) => item.session_id === run.session_id);
   recordExecution(data, {
     run,
@@ -4003,6 +4154,28 @@ function requireAdmin(req) {
   }
 }
 
+function billingTargetIdentity(data, rawUserId, rawWorkspaceId = null) {
+  const userId = String(rawUserId || "").trim();
+  const requestedWorkspaceId = String(rawWorkspaceId || "").trim();
+  if (!userId || userId.length > 160 || !/^[A-Za-z0-9][A-Za-z0-9_.:@/-]*$/.test(userId)) {
+    throwStatus(400, "A valid billing user id is required.");
+  }
+  const user = (data.users || []).find((candidate) => candidate.user_id === userId);
+  const matchingAccounts = (data.billingAccounts || []).filter((candidate) => (
+    candidate.user_id === userId
+    && (!requestedWorkspaceId || candidate.workspace_id === requestedWorkspaceId)
+  ));
+  if (!requestedWorkspaceId && !user?.workspace_id && matchingAccounts.length > 1) {
+    throwStatus(409, "This user id belongs to more than one workspace; include workspace_id explicitly.");
+  }
+  const workspaceId = String(user?.workspace_id || matchingAccounts[0]?.workspace_id || "").trim();
+  if (!workspaceId) throwStatus(404, "Billing user not found.");
+  if (requestedWorkspaceId && requestedWorkspaceId !== workspaceId) {
+    throwStatus(409, "The requested workspace does not match this billing user.");
+  }
+  return { user_id: userId, workspace_id: workspaceId };
+}
+
 function requestWorkspaceId(req, requested) {
   if (isAdmin(req) && requested && process.env.APP_ALLOW_WORKSPACE_OVERRIDE === "1") {
     return String(requested);
@@ -4768,6 +4941,7 @@ function readRunResult(store, runId, req) {
       created_at: contract.created_at,
       settled_at: contract.settled_at
     }));
+  const usageReceipt = run.usage_receipt || null;
   return {
     run_id: run.run_id,
     session_id: run.session_id,
@@ -4778,10 +4952,15 @@ function readRunResult(store, runId, req) {
     parallel: run.parallel,
     expert_outputs: data.runSteps
       .filter((step) => step.run_id === run.run_id)
-      .map((step) => redactRunStepForRequest(step, req)),
+      .map((step) => ({
+        ...redactRunStepForRequest(step, req),
+        token_usage: usageForRunStep(usageReceipt, step)
+      })),
     sources: (run.sources || []).map((source) => redactSourceForRequest(source, req)),
     policy_events: run.policy_events || [],
     token_accounting: run.token_accounting || null,
+    usage_receipt: usageReceipt,
+    billing: run.billing || null,
     execution: execution ? {
       execution_id: execution.execution_id,
       record_hash: execution.record_hash,
@@ -4879,6 +5058,7 @@ async function recordBackgroundChatFailure({ store, bus, run_id, error, attemptI
     };
     run.events = Array.isArray(run.events) ? run.events : [];
     run.events.push({ type: "run.failed", code, message: publicRunFailureMessage(code), at: completedAt });
+    releaseRunReservation(data, run, { reason: code });
     const session = data.sessions.find((item) => item.session_id === run.session_id);
     recordExecution(data, {
       run,

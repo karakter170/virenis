@@ -31,7 +31,13 @@ const MANAGED_ENV = [
   "TCAR_RUNTIME_API_KEY_FILE",
   "TCAR_RUNTIME_WORKFLOW_TIMEOUT_MS",
   "TCAR_RUNTIME_CHAT_TIMEOUT_MS",
-  "TCAR_RUNTIME_ADMIN_TIMEOUT_MS"
+  "TCAR_RUNTIME_ADMIN_TIMEOUT_MS",
+  "APP_BILLING_WELCOME_CREDITS",
+  "APP_BILLING_PROMPT_CREDITS_PER_1K",
+  "APP_BILLING_COMPLETION_CREDITS_PER_1K",
+  "APP_BILLING_CACHED_CREDITS_PER_1K",
+  "APP_BILLING_UNCLASSIFIED_CREDITS_PER_1K",
+  "APP_BILLING_MINIMUM_RESERVATION_CREDITS"
 ];
 
 function requireCondition(condition, message) {
@@ -116,6 +122,23 @@ function assertSafeGraph(workflow) {
   }
 }
 
+function assertMeteredRun(run, label, { expectedAgentIds = [] } = {}) {
+  const receipt = run.usage_receipt;
+  requireCondition(run.billing?.status === "settled", `${label} did not settle its credit reservation`);
+  requireCondition(receipt?.provider_reported === true, `${label} did not preserve provider-reported usage`);
+  requireCondition(Number.isSafeInteger(receipt.total_tokens) && receipt.total_tokens > 0, `${label} has no positive token total`);
+  requireCondition(Number.isSafeInteger(receipt.charged_micros) && receipt.charged_micros > 0, `${label} has no positive credit charge`);
+  requireCondition(receipt.charged_micros === run.billing.charged_micros, `${label} receipt and settlement charges differ`);
+  requireCondition(Number.isSafeInteger(receipt.balance_after_micros), `${label} did not expose its post-run balance`);
+  for (const agentId of expectedAgentIds) {
+    const component = (receipt.components || []).find((item) => item.kind === "agent" && item.agent_id === agentId);
+    requireCondition(component?.total_tokens > 0, `${label} did not expose token usage for ${agentId}`);
+    const output = (run.expert_outputs || []).find((item) => item.adapter === agentId);
+    requireCondition(output?.token_usage?.total_tokens > 0, `${label} did not attach token usage to ${agentId}'s output`);
+  }
+  return receipt;
+}
+
 async function cleanupWorkflowAgents(app) {
   if (!app?.locals?.store) return [];
   const agents = app.locals.store.read((data) => (data.agents || [])
@@ -163,6 +186,12 @@ async function main() {
     process.env.TCAR_RUNTIME_WORKFLOW_TIMEOUT_MS = "1200000";
     process.env.TCAR_RUNTIME_CHAT_TIMEOUT_MS = "1200000";
     process.env.TCAR_RUNTIME_ADMIN_TIMEOUT_MS = "300000";
+    process.env.APP_BILLING_WELCOME_CREDITS = "1000";
+    process.env.APP_BILLING_PROMPT_CREDITS_PER_1K = "0.10";
+    process.env.APP_BILLING_COMPLETION_CREDITS_PER_1K = "0.20";
+    process.env.APP_BILLING_CACHED_CREDITS_PER_1K = "0.02";
+    process.env.APP_BILLING_UNCLASSIFIED_CREDITS_PER_1K = "0.20";
+    process.env.APP_BILLING_MINIMUM_RESERVATION_CREDITS = "0.10";
 
     stage = "create initial web app";
     app = await createApp({ dbPath, uploadRoot: path.join(tempRoot, "uploads") });
@@ -178,6 +207,7 @@ async function main() {
     );
     const textileRun = await waitForRun(app, textileSubmission.run_id);
     requireCondition(textileRun.status === "completed", `Textile /agent composition failed: ${JSON.stringify(textileRun.error || {})}`);
+    assertMeteredRun(textileRun, "Textile /agent composition");
     let detail = await sessionDetail(app, session.session_id);
     let textile = workflowForRun(app, detail, textileSubmission.run_id);
     requireCondition(textile, "Textile /agent did not persist a workflow draft");
@@ -207,6 +237,7 @@ async function main() {
     requireCondition((downstreamTextileStep?.depends_on || []).length > 0, "Activated textile handoff was not compiled into the execution DAG");
     requireCondition((textileExecution.expert_outputs || []).length >= 2, "Activated textile team did not return both expert outputs");
     requireCondition(String(textileExecution.final_answer || "").trim().length > 0, "Activated textile team returned an empty synthesis");
+    const textileUsage = assertMeteredRun(textileExecution, "Activated textile team", { expectedAgentIds: textileAgentIds });
 
     stage = "compose repeated math /agent";
     const mathSubmission = await sendMessage(
@@ -217,6 +248,7 @@ async function main() {
     );
     const mathRun = await waitForRun(app, mathSubmission.run_id);
     requireCondition(mathRun.status === "completed", `Math /agent composition failed: ${JSON.stringify(mathRun.error || {})}`);
+    assertMeteredRun(mathRun, "Math /agent composition");
     detail = await sessionDetail(app, session.session_id);
     let math = workflowForRun(app, detail, mathSubmission.run_id);
     requireCondition(math, "Repeated /agent command did not persist a second draft");
@@ -258,6 +290,7 @@ async function main() {
     );
     const gmailRun = await waitForRun(app, gmailSubmission.run_id);
     requireCondition(gmailRun.status === "completed", `Gmail /workflow composition failed: ${JSON.stringify(gmailRun.error || {})}`);
+    assertMeteredRun(gmailRun, "Gmail /workflow composition");
     detail = await sessionDetail(app, session.session_id);
     let gmail = workflowForRun(app, detail, gmailSubmission.run_id);
     requireCondition(gmail, "/workflow did not persist a Gmail draft");
@@ -292,6 +325,10 @@ async function main() {
     const normalRun = await waitForRun(app, normalSubmission.run_id);
     requireCondition(normalRun.status === "completed", `Normal chat after workflow denial failed: ${JSON.stringify(normalRun.error || {})}`);
     requireCondition(String(normalRun.final_answer || "").trim().length > 0, "Normal chat returned an empty answer");
+    const normalUsage = assertMeteredRun(normalRun, "Normal all-agents-off chat");
+    const billingSnapshot = (await auth(request(app).get("/api/billing/account")).expect(200)).body.account;
+    requireCondition(billingSnapshot.reserved_micros === 0, "Completed live runs left credits reserved");
+    requireCondition(billingSnapshot.lifetime_debited_micros > 0, "Completed live runs did not debit the account");
 
     stage = "emit live proof";
     console.log(JSON.stringify({
@@ -303,7 +340,12 @@ async function main() {
         status: textile.status,
         executed_agents: textileAgentIds,
         expert_outputs: textileExecution.expert_outputs.length,
-        handoff_compiled: (downstreamTextileStep?.depends_on || []).length > 0
+        handoff_compiled: (downstreamTextileStep?.depends_on || []).length > 0,
+        usage: {
+          total_tokens: textileUsage.total_tokens,
+          agent_components: textileUsage.components.filter((item) => item.kind === "agent").length,
+          charged_credits: textileUsage.charged_credits
+        }
       },
       recovered_agent: {
         title: math.title,
@@ -320,7 +362,14 @@ async function main() {
       },
       normal_chat_with_all_agents_off: {
         status: normalRun.status,
-        answer_preview: String(normalRun.final_answer || "").slice(0, 240)
+        answer_preview: String(normalRun.final_answer || "").slice(0, 240),
+        total_tokens: normalUsage.total_tokens,
+        charged_credits: normalUsage.charged_credits
+      },
+      billing: {
+        balance_credits: billingSnapshot.balance_credits,
+        reserved_credits: billingSnapshot.reserved_credits,
+        lifetime_debited_credits: billingSnapshot.lifetime_debited_credits
       }
     }, null, 2));
   } catch (error) {

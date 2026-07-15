@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 
+import { releaseRunReservation, reserveRunCredits, settleRunCredits } from "./billing.js";
 import { isManagedMcpProviderId } from "./mcpOAuth.js";
 import { makeId, nowIso } from "./store.js";
 
@@ -16,7 +17,7 @@ const MAX_CANDIDATES = MAX_WORKSPACE_CANDIDATES + MAX_MARKETPLACE_CANDIDATES;
 const MAX_CONNECTION_CANDIDATES = 24;
 const MAX_CONNECTION_TOOLS = 12;
 const MAX_TOOL_RESULT_CHARS = 120_000;
-const DEFAULT_RESUME_CLAIM_TTL_MS = 2 * 60 * 1000;
+const DEFAULT_RESUME_CLAIM_TTL_MS = 16 * 60 * 1000;
 
 const NODE_TYPES = new Set(["trigger", "agent", "decision", "tool", "action", "approval"]);
 const TERMINAL_CHECKPOINT_STATES = new Set(["approved", "denied", "resumed", "cancelled"]);
@@ -171,7 +172,7 @@ export async function processWorkflowCompositionRun({ store, bus, run_id, compos
       updated_at: completedAt
     });
     const content = workflowDraftMessage(normalized);
-    data.messages.push({
+    const assistantMessage = {
       message_id: assistantMessageId,
       session_id: normalized.session_id,
       role: "assistant",
@@ -181,9 +182,14 @@ export async function processWorkflowCompositionRun({ store, bus, run_id, compos
       attachments: [],
       run_id,
       created_at: completedAt
-    });
+    };
+    data.messages.push(assistantMessage);
     run.status = "completed";
     run.final_answer = content;
+    run.token_accounting = rawProposal?.token_accounting || null;
+    settleRunCredits(data, run, run.token_accounting);
+    assistantMessage.usage_receipt = run.usage_receipt;
+    assistantMessage.billing = run.billing;
     run.assistant_message_id = assistantMessageId;
     run.completed_at = completedAt;
     run.plan = workflowRunPlan(normalized);
@@ -219,6 +225,8 @@ async function completeWorkflowHelpRun({ store, bus, run, command }) {
     current.started_at ||= completedAt;
     current.completed_at = completedAt;
     current.final_answer = content;
+    current.token_accounting = null;
+    settleRunCredits(data, current, null);
     current.assistant_message_id = assistantMessageId;
     current.plan = { steps: [] };
     current.events ||= [];
@@ -231,6 +239,8 @@ async function completeWorkflowHelpRun({ store, bus, run, command }) {
       content,
       attachments: [],
       run_id: run.run_id,
+      usage_receipt: current.usage_receipt,
+      billing: current.billing,
       created_at: completedAt
     });
     if (session) {
@@ -715,16 +725,18 @@ export async function resumeMcpApprovalConversation({
       throw workflowError(404, "Conversation checkpoint not found.", "checkpoint_not_found");
     }
     if (checkpoint.resume_message_id) return { checkpoint, claimed: false };
-    const claimTtlMs = positiveInteger(
-      process.env.WORKFLOW_CONTINUATION_CLAIM_TTL_MS,
-      DEFAULT_RESUME_CLAIM_TTL_MS
-    );
+    const claimTtlMs = resumeClaimTtlMs();
     const claimedAt = Date.parse(checkpoint.resume_claimed_at || "");
     const liveClaim = checkpoint.status === "resuming"
       && checkpoint.resume_claim_id
       && Number.isFinite(claimedAt)
       && claimedAt > Date.now() - claimTtlMs;
     if (liveClaim && !force) return { checkpoint, claimed: false };
+    if (checkpoint.status === "resuming" && checkpoint.billing_run_id) {
+      releaseRunReservation(data, { run_id: checkpoint.billing_run_id }, {
+        reason: force ? "continuation_claim_replaced" : "continuation_claim_expired"
+      });
+    }
     checkpoint.status = "resuming";
     checkpoint.resume_claim_id = claimId;
     checkpoint.resume_claimed_at = nowIso();
@@ -732,6 +744,19 @@ export async function resumeMcpApprovalConversation({
     checkpoint.decided_at ||= nowIso();
     checkpoint.updated_at = nowIso();
     checkpoint.resume_attempts = Number(checkpoint.resume_attempts || 0) + 1;
+    const billingRun = {
+      run_id: `continuation_${checkpoint.checkpoint_id}_${checkpoint.resume_attempts}`,
+      workspace_id: checkpoint.workspace_id,
+      created_by: checkpoint.created_by
+    };
+    reserveRunCredits(data, {
+      run: billingRun,
+      actor,
+      options: {},
+      kind: "conversation_continuation"
+    });
+    checkpoint.billing_run_id = billingRun.run_id;
+    checkpoint.billing = billingRun.billing;
     delete checkpoint.resume_error;
     return { checkpoint, claimed: true };
   });
@@ -769,6 +794,13 @@ export async function resumeMcpApprovalConversation({
       if (checkpoint.resume_claim_id !== claimId) return checkpoint;
       const messageId = makeId("msg");
       const now = nowIso();
+      const billingRun = {
+        run_id: checkpoint.billing_run_id,
+        workspace_id: checkpoint.workspace_id,
+        created_by: checkpoint.created_by,
+        token_accounting: continuation?.token_accounting || null
+      };
+      settleRunCredits(data, billingRun, billingRun.token_accounting);
       data.messages.push({
         message_id: messageId,
         session_id: checkpoint.session_id,
@@ -778,10 +810,14 @@ export async function resumeMcpApprovalConversation({
         content,
         attachments: [],
         run_id: null,
+        usage_receipt: billingRun.usage_receipt,
+        billing: billingRun.billing,
         created_at: now
       });
       checkpoint.status = "resumed";
       checkpoint.resume_message_id = messageId;
+      checkpoint.usage_receipt = billingRun.usage_receipt;
+      checkpoint.billing = billingRun.billing;
       checkpoint.updated_at = now;
       delete checkpoint.resume_claim_id;
       delete checkpoint.resume_claimed_at;
@@ -801,6 +837,9 @@ export async function resumeMcpApprovalConversation({
     await store.mutate((data) => {
       const checkpoint = (data.conversationCheckpoints || []).find((item) => item.checkpoint_id === claimed.checkpoint.checkpoint_id);
       if (checkpoint && !checkpoint.resume_message_id && checkpoint.resume_claim_id === claimId) {
+        if (checkpoint.billing_run_id) {
+          releaseRunReservation(data, { run_id: checkpoint.billing_run_id }, { reason: "continuation_failed" });
+        }
         checkpoint.status = "resume_failed";
         checkpoint.resume_error = "The action was decided, but the response could not be resumed. Retry the continuation.";
         checkpoint.updated_at = nowIso();
@@ -811,6 +850,39 @@ export async function resumeMcpApprovalConversation({
     });
     throw error;
   }
+}
+
+export async function recoverStaleContinuationReservations({ store, actor = null, nowMs = Date.now() }) {
+  const cutoff = nowMs - resumeClaimTtlMs();
+  const hasStaleCheckpoint = store.read((data) => (data.conversationCheckpoints || []).some((checkpoint) => {
+    if (checkpoint.status !== "resuming" || !checkpoint.resume_claim_id) return false;
+    if (actor && (checkpoint.workspace_id !== actor.workspace_id || checkpoint.created_by !== actor.user_id)) return false;
+    const claimedAt = Date.parse(checkpoint.resume_claimed_at || "");
+    return !Number.isFinite(claimedAt) || claimedAt <= cutoff;
+  }));
+  if (!hasStaleCheckpoint) return { recovered: 0, checkpoint_ids: [] };
+  return store.mutate((data) => {
+    const recovered = [];
+    for (const checkpoint of data.conversationCheckpoints || []) {
+      if (checkpoint.status !== "resuming" || !checkpoint.resume_claim_id) continue;
+      if (actor && (
+        checkpoint.workspace_id !== actor.workspace_id
+        || checkpoint.created_by !== actor.user_id
+      )) continue;
+      const claimedAt = Date.parse(checkpoint.resume_claimed_at || "");
+      if (Number.isFinite(claimedAt) && claimedAt > cutoff) continue;
+      if (checkpoint.billing_run_id) {
+        releaseRunReservation(data, { run_id: checkpoint.billing_run_id }, { reason: "continuation_claim_expired" });
+      }
+      checkpoint.status = "resume_failed";
+      checkpoint.resume_error = "The previous continuation was interrupted. Retry to continue the conversation.";
+      checkpoint.updated_at = new Date(nowMs).toISOString();
+      delete checkpoint.resume_claim_id;
+      delete checkpoint.resume_claimed_at;
+      recovered.push(checkpoint.checkpoint_id);
+    }
+    return { recovered: recovered.length, checkpoint_ids: recovered };
+  });
 }
 
 export function defaultToolContinuation(approval, decision) {
@@ -1854,6 +1926,12 @@ function boundedJson(value, maxChars) {
 function positiveInteger(value, fallback) {
   const parsed = Number.parseInt(String(value ?? ""), 10);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function resumeClaimTtlMs() {
+  const runtimeTimeout = positiveInteger(process.env.TCAR_RUNTIME_CONTINUATION_TIMEOUT_MS, 15 * 60 * 1000);
+  const configured = positiveInteger(process.env.WORKFLOW_CONTINUATION_CLAIM_TTL_MS, DEFAULT_RESUME_CLAIM_TTL_MS);
+  return Math.max(configured, runtimeTimeout + 30_000);
 }
 
 function appendSharedMemory(existing, additions) {

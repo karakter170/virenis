@@ -292,13 +292,41 @@ export function createClerkIdentityManager({
       if (String(body.confirmation || "") !== "DELETE") {
         throw identityError(400, "confirmation_required", "Type DELETE exactly to confirm account deletion.");
       }
-      const data = store.read();
-      const user = registeredUserForActor(data, actor);
-      if (!user) throw identityError(404, "account_not_found", "Registered account not found.");
-      if (user.role === "admin" && activeRegisteredAdmins(data).length <= 1) {
-        throw identityError(409, "last_admin", "The last active administrator cannot delete their account.");
-      }
-      return accountOwnedResources(data, user);
+      return store.mutate((data) => {
+        const user = registeredUserForActor(data, actor);
+        if (!user) throw identityError(404, "account_not_found", "Registered account not found.");
+        if (user.role === "admin" && activeRegisteredAdmins(data).length <= 1) {
+          throw identityError(409, "last_admin", "The last active administrator cannot delete their account.");
+        }
+        const accountIds = new Set((data.billingAccounts || [])
+          .filter((account) => account.user_id === user.user_id && account.workspace_id === user.workspace_id)
+          .map((account) => account.account_id));
+        const hasActiveReservation = (data.billingReservations || []).some((reservation) => (
+          accountIds.has(reservation.account_id) && reservation.status === "active"
+        ));
+        const ownedSessionIds = new Set((data.sessions || [])
+          .filter((session) => ownsWorkspaceItem(session, user))
+          .map((session) => session.session_id));
+        const hasActiveLegacyRun = (data.runs || []).some((run) => (
+          (ownedSessionIds.has(run.session_id) || ownsWorkspaceItem(run, user))
+          && ["queued", "claimed", "planning", "running", "synthesizing"].includes(run.status)
+        ));
+        if (hasActiveReservation || hasActiveLegacyRun) {
+          throw identityError(
+            409,
+            "account_has_active_runs",
+            "Wait for active requests to finish before deleting this account."
+          );
+        }
+        const now = nowIso();
+        for (const account of data.billingAccounts || []) {
+          if (accountIds.has(account.account_id)) {
+            account.status = "closing";
+            account.updated_at = now;
+          }
+        }
+        return accountOwnedResources(data, user);
+      });
     },
 
     resourcesForActor(actor) {
@@ -324,6 +352,18 @@ export function createClerkIdentityManager({
       return store.mutate((data) => {
         const user = registeredUserForActor(data, actor);
         if (!user) return null;
+        const accountIds = new Set((data.billingAccounts || [])
+          .filter((account) => account.user_id === user.user_id && account.workspace_id === user.workspace_id)
+          .map((account) => account.account_id));
+        if ((data.billingReservations || []).some((reservation) => (
+          accountIds.has(reservation.account_id) && reservation.status === "active"
+        ))) {
+          throw identityError(
+            409,
+            "account_has_active_runs",
+            "Wait for active requests to finish before deleting this account."
+          );
+        }
         const providerUserHash = hashClerkUserId(user.clerk_user_id);
         const result = deleteAccountData(data, user);
         data.identityDeletionTombstones ||= [];
@@ -519,11 +559,20 @@ function buildAccountExport(data, user) {
   const documents = data.documents.filter((item) => ownsWorkspaceItem(item, user));
   const workflows = data.workflows.filter((item) => ownsWorkspaceItem(item, user) || sessionIds.has(item.session_id));
   const workflowIds = new Set(workflows.map((item) => item.workflow_id));
+  const billingAccounts = (data.billingAccounts || []).filter((item) => ownsWorkspaceItem(item, user));
+  const billingAccountIds = new Set(billingAccounts.map((item) => item.account_id));
   return stripSecrets({
     export_version: 2,
     exported_at: nowIso(),
     retention_note: "Append-only integrity receipts may be retained in de-identified form for security, provenance, and abuse prevention.",
     account: publicUser(user),
+    billing: {
+      accounts: billingAccounts,
+      ledger_entries: (data.billingLedgerEntries || []).filter((item) => billingAccountIds.has(item.account_id)),
+      reservations: (data.billingReservations || []).filter((item) => billingAccountIds.has(item.account_id)),
+      usage_records: (data.billingUsageRecords || []).filter((item) => billingAccountIds.has(item.account_id)),
+      funding_events: (data.billingFundingEvents || []).filter((item) => billingAccountIds.has(item.account_id))
+    },
     workspace: { workspace_id: workspaceId, owner_user_id: userId },
     identity_events: data.identityAuditEvents.filter((item) => item.target_user_id === userId || item.actor_user_id === userId),
     authentication: { provider: "clerk", provider_user_id: user.clerk_user_id },
@@ -564,8 +613,16 @@ function deleteAccountData(data, user) {
   const workflowIds = new Set(workflows.map((item) => item.workflow_id));
   const connections = data.mcpConnections.filter((item) => ownsWorkspaceItem(item, user));
   const connectionIds = new Set(connections.map((item) => item.connection_id));
+  const billingAccountIds = new Set((data.billingAccounts || [])
+    .filter((item) => ownsWorkspaceItem(item, user))
+    .map((item) => item.account_id));
 
   data.users = data.users.filter((item) => item.user_id !== userId);
+  data.billingAccounts = (data.billingAccounts || []).filter((item) => !billingAccountIds.has(item.account_id));
+  data.billingLedgerEntries = (data.billingLedgerEntries || []).filter((item) => !billingAccountIds.has(item.account_id));
+  data.billingReservations = (data.billingReservations || []).filter((item) => !billingAccountIds.has(item.account_id));
+  data.billingUsageRecords = (data.billingUsageRecords || []).filter((item) => !billingAccountIds.has(item.account_id));
+  data.billingFundingEvents = (data.billingFundingEvents || []).filter((item) => !billingAccountIds.has(item.account_id));
   data.sessions = data.sessions.filter((item) => !sessionIds.has(item.session_id));
   data.messages = data.messages.filter((item) => !sessionIds.has(item.session_id));
   data.runs = data.runs.filter((item) => !runIds.has(item.run_id));

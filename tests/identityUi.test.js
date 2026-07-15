@@ -40,6 +40,22 @@ describe("Clerk identity UI", () => {
           role: "user",
           auth_type: "clerk"
         },
+        billing: {
+          account: {
+            balance_credits: "87.5",
+            reserved_credits: "1.25",
+            lifetime_debited_credits: "12.5",
+            recent_entries: [{
+              entry_id: "ledger_usage_1",
+              type: "usage_settlement",
+              available_delta_micros: -250000,
+              available_delta_credits: "-0.25",
+              debited_micros: 400000,
+              debited_credits: "0.4",
+              created_at: "2026-07-15T08:00:00.000Z"
+            }]
+          }
+        },
         onSignedOut: () => undefined
       })
     );
@@ -48,6 +64,12 @@ describe("Clerk identity UI", () => {
     expect(markup).toContain("Export account data");
     expect(markup).toContain("Delete account permanently");
     expect(markup).toContain("Type DELETE to confirm");
+    expect(markup).toContain("Credit balance");
+    expect(markup).toContain("87.5 credits");
+    expect(markup).toContain("1.25 credits");
+    expect(markup).toContain("Token usage");
+    expect(markup).toContain("0.4 credits used");
+    expect(markup).toContain("0.25 credits over reserve");
     expect(markup).not.toContain("Current password");
   });
 
@@ -57,6 +79,8 @@ describe("Clerk identity UI", () => {
     expect(markup).toContain("Assign product roles");
     expect(markup).toContain("Clerk manages identity verification");
     expect(markup).toContain("No Clerk users have signed up yet");
+    expect(markup).toContain("Token pricing");
+    expect(markup).toContain("Save pricing");
     expect(markup).not.toContain(">Verify<");
   });
 });

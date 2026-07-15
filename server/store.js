@@ -2,6 +2,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
 import pg from "pg";
+import { verifyBillingState } from "./billing.js";
+import { normalizedBillingAvailable, syncNormalizedBilling } from "./normalizedBilling.js";
 import { normalizedLedgerAvailable, syncNormalizedLedger } from "./normalizedLedger.js";
 
 const { Pool } = pg;
@@ -38,9 +40,15 @@ function mergeSeedCatalog(agents, seedAgents) {
 function initialData(seedAgents) {
   const now = new Date().toISOString();
   return {
-    version: 10,
+    version: 11,
     created_at: now,
     users: [],
+    billingAccounts: [],
+    billingPricingVersions: [],
+    billingLedgerEntries: [],
+    billingReservations: [],
+    billingUsageRecords: [],
+    billingFundingEvents: [],
     identityAuditEvents: [],
     identityDeletionTombstones: [],
     sessions: [],
@@ -78,6 +86,7 @@ export class JsonStore {
     try {
       const raw = await fs.readFile(this.dbPath, "utf8");
       this.data = normalizeData(JSON.parse(raw), this.seedAgents);
+      assertBillingStateIntegrity(this.data);
       await this.saveNow();
     } catch (error) {
       if (error.code !== "ENOENT") {
@@ -101,6 +110,7 @@ export class JsonStore {
       const before = clone(this.data);
       try {
         const result = mutator(this.data);
+        assertBillingStateIntegrity(this.data);
         await this.saveNow();
         return clone(result);
       } catch (error) {
@@ -113,6 +123,7 @@ export class JsonStore {
   }
 
   async saveNow() {
+    assertBillingStateIntegrity(this.data);
     const tmpPath = `${this.dbPath}.tmp`;
     await fs.writeFile(tmpPath, `${JSON.stringify(this.data)}\n`, "utf8");
     await fs.rename(tmpPath, this.dbPath);
@@ -147,6 +158,7 @@ export class PostgresStore {
       idleTimeoutMillis: Number(process.env.WEB_DB_IDLE_TIMEOUT_MS || 30000)
     });
     this.normalizedLedger = false;
+    this.normalizedBilling = false;
   }
 
   async init() {
@@ -166,10 +178,16 @@ export class PostgresStore {
       `);
     }
     this.normalizedLedger = await normalizedLedgerAvailable(this.pool);
+    this.normalizedBilling = await normalizedBillingAvailable(this.pool);
     const ledgerRequired = process.env.WEB_NORMALIZED_LEDGER_REQUIRED === "1"
       || (process.env.NODE_ENV === "production" && process.env.WEB_NORMALIZED_LEDGER_REQUIRED !== "0");
     if (ledgerRequired && !this.normalizedLedger) {
       throw new Error("Production Postgres requires deploy/sql/provenance_outcomes.sql. Set WEB_NORMALIZED_LEDGER_REQUIRED=0 only for isolated migration work.");
+    }
+    const billingRequired = process.env.WEB_NORMALIZED_BILLING_REQUIRED === "1"
+      || (process.env.NODE_ENV === "production" && process.env.WEB_NORMALIZED_BILLING_REQUIRED !== "0");
+    if (billingRequired && !this.normalizedBilling) {
+      throw new Error("Production Postgres requires deploy/sql/billing.sql. Set WEB_NORMALIZED_BILLING_REQUIRED=0 only for isolated migration work.");
     }
     if (process.env.NODE_ENV === "production") {
       const role = await this.pool.query(
@@ -200,6 +218,7 @@ export class PostgresStore {
         throw new Error(`Postgres store initialization could not lock store key ${this.storeKey}.`);
       }
       initializedData = normalizeData(response.rows[0].data, this.seedAgents);
+      assertBillingStateIntegrity(initializedData);
       await client.query(
         `UPDATE ${this.tableName}
          SET data = $2::jsonb, updated_at = now()
@@ -208,6 +227,9 @@ export class PostgresStore {
       );
       if (this.normalizedLedger) {
         await syncNormalizedLedger(client, initializedData);
+      }
+      if (this.normalizedBilling) {
+        await syncNormalizedBilling(client, initializedData);
       }
       await client.query("COMMIT");
       this.data = initializedData;
@@ -236,6 +258,7 @@ export class PostgresStore {
         this.data = response.rowCount === 0 ? initialData(this.seedAgents) : normalizeData(response.rows[0].data, this.seedAgents);
         before = clone(this.data);
         const result = mutator(this.data);
+        assertBillingStateIntegrity(this.data);
         await client.query(
           `INSERT INTO ${this.tableName} (store_key, data, updated_at)
            VALUES ($1, $2::jsonb, now())
@@ -245,6 +268,9 @@ export class PostgresStore {
         );
         if (this.normalizedLedger) {
           await syncNormalizedLedger(client, this.data);
+        }
+        if (this.normalizedBilling) {
+          await syncNormalizedBilling(client, this.data);
         }
         await client.query("COMMIT");
         return clone(result);
@@ -261,13 +287,31 @@ export class PostgresStore {
   }
 
   async saveNow() {
-    await this.pool.query(
-      `INSERT INTO ${this.tableName} (store_key, data, updated_at)
-       VALUES ($1, $2::jsonb, now())
-       ON CONFLICT (store_key)
-       DO UPDATE SET data = EXCLUDED.data, updated_at = now()`,
-      [this.storeKey, JSON.stringify(this.data)]
-    );
+    const transaction = this.txQueue.then(async () => {
+      const snapshot = clone(this.data);
+      assertBillingStateIntegrity(snapshot);
+      const client = await this.pool.connect();
+      try {
+        await client.query("BEGIN");
+        await client.query(
+          `INSERT INTO ${this.tableName} (store_key, data, updated_at)
+           VALUES ($1, $2::jsonb, now())
+           ON CONFLICT (store_key)
+           DO UPDATE SET data = EXCLUDED.data, updated_at = now()`,
+          [this.storeKey, JSON.stringify(snapshot)]
+        );
+        if (this.normalizedLedger) await syncNormalizedLedger(client, snapshot);
+        if (this.normalizedBilling) await syncNormalizedBilling(client, snapshot);
+        await client.query("COMMIT");
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => undefined);
+        throw error;
+      } finally {
+        client.release();
+      }
+    });
+    this.txQueue = transaction.catch(() => undefined);
+    return transaction;
   }
 
   async close() {
@@ -298,6 +342,12 @@ function normalizeData(value, seedAgents) {
   data.version = defaults.version;
   for (const collection of [
     "users",
+    "billingAccounts",
+    "billingPricingVersions",
+    "billingLedgerEntries",
+    "billingReservations",
+    "billingUsageRecords",
+    "billingFundingEvents",
     "identityAuditEvents",
     "identityDeletionTombstones",
     "mcpConnections",
@@ -379,4 +429,11 @@ export function nowIso() {
 
 export function makeId(prefix) {
   return `${prefix}_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;
+}
+
+function assertBillingStateIntegrity(data) {
+  const integrity = verifyBillingState(data);
+  if (!integrity.valid) {
+    throw new Error(`Billing state integrity verification failed: ${integrity.errors.slice(0, 12).join(", ")}`);
+  }
 }

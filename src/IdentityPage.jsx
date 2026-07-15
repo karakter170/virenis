@@ -63,7 +63,7 @@ export function IdentityPage({ mode = "login", onHome }) {
   );
 }
 
-export function AccountPanel({ auth, onSignedOut }) {
+export function AccountPanel({ auth, billing, onRefreshBilling, onSignedOut }) {
   const { openUserProfile, signOut } = useClerk();
   const { user } = useUser();
   const [deletion, setDeletion] = useState("");
@@ -120,6 +120,7 @@ export function AccountPanel({ auth, onSignedOut }) {
       <section className="resource-section account-panel" aria-labelledby="account-heading">
         <div className="section-heading"><div><h3 id="account-heading">Account</h3><p>This identity is managed by the deployment administrator.</p></div></div>
         <div className="account-summary"><KeyRound size={18} /><div><strong>{auth?.display_name || auth?.user_id}</strong><span>{auth?.auth_type === "bearer" ? "API bearer identity" : "Configured administrator identity"}</span></div></div>
+        <BillingAccountCard billing={billing} onRefresh={onRefreshBilling} />
       </section>
     );
   }
@@ -142,6 +143,8 @@ export function AccountPanel({ auth, onSignedOut }) {
         <button className="text-button secondary" type="button" onClick={() => openUserProfile()} disabled={Boolean(busy)}><UserRound size={15} />Manage identity</button>
       </div>
 
+      <BillingAccountCard billing={billing} onRefresh={onRefreshBilling} />
+
       <div className="account-grid clerk-account-grid">
         <section className="account-card">
           <div className="account-card-heading"><div><h4>Identity & security</h4><p>Update your profile, email addresses, password, connected accounts, MFA, and active sessions through Clerk.</p></div><ShieldCheck size={17} /></div>
@@ -163,8 +166,51 @@ export function AccountPanel({ auth, onSignedOut }) {
   );
 }
 
+function BillingAccountCard({ billing, onRefresh }) {
+  const account = billing?.account;
+  return (
+    <section className="account-card billing-account-card" aria-labelledby="billing-balance-heading">
+      <div className="account-card-heading">
+        <div>
+          <h4 id="billing-balance-heading">Credit balance</h4>
+          <p>Model usage is charged from server-reported tokens. Active requests reserve credits, then return any unused amount.</p>
+        </div>
+        <button className="icon-button compact" type="button" aria-label="Refresh credit balance" onClick={onRefresh} disabled={!onRefresh}>
+          <RefreshCw size={15} />
+        </button>
+      </div>
+      {account ? (
+        <>
+          <dl className="billing-stat-grid">
+            <div><dt>Available</dt><dd>{formatCredits(account.balance_credits)}</dd></div>
+            <div><dt>Reserved</dt><dd>{formatCredits(account.reserved_credits)}</dd></div>
+            <div><dt>Lifetime used</dt><dd>{formatCredits(account.lifetime_debited_credits)}</dd></div>
+          </dl>
+          <div className="billing-history" aria-label="Recent balance activity">
+            {(account.recent_entries || []).slice(0, 6).map((entry) => {
+              const amount = billingEntryAmount(entry);
+              return (
+                <div key={entry.entry_id}>
+                  <span><strong>{billingEntryLabel(entry.type)}</strong><small>{formatIdentityDateTime(entry.created_at)}</small></span>
+                  <em className={amount.tone}>{amount.text}</em>
+                </div>
+              );
+            })}
+            {!account.recent_entries?.length && <p className="muted-empty">No balance activity yet.</p>}
+          </div>
+        </>
+      ) : <p className="muted-empty">Loading your balance…</p>}
+    </section>
+  );
+}
+
 export function AdminUsersPanel() {
   const [users, setUsers] = useState([]);
+  const [accounts, setAccounts] = useState({});
+  const [pricing, setPricing] = useState(null);
+  const [pricingDraft, setPricingDraft] = useState(() => pricingDraftFrom(null));
+  const [pricingMutationKey, setPricingMutationKey] = useState("");
+  const [adjustments, setAdjustments] = useState({});
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -173,8 +219,16 @@ export function AdminUsersPanel() {
 
   async function refresh() {
     try {
-      const result = await identityRequest("/api/admin/users");
-      setUsers(result.users || []);
+      const [userResult, accountResult, pricingResult] = await Promise.all([
+        identityRequest("/api/admin/users"),
+        identityRequest("/api/admin/billing/accounts"),
+        identityRequest("/api/admin/billing/pricing")
+      ]);
+      setUsers(userResult.users || []);
+      setAccounts(Object.fromEntries((accountResult.accounts || []).map((account) => [account.user_id, account])));
+      setPricing(pricingResult.pricing || null);
+      setPricingDraft(pricingDraftFrom(pricingResult.pricing));
+      setPricingMutationKey("");
     } catch (requestError) {
       setError(requestError.message);
     }
@@ -209,11 +263,80 @@ export function AdminUsersPanel() {
     }
   }
 
+  async function adjustBalance(user) {
+    const draft = adjustments[user.user_id] || {};
+    const idempotencyKey = draft.idempotencyKey || mutationKey("balance");
+    setAdjustments((current) => ({
+      ...current,
+      [user.user_id]: { ...current[user.user_id], idempotencyKey }
+    }));
+    setBusy(`billing:${user.user_id}`);
+    setError("");
+    setNotice("");
+    try {
+      await identityRequest(`/api/admin/billing/accounts/${encodeURIComponent(user.user_id)}/adjustments`, {
+        method: "POST",
+        body: { amount_credits: draft.amount, reason: draft.reason },
+        idempotencyKey
+      });
+      setAdjustments((current) => ({ ...current, [user.user_id]: { amount: "", reason: "" } }));
+      setNotice(`${user.display_name || user.email}'s balance was adjusted.`);
+      await refresh();
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function savePricing(event) {
+    event.preventDefault();
+    const idempotencyKey = pricingMutationKey || mutationKey("pricing");
+    setPricingMutationKey(idempotencyKey);
+    setBusy("pricing");
+    setError("");
+    setNotice("");
+    try {
+      const result = await identityRequest("/api/admin/billing/pricing", {
+        method: "POST",
+        body: {
+          prompt_credits_per_1k: pricingDraft.prompt,
+          completion_credits_per_1k: pricingDraft.completion,
+          cached_credits_per_1k: pricingDraft.cached,
+          unclassified_credits_per_1k: pricingDraft.completion,
+          minimum_reservation_credits: pricingDraft.minimum,
+          reason: pricingDraft.reason
+        },
+        idempotencyKey
+      });
+      setPricing(result.pricing);
+      setPricingDraft(pricingDraftFrom(result.pricing));
+      setPricingMutationKey("");
+      setNotice("Token pricing was updated. Existing reservations keep their original rate.");
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setBusy("");
+    }
+  }
+
   return (
     <section className="admin-users" aria-labelledby="admin-users-heading">
       <div className="account-card-heading"><div><h4 id="admin-users-heading">Registered users</h4><p>Assign product roles, suspend access, or revoke Clerk sessions. Clerk manages identity verification.</p></div><button className="icon-button compact" type="button" aria-label="Refresh registered users" onClick={refresh}><RefreshCw size={15} /></button></div>
       {error && <div className="identity-message error" role="alert"><AlertCircle size={15} />{error}</div>}
       {notice && <div className="identity-message success" role="status"><Check size={15} />{notice}</div>}
+      {pricingDraft && (
+        <form className="admin-pricing-form" onSubmit={savePricing}>
+          <div><strong>Token pricing</strong><span>Credits per 1,000 provider-reported tokens. New rates apply only to new reservations.</span></div>
+          <label><span>Input</span><input inputMode="decimal" value={pricingDraft.prompt} onChange={(event) => { setPricingDraft({ ...pricingDraft, prompt: event.target.value }); setPricingMutationKey(""); }} required /></label>
+          <label><span>Output</span><input inputMode="decimal" value={pricingDraft.completion} onChange={(event) => { setPricingDraft({ ...pricingDraft, completion: event.target.value }); setPricingMutationKey(""); }} required /></label>
+          <label><span>Cached input</span><input inputMode="decimal" value={pricingDraft.cached} onChange={(event) => { setPricingDraft({ ...pricingDraft, cached: event.target.value }); setPricingMutationKey(""); }} required /></label>
+          <label><span>Minimum reserve</span><input inputMode="decimal" value={pricingDraft.minimum} onChange={(event) => { setPricingDraft({ ...pricingDraft, minimum: event.target.value }); setPricingMutationKey(""); }} required /></label>
+          <label className="pricing-reason"><span>Change reason</span><input value={pricingDraft.reason} maxLength={500} onChange={(event) => { setPricingDraft({ ...pricingDraft, reason: event.target.value }); setPricingMutationKey(""); }} required /></label>
+          <button type="submit" disabled={busy === "pricing"}>{busy === "pricing" ? <LoaderCircle className="spin" size={14} /> : <Check size={14} />}Save pricing</button>
+          {pricing && <small>Current version {pricing.pricing_version_id}</small>}
+        </form>
+      )}
       <div className="admin-user-list">
         {users.map((user) => (
           <div className="admin-user-row" key={user.user_id}>
@@ -222,6 +345,18 @@ export function AdminUsersPanel() {
             <label><span className="sr-only">Role for {user.email}</span><select value={user.role} disabled={busy === user.user_id} onChange={(event) => update(user, { role: event.target.value })}><option value="user">User</option><option value="viewer">Viewer</option><option value="admin">Admin</option></select></label>
             <label><span className="sr-only">Status for {user.email}</span><select value={user.status} disabled={busy === user.user_id} onChange={(event) => update(user, { status: event.target.value })}><option value="active">Active</option><option value="suspended">Suspended</option></select></label>
             <div className="admin-user-actions"><button type="button" onClick={() => revoke(user)} disabled={busy === user.user_id}>Revoke sessions</button></div>
+            <div className="admin-billing-summary">
+              <span>Balance</span>
+              <strong>{formatCredits(accounts[user.user_id]?.balance_credits)}</strong>
+              <small>{formatCredits(accounts[user.user_id]?.reserved_credits)} reserved</small>
+            </div>
+            <div className="admin-balance-adjustment">
+              <label><span className="sr-only">Signed credit adjustment for {user.email}</span><input inputMode="decimal" placeholder="10 or -5" value={adjustments[user.user_id]?.amount || ""} onChange={(event) => setAdjustments((current) => ({ ...current, [user.user_id]: { ...current[user.user_id], amount: event.target.value, idempotencyKey: "" } }))} /></label>
+              <label><span className="sr-only">Adjustment reason for {user.email}</span><input placeholder="Reason" maxLength={500} value={adjustments[user.user_id]?.reason || ""} onChange={(event) => setAdjustments((current) => ({ ...current, [user.user_id]: { ...current[user.user_id], reason: event.target.value, idempotencyKey: "" } }))} /></label>
+              <button type="button" onClick={() => adjustBalance(user)} disabled={busy === `billing:${user.user_id}` || !adjustments[user.user_id]?.amount || !adjustments[user.user_id]?.reason}>
+                {busy === `billing:${user.user_id}` ? <LoaderCircle className="spin" size={13} /> : "Adjust"}
+              </button>
+            </div>
           </div>
         ))}
         {users.length === 0 && <p className="muted-empty">No Clerk users have signed up yet.</p>}
@@ -230,10 +365,13 @@ export function AdminUsersPanel() {
   );
 }
 
-async function identityRequest(path, { method = "GET", body } = {}) {
+async function identityRequest(path, { method = "GET", body, idempotencyKey } = {}) {
+  const headers = {};
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+  if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
   const response = await fetch(path, {
     method,
-    headers: body === undefined ? undefined : { "Content-Type": "application/json" },
+    headers: Object.keys(headers).length ? headers : undefined,
     body: body === undefined ? undefined : JSON.stringify(body)
   });
   const text = await response.text();
@@ -258,6 +396,65 @@ function formatIdentityDate(value) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "recently";
   return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", year: "numeric" }).format(date);
+}
+
+function formatIdentityDateTime(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "Recently";
+  return new Intl.DateTimeFormat(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit"
+  }).format(date);
+}
+
+function formatCredits(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return "—";
+  return `${new Intl.NumberFormat(undefined, { maximumFractionDigits: 6 }).format(numeric)} credits`;
+}
+
+function billingEntryLabel(type) {
+  const labels = {
+    welcome_grant: "Welcome balance",
+    usage_reservation: "Request reserved",
+    usage_settlement: "Token usage",
+    reservation_release: "Unused reserve returned",
+    admin_adjustment: "Admin adjustment",
+    external_funding: "Credits added"
+  };
+  return labels[type] || String(type || "Balance activity").replaceAll("_", " ");
+}
+
+function billingEntryAmount(entry) {
+  const availableDelta = Number(entry?.available_delta_micros || 0);
+  if (entry?.type === "usage_settlement") {
+    const charged = `${formatCredits(entry.debited_credits)} used`;
+    if (availableDelta > 0) return { tone: "debit", text: `${charged} · ${formatCredits(entry.available_delta_credits)} returned` };
+    if (availableDelta < 0) return { tone: "debit", text: `${charged} · ${formatCredits(Math.abs(Number(entry.available_delta_credits)))} over reserve` };
+    return { tone: "debit", text: charged };
+  }
+  return {
+    tone: availableDelta < 0 ? "debit" : "credit",
+    text: `${availableDelta > 0 ? "+" : ""}${formatCredits(entry?.available_delta_credits)}`
+  };
+}
+
+function pricingDraftFrom(pricing) {
+  const rule = pricing?.rules?.[0] || {};
+  return {
+    prompt: rule.prompt_credits_per_1k ?? "0.1",
+    completion: rule.completion_credits_per_1k ?? "0.2",
+    cached: rule.cached_credits_per_1k ?? "0.02",
+    minimum: pricing?.minimum_reservation_credits ?? "0.1",
+    reason: "Administrator pricing update"
+  };
+}
+
+function mutationKey(scope) {
+  const suffix = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return `${scope}-${suffix}`;
 }
 
 function initialsFor(identity) {

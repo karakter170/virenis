@@ -175,6 +175,7 @@ describe("Clerk identity integration", () => {
     await startApp();
     const headers = asUser("user_delete0001");
     await request(app).get("/api/auth/me").set(headers).expect(200);
+    await request(app).get("/api/billing/account").set(headers).expect(200);
     await request(app).post("/api/chat/sessions").set(headers).send({ title: "Exported chat" }).expect(201);
     await request(app).post("/api/agents").set(headers).send({
       id: "delete_me_agent",
@@ -191,6 +192,11 @@ describe("Clerk identity integration", () => {
     expect(exported.headers["content-disposition"]).toContain("virenis-account-export");
     expect(exported.body.authentication).toMatchObject({ provider: "clerk", provider_user_id: "user_delete0001" });
     expect(exported.body.chats.sessions[0].title).toBe("Exported chat");
+    expect(exported.body.billing.accounts[0]).toMatchObject({
+      user_id: "user_delete0001",
+      available_micros: 1_000_000_000
+    });
+    expect(exported.body.billing.ledger_entries.map((entry) => entry.type)).toContain("welcome_grant");
     expect(JSON.stringify(exported.body)).not.toMatch(/password|token_hash|credential|ciphertext/);
 
     await request(app).delete("/api/account").set(headers).send({ confirmation: "delete" }).expect(400);
@@ -200,8 +206,35 @@ describe("Clerk identity integration", () => {
     const persisted = app.locals.store.read();
     expect(persisted.users).toEqual([]);
     expect(persisted.sessions).toEqual([]);
+    expect(persisted.billingAccounts).toEqual([]);
+    expect(persisted.billingLedgerEntries).toEqual([]);
     expect(persisted.agents.some((agent) => agent.id === "delete_me_agent")).toBe(false);
     await request(app).get("/api/auth/me").set(headers).expect(401);
+  });
+
+  it("refuses account deletion while a metered request has an active reservation", async () => {
+    fake.addUser({ id: "user_busydelete1", email: "busy-delete@example.com", name: "Busy Delete" });
+    await startApp();
+    const headers = asUser("user_busydelete1");
+    await request(app).get("/api/auth/me").set(headers).expect(200);
+    await request(app).get("/api/billing/account").set(headers).expect(200);
+    const session = await request(app).post("/api/chat/sessions").set(headers).send({ title: "Active request" }).expect(201);
+    await request(app)
+      .post(`/api/chat/sessions/${session.body.session_id}/messages`)
+      .set(headers)
+      .send({ content: "Keep this request queued during deletion." })
+      .expect(202);
+
+    const rejected = await request(app)
+      .delete("/api/account")
+      .set(headers)
+      .send({ confirmation: "DELETE" })
+      .expect(409);
+    expect(rejected.body.error).toBe("account_has_active_runs");
+    expect(fake.users.has("user_busydelete1")).toBe(true);
+    const snapshot = app.locals.store.read();
+    expect(snapshot.billingReservations[0].status).toBe("active");
+    expect(snapshot.billingAccounts[0].status).toBe("active");
   });
 
   it("keeps product roles local while Clerk handles suspension and session revocation", async () => {

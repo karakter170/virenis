@@ -12,6 +12,7 @@ import {
   PublishDialog,
   RatingDialog,
   ToolApprovalCheckpoint,
+  UsageReceipt,
   WorkflowDraftCard,
   agentPayloadFromForm,
   availableSessionAgents,
@@ -101,6 +102,67 @@ describe("Agent Studio product surfaces", () => {
     expect(markup).not.toContain("window.__unsafe");
     expect(markup).not.toContain("javascript:");
     expect(markup).not.toContain("tracker.png");
+  });
+
+  it("shows transparent Router, per-agent, and final-answer token usage", () => {
+    const markup = renderToStaticMarkup(createElement(UsageReceipt, {
+      agents: [
+        { id: "research_agent", title: "Research Agent" },
+        { id: "writer_agent", title: "Writer Agent" }
+      ],
+      receipt: {
+        provider_reported: true,
+        complete: true,
+        prompt_tokens: 1800,
+        completion_tokens: 700,
+        total_tokens: 2500,
+        charged_credits: "0.32",
+        balance_after_credits: "99.68",
+        components: [
+          { component_key: "router", component: "session_controller_planning", kind: "router", prompt_tokens: 400, completion_tokens: 100, total_tokens: 500, charged_credits: "0.06" },
+          { component_key: "research", component: "agent:research_agent:call_1", kind: "agent", agent_id: "research_agent", prompt_tokens: 500, completion_tokens: 200, total_tokens: 700, charged_credits: "0.09" },
+          { component_key: "writer", component: "agent:writer_agent:call_1", kind: "agent", agent_id: "writer_agent", prompt_tokens: 500, completion_tokens: 200, total_tokens: 700, charged_credits: "0.09" },
+          { component_key: "final", component: "final_synthesis", kind: "final_output", prompt_tokens: 400, completion_tokens: 200, total_tokens: 600, charged_credits: "0.08" }
+        ]
+      }
+    }));
+    expect(markup).toContain("2,500 tokens");
+    expect(markup).toContain("Router");
+    expect(markup).toContain("Research Agent");
+    expect(markup).toContain("Writer Agent");
+    expect(markup).toContain("Final answer");
+    expect(markup).toContain("0.32 credits");
+    expect(markup).toContain("99.68 credits remaining");
+  });
+
+  it("lists agent and final outputs explicitly when provider usage is missing", () => {
+    const markup = renderToStaticMarkup(createElement(UsageReceipt, {
+      agents: [{ id: "writer_agent", title: "Writer Agent" }],
+      expertOutputs: [{ id: "step_writer", adapter: "writer_agent", token_usage: { reported: false } }],
+      includeFinalOutput: true,
+      receipt: {
+        provider_reported: true,
+        complete: false,
+        prompt_tokens: 100,
+        completion_tokens: 20,
+        total_tokens: 120,
+        charged_credits: "0.014",
+        balance_after_credits: "99.986",
+        components: [{
+          component_key: "router",
+          component: "session_controller_planning",
+          kind: "router",
+          prompt_tokens: 100,
+          completion_tokens: 20,
+          total_tokens: 120,
+          charged_credits: "0.014"
+        }]
+      }
+    }));
+    expect(markup).toContain("Writer Agent");
+    expect(markup).toContain("Final answer");
+    expect(markup.match(/Not reported/g)).toHaveLength(2);
+    expect(markup).toContain("Provider token usage was not reported for this output");
   });
 
   it("shows a reviewable workflow graph with agent provenance and connection consent", () => {

@@ -4,6 +4,7 @@ import pg from "pg";
 import { setTimeout as delay } from "node:timers/promises";
 import { clearTimeout, setTimeout } from "node:timers";
 import { seedAgents } from "../server/catalog.js";
+import { ensureBillingAccount } from "../server/billing.js";
 import { PostgresStore } from "../server/store.js";
 
 const { Pool } = pg;
@@ -130,6 +131,8 @@ async function closeStore(store) {
 try {
   const ledger = await pool.query("SELECT to_regclass('tcar_ledger.execution_runs') AS relation");
   assert(ledger.rows[0]?.relation, "normalized ledger schema is required for the Postgres store smoke test");
+  const billingSchema = await pool.query("SELECT to_regclass('tcar_billing.ledger_entries') AS relation");
+  assert(billingSchema.rows[0]?.relation, "normalized billing schema is required for the Postgres store smoke test");
   progress("schema ready");
 
   const first = createStore(storeKey);
@@ -165,6 +168,7 @@ try {
     return session;
   });
   assert(second.read().sessions.find((session) => session.session_id === sessionId).title === "Postgres smoke updated", "mutation result was not visible after update");
+  await second.saveNow();
   await closeStore(second);
   progress("basic persistence verified");
 
@@ -402,6 +406,69 @@ try {
   await closeStore(existingFailure);
   progress("existing-store rollback verified");
 
+  const billingFailureStoreKey = `${storeKey}_billing_sync_failure`;
+  const billingFailure = createStore(billingFailureStoreKey);
+  await billingFailure.init();
+  const billingFailureMessage = `injected billing ledger failure ${storeKey}`;
+  let billingSyncAttempted = false;
+  interceptClientQueries(billingFailure, async ({ sql, run }) => {
+    if (/insert\s+into\s+tcar_billing\.accounts/i.test(sql)) {
+      billingSyncAttempted = true;
+      throw new Error(billingFailureMessage);
+    }
+    return run();
+  });
+  let billingFailureError;
+  try {
+    await billingFailure.mutate((data) => ensureBillingAccount(data, {
+      user_id: "postgres_billing_smoke",
+      workspace_id: "workspace_pg_billing"
+    }));
+  } catch (error) {
+    billingFailureError = error;
+  }
+  assert(billingSyncAttempted, "billing mutation skipped normalized billing synchronization");
+  assert(billingFailureError?.message === billingFailureMessage, "normalized billing failure did not reject the mutation");
+  const failedBillingRow = await pool.query(
+    `SELECT data FROM ${tableName} WHERE store_key = $1`,
+    [billingFailureStoreKey]
+  );
+  assert(failedBillingRow.rows[0].data.billingAccounts.length === 0, "canonical billing state committed despite normalized billing failure");
+  await closeStore(billingFailure);
+  progress("billing rollback verified");
+
+  const billingSaveFailureStoreKey = `${storeKey}_billing_save_sync_failure`;
+  const billingSaveFailure = createStore(billingSaveFailureStoreKey);
+  await billingSaveFailure.init();
+  ensureBillingAccount(billingSaveFailure.data, {
+    user_id: "postgres_billing_save_smoke",
+    workspace_id: "workspace_pg_billing_save"
+  });
+  const billingSaveFailureMessage = `injected billing save failure ${storeKey}`;
+  let billingSaveSyncAttempted = false;
+  interceptClientQueries(billingSaveFailure, async ({ sql, run }) => {
+    if (/insert\s+into\s+tcar_billing\.accounts/i.test(sql)) {
+      billingSaveSyncAttempted = true;
+      throw new Error(billingSaveFailureMessage);
+    }
+    return run();
+  });
+  let billingSaveFailureError;
+  try {
+    await billingSaveFailure.saveNow();
+  } catch (error) {
+    billingSaveFailureError = error;
+  }
+  assert(billingSaveSyncAttempted, "direct save skipped normalized billing synchronization");
+  assert(billingSaveFailureError?.message === billingSaveFailureMessage, "normalized billing failure did not reject direct save");
+  const failedBillingSaveRow = await pool.query(
+    `SELECT data FROM ${tableName} WHERE store_key = $1`,
+    [billingSaveFailureStoreKey]
+  );
+  assert(failedBillingSaveRow.rows[0].data.billingAccounts.length === 0, "canonical billing state committed despite direct-save projection failure");
+  await closeStore(billingSaveFailure);
+  progress("billing direct-save rollback verified");
+
   const roleFlags = await pool.query(
     "SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname=current_user"
   );
@@ -431,6 +498,8 @@ try {
     startup_write_serialized: true,
     new_store_sync_rollback: true,
     existing_store_sync_rollback: true,
+    billing_sync_rollback: true,
+    billing_direct_save_sync_rollback: true,
     production_privileged_role_rejected: productionPrivilegedRoleRejected
   }, null, 2));
 } finally {

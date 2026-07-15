@@ -118,6 +118,8 @@ async function request(path, options) {
   if (!response.ok) {
     const error = new Error(payload.message || "The request could not be completed.");
     error.status = response.status;
+    error.code = payload.error;
+    error.details = payload.details;
     if (response.status === 401 && typeof window !== "undefined") {
       window.dispatchEvent(new Event("virenis:authentication-required"));
     }
@@ -242,6 +244,18 @@ function formatDate(value, { includeTime = false } = {}) {
   return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" }).format(date);
 }
 
+function formatCreditDisplay(value) {
+  if (value === undefined || value === null || value === "") return "—";
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return String(value);
+  return `${new Intl.NumberFormat(undefined, { maximumFractionDigits: 6 }).format(numeric)} credits`;
+}
+
+function formatTokenCount(value) {
+  const numeric = Number(value || 0);
+  return new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 }).format(Number.isFinite(numeric) ? numeric : 0);
+}
+
 function initialsFor(auth) {
   return String(auth?.display_name || auth?.user_id || "User")
     .split(/[^a-z0-9]+/i)
@@ -360,6 +374,7 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
   const [mcpTemplates, setMcpTemplates] = useState([]);
   const [mcpApprovals, setMcpApprovals] = useState([]);
   const [auth, setAuth] = useState(null);
+  const [billing, setBilling] = useState(null);
   const [runsById, setRunsById] = useState({});
   const [contractsById, setContractsById] = useState({});
   const [activeRun, setActiveRun] = useState(null);
@@ -477,7 +492,8 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
         api.get("/api/marketplace"),
         api.get("/api/mcp/connections"),
         api.get("/api/mcp/templates"),
-        api.get("/api/mcp/approvals")
+        api.get("/api/mcp/approvals"),
+        api.get("/api/billing/account")
       ]);
       const required = (index) => {
         if (results[index].status === "rejected") throw results[index].reason;
@@ -495,7 +511,8 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
       const connectionList = optional(6, { connections: [] });
       const templateList = optional(7, { templates: [] });
       const approvalList = optional(8, { approvals: [] });
-      let optionalLoadFailed = results.slice(2).some((result) => result.status === "rejected");
+      const billingData = required(9);
+      let optionalLoadFailed = results.slice(2, 9).some((result) => result.status === "rejected");
       let metricData = emptyMetrics();
       if (me.is_admin) {
         try {
@@ -512,6 +529,7 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
       setMcpConnections(connectionList.connections || []);
       setMcpTemplates(templateList.templates || []);
       setMcpApprovals(approvalList.approvals || []);
+      setBilling(billingData);
       setMetrics(metricData);
       const oauthSessionId = oauthReturnRef.current.sessionId;
       let nextSession = oauthSessionId
@@ -549,7 +567,8 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
       api.get("/api/marketplace"),
       api.get("/api/mcp/connections"),
       api.get("/api/mcp/templates"),
-      api.get("/api/mcp/approvals")
+      api.get("/api/mcp/approvals"),
+      api.get("/api/billing/account")
     ]);
     const required = (index) => {
       if (results[index].status === "rejected") throw results[index].reason;
@@ -565,7 +584,8 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
     const connectionList = fulfilled(6);
     const templateList = fulfilled(7);
     const approvalList = fulfilled(8);
-    let optionalLoadFailed = results.slice(2).some((result) => result.status === "rejected");
+    const billingData = required(9);
+    let optionalLoadFailed = results.slice(2, 9).some((result) => result.status === "rejected");
     let metricData = me.is_admin ? null : emptyMetrics();
     if (me.is_admin) {
       try {
@@ -583,6 +603,7 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
     if (connectionList) setMcpConnections(connectionList.connections || []);
     if (templateList) setMcpTemplates(templateList.templates || []);
     if (approvalList) setMcpApprovals(approvalList.approvals || []);
+    setBilling(billingData);
     if (metricData) setMetrics(metricData);
     if (optionalLoadFailed) {
       setError("Some Studio resources could not be refreshed. Your current chat data was preserved.");
@@ -603,6 +624,7 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
       connections: ["/api/mcp/connections", (payload) => setMcpConnections(payload.connections || [])],
       templates: ["/api/mcp/templates", (payload) => setMcpTemplates(payload.templates || [])],
       approvals: ["/api/mcp/approvals", (payload) => setMcpApprovals(payload.approvals || [])],
+      billing: ["/api/billing/account", setBilling],
       metrics: ["/api/admin/metrics", setMetrics]
     };
     const selected = requested
@@ -622,6 +644,7 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
     if (!runId) return null;
     const run = await api.get(`/api/chat/runs/${encodeURIComponent(runId)}`);
     setRunsById((current) => ({ ...current, [runId]: run }));
+    applyRunBilling(run.billing);
     if (makeActive) setActiveRun(run);
     if (hydrateContracts) {
       await Promise.allSettled(
@@ -629,6 +652,38 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
       );
     }
     return run;
+  }
+
+  function applyRunBilling(runBilling) {
+    const incomingRevision = Number(runBilling?.account_revision);
+    if (!Number.isSafeInteger(incomingRevision)) return;
+    setBilling((current) => {
+      const currentRevision = Number(current?.account?.revision || 0);
+      if (current?.account && incomingRevision < currentRevision) return current;
+      return {
+        ...current,
+        account: {
+          ...(current?.account || {}),
+          revision: incomingRevision,
+          balance_micros: runBilling.balance_after_micros,
+          balance_credits: runBilling.balance_after_credits,
+          reserved_micros: runBilling.reserved_after_micros,
+          reserved_credits: runBilling.reserved_after_credits,
+          updated_at: new Date().toISOString()
+        }
+      };
+    });
+  }
+
+  async function refreshBilling() {
+    try {
+      const payload = await api.get("/api/billing/account");
+      setBilling(payload);
+      return payload;
+    } catch (billingError) {
+      setError(friendlyError(billingError));
+      return null;
+    }
   }
 
   async function fetchContract(contractId) {
@@ -645,6 +700,7 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
     ]);
     setSession(payload);
     setMessages(payload.messages || []);
+    for (const message of payload.messages || []) applyRunBilling(message.billing);
     setWorkflows(payload.workflows || []);
     setCheckpoints(payload.checkpoints || []);
     setChatDocuments(payload.chat_documents || []);
@@ -1105,6 +1161,21 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
           <button className="wordmark" type="button" onClick={onHome} aria-label="Go to Virenis homepage">Virenis</button>
         </div>
         <div className="header-side header-actions">
+          <button
+            className="balance-pill"
+            type="button"
+            onClick={() => {
+              setResourceView("account");
+              setResourcesOpen(true);
+              void refreshBilling();
+            }}
+            title={billing?.account?.reserved_micros > 0
+              ? `${billing.account.reserved_credits} credits are reserved for active requests`
+              : "Open balance details"}
+          >
+            <span>Balance</span>
+            <strong>{formatCreditDisplay(billing?.account?.balance_credits)}</strong>
+          </button>
           <IconButton label="New chat" onClick={newChat} disabled={!canWrite}>
             <SquarePen size={19} />
           </IconButton>
@@ -1246,6 +1317,7 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
       {resourcesOpen && (
         <ResourcesSheet
           auth={auth}
+          billing={billing}
           agents={agents}
           documents={documents}
           runtime={runtime}
@@ -1297,6 +1369,7 @@ function Workspace({ onHome, onAuthenticationRequired, onSignedOut }) {
           onConnectAgents={(fromId, toId) => setGraphConnection(fromId, toId, true)}
           onDisconnectAgents={(fromId, toId) => setGraphConnection(fromId, toId, false)}
           onRefresh={refreshResources}
+          onRefreshBilling={refreshBilling}
           onRefreshConnections={() => refreshStudioResources(["connections", "templates", "approvals", "agents"])}
           onSignedOut={onSignedOut}
           onConnectionChanged={async () => {
@@ -1764,30 +1837,38 @@ function ChatMessage({
         )}
       </div>
       {isAssistant && (
-        <div className="answer-footer">
-          {message.run_id && (
-            <RunReceipt run={run} agents={agents} onClick={() => onDetails(message.run_id)} />
-          )}
-          <div className="answer-actions" aria-label="Answer actions">
-            <IconButton label="Copy answer" compact onClick={() => onCopy(message.content)}>
-              <Copy size={16} />
-            </IconButton>
-            <IconButton
-              label="Try this prompt again"
-              compact
-              onClick={() => onRetry(run || { query: previousUser?.content || "" })}
-              disabled={!canWrite}
-            >
-              <RotateCcw size={16} />
-            </IconButton>
-            <IconButton
-              label="Report a problem"
-              compact
-              onClick={() => onFeedback(message.run_id)}
-              disabled={!canWrite || !message.run_id}
-            >
-              <Flag size={16} />
-            </IconButton>
+        <div className="answer-meta">
+          <UsageReceipt
+            receipt={run?.usage_receipt || message.usage_receipt}
+            agents={agents}
+            expertOutputs={run?.expert_outputs || []}
+            includeFinalOutput
+          />
+          <div className="answer-footer">
+            {message.run_id && (
+              <RunReceipt run={run} agents={agents} onClick={() => onDetails(message.run_id)} />
+            )}
+            <div className="answer-actions" aria-label="Answer actions">
+              <IconButton label="Copy answer" compact onClick={() => onCopy(message.content)}>
+                <Copy size={16} />
+              </IconButton>
+              <IconButton
+                label="Try this prompt again"
+                compact
+                onClick={() => onRetry(run || { query: previousUser?.content || "" })}
+                disabled={!canWrite}
+              >
+                <RotateCcw size={16} />
+              </IconButton>
+              <IconButton
+                label="Report a problem"
+                compact
+                onClick={() => onFeedback(message.run_id)}
+                disabled={!canWrite || !message.run_id}
+              >
+                <Flag size={16} />
+              </IconButton>
+            </div>
           </div>
         </div>
       )}
@@ -2088,6 +2169,93 @@ function RunReceipt({ run, onClick }) {
   );
 }
 
+export function UsageReceipt({ receipt, agents = [], expertOutputs = [], includeFinalOutput = false }) {
+  if (!receipt) return null;
+  const components = Array.isArray(receipt.components) ? [...receipt.components] : [];
+  for (const output of expertOutputs) {
+    if (!output?.adapter) continue;
+    const outputStepId = output.id || output.step_id || null;
+    const outputAccounted = components.some((component) => (
+      component.kind === "agent"
+      && component.agent_id === output.adapter
+      && (!outputStepId || !component.step_id || component.step_id === outputStepId)
+    ));
+    if (outputAccounted) continue;
+    const usage = output.token_usage || {};
+    components.push({
+      component_key: `unreported-agent:${output.adapter}:${outputStepId || components.length}`,
+      component: `agent:${output.adapter}:unreported`,
+      kind: "agent",
+      agent_id: output.adapter,
+      step_id: outputStepId,
+      prompt_tokens: usage.prompt_tokens || 0,
+      completion_tokens: usage.completion_tokens || 0,
+      total_tokens: usage.total_tokens || 0,
+      charged_credits: usage.charged_credits || "0",
+      reported: usage.reported === true
+    });
+  }
+  const finalOutputAccounted = components.some((component) => (
+    component.kind === "final_output"
+    || component.component === "workflow_composition"
+    || component.component === "conversation_continuation"
+  ));
+  if (includeFinalOutput && !finalOutputAccounted) {
+    components.push({
+      component_key: "unreported-final-output",
+      component: "final_synthesis",
+      kind: "final_output",
+      prompt_tokens: 0,
+      completion_tokens: 0,
+      total_tokens: 0,
+      charged_credits: "0",
+      reported: false
+    });
+  }
+  const usageReported = receipt.provider_reported === true || components.length > 0;
+  return (
+    <section className="usage-receipt" aria-label="Token usage and credit charge">
+      <div className="usage-summary">
+        <span>
+          <strong>{formatTokenCount(receipt.total_tokens)} tokens</strong>
+          <small>{usageReported ? `${formatTokenCount(receipt.prompt_tokens)} input · ${formatTokenCount(receipt.completion_tokens)} output` : "Provider token usage was not reported"}</small>
+        </span>
+        <span>
+          <strong>{formatCreditDisplay(receipt.charged_credits)}</strong>
+          <small>{receipt.balance_after_credits == null ? "No balance change" : `${formatCreditDisplay(receipt.balance_after_credits)} remaining`}</small>
+        </span>
+      </div>
+      {components.length > 0 && (
+        <div className="usage-components" role="list" aria-label="Usage by router, agent, and final output">
+          {components.map((component, index) => (
+            <div className={`usage-component ${component.kind || "other"}`} role="listitem" key={component.component_key || `${component.component}-${index}`}>
+              <span className="usage-kind-dot" aria-hidden="true" />
+              <span>
+                <strong>{usageComponentLabel(component, agents)}</strong>
+                <small>{component.reported === false
+                  ? "Provider token usage was not reported for this output"
+                  : `${formatTokenCount(component.prompt_tokens)} input · ${formatTokenCount(component.completion_tokens)} output · ${formatCreditDisplay(component.charged_credits)}`}</small>
+              </span>
+              <em>{component.reported === false ? "Not reported" : `${formatTokenCount(component.total_tokens)} tokens`}</em>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function usageComponentLabel(component, agents) {
+  if (component.kind === "agent") return formatAgentName(component.agent_id, agents);
+  if (component.kind === "router") return "Router";
+  if (component.kind === "final_output") {
+    return component.component === "conversation_continuation" ? "Conversation response" : "Final answer";
+  }
+  return String(component.component || "Model call")
+    .replaceAll("_", " ")
+    .replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
 function RunProgress({ run }) {
   return (
     <div className="run-progress" role="status" aria-live="polite" aria-atomic="true">
@@ -2352,6 +2520,7 @@ function Composer({
 
 function ResourcesSheet({
   auth,
+  billing,
   agents,
   documents,
   runtime,
@@ -2381,6 +2550,7 @@ function ResourcesSheet({
   onConnectAgents,
   onDisconnectAgents,
   onRefresh,
+  onRefreshBilling,
   onRefreshConnections,
   onSignedOut,
   onConnectionChanged
@@ -2390,6 +2560,7 @@ function ResourcesSheet({
   function changeView(next) {
     setView(next);
     onViewChange(next);
+    if (next === "account") void onRefreshBilling?.();
   }
   return (
     <ModalSurface title="Agent studio" description="Build, connect, and share specialized intelligence." side="right" onClose={onClose} className="resource-hub-sheet">
@@ -2464,7 +2635,7 @@ function ResourcesSheet({
         )}
 
         {view === "account" && (
-          <AccountPanel auth={auth} onSignedOut={onSignedOut} />
+          <AccountPanel auth={auth} billing={billing} onRefreshBilling={onRefreshBilling} onSignedOut={onSignedOut} />
         )}
 
         {view === "admin" && auth?.is_admin && (
@@ -3681,6 +3852,14 @@ function RunDetailsSheet({
                           ) : route.allowed_tools?.length > 0 && (
                             <p><strong>Tools available</strong>{route.allowed_tools.map(workflowToolLabel).join(", ")}</p>
                           )}
+                          {route.token_usage && (
+                            <p>
+                              <strong>Token usage</strong>
+                              {route.token_usage.reported
+                                ? `${formatTokenCount(route.token_usage.total_tokens)} total (${formatTokenCount(route.token_usage.prompt_tokens)} input · ${formatTokenCount(route.token_usage.completion_tokens)} output) · ${formatCreditDisplay(route.token_usage.charged_credits)}`
+                                : "Provider token usage was not reported for this contribution."}
+                            </p>
+                          )}
                           {route.consumption_validation?.valid === false && (
                             <p><strong>Missing context</strong>{(route.consumption_validation.missing_from_upstream || []).map((value) => contractFieldLabel(value, agents)).join(", ") || "A required verified handoff was unavailable."}</p>
                           )}
@@ -3819,14 +3998,17 @@ function RunDetailsSheet({
                     </dl>
                   </details>
                 )}
-                {run.token_accounting?.provider_reported === true && (
+                {run.usage_receipt && (
                   <details className="provenance-details">
                     <summary>Model usage</summary>
                     <dl>
-                      <div><dt>Calls</dt><dd>{run.token_accounting.call_count}</dd></div>
-                      <div><dt>Input tokens</dt><dd>{run.token_accounting.totals?.prompt_tokens || 0}</dd></div>
-                      <div><dt>Output tokens</dt><dd>{run.token_accounting.totals?.completion_tokens || 0}</dd></div>
-                      <div><dt>Accounting</dt><dd>{run.token_accounting.complete ? "Complete" : "Partial"}</dd></div>
+                      <div><dt>Calls</dt><dd>{run.usage_receipt.call_count}</dd></div>
+                      <div><dt>Input tokens</dt><dd>{formatTokenCount(run.usage_receipt.prompt_tokens)}</dd></div>
+                      <div><dt>Output tokens</dt><dd>{formatTokenCount(run.usage_receipt.completion_tokens)}</dd></div>
+                      <div><dt>Total tokens</dt><dd>{formatTokenCount(run.usage_receipt.total_tokens)}</dd></div>
+                      <div><dt>Credits charged</dt><dd>{formatCreditDisplay(run.usage_receipt.charged_credits)}</dd></div>
+                      <div><dt>Balance after</dt><dd>{formatCreditDisplay(run.usage_receipt.balance_after_credits)}</dd></div>
+                      <div><dt>Accounting</dt><dd>{run.usage_receipt.complete ? "Complete" : run.usage_receipt.provider_reported ? "Partial" : "Not reported"}</dd></div>
                     </dl>
                   </details>
                 )}
