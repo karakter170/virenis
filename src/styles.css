@@ -2228,8 +2228,12 @@ summary:focus-visible,
 .marketplace-copy-target select { max-width: 150px; min-height: 31px; border: 1px solid var(--line); border-radius: 7px; padding: 0 7px; color: var(--text); background: #fff; font-size: 8px; }
 .workspace-marketplace-detail { overflow-y: auto; padding: 26px clamp(20px, 4vw, 42px) 0; }
 .workspace-marketplace-agents { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 18px; }
-.workspace-marketplace-agents article { min-width: 0; display: grid; grid-template-columns: 28px minmax(0, 1fr); gap: 9px; border: 1px solid var(--line); border-radius: 10px; padding: 12px; background: #fff; }
-.workspace-marketplace-agents article > span { width: 28px; height: 28px; display: grid; place-items: center; border-radius: 50%; color: var(--accent); background: var(--accent-soft); font-size: 9px; font-weight: 750; }
+.workspace-marketplace-agent-card { min-width: 0; display: grid; grid-template-columns: 28px minmax(0, 1fr) auto; align-items: center; gap: 9px; border: 1px solid var(--line); border-radius: 10px; padding: 12px; color: inherit; background: #fff; text-align: left; transition: border-color 140ms ease, box-shadow 140ms ease, transform 140ms ease; }
+.workspace-marketplace-agent-card:hover { border-color: #b9cbc1; box-shadow: 0 7px 18px rgba(31, 51, 40, 0.07); transform: translateY(-1px); }
+.workspace-marketplace-agent-card:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.workspace-marketplace-agent-card > span { width: 28px; height: 28px; display: grid; place-items: center; border-radius: 50%; color: var(--accent); background: var(--accent-soft); font-size: 9px; font-weight: 750; }
+.workspace-marketplace-agent-card > svg { color: var(--text-faint); }
+.workspace-marketplace-agent-card:hover > svg { color: var(--accent); }
 .workspace-marketplace-agents strong,
 .workspace-marketplace-agents p,
 .workspace-marketplace-agents small { display: block; margin: 0; }
@@ -2242,6 +2246,8 @@ summary:focus-visible,
 .workspace-marketplace-handoffs b { color: var(--text); font-weight: 650; }
 .workspace-marketplace-detail > .marketplace-sharing-boundary { margin-bottom: 22px; }
 .workspace-marketplace-detail > .marketplace-detail-actions { margin: auto calc(clamp(20px, 4vw, 42px) * -1) 0; }
+.workspace-agent-detail-back { width: fit-content; display: inline-flex; align-items: center; gap: 5px; margin-bottom: 18px; border: 0; padding: 0; color: var(--accent); background: transparent; font-size: 9px; font-weight: 700; }
+.workspace-agent-detail-back:hover { color: var(--text); }
 
 .builder-field label small { color: var(--text-faint); font-size: 9px; font-weight: 450; }
 
@@ -4667,6 +4673,28 @@ summary:focus-visible,
   min-height: 94px;
   resize: vertical;
   line-height: 1.5;
+}
+
+/* Generic dialog fields are full-width. Workspace membership choices are
+   compact native controls and must not inherit those field dimensions. */
+.dialog-form .workspace-member-list > label {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr) auto;
+  flex-direction: initial;
+  align-items: center;
+  gap: 9px;
+}
+
+.dialog-form .workspace-member-list input[type="checkbox"] {
+  width: 16px;
+  min-width: 16px;
+  height: 16px;
+  min-height: 16px;
+  margin: 0;
+  border: 0;
+  border-radius: 4px;
+  padding: 0;
+  accent-color: var(--accent);
 }
 
 .dialog-form input:focus,

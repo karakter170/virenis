@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 
@@ -10,6 +11,7 @@ import {
   FormattedText,
   ProgressiveFormattedText,
   MarketplaceAgentDialog,
+  MarketplaceWorkspaceAgentDetails,
   MarketplacePanel,
   PublishDialog,
   RatingDialog,
@@ -19,6 +21,7 @@ import {
   UsageReceipt,
   WorkflowDraftCard,
   agentPayloadFromForm,
+  agentsForWorkspace,
   availableSessionAgents,
   graphConnectionInputs,
   graphConnectionWouldCycle,
@@ -506,6 +509,25 @@ describe("Agent Studio product surfaces", () => {
     expect(available.filter((agent) => agent.session_active !== false)).toHaveLength(10);
   });
 
+  it("scopes the composer agent picker and mentions to the currently selected workspace", () => {
+    const agents = [
+      { id: "first_writer", enabled: true },
+      { id: "first_reviewer", enabled: true },
+      { id: "second_researcher", enabled: true }
+    ];
+    const firstWorkspace = { agent_workspace_id: "team_first", agent_ids: ["first_writer", "first_reviewer"] };
+    const secondWorkspace = { agent_workspace_id: "team_second", agent_ids: ["second_researcher"] };
+
+    expect(availableSessionAgents(agentsForWorkspace(agents, firstWorkspace)).map((agent) => agent.id)).toEqual([
+      "first_writer",
+      "first_reviewer"
+    ]);
+    expect(availableSessionAgents(agentsForWorkspace(agents, secondWorkspace)).map((agent) => agent.id)).toEqual([
+      "second_researcher"
+    ]);
+    expect(agentsForWorkspace(agents, null)).toEqual([]);
+  });
+
   it("builds directed handoff/knowledge edges and bounded large-graph positions", () => {
     const agents = [
       { id: "source_agent", resources: [], consumes: [] },
@@ -705,5 +727,60 @@ describe("Agent Studio product surfaces", () => {
     expect(catalogMarkup).toContain("Edit description");
     expect(catalogMarkup).toContain("Unpublish");
     expect(catalogMarkup).toContain("Permanently delete Archived agent");
+  });
+
+  it("opens published workspace agents with the same contract details as Marketplace agents", () => {
+    const entry = {
+      source_agent_id: "workspace_writer",
+      agent: {
+        title: "Workspace writer",
+        capability: "Writes a structured first draft.",
+        boundary: "Use the supplied brief and identify missing context.",
+        tools: ["web_search"],
+        connector_requirements: [{ connection_name: "Google Drive", tools: [{ name: "drive_read", title: "Read files" }] }],
+        consumes: ["user_request"],
+        produces: ["first_draft"],
+        routing_cues: ["write a draft"],
+        exclusions: { private_knowledge: true }
+      }
+    };
+    const cardMarkup = renderToStaticMarkup(createElement(MarketplaceAgentDialog, {
+      item: {
+        id: "workspace_editorial",
+        item_type: "workspace",
+        title: "Editorial team",
+        description: "A coordinated writing team.",
+        publisher_display_name: "Alice",
+        workspace: { agents: [entry], edges: [] }
+      },
+      auth: { user_id: "bob", workspace_id: "workspace_b" },
+      onClose: () => undefined,
+      onRate: () => undefined,
+      onCopied: () => undefined
+    }));
+    expect(cardMarkup).toContain("workspace-marketplace-agent-card");
+    expect(cardMarkup).toContain("View details for Workspace writer");
+
+    const detailMarkup = renderToStaticMarkup(createElement(MarketplaceWorkspaceAgentDetails, {
+      entry,
+      workspaceTitle: "Editorial team",
+      publisher: "Alice"
+    }));
+    expect(detailMarkup).toContain("Purpose and instructions");
+    expect(detailMarkup).toContain("Use the supplied brief and identify missing context.");
+    expect(detailMarkup).toContain("web search");
+    expect(detailMarkup).toContain("Google Drive · Read files");
+    expect(detailMarkup).toContain("first draft");
+    expect(detailMarkup).toContain("Back to workspace");
+    expect(detailMarkup).toContain("Published by Alice");
+  });
+
+  it("keeps workspace membership checkboxes compact inside generic dialogs", () => {
+    const styles = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
+    const compactControl = styles.match(/\.dialog-form \.workspace-member-list input\[type="checkbox"\]\s*\{([\s\S]*?)\}/)?.[1] || "";
+    expect(compactControl).toContain("width: 16px");
+    expect(compactControl).toContain("height: 16px");
+    expect(compactControl).toContain("min-height: 16px");
+    expect(compactControl).toContain("padding: 0");
   });
 });

@@ -200,6 +200,13 @@ describe("agent workspaces", () => {
     await createAgent({ id: "second_team_specialist", workspaceId: second.agent_workspace_id });
     const session = await createSession(first.agent_workspace_id);
 
+    const firstPicker = await request(app)
+      .get(`/api/agents?session_id=${session.session_id}`)
+      .set("Authorization", as("alice"))
+      .expect(200);
+    expect(firstPicker.body.agents.find((agent) => agent.id === "first_team_specialist").agent_workspace_member).toBe(true);
+    expect(firstPicker.body.agents.find((agent) => agent.id === "second_team_specialist").agent_workspace_member).toBe(false);
+
     const firstRun = await request(app)
       .post(`/api/chat/sessions/${session.session_id}/messages`)
       .set("Authorization", as("alice"))
@@ -214,6 +221,12 @@ describe("agent workspaces", () => {
       .set("Authorization", as("alice"))
       .send({ agent_workspace_id: second.agent_workspace_id })
       .expect(200);
+    const secondPicker = await request(app)
+      .get(`/api/agents?session_id=${session.session_id}`)
+      .set("Authorization", as("alice"))
+      .expect(200);
+    expect(secondPicker.body.agents.find((agent) => agent.id === "first_team_specialist").agent_workspace_member).toBe(false);
+    expect(secondPicker.body.agents.find((agent) => agent.id === "second_team_specialist").agent_workspace_member).toBe(true);
     const secondRun = await request(app)
       .post(`/api/chat/sessions/${session.session_id}/messages`)
       .set("Authorization", as("alice"))
@@ -312,6 +325,17 @@ describe("agent workspaces", () => {
       schema_version: "virenis-marketplace-workspace-v1",
       agents: expect.any(Array),
       edges: [{ from: "private_draft_writer", to: "private_draft_reviewer", label: "handoff" }]
+    });
+    const publishedWriter = detail.body.workspace.agents.find((entry) => entry.source_agent_id === "private_draft_writer").agent;
+    expect(publishedWriter).toMatchObject({
+      title: "private draft writer",
+      capability: expect.stringContaining("private_draft_writer specialty"),
+      boundary: "Stay within the declared specialty.",
+      consumes: ["user_request"],
+      produces: ["private_draft_writer_output"],
+      routing_cues: ["private draft writer"],
+      tools: [],
+      connector_requirements: []
     });
     expect(JSON.stringify(detail.body)).not.toContain("Secret editorial customer names");
     expect(detail.body.workspace.agents.every((entry) => entry.agent.sources === undefined)).toBe(true);

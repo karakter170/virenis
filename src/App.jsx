@@ -156,6 +156,12 @@ export function availableSessionAgents(agents = []) {
     .filter((agent) => !agent.document && !agent.resource_for_agent_id);
 }
 
+export function agentsForWorkspace(agents = [], workspace = null) {
+  if (!workspace || !Array.isArray(workspace.agent_ids)) return [];
+  const memberIds = new Set(workspace.agent_ids.map((agentId) => String(agentId || "")).filter(Boolean));
+  return agents.filter((agent) => memberIds.has(String(agent?.id || "")));
+}
+
 function workflowRequirementConnectionCandidates(requirement, connections = []) {
   const aliases = {
     email: "gmail",
@@ -505,6 +511,7 @@ function Workspace({ onHome, onSignedOut }) {
   const activeAgentWorkspace = agentWorkspaces.find((workspace) => (
     workspace.agent_workspace_id === session?.agent_workspace_id
   )) || agentWorkspaces.find((workspace) => workspace.is_general) || agentWorkspaces[0] || null;
+  const activeAgentWorkspaceAgents = agentsForWorkspace(agents, activeAgentWorkspace);
 
   useEffect(() => {
     bootstrap();
@@ -1462,7 +1469,7 @@ function Workspace({ onHome, onSignedOut }) {
             onAttachFile={openChatUpload}
             chatDocuments={chatDocuments}
             onDeleteChatDocument={setDeleteDocumentTarget}
-            agents={agents}
+            agents={activeAgentWorkspaceAgents}
             sessionId={session?.session_id}
             canWrite={canWrite}
             focusRequest={focusComposer}
@@ -2940,8 +2947,7 @@ function ResourcesSheet({
 }) {
   const [view, setView] = useState(initialView || "agents");
   const canWrite = !auth?.is_viewer;
-  const activeWorkspaceAgentIds = new Set(activeAgentWorkspace?.agent_ids || []);
-  const activeWorkspaceAgents = agents.filter((agent) => activeWorkspaceAgentIds.has(agent.id));
+  const activeWorkspaceAgents = agentsForWorkspace(agents, activeAgentWorkspace);
   function changeView(next) {
     setView(next);
     onViewChange(next);
@@ -4001,6 +4007,90 @@ export function RatingDialog({ item, onClose, onSaved }) {
   );
 }
 
+export function MarketplaceWorkspaceAgentDetails({
+  entry,
+  workspaceTitle,
+  publisher,
+  onBack = () => undefined
+}) {
+  const agent = entry?.agent || {};
+  const title = agentFacingText(agent.title, "Workspace agent");
+  const description = agentFacingText(agent.capability, "No purpose provided.");
+  const tools = Array.isArray(agent.tools) ? agent.tools : [];
+  const consumes = Array.isArray(agent.consumes) ? agent.consumes : [];
+  const produces = Array.isArray(agent.produces) ? agent.produces : [];
+  const cues = Array.isArray(agent.routing_cues) ? agent.routing_cues : [];
+  const connectorRequirements = Array.isArray(agent.connector_requirements) ? agent.connector_requirements : [];
+  const exclusions = agent.exclusions || {};
+  const connectionTools = connectorRequirements.flatMap((requirement, requirementIndex) => (
+    (Array.isArray(requirement?.tools) ? requirement.tools : []).map((tool, toolIndex) => ({
+      key: `${requirementIndex}:${toolIndex}:${tool?.name || "tool"}`,
+      label: `${requirement.connection_name || "Connection"} · ${tool?.title || tool?.name || "Tool"}`
+    }))
+  ));
+  return (
+    <>
+      <div className="marketplace-detail-layout workspace-agent-detail-layout">
+        <main className="marketplace-detail-content">
+          <button type="button" className="workspace-agent-detail-back" onClick={onBack}><ArrowLeft size={14} />Back to workspace</button>
+          <section className="builder-panel marketplace-detail-intro">
+            <div className="builder-heading">
+              <span>WORKSPACE AGENT</span>
+              <h3>{description}</h3>
+              <p>Part of <strong>{agentFacingText(workspaceTitle, "Shared workspace")}</strong> · Published by <strong>{publisher}</strong>.</p>
+            </div>
+          </section>
+
+          <section className="builder-panel marketplace-detail-section" aria-labelledby="workspace-agent-purpose-heading">
+            <div className="builder-heading"><span>AGENT BASICS</span><h3 id="workspace-agent-purpose-heading">Purpose and instructions</h3></div>
+            <dl className="marketplace-spec-list">
+              <div><dt>What it does</dt><dd>{description}</dd></div>
+              <div><dt>Instructions and limits</dt><dd>{agentFacingText(agent.boundary, "No additional limits provided.")}</dd></div>
+            </dl>
+          </section>
+
+          <section className="builder-panel marketplace-detail-section" aria-labelledby="workspace-agent-workflow-heading">
+            <div className="builder-heading"><span>TOOLS &amp; TEAMWORK</span><h3 id="workspace-agent-workflow-heading">How it works</h3></div>
+            <dl className="marketplace-spec-list compact">
+              <div><dt>Tools</dt><dd>{tools.length ? tools.map((value) => <span className="marketplace-spec-chip" key={value}>{String(value).replaceAll("_", " ")}</span>) : "No tools required"}</dd></div>
+              <div><dt>Connections</dt><dd>{connectionTools.length ? connectionTools.map((tool) => <span className="marketplace-spec-chip" key={tool.key}>{tool.label}</span>) : "No external connection required"}</dd></div>
+              <div><dt>Receives</dt><dd>{consumes.length ? consumes.map((value) => <span className="marketplace-spec-chip" key={value}>{String(value).replaceAll("_", " ")}</span>) : "User request"}</dd></div>
+              <div><dt>Produces</dt><dd>{produces.length ? produces.map((value) => <span className="marketplace-spec-chip" key={value}>{String(value).replaceAll("_", " ")}</span>) : "Domain output"}</dd></div>
+              <div><dt>Router cues</dt><dd>{cues.length ? cues.join(", ") : "Uses its name and purpose"}</dd></div>
+            </dl>
+          </section>
+
+          {(exclusions.private_knowledge || exclusions.agent_connections || exclusions.mcp_credentials_and_bindings) && (
+            <div className="marketplace-sharing-boundary">
+              <AlertCircle size={16} />
+              <span><strong>Workspace-safe agent</strong><small>{[exclusions.private_knowledge ? "Private knowledge" : null, exclusions.agent_connections ? "private workspace connections" : null, exclusions.mcp_credentials_and_bindings ? "live MCP credentials and bindings" : null].filter(Boolean).join(", ")} are not included in the published workspace.</small></span>
+            </div>
+          )}
+        </main>
+
+        <aside className="builder-preview marketplace-detail-preview" aria-label="Published workspace agent summary">
+          <div className="preview-badge"><Bot size={18} /><span>WORKSPACE AGENT</span></div>
+          <h4>{title}</h4>
+          <p>{description}</p>
+          <dl>
+            <div><dt>Workspace</dt><dd>{agentFacingText(workspaceTitle, "Shared workspace")}</dd></div>
+            <div><dt>Publisher</dt><dd>{publisher}</dd></div>
+            <div><dt>Tools</dt><dd>{tools.length || "None"}</dd></div>
+            <div><dt>Connections</dt><dd>{connectorRequirements.length || "None"}</dd></div>
+            <div><dt>Outputs</dt><dd>{produces.length || "Default"}</dd></div>
+          </dl>
+          <div className="preview-status"><Check size={14} /><div><strong>Included in this team</strong><small>Its sanitized contract is part of the workspace copy.</small></div></div>
+        </aside>
+      </div>
+
+      <footer className="builder-actions marketplace-detail-actions">
+        <button type="button" className="text-button ghost" onClick={onBack}><ArrowLeft size={15} />Back to workspace</button>
+        <span>Published by {publisher}</span>
+      </footer>
+    </>
+  );
+}
+
 export function MarketplaceAgentDialog({
   item,
   auth,
@@ -4017,10 +4107,12 @@ export function MarketplaceAgentDialog({
   const [copying, setCopying] = useState(false);
   const [error, setError] = useState("");
   const [targetWorkspaceId, setTargetWorkspaceId] = useState(activeAgentWorkspaceId);
+  const [selectedWorkspaceAgent, setSelectedWorkspaceAgent] = useState(null);
 
   useEffect(() => {
     let active = true;
     setLoading(true);
+    setSelectedWorkspaceAgent(null);
     api.get(`/api/marketplace/items/${encodeURIComponent(item.id)}`)
       .then((payload) => {
         if (active) setDetail(payload);
@@ -4068,6 +4160,26 @@ export function MarketplaceAgentDialog({
   if (workspaceListing) {
     const workspaceAgents = sharedWorkspace.agents || [];
     const workspaceEdges = sharedWorkspace.edges || [];
+    if (selectedWorkspaceAgent) {
+      return (
+        <ModalSurface
+          title={agentFacingText(selectedWorkspaceAgent.agent?.title, "Workspace agent")}
+          description={`Part of ${agentFacingText(detail.title, "Marketplace workspace")}`}
+          onClose={onClose}
+          className="agent-builder-dialog marketplace-agent-dialog"
+        >
+          <div className="marketplace-detail-body">
+            {error && <div className="form-error" role="alert">{error}</div>}
+            <MarketplaceWorkspaceAgentDetails
+              entry={selectedWorkspaceAgent}
+              workspaceTitle={detail.title}
+              publisher={publisher}
+              onBack={() => setSelectedWorkspaceAgent(null)}
+            />
+          </div>
+        </ModalSurface>
+      );
+    }
     return (
       <ModalSurface
         title={agentFacingText(detail.title, "Marketplace workspace")}
@@ -4083,10 +4195,17 @@ export function MarketplaceAgentDialog({
           </section>
           <div className="workspace-marketplace-agents">
             {workspaceAgents.map((entry, index) => (
-              <article key={entry.source_agent_id || index}>
+              <button
+                type="button"
+                className="workspace-marketplace-agent-card"
+                key={entry.source_agent_id || index}
+                onClick={() => setSelectedWorkspaceAgent(entry)}
+                aria-label={`View details for ${agentFacingText(entry.agent?.title, "workspace agent")}`}
+              >
                 <span>{index + 1}</span>
                 <div><strong>{entry.agent?.title || "Agent"}</strong><p>{entry.agent?.capability}</p><small>{(entry.agent?.produces || []).join(" · ") || "Domain output"}</small></div>
-              </article>
+                <ChevronRight size={15} aria-hidden="true" />
+              </button>
             ))}
           </div>
           {workspaceEdges.length > 0 && (
