@@ -237,6 +237,62 @@ function runStatusLabel(status) {
   return "Working";
 }
 
+function liveRunStatusForEvent(type) {
+  if (type === "planner.started" || type === "run.started") return "planning";
+  if (["planner.completed", "route.started", "route.completed", "route.reused"].includes(type)) return "running";
+  if (type === "synthesis.started") return "synthesizing";
+  if (type === "final.completed") return "completed";
+  if (type === "run.failed") return "failed";
+  return null;
+}
+
+function liveRunEventKey(event = {}) {
+  return [event.type, event.step_id, event.adapter, event.message_id]
+    .map((value) => String(value || ""))
+    .join("|");
+}
+
+function safeLivePlanSteps(steps = []) {
+  return (Array.isArray(steps) ? steps : []).map((step) => ({
+    id: String(step?.id || ""),
+    adapter: String(step?.adapter || ""),
+    task: agentFacingText(step?.task, "Handle the relevant part of the request.").slice(0, 600),
+    depends_on: (Array.isArray(step?.depends_on) ? step.depends_on : [])
+      .map((value) => String(value || ""))
+      .filter(Boolean)
+      .slice(0, 24)
+  })).filter((step) => step.id && step.adapter);
+}
+
+function safeLiveRunEvent(event = {}) {
+  const safe = {
+    type: String(event.type || ""),
+    ...(event.at ? { at: String(event.at) } : {}),
+    ...(event.ts ? { ts: String(event.ts) } : {}),
+    ...(event.step_id ? { step_id: String(event.step_id) } : {}),
+    ...(event.adapter ? { adapter: String(event.adapter) } : {}),
+    ...(event.message_id ? { message_id: String(event.message_id) } : {})
+  };
+  if (safe.type === "planner.completed") safe.steps = safeLivePlanSteps(event.steps);
+  return safe;
+}
+
+export function mergeLiveRunEvent(run, event = {}) {
+  const current = run || {};
+  const safeEvent = safeLiveRunEvent(event);
+  const events = Array.isArray(current.events) ? current.events : [];
+  const eventKey = liveRunEventKey(safeEvent);
+  const nextEvents = events.some((item) => liveRunEventKey(item) === eventKey)
+    ? events
+    : [...events, safeEvent];
+  const status = liveRunStatusForEvent(safeEvent.type) || current.status;
+  const next = { ...current, status, events: nextEvents };
+  if (safeEvent.type === "planner.completed") {
+    next.plan = { ...(current.plan || {}), steps: safeEvent.steps || [] };
+  }
+  return next;
+}
+
 function agentFacingText(value, fallback = "") {
   const cleaned = String(value || "")
     .replace(/\bLoRAs\b/gi, "specialists")
@@ -481,6 +537,8 @@ function Workspace({ onHome, onSignedOut }) {
   const [detailsRunId, setDetailsRunId] = useState(null);
   const [uploadOpen, setUploadOpen] = useState(false);
   const [uploadScope, setUploadScope] = useState("knowledge");
+  const [customMcpOpen, setCustomMcpOpen] = useState(false);
+  const [knowledgeTarget, setKnowledgeTarget] = useState(null);
   const [agentEditor, setAgentEditor] = useState(undefined);
   const [adoptionTarget, setAdoptionTarget] = useState(null);
   const [archiveTarget, setArchiveTarget] = useState(null);
@@ -1020,24 +1078,11 @@ function Workspace({ onHome, onSignedOut }) {
     eventSourceRef.current = source;
     source.onmessage = async (message) => {
       const event = JSON.parse(message.data);
-      const nextStatus = event.type === "planner.started" || event.type === "run.started"
-        ? "planning"
-        : event.type === "planner.completed" || event.type === "route.started" || event.type === "route.completed"
-          ? "running"
-          : event.type === "synthesis.started"
-            ? "synthesizing"
-            : event.type === "final.completed"
-              ? "completed"
-              : event.type === "run.failed"
-                ? "failed"
-                : null;
-      if (nextStatus) {
-        setActiveRun((current) => current?.run_id === runId ? { ...current, status: nextStatus } : current);
-        setRunsById((current) => ({
-          ...current,
-          [runId]: { ...(current[runId] || { run_id: runId }), status: nextStatus }
-        }));
-      }
+      setActiveRun((current) => current?.run_id === runId ? mergeLiveRunEvent(current, event) : current);
+      setRunsById((current) => ({
+        ...current,
+        [runId]: mergeLiveRunEvent(current[runId] || { run_id: runId }, event)
+      }));
       if (["final.completed", "run.failed"].includes(event.type)) {
         if (event.type === "final.completed" && !progressivelyRenderedRunIdsRef.current.has(runId)) {
           progressivelyRenderedRunIdsRef.current.add(runId);
@@ -1428,6 +1473,13 @@ function Workspace({ onHome, onSignedOut }) {
     setUploadOpen(true);
   }
 
+  async function resumeAfterConnectionChange() {
+    if (!connectionResumeWorkflowId) return;
+    const target = workflows.find((item) => item.workflow_id === connectionResumeWorkflowId);
+    if (target) await resumeWorkflow(target);
+    setConnectionResumeWorkflowId("");
+  }
+
   async function outcomeSaved(runId) {
     setOutcomeEditorRun(null);
     setSettlementContract(null);
@@ -1599,7 +1651,7 @@ function Workspace({ onHome, onSignedOut }) {
               />
             ))}
 
-            {isBusy && <RunProgress run={activeRun} />}
+            {isBusy && <RunProgress run={activeRun} agents={agents} />}
 
             {activeRun?.status === "failed" && !messages.some((message) => message.role === "assistant" && message.run_id === activeRun.run_id) && (
               <div className="inline-error" role="alert">
@@ -1780,6 +1832,10 @@ function Workspace({ onHome, onSignedOut }) {
             setRatingTarget(item);
           }}
           onAddKnowledge={openKnowledgeUpload}
+          onOpenKnowledge={(document) => {
+            setResourcesOpen(false);
+            setKnowledgeTarget(document);
+          }}
           onDeleteKnowledge={(document) => {
             setResourcesOpen(false);
             setDeleteDocumentTarget(document);
@@ -1789,12 +1845,44 @@ function Workspace({ onHome, onSignedOut }) {
           onRefresh={refreshResources}
           onRefreshBilling={refreshBilling}
           onRefreshConnections={() => refreshStudioResources(["connections", "templates", "approvals", "agents"])}
+          onOpenCustomMcp={() => {
+            setResourcesOpen(false);
+            setCustomMcpOpen(true);
+          }}
           onSignedOut={onSignedOut}
-          onConnectionChanged={async () => {
-            if (!connectionResumeWorkflowId) return;
-            const target = workflows.find((item) => item.workflow_id === connectionResumeWorkflowId);
-            if (target) await resumeWorkflow(target);
-            setConnectionResumeWorkflowId("");
+        />
+      )}
+
+      {customMcpOpen && (
+        <CustomMcpDialog
+          templates={mcpTemplates}
+          onClose={() => {
+            setCustomMcpOpen(false);
+            setResourceView("connections");
+            setResourcesOpen(true);
+          }}
+          onSaved={async () => {
+            setCustomMcpOpen(false);
+            setResourceView("connections");
+            setResourcesOpen(true);
+            try {
+              await refreshStudioResources(["connections", "templates", "approvals", "agents"]);
+              await resumeAfterConnectionChange();
+            } catch (connectionError) {
+              setError(friendlyError(connectionError));
+            }
+          }}
+        />
+      )}
+
+      {knowledgeTarget && (
+        <KnowledgeDocumentDialog
+          document={knowledgeTarget}
+          agents={agents}
+          onClose={() => {
+            setKnowledgeTarget(null);
+            setResourceView("knowledge");
+            setResourcesOpen(true);
           }}
         />
       )}
@@ -1805,6 +1893,7 @@ function Workspace({ onHome, onSignedOut }) {
           agents={agents}
           contractsById={contractsById}
           canWrite={canWrite}
+          isAdmin={auth?.is_admin === true}
           onClose={() => setDetailsRunId(null)}
           onCreateOutcome={() => {
             setDetailsRunId(null);
@@ -2428,9 +2517,8 @@ export function WorkflowDraftCard({
   return (
     <section className={`workflow-draft-card status-${workflow.status}`} aria-label={`${workflow.title} workflow proposal`}>
       <header className="workflow-card-head">
-        <span className="workflow-card-icon"><WandSparkles size={17} /></span>
-        <div><small>{workflow.mode === "agent_team" ? "PROPOSED TEAM" : "PROPOSED WORKFLOW"}</small><strong>{workflow.title}</strong></div>
-        <i className={status.tone}>{busy || workflow.status === "activating" ? <LoaderCircle className="spin" size={13} /> : status.icon}{status.label}</i>
+        <div className="workflow-card-copy"><small>AUTO COMPOSE · {workflow.mode === "agent_team" ? "PROPOSED TEAM" : "PROPOSED WORKFLOW"}</small><strong>{workflow.title}</strong></div>
+        <i className={status.tone}>{(busy || workflow.status === "activating") && <LoaderCircle className="spin" size={13} aria-hidden="true" />}{status.label}</i>
       </header>
 
       <WorkflowMiniGraph nodes={workflow.nodes || []} edges={workflow.edges || []} />
@@ -2678,13 +2766,13 @@ function workflowToolLabel(tool) {
 }
 
 function workflowStatusCopy(status) {
-  if (status === "active") return { label: "Ready", tone: "success", icon: <Check size={12} /> };
-  if (status === "declined") return { label: "Closed", tone: "muted", icon: <X size={12} /> };
-  if (status === "awaiting_connections") return { label: "Connection needed", tone: "warning", icon: <Plug size={12} /> };
-  if (status === "activation_failed") return { label: "Needs attention", tone: "warning", icon: <AlertCircle size={12} /> };
-  if (status === "activating") return { label: "Creating", tone: "working", icon: null };
-  if (status === "ready_to_activate") return { label: "Ready to finish", tone: "working", icon: <Check size={12} /> };
-  return { label: "Draft · review required", tone: "draft", icon: <WandSparkles size={12} /> };
+  if (status === "active") return { label: "Ready", tone: "success" };
+  if (status === "declined") return { label: "Closed", tone: "muted" };
+  if (status === "awaiting_connections") return { label: "Connection needed", tone: "warning" };
+  if (status === "activation_failed") return { label: "Needs attention", tone: "warning" };
+  if (status === "activating") return { label: "Creating", tone: "working" };
+  if (status === "ready_to_activate") return { label: "Ready to finish", tone: "working" };
+  return { label: "Draft · review required", tone: "draft" };
 }
 
 export function FormattedText({ text }) {
@@ -2961,11 +3049,88 @@ function usageComponentLabel(component, agents) {
     .replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
-function RunProgress({ run }) {
+export function runProgressSpecialists(run, agents = []) {
+  const steps = Array.isArray(run?.plan?.steps) ? run.plan.steps : [];
+  const events = Array.isArray(run?.events) ? run.events : [];
+  const stepById = new Map(steps.map((step) => [step.id, step]));
+  return steps.map((step) => {
+    const reused = events.some((event) => event.type === "route.reused" && event.step_id === step.id);
+    const completed = events.some((event) => event.type === "route.completed" && event.step_id === step.id);
+    const started = events.some((event) => event.type === "route.started" && event.step_id === step.id);
+    const state = reused ? "reused" : completed ? "ready" : started ? "working" : "queued";
+    return {
+      id: step.id,
+      adapter: step.adapter,
+      name: formatAgentName(step.adapter, agents),
+      task: agentFacingText(step.task, "Handle the relevant part of your request."),
+      dependencies: (step.depends_on || [])
+        .map((dependencyId) => stepById.get(dependencyId)?.adapter)
+        .filter(Boolean)
+        .map((adapter) => formatAgentName(adapter, agents)),
+      state
+    };
+  });
+}
+
+export function RunProgress({ run, agents = [] }) {
+  const events = Array.isArray(run?.events) ? run.events : [];
+  const specialists = runProgressSpecialists(run, agents);
+  const plannerStarted = events.some((event) => ["run.started", "planner.started", "planner.completed"].includes(event.type));
+  const plannerCompleted = events.some((event) => event.type === "planner.completed") || Array.isArray(run?.plan?.steps);
+  const synthesizing = run?.status === "synthesizing";
+  const workingCount = specialists.filter((item) => item.state === "working").length;
+  const finishedCount = specialists.filter((item) => ["ready", "reused"].includes(item.state)).length;
+  const title = synthesizing
+    ? "Your team finished · composing the answer"
+    : plannerCompleted && specialists.length
+      ? `${specialists.length} ${specialists.length === 1 ? "teammate" : "teammates"} selected`
+      : plannerCompleted
+        ? "No specialist handoff is needed"
+        : "Choosing the right teammates";
+  const subtitle = synthesizing
+    ? "Combining the completed work into one clear response."
+    : specialists.length
+      ? `${finishedCount} ready${workingCount ? ` · ${workingCount} working now` : " · assignments prepared"}`
+      : plannerCompleted
+        ? "The main model can answer this request directly."
+        : "The Router is matching your request to the roles on this team.";
   return (
-    <div className="run-progress" role="status" aria-live="polite" aria-atomic="true">
-      <LoaderCircle className="spin" size={17} />
-      <span>{runStatusLabel(run?.status)}</span>
+    <div className="run-progress" role="status" aria-live="polite" aria-atomic="false">
+      <div className="run-progress-heading">
+        <span className="run-progress-mark" aria-hidden="true">
+          {synthesizing ? <Sparkles size={17} /> : <LoaderCircle className="spin" size={17} />}
+        </span>
+        <span><strong>{title}</strong><small>{subtitle}</small></span>
+      </div>
+      <div className="run-decision-trail" aria-label="Live Router decision progress">
+        <span className={plannerStarted ? "done" : "active"}><i>{plannerStarted ? <Check size={11} /> : "1"}</i>Request read</span>
+        <ChevronRight size={12} aria-hidden="true" />
+        <span className={plannerCompleted ? "done" : plannerStarted ? "active" : ""}><i>{plannerCompleted ? <Check size={11} /> : "2"}</i>Roles matched</span>
+        <ChevronRight size={12} aria-hidden="true" />
+        <span className={plannerCompleted ? "done" : ""}><i>{plannerCompleted ? <Check size={11} /> : "3"}</i>Handoffs ordered</span>
+      </div>
+      {specialists.length > 0 && (
+        <div className="run-specialist-list" aria-label="Selected teammates and assignments">
+          {specialists.map((specialist) => (
+            <div className={`run-specialist-row ${specialist.state}`} key={specialist.id}>
+              <span className="run-specialist-avatar" aria-hidden="true">{specialist.name.slice(0, 1)}</span>
+              <span className="run-specialist-copy">
+                <strong>{specialist.name}</strong>
+                <small><b>Why selected:</b> {specialist.task}</small>
+                {specialist.dependencies.length > 0 && <em>Receives work from {specialist.dependencies.join(", ")}</em>}
+              </span>
+              <span className="run-specialist-state">{specialist.state === "reused"
+                ? "Reused"
+                : specialist.state === "ready"
+                  ? "Ready"
+                  : specialist.state === "working"
+                    ? "Working"
+                    : "Queued"}</span>
+            </div>
+          ))}
+        </div>
+      )}
+      <small className="run-progress-safety">Live decision summary · private model reasoning is never displayed</small>
     </div>
   );
 }
@@ -3400,14 +3565,15 @@ function ResourcesSheet({
   onOpenMarketplaceItem,
   onRate,
   onAddKnowledge,
+  onOpenKnowledge,
   onDeleteKnowledge,
   onConnectAgents,
   onDisconnectAgents,
   onRefresh,
   onRefreshBilling,
   onRefreshConnections,
-  onSignedOut,
-  onConnectionChanged
+  onOpenCustomMcp,
+  onSignedOut
 }) {
   const [view, setView] = useState(initialView || "agents");
   const canWrite = !auth?.is_viewer;
@@ -3489,6 +3655,7 @@ function ResourcesSheet({
             auth={auth}
             canWrite={canWrite}
             onAdd={onAddKnowledge}
+            onOpen={onOpenKnowledge}
             onDelete={onDeleteKnowledge}
           />
         )}
@@ -3503,7 +3670,7 @@ function ResourcesSheet({
             isAdmin={auth?.is_admin === true}
             onRefresh={onRefreshConnections}
             resumeWorkflowId={resumeWorkflowId}
-            onConnectionChanged={onConnectionChanged}
+            onOpenCustomMcp={onOpenCustomMcp}
           />
         )}
 
@@ -3536,10 +3703,8 @@ export function ConnectionsPanel({
   isAdmin = false,
   onRefresh,
   resumeWorkflowId = "",
-  onConnectionChanged = async () => undefined
+  onOpenCustomMcp = () => undefined
 }) {
-  const [showForm, setShowForm] = useState(false);
-  const [form, setForm] = useState({ template_id: "custom", name: "", endpoint_url: "", auth_type: "none", token: "", trust_read_annotations: false });
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -3549,7 +3714,6 @@ export function ConnectionsPanel({
   const pendingApprovals = approvals.filter((approval) => approval.status === "pending");
   const recentApprovals = approvals.filter((approval) => approval.status !== "pending").slice(-4).reverse();
   const managedProviders = templates.filter((template) => template.connection_mode === "managed");
-  const customTemplates = templates.filter((template) => template.connection_mode !== "managed");
 
   async function refreshRevocations({ reportError = false } = {}) {
     try {
@@ -3569,15 +3733,6 @@ export function ConnectionsPanel({
       .catch(() => undefined);
     return () => { active = false; };
   }, []);
-
-  function chooseTemplate(template) {
-    setForm((current) => ({
-      ...current,
-      template_id: template.id,
-      name: template.id === "custom" ? current.name : template.name,
-      auth_type: template.auth_type || "none"
-    }));
-  }
 
   async function connectManaged(provider, connectionId) {
     if (provider.availability !== "available") {
@@ -3599,30 +3754,6 @@ export function ConnectionsPanel({
     } catch (connectionError) {
       setBusy("");
       setError(friendlyError(connectionError));
-    }
-  }
-
-  async function createConnection(event) {
-    event.preventDefault();
-    setBusy("create");
-    setError("");
-    setNotice("");
-    try {
-      await api.post("/api/mcp/connections", {
-        name: form.name,
-        template_id: form.template_id,
-        endpoint_url: form.endpoint_url,
-        trust_read_annotations: form.trust_read_annotations,
-        auth: form.auth_type === "bearer" ? { type: "bearer", token: form.token } : { type: "none" }
-      });
-      setForm({ template_id: "custom", name: "", endpoint_url: "", auth_type: "none", token: "", trust_read_annotations: false });
-      setShowForm(false);
-      await onRefresh();
-      await onConnectionChanged();
-    } catch (connectionError) {
-      setError(friendlyError(connectionError));
-    } finally {
-      setBusy("");
     }
   }
 
@@ -3724,7 +3855,7 @@ export function ConnectionsPanel({
           <h2 id="connections-heading">Connected apps</h2>
           <p>Sign in once, then choose the exact app abilities each specialist may request.</p>
         </div>
-        {canWrite && <button type="button" className="text-button ghost" onClick={() => setShowForm((value) => !value)}><Settings2 size={15} />Advanced connection</button>}
+        {canWrite && <button type="button" className="text-button ghost" onClick={onOpenCustomMcp}><Settings2 size={15} />Advanced connection</button>}
       </div>
 
       {error && <div className="form-error" role="alert">{error}</div>}
@@ -3825,27 +3956,6 @@ export function ConnectionsPanel({
         </details>
       )}
 
-      {showForm && (
-        <form className="connection-form" onSubmit={createConnection}>
-          <div className="builder-heading"><span>ADVANCED</span><h3>Connect a custom MCP server</h3><p>For servers that do not offer a managed sign-in. Virenis performs a live handshake and imports the current tool schemas.</p></div>
-          <div className="connection-template-grid">
-            {customTemplates.map((template) => (
-              <button type="button" className={form.template_id === template.id ? "selected" : ""} key={template.id} onClick={() => chooseTemplate(template)}>
-                <Plug size={16} /><span><strong>{template.name}</strong><small>{template.description}</small></span>{form.template_id === template.id && <Check size={13} />}
-              </button>
-            ))}
-          </div>
-          <div className="advanced-builder-grid">
-            <div className="builder-field"><label htmlFor="mcp-name">Connection name</label><input id="mcp-name" value={form.name} onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))} required maxLength={100} placeholder="Product workspace" /></div>
-            <div className="builder-field"><label htmlFor="mcp-endpoint">HTTPS endpoint</label><input id="mcp-endpoint" value={form.endpoint_url} onChange={(event) => setForm((current) => ({ ...current, endpoint_url: event.target.value }))} required type="url" placeholder={customTemplates.find((template) => template.id === form.template_id)?.endpoint_placeholder || "https://mcp.example.com/mcp"} /></div>
-          </div>
-          <fieldset className="connection-auth"><legend>Authentication</legend><label><input type="radio" name="mcp-auth" checked={form.auth_type === "none"} onChange={() => setForm((current) => ({ ...current, auth_type: "none", token: "" }))} />No authentication</label><label><input type="radio" name="mcp-auth" checked={form.auth_type === "bearer"} onChange={() => setForm((current) => ({ ...current, auth_type: "bearer" }))} />Bearer token</label></fieldset>
-          {form.auth_type === "bearer" && <div className="builder-field"><label htmlFor="mcp-token">Bearer token</label><input id="mcp-token" type="password" autoComplete="new-password" value={form.token} onChange={(event) => setForm((current) => ({ ...current, token: event.target.value }))} required /><small>Encrypted before it is written; never sent to a specialist or published.</small></div>}
-          <label className="connection-trust-read"><input type="checkbox" checked={form.trust_read_annotations} onChange={(event) => setForm((current) => ({ ...current, trust_read_annotations: event.target.checked }))} /><span><strong>Allow declared read-only tools without approval</strong><small>Enable this only when you trust this MCP server's tool labels. Otherwise every call asks first.</small></span></label>
-          <div className="connection-form-actions"><button type="button" className="text-button ghost" onClick={() => setShowForm(false)} disabled={busy === "create"}>Cancel</button><button type="submit" className="text-button primary" disabled={busy === "create"}>{busy === "create" ? <LoaderCircle className="spin" size={14} /> : <Plug size={14} />}Connect and discover tools</button></div>
-        </form>
-      )}
-
       {disconnectTarget && (() => {
         const affectedAgents = agents.filter((agent) => (agent.mcp_bindings || []).some((binding) => binding.connection_id === disconnectTarget.connection_id));
         return (
@@ -3867,9 +3977,88 @@ export function ConnectionsPanel({
             <footer><small>{connection.tools?.length || 0} available abilities · {connection.read_policy === "allow_declared_reads" ? "approved read actions run automatically" : "every action asks first"}</small>{canWrite && <div>{connection.reauthorization_required && <button type="button" className="text-button primary compact" disabled={busy === connection.connection_id} onClick={() => connectManaged(templates.find((template) => template.id === connection.provider_id) || { id: connection.provider_id, availability: "available" }, connection.connection_id)}>{busy === connection.connection_id ? <LoaderCircle className="spin" size={13} /> : <RefreshCw size={13} />}Reconnect</button>}<IconButton compact label={`Refresh available abilities for ${connection.name}`} disabled={busy === connection.connection_id || connection.reauthorization_required} onClick={() => refreshConnection(connection)}><RefreshCw className={busy === connection.connection_id ? "spin" : ""} size={15} /></IconButton><IconButton compact label={`Disconnect ${connection.name}`} disabled={busy === connection.connection_id} onClick={() => setDisconnectTarget(connection)}><Trash2 size={15} /></IconButton></div>}</footer>
           </article>
         ))}
-        {!connections.length && !showForm && <div className="empty-resource-state"><span><Plug size={22} /></span><h3>No accounts connected yet</h3><p>Connect an app above, review its abilities, and give each specialist only what the role needs.</p></div>}
+        {!connections.length && <div className="empty-resource-state"><span><Plug size={22} /></span><h3>No accounts connected yet</h3><p>Connect an app above, review its abilities, and give each specialist only what the role needs.</p></div>}
       </div>
     </section>
+  );
+}
+
+export function CustomMcpDialog({ templates = [], onClose, onSaved = async () => undefined }) {
+  const customTemplates = templates.filter((template) => template.connection_mode !== "managed");
+  const initialTemplate = customTemplates.find((template) => template.id === "custom") || customTemplates[0] || null;
+  const [form, setForm] = useState({
+    template_id: initialTemplate?.id || "custom",
+    name: initialTemplate && initialTemplate.id !== "custom" ? initialTemplate.name : "",
+    endpoint_url: "",
+    auth_type: initialTemplate?.auth_type || "none",
+    token: "",
+    trust_read_annotations: false
+  });
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const nameId = useId();
+  const endpointId = useId();
+  const tokenId = useId();
+  const selectedTemplate = customTemplates.find((template) => template.id === form.template_id);
+
+  function chooseTemplate(template) {
+    setForm((current) => ({
+      ...current,
+      template_id: template.id,
+      name: template.id === "custom" ? current.name : template.name,
+      auth_type: template.auth_type || "none",
+      token: ""
+    }));
+  }
+
+  async function createConnection(event) {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      const connection = await api.post("/api/mcp/connections", {
+        name: form.name,
+        template_id: form.template_id,
+        endpoint_url: form.endpoint_url,
+        trust_read_annotations: form.trust_read_annotations,
+        auth: form.auth_type === "bearer" ? { type: "bearer", token: form.token } : { type: "none" }
+      });
+      await onSaved(connection);
+    } catch (connectionError) {
+      setError(friendlyError(connectionError));
+      setBusy(false);
+    }
+  }
+
+  return (
+    <ModalSurface
+      title="Connect a custom MCP server"
+      description="For servers without managed sign-in. Virenis verifies the HTTPS endpoint and discovers its current abilities."
+      onClose={onClose}
+      closeDisabled={busy}
+      className="wide-dialog custom-mcp-dialog"
+    >
+      <form className="dialog-form connection-form custom-mcp-form" onSubmit={createConnection}>
+        {error && <div className="form-error" role="alert">{error}</div>}
+        {customTemplates.length > 0 && (
+          <div className="connection-template-grid" aria-label="Custom MCP connection types">
+            {customTemplates.map((template) => (
+              <button type="button" className={form.template_id === template.id ? "selected" : ""} key={template.id} onClick={() => chooseTemplate(template)} disabled={busy}>
+                <Plug size={16} /><span><strong>{template.name}</strong><small>{template.description}</small></span>{form.template_id === template.id && <Check size={13} />}
+              </button>
+            ))}
+          </div>
+        )}
+        <div className="advanced-builder-grid">
+          <div className="builder-field"><label htmlFor={nameId}>Connection name</label><input id={nameId} data-autofocus value={form.name} onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))} required maxLength={100} placeholder="Product workspace" disabled={busy} /></div>
+          <div className="builder-field"><label htmlFor={endpointId}>HTTPS endpoint</label><input id={endpointId} value={form.endpoint_url} onChange={(event) => setForm((current) => ({ ...current, endpoint_url: event.target.value }))} required type="url" inputMode="url" autoCapitalize="none" spellCheck="false" placeholder={selectedTemplate?.endpoint_placeholder || "https://mcp.example.com/mcp"} disabled={busy} /></div>
+        </div>
+        <fieldset className="connection-auth" disabled={busy}><legend>Authentication</legend><label><input type="radio" name="mcp-auth" checked={form.auth_type === "none"} onChange={() => setForm((current) => ({ ...current, auth_type: "none", token: "" }))} />No authentication</label><label><input type="radio" name="mcp-auth" checked={form.auth_type === "bearer"} onChange={() => setForm((current) => ({ ...current, auth_type: "bearer" }))} />Bearer token</label></fieldset>
+        {form.auth_type === "bearer" && <div className="builder-field"><label htmlFor={tokenId}>Bearer token</label><input id={tokenId} type="password" autoComplete="new-password" value={form.token} onChange={(event) => setForm((current) => ({ ...current, token: event.target.value }))} required disabled={busy} /><small>Encrypted before storage; never sent to a specialist or included in a public listing.</small></div>}
+        <label className="connection-trust-read"><input type="checkbox" checked={form.trust_read_annotations} onChange={(event) => setForm((current) => ({ ...current, trust_read_annotations: event.target.checked }))} disabled={busy} /><span><strong>Allow declared read-only tools without approval</strong><small>Enable this only when you trust this server's tool labels. Otherwise every call asks first.</small></span></label>
+        <div className="connection-form-actions"><button type="button" className="text-button ghost" onClick={onClose} disabled={busy}>Cancel</button><button type="submit" className="text-button primary" disabled={busy}>{busy ? <LoaderCircle className="spin" size={14} /> : <Plug size={14} />}Connect and discover tools</button></div>
+      </form>
+    </ModalSurface>
   );
 }
 
@@ -4735,11 +4924,16 @@ export function MarketplacePanel({ items, auth, onOpen = () => undefined, onRate
   );
   return (
     <section className="resource-section marketplace-section" aria-labelledby="marketplace-heading">
-      <div className="marketplace-hero">
-        <span><Sparkles size={15} /> COMMUNITY LIBRARY</span>
-        <h3 id="marketplace-heading">Shared specialists and teams, ready to make your own.</h3>
+      <details className="marketplace-hero">
+        <summary>
+          <span className="marketplace-hero-copy">
+            <small className="marketplace-hero-eyebrow">COMMUNITY LIBRARY</small>
+            <span className="marketplace-hero-title" id="marketplace-heading" role="heading" aria-level="3">Shared agents and teams, ready to make your own.</span>
+          </span>
+          <span className="marketplace-hero-toggle" aria-hidden="true"><ChevronDown size={16} /></span>
+        </summary>
         <p>See each role, its abilities, and its publisher. Add an independent copy to your own team when it fits.</p>
-      </div>
+      </details>
       <div className="marketplace-toolbar">
         <label className="search-field full-width"><Search size={16} /><span className="sr-only">Search shared specialists and teams</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search roles, teams, or publishers" /></label>
       </div>
@@ -5345,7 +5539,7 @@ export function WorkflowWorkspaceDialog({ workspaces, workflow, activeWorkspaceI
   );
 }
 
-function KnowledgeList({ documents, agents, auth, canWrite, onAdd, onDelete }) {
+export function KnowledgeList({ documents, agents, auth, canWrite, onAdd, onOpen = () => undefined, onDelete }) {
   return (
     <section className="resource-section" aria-labelledby="knowledge-heading">
       <div className="section-heading">
@@ -5362,12 +5556,15 @@ function KnowledgeList({ documents, agents, auth, canWrite, onAdd, onDelete }) {
           const parentAgent = agents.find((item) => item.id === document.resource_for_agent_id);
           return (
             <div className="knowledge-row" key={document.document_id}>
-              <BookOpen size={18} aria-hidden="true" />
-              <div className="row-copy">
-                <strong>{document.title}</strong>
-                <span>{document.chunks ? "Ready for grounded search" : "Ready to search"}</span>
-                <small>{parentAgent ? `Used by ${formatAgentName(parentAgent.id, agents)}` : document.visibility === "private" ? "Private · All chats" : `${document.visibility || "Available"} · All chats`}</small>
-              </div>
+              <button type="button" className="knowledge-open-action" onClick={() => onOpen(document)} aria-label={`Review ${document.title || "knowledge file"}`}>
+                <BookOpen size={18} aria-hidden="true" />
+                <span className="row-copy">
+                  <strong>{document.title}</strong>
+                  <span>{document.chunks ? `${document.chunks} indexed ${document.chunks === 1 ? "section" : "sections"} · Ready for grounded search` : "Ready to search"}</span>
+                  <small>{parentAgent ? `Used by ${formatAgentName(parentAgent.id, agents)}` : document.visibility === "private" ? "Private · All chats" : `${document.visibility || "Available"} · All chats`}</small>
+                </span>
+                <ChevronRight size={17} aria-hidden="true" />
+              </button>
               {canManageDocument(document, agents, auth) && (
                 <div className="row-actions">
                   <IconButton label={`Delete ${document.title || "knowledge"}`} compact onClick={() => onDelete(document)}>
@@ -5381,6 +5578,83 @@ function KnowledgeList({ documents, agents, auth, canWrite, onAdd, onDelete }) {
         {documents.length === 0 && <p className="muted-empty">No knowledge files yet.</p>}
       </div>
     </section>
+  );
+}
+
+export function KnowledgeDocumentDialog({ document, agents = [], onClose }) {
+  const [review, setReview] = useState({ status: "loading", chunks: [], total: Number(document?.chunks || 0), error: "" });
+  const [reloadToken, setReloadToken] = useState(0);
+  const parentAgent = agents.find((item) => item.id === document?.resource_for_agent_id);
+  const sourceAgent = agents.find((item) => item.id === document?.agent_id);
+  const fingerprint = shortRevision(document?.upload_digest || document?.extracted_text_digest || document?.corpus_revision);
+
+  useEffect(() => {
+    let active = true;
+    setReview((current) => ({ ...current, status: "loading", error: "" }));
+    void api.get(`/api/documents/${encodeURIComponent(document.document_id)}/chunks?limit=100`)
+      .then((result) => {
+        if (!active) return;
+        setReview({
+          status: "ready",
+          chunks: Array.isArray(result.chunks) ? result.chunks : [],
+          total: Number(result.total || 0),
+          error: ""
+        });
+      })
+      .catch((reviewError) => {
+        if (!active) return;
+        setReview({ status: "error", chunks: [], total: 0, error: friendlyError(reviewError) });
+      });
+    return () => { active = false; };
+  }, [document.document_id, reloadToken]);
+
+  return (
+    <ModalSurface
+      title={document.title || "Knowledge details"}
+      description="Review what was indexed so you can identify this private reference before using it."
+      onClose={onClose}
+      className="wide-dialog knowledge-review-dialog"
+    >
+      <div className="dialog-form knowledge-review-body">
+        <section className="knowledge-review-overview" aria-labelledby="knowledge-review-summary">
+          <div className="knowledge-review-title">
+            <span><BookOpen size={20} aria-hidden="true" /></span>
+            <div><h3 id="knowledge-review-summary">Indexed and ready</h3><p>{parentAgent ? `Available to ${formatAgentName(parentAgent.id, agents)}` : "Available as reusable Knowledge across your chats"}</p></div>
+          </div>
+          <dl className="knowledge-review-meta">
+            <div><dt>Added</dt><dd>{formatDate(document.created_at, { includeTime: true }) || "Date unavailable"}</dd></div>
+            <div><dt>Size</dt><dd>{document.page_count ? `${document.page_count} ${document.page_count === 1 ? "page" : "pages"}` : `${document.chunks || review.total || 0} indexed ${(document.chunks || review.total) === 1 ? "section" : "sections"}`}</dd></div>
+            <div><dt>Search role</dt><dd>{sourceAgent ? formatAgentName(sourceAgent.id, agents) : "Private source specialist"}</dd></div>
+            <div><dt>File fingerprint</dt><dd><code>{fingerprint}</code></dd></div>
+          </dl>
+          <div className="knowledge-privacy-note"><ShieldCheck size={16} aria-hidden="true" /><span><strong>{document.visibility === "private" ? "Private reference" : "Workspace reference"}</strong><small>Only people already authorized for this workspace can load these indexed details. Raw file paths and full chunk bodies are not exposed here.</small></span></div>
+        </section>
+
+        <section className="knowledge-chunk-review" aria-labelledby="knowledge-chunks-heading" aria-busy={review.status === "loading"}>
+          <div className="knowledge-chunk-heading"><div><h3 id="knowledge-chunks-heading">Indexed content review</h3><p>Section titles, summaries, topics, and page locations extracted for grounded search.</p></div>{review.status === "ready" && <span>{review.total} {review.total === 1 ? "section" : "sections"}</span>}</div>
+          {review.status === "loading" && <div className="knowledge-review-state" role="status"><LoaderCircle className="spin" size={18} />Loading the authorized review…</div>}
+          {review.status === "error" && <div className="knowledge-review-state error" role="alert"><AlertCircle size={18} /><span><strong>Could not load this review</strong><small>{review.error}</small></span><button type="button" className="text-button ghost compact" onClick={() => setReloadToken((value) => value + 1)}><RefreshCw size={13} />Try again</button></div>}
+          {review.status === "ready" && review.chunks.length === 0 && <div className="knowledge-review-state"><FileSearch size={18} />No indexed sections are available for review.</div>}
+          {review.status === "ready" && review.chunks.length > 0 && (
+            <div className="knowledge-chunk-list">
+              {review.chunks.map((chunk, index) => {
+                const pageLabel = chunk.page_start
+                  ? chunk.page_end && chunk.page_end !== chunk.page_start ? `Pages ${chunk.page_start}–${chunk.page_end}` : `Page ${chunk.page_start}`
+                  : "Section without page metadata";
+                return (
+                  <article key={chunk.chunk_id || index}>
+                    <header><span>{String(index + 1).padStart(2, "0")}</span><div><strong>{chunk.title || `Indexed section ${index + 1}`}</strong><small>{pageLabel}{chunk.token_count_approx ? ` · About ${chunk.token_count_approx} tokens` : ""}</small></div></header>
+                    <p>{chunk.summary || "No summary was generated for this section."}</p>
+                    {Array.isArray(chunk.tags) && chunk.tags.length > 0 && <div className="knowledge-chunk-tags" aria-label="Topics">{chunk.tags.slice(0, 8).map((tag) => <span key={tag}>{tag}</span>)}</div>}
+                  </article>
+                );
+              })}
+              {review.total > review.chunks.length && <p className="knowledge-review-limit">Showing the first {review.chunks.length} of {review.total} indexed sections.</p>}
+            </div>
+          )}
+        </section>
+      </div>
+    </ModalSurface>
   );
 }
 
@@ -5460,7 +5734,7 @@ function RankTieBreakNote({ tieBreak, adapter, agents }) {
   );
 }
 
-export function WorldGraphChanges({ run, agents, canWrite, onRefreshTracked, onRunFresh }) {
+export function WorldGraphChanges({ run, agents, canWrite, onRefreshTracked, onRunFresh, embedded = false }) {
   const graph = run?.world_graph || {};
   const preparation = graph.preparation || {};
   const [currentCheck, setCurrentCheck] = useState(null);
@@ -5477,6 +5751,8 @@ export function WorldGraphChanges({ run, agents, canWrite, onRefreshTracked, onR
     && Number(graph.total || 0) > 0
     && decisions.length > 0;
   const planById = new Map((run?.plan?.steps || []).map((step) => [step.id, step]));
+  const Container = embedded ? "div" : "section";
+  const containerClassName = `detail-section world-changes${embedded ? " embedded" : ""}`;
 
   useEffect(() => {
     setCurrentCheck(null);
@@ -5557,7 +5833,7 @@ export function WorldGraphChanges({ run, agents, canWrite, onRefreshTracked, onR
         ? "Change tracking will appear after this answer finishes."
         : "This answer does not include a verified change record.";
     return (
-      <section className="detail-section world-changes" aria-labelledby="world-changes-heading">
+      <Container className={containerClassName} role={embedded ? "region" : undefined} aria-labelledby="world-changes-heading">
         <span className="worldgraph-product-label">WorldGraph · change-aware reuse</span>
         <div className="world-unavailable-card">
           <span><AlertCircle size={18} aria-hidden="true" /></span>
@@ -5582,11 +5858,11 @@ export function WorldGraphChanges({ run, agents, canWrite, onRefreshTracked, onR
             {actionError && <p className="form-error world-action-error" role="alert">{actionError}</p>}
           </>
         )}
-      </section>
+      </Container>
     );
   }
   return (
-    <section className="detail-section world-changes" aria-labelledby="world-changes-heading">
+    <Container className={containerClassName} role={embedded ? "region" : undefined} aria-labelledby="world-changes-heading">
       <span className="worldgraph-product-label">WorldGraph · change-aware reuse</span>
       <div className="world-current-card" role="status" aria-live="polite">
         <span><Check size={18} aria-hidden="true" /></span>
@@ -5704,7 +5980,7 @@ export function WorldGraphChanges({ run, agents, canWrite, onRefreshTracked, onR
           {actionError && <p className="form-error world-action-error" role="alert">{actionError}</p>}
         </>
       )}
-    </section>
+    </Container>
   );
 }
 
@@ -5713,6 +5989,7 @@ export function RunDetailsSheet({
   agents,
   contractsById,
   canWrite,
+  isAdmin = false,
   onClose,
   onCreateOutcome,
   onSettleOutcome,
@@ -5721,11 +5998,7 @@ export function RunDetailsSheet({
   onRefreshTracked,
   onRunFresh
 }) {
-  const hasCurrentWorldGraph = run?.status === "completed"
-    && ["unchecked", "current"].includes(run?.world_graph?.validity)
-    && Number(run?.world_graph?.total || 0) > 0
-    && (run?.world_graph?.decisions || []).length > 0;
-  const [view, setView] = useState(hasCurrentWorldGraph ? "changes" : "agents");
+  const [view, setView] = useState("agents");
   const userSelectedViewRef = useRef(false);
   const viewedRunIdRef = useRef(run?.run_id || null);
   const routeSelections = new Map((run?.plan?.routing?.selected || []).map((item) => [item.adapter, item]));
@@ -5738,10 +6011,15 @@ export function RunDetailsSheet({
       viewedRunIdRef.current = run.run_id;
       userSelectedViewRef.current = false;
     }
-    if (!userSelectedViewRef.current) setView(hasCurrentWorldGraph ? "changes" : "agents");
-  }, [hasCurrentWorldGraph, run?.run_id]);
+    if (!userSelectedViewRef.current) setView("agents");
+  }, [run?.run_id]);
+
+  useEffect(() => {
+    if (!isAdmin && view === "activity") setView("agents");
+  }, [isAdmin, view]);
 
   function selectView(nextView) {
+    if (nextView === "activity" && !isAdmin) return;
     userSelectedViewRef.current = true;
     setView(nextView);
   }
@@ -5752,28 +6030,31 @@ export function RunDetailsSheet({
         {!run && <div className="center-state"><LoaderCircle className="spin" size={19} />Loading details</div>}
         {run && (
           <>
-            <div className="view-switch five-up" aria-label="Answer detail view">
-              <button type="button" aria-pressed={view === "changes"} onClick={() => selectView("changes")}>What changed</button>
+            <div className={`view-switch ${isAdmin ? "four-up" : ""}`.trim()} role="group" aria-label="Answer detail view">
               <button type="button" aria-pressed={view === "agents"} onClick={() => selectView("agents")}>Team</button>
               <button type="button" aria-pressed={view === "sources"} onClick={() => selectView("sources")}>Sources</button>
               <button type="button" aria-pressed={view === "outcomes"} onClick={() => selectView("outcomes")}>Results</button>
-              <button type="button" aria-pressed={view === "activity"} onClick={() => selectView("activity")}>Activity</button>
+              {isAdmin && <button type="button" aria-pressed={view === "activity"} onClick={() => selectView("activity")}>Activity</button>}
             </div>
 
-            {view === "changes" && (
-              <WorldGraphChanges
-                run={run}
-                agents={agents}
-                canWrite={canWrite}
-                onRefreshTracked={onRefreshTracked}
-                onRunFresh={onRunFresh}
-              />
-            )}
-
             {view === "agents" && (
-              <section className="detail-section" aria-labelledby="used-agents-heading">
+              <section className="detail-section answer-team-view" aria-labelledby="used-agents-heading">
                 <div className="section-heading compact-heading">
-                  <div><h3 id="used-agents-heading">How your team contributed</h3><p>{run.expert_outputs?.length || 0} {(run.expert_outputs?.length || 0) === 1 ? "specialist" : "specialists"} contributed. Open any role to read the work it handed back.</p></div>
+                  <div><h3 id="used-agents-heading">How your team built this answer</h3><p>See what was completed now, what was safely reused, and the result each specialist handed back.</p></div>
+                </div>
+                <div className="answer-team-worldgraph">
+                  <WorldGraphChanges
+                    run={run}
+                    agents={agents}
+                    canWrite={canWrite}
+                    onRefreshTracked={onRefreshTracked}
+                    onRunFresh={onRunFresh}
+                    embedded
+                  />
+                </div>
+                <div className="answer-team-contribution-heading">
+                  <strong>Specialist contributions</strong>
+                  <span>{run.expert_outputs?.length || 0} {(run.expert_outputs?.length || 0) === 1 ? "specialist" : "specialists"} contributed. Open a role to read its complete work.</span>
                 </div>
                 <UsageReceipt
                   receipt={run.usage_receipt}
@@ -5944,7 +6225,7 @@ export function RunDetailsSheet({
               </section>
             )}
 
-            {view === "activity" && (
+            {isAdmin && view === "activity" && (
               <section className="detail-section" aria-labelledby="activity-heading">
                 <div className="section-heading compact-heading">
                   <div><h3 id="activity-heading">Activity</h3><p>How the answer was assembled.</p></div>

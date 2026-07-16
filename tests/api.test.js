@@ -2445,6 +2445,7 @@ describe("runtime and catalog", () => {
     process.env.APP_API_TOKENS_JSON = JSON.stringify({
       token_alice: { user_id: "alice", workspace_id: "workspace_shared", role: "user" },
       token_bob: { user_id: "bob", workspace_id: "workspace_shared", role: "user" },
+      token_foreign: { user_id: "mallory", workspace_id: "workspace_foreign", role: "user" },
       token_admin_shared: { user_id: "admin", workspace_id: "workspace_shared", role: "admin" }
     });
 
@@ -2478,6 +2479,24 @@ describe("runtime and catalog", () => {
         .field("routing_cues", "private-manual")
         .attach("file", Buffer.from("Only Alice should see this private manual."), "manual.txt")
         .expect(201);
+
+      const bobDocuments = await request(app)
+        .get("/api/documents")
+        .set("Authorization", "Bearer token_bob")
+        .expect(200);
+      expect(bobDocuments.body.documents.map((document) => document.document_id)).not.toContain(upload.body.document_id);
+      await request(app)
+        .get(`/api/documents/${upload.body.document_id}/chunks`)
+        .set("Authorization", "Bearer token_bob")
+        .expect(404);
+      await request(app)
+        .get(`/api/documents/${upload.body.document_id}/chunks`)
+        .set("Authorization", "Bearer token_foreign")
+        .expect(404);
+      await request(app)
+        .get(`/api/documents/${upload.body.document_id}/chunks`)
+        .set("Authorization", "Bearer token_admin_shared")
+        .expect(200);
 
       await request(app)
         .patch(`/api/agents/${upload.body.agent_id}`)

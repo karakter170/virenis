@@ -8,6 +8,7 @@ import {
   AgentGraph,
   ApprovalArguments,
   ConnectionsPanel,
+  CustomMcpDialog,
   ChatMessage,
   EmptyTeamWelcome,
   FormattedText,
@@ -15,9 +16,12 @@ import {
   MarketplaceAgentDialog,
   MarketplaceWorkspaceAgentDetails,
   MarketplacePanel,
+  KnowledgeDocumentDialog,
+  KnowledgeList,
   PublishDialog,
   RatingDialog,
   RunDetailsSheet,
+  RunProgress,
   RunReceipt,
   ToolApprovalCheckpoint,
   UsageReceipt,
@@ -34,8 +38,10 @@ import {
   graphPositionForCanvas,
   graphPositionFromPointer,
   initialGraphPositions,
+  mergeLiveRunEvent,
   progressiveRevealPlan,
   responseStyleFromBoundary,
+  runProgressSpecialists,
   storedGraphPositions,
   unavailableCollaboratorHandoffs,
   workflowProposedNewSpecialists,
@@ -56,6 +62,87 @@ afterEach(() => {
 
 
 describe("Agent Studio product surfaces", () => {
+  it("keeps live Router assignments safe, current, and deduplicated", () => {
+    const planning = mergeLiveRunEvent({ run_id: "run_live", status: "queued", events: [] }, {
+      type: "planner.completed",
+      at: "2026-07-16T10:00:00.000Z",
+      steps: [
+        {
+          id: "s1",
+          adapter: "renault_specialist",
+          task: "Summarize Renault and identify the details needed by the idea specialist.",
+          depends_on: [],
+          internal_note: "must never become part of the safe plan"
+        },
+        {
+          id: "s2",
+          adapter: "idea_specialist",
+          task: "Combine the Renault and Python findings into a practical business idea.",
+          depends_on: ["s1"]
+        }
+      ],
+      agent_reasoning: "hidden chain of thought"
+    });
+    const duplicate = mergeLiveRunEvent(planning, {
+      type: "planner.completed",
+      steps: planning.plan.steps
+    });
+    const working = mergeLiveRunEvent(duplicate, {
+      type: "route.started",
+      step_id: "s1",
+      adapter: "renault_specialist"
+    });
+
+    expect(working.status).toBe("running");
+    expect(working.events).toHaveLength(2);
+    expect(working.plan.steps[0]).toEqual({
+      id: "s1",
+      adapter: "renault_specialist",
+      task: "Summarize Renault and identify the details needed by the idea specialist.",
+      depends_on: []
+    });
+    expect(JSON.stringify(working.plan)).not.toContain("hidden chain of thought");
+    expect(JSON.stringify(working.plan)).not.toContain("internal_note");
+    expect(JSON.stringify(working)).not.toContain("hidden chain of thought");
+    expect(JSON.stringify(working)).not.toContain("internal_note");
+  });
+
+  it("shows selected specialist names, assignments, dependencies, and live state", () => {
+    const run = {
+      status: "running",
+      plan: {
+        steps: [
+          { id: "s1", adapter: "renault_specialist", task: "Review the Renault context.", depends_on: [] },
+          { id: "s2", adapter: "idea_specialist", task: "Create the combined idea.", depends_on: ["s1"] }
+        ]
+      },
+      events: [
+        { type: "planner.completed" },
+        { type: "route.completed", step_id: "s1", adapter: "renault_specialist" },
+        { type: "route.started", step_id: "s2", adapter: "idea_specialist" }
+      ]
+    };
+    const agents = [
+      { id: "renault_specialist", title: "Renault Specialist" },
+      { id: "idea_specialist", title: "Business Idea Specialist" }
+    ];
+
+    expect(runProgressSpecialists(run, agents)).toMatchObject([
+      { name: "Renault Specialist", state: "ready", dependencies: [] },
+      { name: "Business Idea Specialist", state: "working", dependencies: ["Renault Specialist"] }
+    ]);
+
+    const markup = renderToStaticMarkup(createElement(RunProgress, { run, agents }));
+    expect(markup).toContain("2 teammates selected");
+    expect(markup).toContain("Renault Specialist");
+    expect(markup).toContain("Business Idea Specialist");
+    expect(markup).toContain("Why selected:");
+    expect(markup).toContain("Receives work from Renault Specialist");
+    expect(markup).toContain("Working");
+    expect(markup).toContain("private model reasoning is never displayed");
+    expect(markup).not.toContain("hidden chain of thought");
+  });
+
   it("requires enough open team places for a proposed workflow", () => {
     expect(workflowWorkspaceHasCapacity({ agent_count: 13, max_agents: 16 }, 3)).toBe(true);
     expect(workflowWorkspaceHasCapacity({ agent_count: 14, max_agents: 16 }, 3)).toBe(false);
@@ -322,12 +409,66 @@ describe("Agent Studio product surfaces", () => {
       onDisputeOutcome: () => undefined,
       onCorrectOutcome: () => undefined
     }));
-    expect(markup).toContain("How your team contributed");
+    expect(markup).toContain("How your team built this answer");
     expect(markup).toContain("Router");
     expect(markup).toContain("Final answer");
     expect(markup).toContain("Specialist result");
     expect(markup).toContain("Opening evidence");
     expect(markup).toContain("Closing evidence");
+  });
+
+  it("keeps WorldGraph evidence inside Team and exposes Activity only to admins", () => {
+    const run = {
+      run_id: "run_answer_details_team",
+      status: "completed",
+      plan: {
+        steps: [{ id: "research", adapter: "research_agent", task: "Research the request", depends_on: [] }],
+        routing: { selected: [] }
+      },
+      expert_outputs: [{ step_id: "research", adapter: "research_agent", domain_answer: "Complete result." }],
+      sources: [{ title: "Reference" }],
+      outcome_contracts: [],
+      events: [{ type: "run.started", at: "2026-01-01T00:00:00.000Z" }],
+      world_graph: {
+        validity: "unchecked",
+        total: 1,
+        decisions: [{
+          step_id: "research",
+          adapter: "research_agent",
+          action: "refreshed",
+          reason: "no_matching_result"
+        }]
+      }
+    };
+    const commonProps = {
+      run,
+      agents: [{ id: "research_agent", title: "Research Agent" }],
+      contractsById: {},
+      canWrite: true,
+      onClose: () => undefined,
+      onCreateOutcome: () => undefined,
+      onSettleOutcome: () => undefined,
+      onDisputeOutcome: () => undefined,
+      onCorrectOutcome: () => undefined,
+      onRefreshTracked: () => undefined,
+      onRunFresh: () => undefined
+    };
+    const standardMarkup = renderToStaticMarkup(createElement(RunDetailsSheet, commonProps));
+    const adminMarkup = renderToStaticMarkup(createElement(RunDetailsSheet, { ...commonProps, isAdmin: true }));
+
+    expect(standardMarkup).toContain('class="view-switch" role="group" aria-label="Answer detail view"');
+    expect(standardMarkup).toContain(">Team</button>");
+    expect(standardMarkup).toContain(">Sources</button>");
+    expect(standardMarkup).toContain(">Results</button>");
+    expect(standardMarkup).not.toContain(">What changed</button>");
+    expect(standardMarkup).not.toContain(">Activity</button>");
+    expect(standardMarkup).toContain("How your team built this answer");
+    expect(standardMarkup).toContain("WorldGraph record ready");
+    expect(standardMarkup).toContain("Specialist contributions");
+    expect(standardMarkup).toContain('class="detail-section world-changes embedded" role="region"');
+    expect(adminMarkup).toContain('class="view-switch four-up"');
+    expect(adminMarkup).toContain(">Activity</button>");
+    expect(adminMarkup).not.toContain(">What changed</button>");
   });
 
   it("shows a completed unchecked change record without falsely calling it current", () => {
@@ -573,7 +714,9 @@ describe("Agent Studio product surfaces", () => {
       }]
     }));
 
-    expect(markup).toContain("PROPOSED WORKFLOW");
+    expect(markup).toContain("AUTO COMPOSE · PROPOSED WORKFLOW");
+    expect(markup).not.toContain("workflow-card-icon");
+    expect(markup).not.toContain("lucide-wand-sparkles");
     expect(markup).toContain("Proposed workflow handoff graph");
     expect(markup).toContain("Already on your team");
     expect(markup).toContain("Marketplace · maker");
@@ -728,6 +871,68 @@ describe("Agent Studio product surfaces", () => {
     expect(markup).toContain("Advanced connection");
     expect(markup).not.toContain("HTTPS endpoint");
     expect(markup).not.toContain("Bearer token");
+  });
+
+  it("renders the advanced MCP setup as a focused accessible dialog", () => {
+    const markup = renderToStaticMarkup(createElement(CustomMcpDialog, {
+      templates: [{
+        id: "custom",
+        name: "Custom HTTPS",
+        description: "Connect a server you administer.",
+        connection_mode: "custom",
+        auth_type: "bearer",
+        endpoint_placeholder: "https://mcp.example.com/mcp"
+      }],
+      onClose: () => undefined,
+      onSaved: async () => undefined
+    }));
+
+    expect(markup).toContain('role="dialog"');
+    expect(markup).toContain('aria-modal="true"');
+    expect(markup).toContain("Connect a custom MCP server");
+    expect(markup).toContain("HTTPS endpoint");
+    expect(markup).toContain('type="password"');
+    expect(markup).toContain("Connect and discover tools");
+    expect(markup).toContain("custom-mcp-dialog");
+  });
+
+  it("makes each Knowledge file identifiable and opens an authorized review surface", () => {
+    const document = {
+      document_id: "doc_launch_manual",
+      agent_id: "launch_manual_source",
+      title: "Launch Manual",
+      chunks: 3,
+      page_count: 2,
+      visibility: "private",
+      created_at: "2026-07-16T12:00:00.000Z",
+      upload_digest: `sha256:${"a".repeat(64)}`
+    };
+    const agents = [{ id: "launch_manual_source", title: "Launch Manual source specialist" }];
+    const listMarkup = renderToStaticMarkup(createElement(KnowledgeList, {
+      documents: [document],
+      agents,
+      auth: { is_viewer: true },
+      canWrite: false,
+      onAdd: () => undefined,
+      onOpen: () => undefined,
+      onDelete: () => undefined
+    }));
+    expect(listMarkup).toContain('aria-label="Review Launch Manual"');
+    expect(listMarkup).toContain("3 indexed sections");
+    expect(listMarkup).toContain("Private · All chats");
+
+    const dialogMarkup = renderToStaticMarkup(createElement(KnowledgeDocumentDialog, {
+      document,
+      agents,
+      onClose: () => undefined
+    }));
+    expect(dialogMarkup).toContain('role="dialog"');
+    expect(dialogMarkup).toContain("Indexed and ready");
+    expect(dialogMarkup).toContain("2 pages");
+    expect(dialogMarkup).toContain("Launch Manual source specialist");
+    expect(dialogMarkup).toContain("aaaaaaaa");
+    expect(dialogMarkup).toContain("Only people already authorized for this workspace");
+    expect(dialogMarkup).toContain("Loading the authorized review");
   });
 
   it("distinguishes agent bubbles by color without embedding icons", () => {
@@ -994,6 +1199,10 @@ describe("Agent Studio product surfaces", () => {
       items: [item],
       auth: { user_id: "bob", workspace_id: "workspace_b" }
     }));
+    expect(marketplaceMarkup).toContain('<details class="marketplace-hero">');
+    expect(marketplaceMarkup).toContain("COMMUNITY LIBRARY");
+    expect(marketplaceMarkup).toContain("Shared agents and teams, ready to make your own.");
+    expect(marketplaceMarkup).not.toContain("lucide-sparkles");
     expect(marketplaceMarkup).toContain("Published by alice");
     expect(marketplaceMarkup).toContain("Rate");
     expect(marketplaceMarkup).not.toContain("Share your work");
@@ -1233,6 +1442,9 @@ describe("Agent Studio product surfaces", () => {
     expect(styles).toContain(".graph-node.world-mixed");
     expect(styles).toContain(".graph-node.world-fresh");
     expect(styles).toMatch(/\.details-sheet-body > \.view-switch button\s*\{[\s\S]*?min-height: 44px;/);
+    expect(styles).toMatch(/\.answer-team-worldgraph\s*\{[\s\S]*?border-radius: 14px;/);
+    expect(styles).toMatch(/@media \(max-width: 640px\)\s*\{[\s\S]*?\.answer-team-contribution-heading\s*\{[\s\S]*?flex-direction: column;/);
+    expect(styles).not.toContain(".view-switch.five-up");
     expect(styles).toMatch(/\.quick-agent-menu\s*\{[\s\S]*?max-height: min\(420px, calc\(100dvh - 180px\)\);/);
     expect(appSource).toContain('aria-haspopup="dialog"');
     expect(appSource).toContain('role="dialog" aria-modal="false"');
