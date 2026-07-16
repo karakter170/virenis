@@ -9,6 +9,10 @@ import {
 } from "./outcomes.js";
 
 const GLOBAL_WORKSPACE = "virenis_global";
+const CONTENT_FREE_LEDGER_SCHEMA = "virenis-ledger-content-free-v1";
+const SERVICE_ACTORS = new Set([
+  "system", "virenis-web", "router-system", "tcar-system", "tracking-user"
+]);
 const RANK_PRIOR_MEAN = 0.5;
 const RANK_PRIOR_WEIGHT = 2;
 const RANK_HALF_LIFE_DAYS = 180;
@@ -35,6 +39,168 @@ const REQUIRED_LEDGER_TRIGGERS = [
     "reality_rank_snapshots"
   ].map((table) => `${table}_immutable_guard`)
 ];
+
+/**
+ * Return the durable identifier used for a human actor in the append-only
+ * projection. The operational store remains the identity source of truth; the
+ * long-retention ledger only needs a stable, workspace-scoped correlation key.
+ * Service principals are non-person identities and remain readable.
+ */
+export function normalizedLedgerActorId(workspaceId, value) {
+  const actor = String(value || "system").trim() || "system";
+  if (SERVICE_ACTORS.has(actor)) return actor;
+  const hash = crypto.createHash("sha256")
+    .update(`virenis-ledger-actor-v1\0${workspace(workspaceId)}\0${actor}`, "utf8")
+    .digest("hex");
+  return `actor_sha256_${hash}`;
+}
+
+/**
+ * Replace arbitrary text/JSON with a typed digest receipt before it reaches an
+ * immutable ledger JSON column. This intentionally contains no excerpt that
+ * could survive an account erasure through the operational store.
+ */
+export function normalizedLedgerContentReceipt(kind, value) {
+  return {
+    schema_version: CONTENT_FREE_LEDGER_SCHEMA,
+    kind: safeEvent(kind, "content"),
+    content_digest: `sha256:${privacyDigest(value).toString("hex")}`,
+    redacted: true
+  };
+}
+
+function normalizedLedgerIdempotencyKey(workspaceId, value) {
+  if (value === null || value === undefined || value === "") return null;
+  return `key_sha256_${crypto.createHash("sha256")
+    .update(`virenis-ledger-key-v1\0${workspace(workspaceId)}\0${String(value)}`, "utf8")
+    .digest("hex")}`;
+}
+
+export function normalizedLedgerLabel(kind, value) {
+  return `${safeEvent(kind, "value")}_sha256_${privacyDigest(value).toString("hex")}`;
+}
+
+function contentReceiptPredicate(column, kind) {
+  if (!/^[a-z_.]+$/.test(column) || !/^[a-z_]+$/.test(kind)) {
+    throw new Error("Invalid normalized-ledger privacy predicate.");
+  }
+  return `(
+    ${column} = jsonb_build_object(
+      'schema_version', '${CONTENT_FREE_LEDGER_SCHEMA}',
+      'kind', '${kind}',
+      'content_digest', ${column}->>'content_digest',
+      'redacted', true
+    )
+    AND COALESCE(${column}->>'content_digest', '') ~ '^sha256:[0-9a-f]{64}$'
+  )`;
+}
+
+const LEGACY_LEDGER_PRIVACY_GATE_SQL = `
+  SELECT category
+    FROM (
+      SELECT 'actor_identifier' AS category, (
+        EXISTS (SELECT 1 FROM tcar_ledger.agent_revisions WHERE workspace_id=$1 AND NOT (created_by=ANY($2::text[]) OR created_by ~ '^actor_sha256_[0-9a-f]{64}$'))
+        OR EXISTS (SELECT 1 FROM tcar_ledger.agent_events WHERE workspace_id=$1 AND NOT (actor_id=ANY($2::text[]) OR actor_id ~ '^actor_sha256_[0-9a-f]{64}$'))
+        OR EXISTS (SELECT 1 FROM tcar_ledger.execution_runs WHERE workspace_id=$1 AND NOT (actor_id=ANY($2::text[]) OR actor_id ~ '^actor_sha256_[0-9a-f]{64}$'))
+        OR EXISTS (SELECT 1 FROM tcar_ledger.execution_events WHERE workspace_id=$1 AND NOT (actor_id=ANY($2::text[]) OR actor_id ~ '^actor_sha256_[0-9a-f]{64}$'))
+        OR EXISTS (SELECT 1 FROM tcar_ledger.source_revisions WHERE workspace_id=$1 AND NOT (created_by=ANY($2::text[]) OR created_by ~ '^actor_sha256_[0-9a-f]{64}$'))
+        OR EXISTS (SELECT 1 FROM tcar_ledger.outcome_contracts WHERE workspace_id=$1 AND NOT (owner_actor_id=ANY($2::text[]) OR owner_actor_id ~ '^actor_sha256_[0-9a-f]{64}$'))
+        OR EXISTS (SELECT 1 FROM tcar_ledger.outcome_contract_versions WHERE workspace_id=$1 AND NOT (created_by=ANY($2::text[]) OR created_by ~ '^actor_sha256_[0-9a-f]{64}$'))
+        OR EXISTS (SELECT 1 FROM tcar_ledger.outcome_instances WHERE workspace_id=$1 AND NOT (created_by=ANY($2::text[]) OR created_by ~ '^actor_sha256_[0-9a-f]{64}$'))
+        OR EXISTS (SELECT 1 FROM tcar_ledger.outcome_observations WHERE workspace_id=$1 AND NOT (oracle_principal_id=ANY($2::text[]) OR oracle_principal_id ~ '^actor_sha256_[0-9a-f]{64}$'))
+        OR EXISTS (SELECT 1 FROM tcar_ledger.outcome_settlements WHERE workspace_id=$1 AND NOT (verifier_principal_id=ANY($2::text[]) OR verifier_principal_id ~ '^actor_sha256_[0-9a-f]{64}$'))
+        OR EXISTS (SELECT 1 FROM tcar_ledger.outcome_disputes WHERE workspace_id=$1 AND NOT (disputed_by=ANY($2::text[]) OR disputed_by ~ '^actor_sha256_[0-9a-f]{64}$'))
+      ) AS present
+      UNION ALL
+      SELECT 'durable_label', (
+        EXISTS (SELECT 1 FROM tcar_ledger.agent_revisions WHERE workspace_id=$1 AND agent_id !~ '^agent_sha256_[0-9a-f]{64}$')
+        OR EXISTS (SELECT 1 FROM tcar_ledger.agent_events WHERE workspace_id=$1 AND agent_id !~ '^agent_sha256_[0-9a-f]{64}$')
+        OR EXISTS (SELECT 1 FROM tcar_ledger.execution_steps WHERE workspace_id=$1 AND agent_id !~ '^agent_sha256_[0-9a-f]{64}$')
+        OR EXISTS (SELECT 1 FROM tcar_ledger.execution_steps WHERE workspace_id=$1 AND adapter_id IS NOT NULL AND adapter_id !~ '^agent_sha256_[0-9a-f]{64}$')
+        OR EXISTS (SELECT 1 FROM tcar_ledger.source_revisions WHERE workspace_id=$1 AND source_id !~ '^source_sha256_[0-9a-f]{64}$')
+        OR EXISTS (SELECT 1 FROM tcar_ledger.execution_steps WHERE workspace_id=$1 AND logical_step_id !~ '^step_sha256_[0-9a-f]{64}$')
+        OR EXISTS (SELECT 1 FROM tcar_ledger.execution_events WHERE workspace_id=$1 AND logical_step_id IS NOT NULL AND logical_step_id !~ '^step_sha256_[0-9a-f]{64}$')
+        OR EXISTS (SELECT 1 FROM tcar_ledger.evidence_records WHERE workspace_id=$1 AND logical_step_id IS NOT NULL AND logical_step_id !~ '^step_sha256_[0-9a-f]{64}$')
+        OR EXISTS (SELECT 1 FROM tcar_ledger.evidence_records WHERE workspace_id=$1 AND chunk_id IS NOT NULL AND chunk_id !~ '^chunk_sha256_[0-9a-f]{64}$')
+        OR EXISTS (SELECT 1 FROM tcar_ledger.execution_artifacts WHERE workspace_id=$1 AND logical_step_id !~ '^step_sha256_[0-9a-f]{64}$')
+        OR EXISTS (SELECT 1 FROM tcar_ledger.execution_artifacts WHERE workspace_id=$1 AND artifact_name !~ '^artifact_sha256_[0-9a-f]{64}$')
+        OR EXISTS (SELECT 1 FROM tcar_ledger.outcome_contracts WHERE workspace_id=$1 AND contract_key !~ '^contract_sha256_[0-9a-f]{64}$')
+        OR EXISTS (SELECT 1 FROM tcar_ledger.outcome_observations WHERE workspace_id=$1 AND metric_key !~ '^metric_sha256_[0-9a-f]{64}$')
+        OR EXISTS (SELECT 1 FROM tcar_ledger.settlement_metric_scores WHERE workspace_id=$1 AND metric_key !~ '^participant_metric_sha256_[0-9a-f]{64}$')
+        OR EXISTS (SELECT 1 FROM tcar_ledger.reality_rank_snapshots WHERE workspace_id=$1 AND contract_family !~ '^contract_family_sha256_[0-9a-f]{64}$')
+        OR EXISTS (SELECT 1 FROM tcar_ledger.reality_rank_snapshots WHERE workspace_id=$1 AND domain_key !~ '^domain_sha256_[0-9a-f]{64}$')
+      ) AS present
+      UNION ALL
+      SELECT 'dependency_label', EXISTS (
+        SELECT 1
+          FROM tcar_ledger.execution_steps AS step,
+               LATERAL jsonb_array_elements_text(step.depends_on) AS dependency(value)
+         WHERE step.workspace_id=$1 AND dependency.value !~ '^step_sha256_[0-9a-f]{64}$'
+      ) AS present
+      UNION ALL
+      SELECT 'metric_definition', EXISTS (
+        SELECT 1
+          FROM tcar_ledger.outcome_contract_versions AS version,
+               LATERAL jsonb_array_elements(version.metric_definitions) AS metric(value)
+         WHERE version.workspace_id=$1
+           AND CASE
+             WHEN jsonb_typeof(metric.value) <> 'object' THEN true
+             ELSE COALESCE(metric.value->>'key', '') !~ '^metric_sha256_[0-9a-f]{64}$'
+               OR EXISTS (
+                 SELECT 1 FROM jsonb_object_keys(metric.value) AS property(name)
+                  WHERE property.name NOT IN ('key', 'type', 'weight')
+               )
+           END
+      ) AS present
+      UNION ALL
+      SELECT 'raw_json_content', (
+        EXISTS (SELECT 1 FROM tcar_ledger.agent_revisions WHERE workspace_id=$1 AND NOT ${contentReceiptPredicate("revision_snapshot", "agent_revision_snapshot")})
+        OR EXISTS (SELECT 1 FROM tcar_ledger.agent_events WHERE workspace_id=$1 AND NOT ${contentReceiptPredicate("payload", "agent_event_payload")})
+        OR EXISTS (SELECT 1 FROM tcar_ledger.source_revisions WHERE workspace_id=$1 AND NOT ${contentReceiptPredicate("source_metadata", "source_metadata")})
+        OR EXISTS (SELECT 1 FROM tcar_ledger.execution_runs WHERE workspace_id=$1 AND NOT ${contentReceiptPredicate("component_snapshot", "execution_component_snapshot")})
+        OR EXISTS (SELECT 1 FROM tcar_ledger.execution_runs WHERE workspace_id=$1 AND NOT ${contentReceiptPredicate("planner_snapshot", "execution_planner_snapshot")})
+        OR EXISTS (SELECT 1 FROM tcar_ledger.execution_steps WHERE workspace_id=$1 AND NOT ${contentReceiptPredicate("metadata", "execution_step_metadata")})
+        OR EXISTS (SELECT 1 FROM tcar_ledger.execution_events WHERE workspace_id=$1 AND NOT ${contentReceiptPredicate("payload", "execution_event_payload")})
+        OR EXISTS (SELECT 1 FROM tcar_ledger.outcome_contracts WHERE workspace_id=$1 AND NOT ${contentReceiptPredicate("metadata", "outcome_contract_metadata")})
+        OR EXISTS (SELECT 1 FROM tcar_ledger.outcome_contract_versions WHERE workspace_id=$1 AND NOT ${contentReceiptPredicate("definition", "outcome_contract_definition")})
+        OR EXISTS (SELECT 1 FROM tcar_ledger.outcome_observations WHERE workspace_id=$1 AND NOT ${contentReceiptPredicate("observed_value", "outcome_observed_value")})
+        OR EXISTS (SELECT 1 FROM tcar_ledger.settlement_metric_scores WHERE workspace_id=$1 AND measured_value IS NOT NULL AND NOT ${contentReceiptPredicate("measured_value", "measured_value")})
+        OR EXISTS (SELECT 1 FROM tcar_ledger.settlement_metric_scores WHERE workspace_id=$1 AND target_value IS NOT NULL AND NOT ${contentReceiptPredicate("target_value", "target_value")})
+      ) AS present
+      UNION ALL
+      SELECT 'raw_outcome_header', EXISTS (
+        SELECT 1 FROM tcar_ledger.outcome_contracts
+         WHERE workspace_id=$1
+           AND (display_name <> 'Content-redacted outcome contract' OR description <> '')
+      ) AS present
+      UNION ALL
+      SELECT 'raw_idempotency_key', (
+        EXISTS (SELECT 1 FROM tcar_ledger.agent_events WHERE workspace_id=$1 AND idempotency_key IS NOT NULL AND idempotency_key !~ '^key_sha256_[0-9a-f]{64}$')
+        OR EXISTS (SELECT 1 FROM tcar_ledger.execution_runs WHERE workspace_id=$1 AND idempotency_key IS NOT NULL AND idempotency_key !~ '^key_sha256_[0-9a-f]{64}$')
+        OR EXISTS (SELECT 1 FROM tcar_ledger.execution_events WHERE workspace_id=$1 AND idempotency_key IS NOT NULL AND idempotency_key !~ '^key_sha256_[0-9a-f]{64}$')
+        OR EXISTS (SELECT 1 FROM tcar_ledger.execution_artifacts WHERE workspace_id=$1 AND idempotency_key IS NOT NULL AND idempotency_key !~ '^key_sha256_[0-9a-f]{64}$')
+        OR EXISTS (SELECT 1 FROM tcar_ledger.outcome_instances WHERE workspace_id=$1 AND idempotency_key IS NOT NULL AND idempotency_key !~ '^key_sha256_[0-9a-f]{64}$')
+        OR EXISTS (SELECT 1 FROM tcar_ledger.outcome_observations WHERE workspace_id=$1 AND idempotency_key IS NOT NULL AND idempotency_key !~ '^key_sha256_[0-9a-f]{64}$')
+        OR EXISTS (SELECT 1 FROM tcar_ledger.outcome_settlements WHERE workspace_id=$1 AND idempotency_key IS NOT NULL AND idempotency_key !~ '^key_sha256_[0-9a-f]{64}$')
+        OR EXISTS (SELECT 1 FROM tcar_ledger.reality_rank_snapshots WHERE workspace_id=$1 AND idempotency_key IS NOT NULL AND idempotency_key !~ '^key_sha256_[0-9a-f]{64}$')
+      ) AS present
+      UNION ALL
+      SELECT 'workspace_header', EXISTS (
+        SELECT 1 FROM tcar_ledger.workspaces
+         WHERE workspace_id=$1
+           AND (
+             display_name <> CASE WHEN workspace_id='${GLOBAL_WORKSPACE}' THEN 'virenis global' ELSE 'Private workspace' END
+             OR metadata <> '{"source":"virenis-web"}'::jsonb
+           )
+      ) AS present
+      UNION ALL
+      SELECT 'inline_artifact_payload', EXISTS (
+        SELECT 1 FROM tcar_ledger.execution_artifacts
+         WHERE workspace_id=$1 AND inline_payload IS NOT NULL
+      ) AS present
+    ) AS checks
+   WHERE present
+   LIMIT 1`;
 
 export async function normalizedLedgerAvailable(client) {
   const result = await client.query(
@@ -70,11 +236,15 @@ export async function syncNormalizedLedger(client, data) {
   const workspaces = collectWorkspaces(data);
   for (const workspaceId of workspaces) {
     await setWorkspace(client, workspaceId);
+    await assertNormalizedLedgerWorkspacePrivacy(client, workspaceId);
+  }
+  for (const workspaceId of workspaces) {
+    await setWorkspace(client, workspaceId);
     await client.query(
       `INSERT INTO tcar_ledger.workspaces(workspace_id, display_name, metadata)
        VALUES ($1, $2, $3::jsonb)
        ON CONFLICT (workspace_id) DO NOTHING`,
-      [workspaceId, workspaceId === GLOBAL_WORKSPACE ? "virenis global" : workspaceId, JSON.stringify({ source: "virenis-web" })]
+      [workspaceId, workspaceId === GLOBAL_WORKSPACE ? "virenis global" : "Private workspace", JSON.stringify({ source: "virenis-web" })]
     );
   }
 
@@ -83,6 +253,21 @@ export async function syncNormalizedLedger(client, data) {
   await syncExecutionLedger(client, data);
   await syncOutcomeLedger(client, data);
   await syncRealityRankLedger(client, data);
+}
+
+export async function assertNormalizedLedgerWorkspacePrivacy(client, workspaceId) {
+  const result = await client.query(
+    LEGACY_LEDGER_PRIVACY_GATE_SQL,
+    [workspaceId, [...SERVICE_ACTORS]]
+  );
+  if (!result.rowCount) return;
+  const error = new Error(
+    `Normalized ledger privacy migration required for ${normalizedLedgerLabel("workspace", workspaceId)} `
+    + `(${result.rows[0]?.category || "legacy_content"}). Stop application writes, inventory this workspace `
+    + "with a migration-only BYPASSRLS role, and complete the approved legacy-ledger privacy migration before retrying."
+  );
+  error.code = "NORMALIZED_LEDGER_LEGACY_PRIVACY_MIGRATION_REQUIRED";
+  throw error;
 }
 
 async function syncAgentLedger(client, data) {
@@ -100,9 +285,12 @@ async function syncAgentLedger(client, data) {
     await setWorkspace(client, workspaceId);
     const ordered = [...events];
     if (!verifyEventChain(ordered)) {
-      throw new Error(`Agent event chain failed integrity verification for ${eventSubject(workspaceId, ordered[0]?.agent_id)}.`);
+      throw new Error(
+        `Agent event chain failed integrity verification for ${eventSubject(workspaceId, normalizedLedgerLabel("agent", ordered[0]?.agent_id))}.`
+      );
     }
-    await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`${workspaceId}|${ordered[0]?.agent_id}`]);
+    const ledgerAgentId = normalizedLedgerLabel("agent", ordered[0]?.agent_id);
+    await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`${workspaceId}|${ledgerAgentId}`]);
     for (const event of ordered) {
       const revision = normalizedDigest(event.agent_revision) || digest(event);
       const agent = findWorkspaceAgent(data, event.agent_id, workspaceId) || { id: event.agent_id };
@@ -111,9 +299,10 @@ async function syncAgentLedger(client, data) {
       await insertAgentRevision(client, {
         workspaceId,
         revisionId,
-        revisionNo: await revisionNumber(client, workspaceId, event.agent_id, revision),
+        revisionNo: await revisionNumber(client, workspaceId, ledgerAgentId, revision),
         revision,
         agent,
+        ledgerAgentId,
         snapshot,
         createdBy: event.actor_id || "system",
         createdAt: event.occurred_at
@@ -123,11 +312,11 @@ async function syncAgentLedger(client, data) {
       const eventId = stableUuid("agent-event", workspaceId, event.event_id);
       const revision = normalizedDigest(event.agent_revision) || digest(event);
       const payload = { details: event.details || {}, actor_role: event.actor_role || null };
+      const ledgerPayload = normalizedLedgerContentReceipt("agent_event_payload", payload);
       const expectedEvent = {
-        agent_id: event.agent_id,
+        agent_id: ledgerAgentId,
         sequence_no: index + 1,
         event_type: safeEvent(event.event_type, "agent.event"),
-        actor_id: event.actor_id || "system",
         payload_digest: digest(payload),
         previous_event_digest: digestOrNull(event.previous_event_hash),
         event_digest: digestOrValue(event.event_hash, event)
@@ -143,13 +332,13 @@ async function syncAgentLedger(client, data) {
         [
           workspaceId,
           eventId,
-          event.agent_id,
+          ledgerAgentId,
           revisionUuid(workspaceId, event.agent_id, revision),
           index + 1,
           safeEvent(event.event_type, "agent.event"),
           event.schema_version || "virenis-agent-event-v1",
-          event.actor_id || "system",
-          JSON.stringify(payload),
+          normalizedLedgerActorId(workspaceId, event.actor_id),
+          JSON.stringify(ledgerPayload),
           digest(payload),
           digestOrNull(event.previous_event_hash),
           digestOrValue(event.event_hash, event),
@@ -166,11 +355,16 @@ async function insertAgentRevision(client, {
   revisionNo,
   revision,
   agent,
+  ledgerAgentId = agent.id,
   snapshot,
   createdBy,
   createdAt
 }) {
   const revisionSnapshotValue = snapshot || revisionSnapshot(null, agent, revision);
+  const ledgerRevisionSnapshot = normalizedLedgerContentReceipt(
+    "agent_revision_snapshot",
+    revisionSnapshotValue
+  );
   await client.query(
     `INSERT INTO tcar_ledger.agent_revisions(
        workspace_id, agent_revision_id, agent_id, revision_no, contract_version,
@@ -181,28 +375,29 @@ async function insertAgentRevision(client, {
     [
       workspaceId,
       revisionId,
-      agent.id,
+      ledgerAgentId,
       revisionNo,
       agent.contract_version || "tcar-agent-v1",
       revision,
       digestOrValue(revisionSnapshotValue.manifest_contract_digest, revisionSnapshotValue),
       digestOrNull(revisionSnapshotValue.adapter_content_digest),
       digest((revisionSnapshotValue.sources || []).slice().sort()),
-      JSON.stringify(revisionSnapshotValue),
-      createdBy || "system",
+      JSON.stringify(ledgerRevisionSnapshot),
+      normalizedLedgerActorId(workspaceId, createdBy),
       iso(createdAt)
     ]
   );
   await assertImmutableRow(client, "agent_revisions", "agent_revision_id", workspaceId, revisionId, {
-    agent_id: agent.id,
+    agent_id: ledgerAgentId,
     revision_digest: revision,
-    revision_snapshot: revisionSnapshotValue
+    manifest_item_digest: digestOrValue(revisionSnapshotValue.manifest_contract_digest, revisionSnapshotValue)
   });
 }
 
 async function syncSourceLedger(client, data) {
   for (const document of data.documents || []) {
     const workspaceId = workspace(document.workspace_id);
+    const documentLabel = normalizedLedgerLabel("source", document.document_id || document.agent_id || "unknown");
     await setWorkspace(client, workspaceId);
     const snapshot = document.source_revision_snapshot && typeof document.source_revision_snapshot === "object"
       ? document.source_revision_snapshot
@@ -210,15 +405,15 @@ async function syncSourceLedger(client, data) {
     const contentDigest = normalizedDigest(snapshot?.content_digest);
     const uploadDigest = normalizedDigest(document.upload_digest);
     if (!contentDigest || !uploadDigest || !contentDigest.equals(uploadDigest)) {
-      throw new Error(`Document ${document.document_id || document.agent_id || "unknown"} is missing its verified upload-byte digest.`);
+      throw new Error(`Document ${documentLabel} is missing its verified upload-byte digest.`);
     }
     const corpusRevision = normalizedDigest(snapshot?.corpus_revision || document.corpus_revision);
     if (!corpusRevision) {
-      throw new Error(`Document ${document.document_id || document.agent_id || "unknown"} is missing its verified corpus revision.`);
+      throw new Error(`Document ${documentLabel} is missing its verified corpus revision.`);
     }
     const indexDigest = normalizedDigest(snapshot?.index_digest || document.index_digest);
     if (!indexDigest) {
-      throw new Error(`Document ${document.document_id || document.agent_id || "unknown"} is missing its verified index digest.`);
+      throw new Error(`Document ${documentLabel} is missing its verified index digest.`);
     }
     const sourceMetadata = canonical(snapshot?.source_metadata || {});
     if (
@@ -226,15 +421,17 @@ async function syncSourceLedger(client, data) {
       || !normalizedDigest(sourceMetadata.extracted_text_digest)
       || !normalizedDigest(sourceMetadata.corpus_revision)?.equals(corpusRevision)
     ) {
-      throw new Error(`Document ${document.document_id || document.agent_id || "unknown"} has an incomplete immutable source snapshot.`);
+      throw new Error(`Document ${documentLabel} has an incomplete immutable source snapshot.`);
     }
     const chunkCount = Number.isSafeInteger(snapshot?.chunk_count)
       ? snapshot.chunk_count
       : (document.chunks || []).length;
     const metadataDigest = digest(sourceMetadata);
+    const ledgerSourceMetadata = normalizedLedgerContentReceipt("source_metadata", sourceMetadata);
     const sourceId = document.document_id || document.agent_id;
+    const ledgerSourceId = normalizedLedgerLabel("source", sourceId);
     const sourceRevisionId = sourceUuid(workspaceId, sourceId, contentDigest);
-    const revisionNo = await sourceRevisionNumber(client, workspaceId, sourceId, contentDigest);
+    const revisionNo = await sourceRevisionNumber(client, workspaceId, ledgerSourceId, contentDigest);
     const createdBy = document.created_by || "system";
     const createdAt = iso(document.created_at);
     await client.query(
@@ -247,29 +444,27 @@ async function syncSourceLedger(client, data) {
       [
         workspaceId,
         sourceRevisionId,
-        sourceId,
+        ledgerSourceId,
         revisionNo,
         contentDigest,
         indexDigest,
         metadataDigest,
         chunkCount,
-        JSON.stringify(sourceMetadata),
-        createdBy,
+        JSON.stringify(ledgerSourceMetadata),
+        normalizedLedgerActorId(workspaceId, createdBy),
         createdAt
       ]
     );
     await assertImmutableRow(client, "source_revisions", "source_revision_id", workspaceId, sourceRevisionId, {
       workspace_id: workspaceId,
       source_revision_id: sourceRevisionId,
-      source_id: sourceId,
+      source_id: ledgerSourceId,
       revision_no: revisionNo,
       source_kind: "document",
       content_digest: contentDigest,
       index_digest: indexDigest,
       metadata_digest: metadataDigest,
       chunk_count: chunkCount,
-      source_metadata: sourceMetadata,
-      created_by: createdBy,
       created_at: createdAt
     });
   }
@@ -293,6 +488,7 @@ async function syncExecutionLedger(client, data) {
       runtime_execution_id: record.runtime_execution_id || null,
       runtime_record_hash: record.runtime_record_hash || null
     };
+    const plannerSnapshot = { mode: record.planner_mode || null, routing: run.plan?.routing || null };
     const executionEventId = stableUuid("execution-event", workspaceId, record.execution_id);
     await client.query(
       `INSERT INTO tcar_ledger.execution_runs(
@@ -307,14 +503,14 @@ async function syncExecutionLedger(client, data) {
         executionId,
         record.run_id,
         record.schema_version || "virenis-execution-v1",
-        record.created_by || "system",
+        normalizedLedgerActorId(workspaceId, record.created_by),
         ledgerVisibility(record.visibility),
         terminalStatus,
         digestOrValue(record.query_digest, run.query || ""),
         digestOrValue(record.manifest_revision, "unavailable"),
         digestOrValue(record.plan_digest, run.plan || {}),
-        JSON.stringify(componentSnapshot),
-        JSON.stringify({ mode: record.planner_mode || null, routing: run.plan?.routing || null }),
+        JSON.stringify(normalizedLedgerContentReceipt("execution_component_snapshot", componentSnapshot)),
+        JSON.stringify(normalizedLedgerContentReceipt("execution_planner_snapshot", plannerSnapshot)),
         digestOrValue(record.record_hash, record),
         iso(run.created_at || record.started_at || record.recorded_at),
         iso(record.started_at || run.started_at || record.recorded_at),
@@ -331,19 +527,22 @@ async function syncExecutionLedger(client, data) {
       const step = runSteps.find((item) => item.step_id === participant.step_id) || {};
       const revision = normalizedDigest(participant.agent_revision) || digest(participant);
       const agent = findWorkspaceAgent(data, participant.agent_id, workspaceId) || { id: participant.agent_id };
+      const ledgerAgentId = normalizedLedgerLabel("agent", participant.agent_id);
       const snapshot = revisionSnapshot(participant.agent_revision_snapshot, agent, revision);
       const revisionId = revisionUuid(workspaceId, participant.agent_id, revision);
       await insertAgentRevision(client, {
         workspaceId,
         revisionId,
-        revisionNo: await revisionNumber(client, workspaceId, participant.agent_id, revision),
+        revisionNo: await revisionNumber(client, workspaceId, ledgerAgentId, revision),
         revision,
         agent,
+        ledgerAgentId,
         snapshot,
         createdBy: record.created_by || "system",
         createdAt: record.recorded_at
       });
       const stepId = executionStepUuid(workspaceId, record.run_id, participant.step_id);
+      const ledgerStepId = normalizedLedgerLabel("step", participant.step_id);
       const startedAt = iso(step.started_at || record.started_at || record.recorded_at);
       const completedAt = iso(step.completed_at || record.completed_at || record.recorded_at);
       await client.query(
@@ -358,10 +557,10 @@ async function syncExecutionLedger(client, data) {
           workspaceId,
           stepId,
           executionId,
-          participant.step_id,
-          participant.agent_id,
+          ledgerStepId,
+          ledgerAgentId,
           revisionId,
-          participant.binding_type === "base_model" ? null : participant.agent_id,
+          participant.binding_type === "base_model" ? null : ledgerAgentId,
           participant.model_id || record.base_model || "unknown",
           digestOrNull(record.base_model_digest),
           digestOrNull(record.router_chat_template_digest),
@@ -369,22 +568,21 @@ async function syncExecutionLedger(client, data) {
           digestOrValue(participant.task_digest, step.task || ""),
           digest({ depends_on: step.depends_on || [], routing: participant.routing || null }),
           digestOrNull(participant.output_digest),
-          JSON.stringify(step.depends_on || []),
+          JSON.stringify((step.depends_on || []).map((stepIdValue) => normalizedLedgerLabel("step", stepIdValue))),
           stepStatus(participant.status),
           startedAt,
           completedAt,
           elapsedMs(step.elapsed_sec, startedAt, completedAt),
-          JSON.stringify({
+          JSON.stringify(normalizedLedgerContentReceipt("execution_step_metadata", {
             participant_index: index,
             routing: participant.routing || null,
             policy_violations: step.policy_violations || [],
             adapter_digest: participant.adapter_digest || null
-          })
+          }))
         ]
       );
       await assertImmutableRow(client, "execution_steps", "execution_step_id", workspaceId, stepId, {
         execution_id: executionId,
-        agent_id: participant.agent_id,
         agent_revision_id: revisionId,
         output_set_digest: digestOrNull(participant.output_digest)
       });
@@ -402,6 +600,10 @@ async function syncExecutionLedger(client, data) {
       sequence_no: 1,
       event_digest: digestOrValue(record.record_hash, record)
     };
+    const executionEventPayload = {
+      record_hash: record.record_hash,
+      result_digest: record.result_digest
+    };
     if (!await immutableRowMatches(client, "execution_events", "execution_event_id", workspaceId, executionEventId, expectedExecutionEvent)) await client.query(
       `INSERT INTO tcar_ledger.execution_events(
          workspace_id, execution_event_id, execution_id, sequence_no, event_type,
@@ -413,9 +615,9 @@ async function syncExecutionLedger(client, data) {
         executionEventId,
         executionId,
         `execution.${terminalStatus}`,
-        record.created_by || "system",
-        JSON.stringify({ record_hash: record.record_hash, result_digest: record.result_digest }),
-        digest({ record_hash: record.record_hash, result_digest: record.result_digest }),
+        normalizedLedgerActorId(workspaceId, record.created_by),
+        JSON.stringify(normalizedLedgerContentReceipt("execution_event_payload", executionEventPayload)),
+        digest(executionEventPayload),
         digestOrValue(record.record_hash, record),
         iso(record.completed_at || record.recorded_at)
       ]
@@ -458,9 +660,9 @@ async function syncEvidence(client, data, record, step, executionId, workspaceId
         workspaceId,
         evidenceId,
         executionId,
-        step.step_id,
+        normalizedLedgerLabel("step", step.step_id),
         sourceRevisionId,
-        citation.chunk_id,
+        normalizedLedgerLabel("chunk", citation.chunk_id),
         positiveIntOrNull(citation.page_start),
         positiveIntOrNull(citation.page_end),
         citation.claim ? digest(citation.claim) : null,
@@ -491,6 +693,7 @@ async function syncArtifacts(client, record, step, executionId, stepId, revision
     if (!artifact?.name) continue;
     const artifactId = stableUuid("artifact", workspaceId, record.run_id, step.step_id, artifact.name);
     const inlinePayload = artifact.value === undefined ? null : artifact.value;
+    const ledgerArtifactName = normalizedLedgerLabel("artifact", artifact.name);
     await client.query(
       `INSERT INTO tcar_ledger.execution_artifacts(
          workspace_id, artifact_id, execution_id, execution_step_id, logical_step_id,
@@ -504,14 +707,14 @@ async function syncArtifacts(client, record, step, executionId, stepId, revision
         artifactId,
         executionId,
         stepId,
-        step.step_id,
+        normalizedLedgerLabel("step", step.step_id),
         revisionId,
-        String(artifact.name).slice(0, 240),
+        ledgerArtifactName.slice(0, 240),
         typeof inlinePayload === "object" ? "json" : "text",
-        artifact.schema_version || "tcar-handoff-artifact-v1",
+        CONTENT_FREE_LEDGER_SCHEMA,
         digestOrValue(artifact.content_digest, inlinePayload),
         digest(artifact),
-        JSON.stringify(inlinePayload),
+        null,
         probabilityOrNull(artifact.confidence),
         artifact.verified === false ? "rejected" : artifact.verified === true ? "verified" : "unverified",
         iso(step.completed_at || record.completed_at || record.recorded_at)
@@ -537,6 +740,11 @@ async function syncOutcomeLedger(client, data) {
     const contractId = stableUuid("outcome-contract", workspaceId, contract.contract_id);
     const versionId = stableUuid("outcome-contract-version", workspaceId, contract.contract_id, "1");
     const instanceId = stableUuid("outcome-instance", workspaceId, contract.contract_id);
+    const contractMetadata = {
+      domain: contract.domain,
+      task_type: contract.task_type,
+      visibility: contract.visibility
+    };
     await client.query(
       `INSERT INTO tcar_ledger.outcome_contracts(
          workspace_id, outcome_contract_id, contract_key, display_name, description,
@@ -546,17 +754,16 @@ async function syncOutcomeLedger(client, data) {
       [
         workspaceId,
         contractId,
-        safeKey(contract.contract_id),
-        contract.title,
-        contract.claim || "",
-        contract.created_by || "system",
-        JSON.stringify({ domain: contract.domain, task_type: contract.task_type, visibility: contract.visibility }),
+        normalizedLedgerLabel("contract", contract.contract_id),
+        "Content-redacted outcome contract",
+        "",
+        normalizedLedgerActorId(workspaceId, contract.created_by),
+        JSON.stringify(normalizedLedgerContentReceipt("outcome_contract_metadata", contractMetadata)),
         iso(contract.created_at)
       ]
     );
     await assertImmutableRow(client, "outcome_contracts", "outcome_contract_id", workspaceId, contractId, {
-      contract_key: safeKey(contract.contract_id),
-      owner_actor_id: contract.created_by || "system"
+      outcome_contract_id: contractId
     });
     const dueAt = iso(contract.resolution?.due_at || contract.created_at);
     const observationSeconds = Math.max(0, (Date.parse(dueAt) - Date.parse(iso(contract.created_at))) / 1000);
@@ -575,19 +782,22 @@ async function syncOutcomeLedger(client, data) {
         versionId,
         contractId,
         contract.schema_version || "virenis-outcome-contract-v2",
-        JSON.stringify(definition),
-        JSON.stringify([{ key: safeKey(contract.resolution?.metric || "outcome"), type: contract.outcome_type, weight: 1 }]),
+        JSON.stringify(normalizedLedgerContentReceipt("outcome_contract_definition", definition)),
+        JSON.stringify([{
+          key: normalizedLedgerLabel("metric", contract.resolution?.metric || "outcome"),
+          type: contract.outcome_type,
+          weight: 1
+        }]),
         definitionDigest,
         `${observationSeconds} seconds`,
         (contract.evidence_ids || []).length,
-        contract.created_by || "system",
+        normalizedLedgerActorId(workspaceId, contract.created_by),
         iso(contract.created_at)
       ]
     );
     await assertImmutableRow(client, "outcome_contract_versions", "outcome_contract_version_id", workspaceId, versionId, {
       outcome_contract_id: contractId,
-      definition_digest: definitionDigest,
-      definition
+      definition_digest: definitionDigest
     });
     const desiredStatus = desiredOutcomeStatus(contract, dueAt);
     const bindingDigest = digest({ execution_id: contract.execution_id, execution_record_hash: contract.execution_record_hash });
@@ -603,11 +813,11 @@ async function syncOutcomeLedger(client, data) {
         instanceId,
         executionId,
         versionId,
-        contract.idempotency_key || null,
+        normalizedLedgerIdempotencyKey(workspaceId, contract.idempotency_key),
         bindingDigest,
         iso(contract.created_at),
         dueAt,
-        contract.created_by || "system"
+        normalizedLedgerActorId(workspaceId, contract.created_by)
       ]
     );
     await assertImmutableRow(client, "outcome_instances", "outcome_instance_id", workspaceId, instanceId, {
@@ -626,7 +836,7 @@ async function syncOutcomeLedger(client, data) {
       const observationId = stableUuid("observation", workspaceId, settlement.settlement_id);
       const prior = index > 0 ? contract.settlements[index - 1] : null;
       const verified = settlement.verified_for_rank === true;
-      const metricKey = safeKey(contract.resolution?.metric || "outcome");
+      const metricKey = normalizedLedgerLabel("metric", contract.resolution?.metric || "outcome");
       const observedValueDigest = digest(settlement.actual_value);
       await client.query(
         `INSERT INTO tcar_ledger.outcome_observations(
@@ -641,11 +851,14 @@ async function syncOutcomeLedger(client, data) {
           observationId,
           instanceId,
           metricKey,
-          settlement.resolver_principal?.principal_id || settlement.settled_by || "tracking-user",
+          normalizedLedgerActorId(
+            workspaceId,
+            settlement.resolver_principal?.principal_id || settlement.settled_by || "tracking-user"
+          ),
           oracleType(settlement.source?.type),
           verified ? "A" : "D",
-          settlement.idempotency_key || null,
-          JSON.stringify(settlement.actual_value),
+          normalizedLedgerIdempotencyKey(workspaceId, settlement.idempotency_key),
+          JSON.stringify(normalizedLedgerContentReceipt("outcome_observed_value", settlement.actual_value)),
           observedValueDigest,
           digestOrNull(settlement.source?.evidence_digest),
           verified ? "verified" : "submitted",
@@ -681,21 +894,24 @@ async function syncOutcomeLedger(client, data) {
           instanceId,
           index + 1,
           index === 0 ? "initial" : "correction",
-          settlement.idempotency_key || null,
+          normalizedLedgerIdempotencyKey(workspaceId, settlement.idempotency_key),
           prior ? stableUuid("settlement", workspaceId, prior.settlement_id) : null,
           prior ? objectHashDigest(prior, "settlement_hash") : null,
           settlementDigest,
           definitionDigest,
           aggregateUtility,
           verified,
-          settlement.resolver_principal?.principal_id || settlement.settled_by || "tracking-user",
+          normalizedLedgerActorId(
+            workspaceId,
+            settlement.resolver_principal?.principal_id || settlement.settled_by || "tracking-user"
+          ),
           settlement.notes ? digest(settlement.notes) : null,
           iso(settlement.settled_at)
         ]
       );
       await assertImmutableRow(client, "outcome_settlements", "settlement_id", workspaceId, settlementId, expectedSettlement);
       for (const [scoreIndex, score] of (settlement.participant_scores || []).entries()) {
-        const scoreKey = safeKey(`participant_${scoreIndex + 1}_${score.agent_id}`);
+        const scoreKey = normalizedLedgerLabel("participant_metric", `${scoreIndex + 1}:${score.agent_id}`);
         await client.query(
           `INSERT INTO tcar_ledger.settlement_metric_scores(
              workspace_id, settlement_id, metric_key, normalized_score, metric_weight,
@@ -708,8 +924,11 @@ async function syncOutcomeLedger(client, data) {
             scoreKey,
             probability(score.utility),
             Math.max(0, Number(score.rank_weight || 0)),
-            JSON.stringify(settlement.actual_value),
-            JSON.stringify(contract.participants?.find((participant) => participant.step_id === score.step_id)?.prediction ?? null),
+            JSON.stringify(normalizedLedgerContentReceipt("measured_value", settlement.actual_value)),
+            JSON.stringify(normalizedLedgerContentReceipt(
+              "target_value",
+              contract.participants?.find((participant) => participant.step_id === score.step_id)?.prediction ?? null
+            )),
             probabilityOrNull(contract.participants?.find((participant) => participant.step_id === score.step_id)?.confidence),
             verified ? 1 : 0,
             digest(score)
@@ -741,7 +960,7 @@ async function syncOutcomeLedger(client, data) {
           disputeDigest,
           digest(dispute.reason || ""),
           digestOrNull(dispute.evidence_digest),
-          dispute.disputed_by,
+          normalizedLedgerActorId(workspaceId, dispute.disputed_by),
           iso(dispute.disputed_at)
         ]
       );
@@ -852,8 +1071,8 @@ async function syncRealityRankLedger(client, data) {
     const projectionStateDigest = digest(inputSet);
     const agentRevisionId = revisionUuid(workspaceId, agentId, normalizedDigest(revision) || digest(revision));
     const subjectId = String(agentRevisionId);
-    const contractFamily = taskType || "decision";
-    const domainKey = domain || "general";
+    const contractFamily = normalizedLedgerLabel("contract_family", taskType || "decision");
+    const domainKey = normalizedLedgerLabel("domain", domain || "general");
     const lockKey = [workspaceId, "agent_revision", subjectId, contractFamily, domainKey, "default", "bayesian-decayed-utility", "v1"].join("|");
     await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [lockKey]);
     const previous = await client.query(
@@ -1080,6 +1299,10 @@ function ledgerValueEqual(actual, expected) {
 
 function collectWorkspaces(data) {
   const values = new Set();
+  for (const user of data.users || []) {
+    const workspaceId = String(user?.workspace_id || "").trim();
+    if (workspaceId && user?.status !== "deleted") values.add(workspace(workspaceId));
+  }
   for (const collection of ["executionRecords", "outcomeContracts", "agentEvents", "documents"]) {
     for (const item of data[collection] || []) values.add(workspace(item.workspace_id));
   }
@@ -1095,9 +1318,13 @@ function workspace(value) {
   return normalized || GLOBAL_WORKSPACE;
 }
 
-function findWorkspaceAgent(data, agentId, workspaceId) {
+export function findWorkspaceAgent(data, agentId, workspaceId) {
   return (data.agents || []).find((agent) =>
-    agent.id === agentId && (!agent.workspace_id || workspace(agent.workspace_id) === workspaceId)
+    agent.id === agentId
+    && (
+      (agent.workspace_id && workspace(agent.workspace_id) === workspaceId)
+      || (!agent.workspace_id && agent.system_managed === true && agent.visibility === "global")
+    )
   );
 }
 
@@ -1116,7 +1343,9 @@ function sourceContentDigest(document) {
   const contentDigest = normalizedDigest(document.source_revision_snapshot?.content_digest);
   const uploadDigest = normalizedDigest(document.upload_digest);
   if (!contentDigest || !uploadDigest || !contentDigest.equals(uploadDigest)) {
-    throw new Error(`Document ${document.document_id || document.agent_id || "unknown"} has no verified upload-byte digest.`);
+    throw new Error(
+      `Document ${normalizedLedgerLabel("source", document.document_id || document.agent_id || "unknown")} has no verified upload-byte digest.`
+    );
   }
   return contentDigest;
 }
@@ -1187,6 +1416,10 @@ function digest(value) {
   return crypto.createHash("sha256").update(JSON.stringify(canonical(value)), "utf8").digest();
 }
 
+function privacyDigest(value) {
+  return crypto.createHash("sha256").update(JSON.stringify(canonical(value)), "utf8").digest();
+}
+
 function normalizedDigest(value) {
   const text = typeof value === "string" ? value.trim().toLowerCase().replace(/^sha256:/, "") : "";
   return /^[a-f0-9]{64}$/.test(text) ? Buffer.from(text, "hex") : null;
@@ -1227,11 +1460,6 @@ function executionStepUuid(workspaceId, runId, stepId) {
 
 function evidenceUuid(workspaceId, runId, stepId, material) {
   return stableUuid("evidence", workspaceId, runId, stepId, digest(material).toString("hex"));
-}
-
-function safeKey(value) {
-  const normalized = String(value || "value").replace(/[^A-Za-z0-9_.:-]+/g, "_").slice(0, 160);
-  return /^[A-Za-z0-9]/.test(normalized) ? normalized : `v_${normalized}`;
 }
 
 function safeEvent(value, fallback) {

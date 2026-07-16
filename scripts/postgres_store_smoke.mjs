@@ -1,8 +1,6 @@
 #!/usr/bin/env node
 /* global console, process */
 import pg from "pg";
-import { setTimeout as delay } from "node:timers/promises";
-import { clearTimeout, setTimeout } from "node:timers";
 import { seedAgents } from "../server/catalog.js";
 import { ensureBillingAccount } from "../server/billing.js";
 import { PostgresStore } from "../server/store.js";
@@ -15,31 +13,8 @@ function assert(condition, message) {
   }
 }
 
-function deferred() {
-  let resolve;
-  const promise = new Promise((resolvePromise) => {
-    resolve = resolvePromise;
-  });
-  return { promise, resolve };
-}
-
-function cancellableTimeout(milliseconds, value) {
-  let timer;
-  const promise = new Promise((resolve) => {
-    timer = setTimeout(resolve, milliseconds, value);
-  });
-  return { promise, cancel: () => clearTimeout(timer) };
-}
-
 function queryText(query) {
   return typeof query === "string" ? query : String(query?.text || "");
-}
-
-function isStoreRead(query, { locked }) {
-  const sql = queryText(query).replace(/\s+/g, " ").trim().toLowerCase();
-  return sql.startsWith("select data from ")
-    && sql.includes(" where store_key = $1")
-    && sql.includes(" for update") === locked;
 }
 
 function interceptClientQueries(store, intercept) {
@@ -203,108 +178,25 @@ try {
   const concurrentStoreKey = `${storeKey}_concurrent_init`;
   const concurrentFirst = createStore(concurrentStoreKey);
   const concurrentSecond = createStore(concurrentStoreKey);
-  await Promise.all([concurrentFirst.init(), concurrentSecond.init()]);
+  await concurrentFirst.init();
+  let secondProcessRejected = false;
+  try {
+    await concurrentSecond.init();
+  } catch (error) {
+    secondProcessRejected = /requires exactly one web process/.test(String(error?.message || ""));
+  }
+  assert(secondProcessRejected, "a second web process acquired the same Postgres application store");
   const concurrentRows = await pool.query(
     `SELECT count(*)::int AS count FROM ${tableName} WHERE store_key = $1`,
     [concurrentStoreKey]
   );
-  assert(concurrentRows.rows[0].count === 1, "concurrent first initialization did not converge on one store row");
-  assert(concurrentFirst.read().agents.length >= seedAgents.length, "first concurrent initializer did not load seed agents");
-  assert(concurrentSecond.read().agents.length >= seedAgents.length, "second concurrent initializer did not load seed agents");
-  await Promise.all([closeStore(concurrentFirst), closeStore(concurrentSecond)]);
-  progress("concurrent initialization verified");
-
-  const interleavedStoreKey = `${storeKey}_interleaved_init`;
-  const writer = createStore(interleavedStoreKey);
-  await writer.init();
-  progress("interleaving baseline ready");
-  const initializer = createStore(interleavedStoreKey);
-  const lockedRead = deferred();
-  const legacyRead = deferred();
-  const releaseLockedRead = deferred();
-  const releaseLegacyRead = deferred();
-  const originalPoolQuery = initializer.pool.query.bind(initializer.pool);
-  initializer.pool.query = async (...args) => {
-    const result = await originalPoolQuery(...args);
-    if (isStoreRead(args[0], { locked: false })) {
-      legacyRead.resolve("legacy");
-      await releaseLegacyRead.promise;
-    }
-    return result;
-  };
-  interceptClientQueries(initializer, async ({ sql, run }) => {
-    const result = await run();
-    if (isStoreRead(sql, { locked: true })) {
-      lockedRead.resolve("locked");
-      await releaseLockedRead.promise;
-    }
-    return result;
-  });
-
-  const initPromise = initializer.init();
-  progress("interleaved initializer started");
-  const initTimeout = cancellableTimeout(5_000, "timeout");
-  const initMode = await Promise.race([
-    lockedRead.promise,
-    legacyRead.promise,
-    initPromise.then(() => "completed"),
-    initTimeout.promise
-  ]);
-  initTimeout.cancel();
-  progress(`interleaved initializer mode: ${initMode}`);
-  if (initMode !== "locked" && initMode !== "legacy") {
-    releaseLockedRead.resolve();
-    releaseLegacyRead.resolve();
-    await Promise.allSettled([initPromise]);
-  }
-  assert(initMode === "locked" || initMode === "legacy", "startup did not perform a row-locking store read");
-
-  const interleavedSessionId = "sess_pg_interleaved";
-  let mutationSettled = false;
-  const mutationPromise = writer.mutate((data) => {
-    data.sessions.push({
-      session_id: interleavedSessionId,
-      title: "Concurrent startup write",
-      workspace_id: "workspace_pg_smoke",
-      visibility: "private",
-      created_by: "postgres_smoke",
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-      last_message_at: new Date().toISOString(),
-      shared_memory: []
-    });
-    return { inserted: interleavedSessionId };
-  });
-  progress("interleaved mutation started");
-  mutationPromise.then(
-    () => { mutationSettled = true; },
-    () => { mutationSettled = true; }
-  );
-  if (initMode === "legacy") {
-    await mutationPromise;
-    progress("legacy mutation committed");
-    releaseLegacyRead.resolve();
-  } else {
-    await delay(100);
-    const mutationCrossedLock = mutationSettled;
-    releaseLockedRead.resolve();
-    progress("startup row lock released");
-    assert(!mutationCrossedLock, "mutation crossed the startup row lock before initialization committed");
-  }
-  await Promise.all([initPromise, mutationPromise]);
-  progress("interleaved initializer and mutation committed");
-  releaseLockedRead.resolve();
-  releaseLegacyRead.resolve();
-  const interleavedRow = await pool.query(
-    `SELECT data FROM ${tableName} WHERE store_key = $1`,
-    [interleavedStoreKey]
-  );
-  assert(
-    interleavedRow.rows[0].data.sessions.some((session) => session.session_id === interleavedSessionId),
-    "startup overwrote a mutation committed after its read"
-  );
-  await Promise.all([closeStore(initializer), closeStore(writer)]);
-  progress("startup serialization verified");
+  assert(concurrentRows.rows[0].count === 1, "single-process initialization did not create exactly one store row");
+  assert(concurrentFirst.read().agents.length >= seedAgents.length, "first initializer did not load seed agents");
+  await closeStore(concurrentFirst);
+  await concurrentSecond.init();
+  assert(concurrentSecond.read().agents.length >= seedAgents.length, "released advisory lock could not be reacquired");
+  await closeStore(concurrentSecond);
+  progress("single-process advisory lock verified");
 
   const newFailureStoreKey = `${storeKey}_new_sync_failure`;
   const newProbe = syncProbeEvent(`pg_new_sync_${process.pid}_${Date.now()}`);
@@ -494,8 +386,8 @@ try {
     tableName,
     storeKey,
     seedAgents: seedAgents.length,
-    concurrent_absent_initialization: true,
-    startup_write_serialized: true,
+    second_web_process_rejected: true,
+    advisory_lock_reacquired_after_close: true,
     new_store_sync_rollback: true,
     existing_store_sync_rollback: true,
     billing_sync_rollback: true,

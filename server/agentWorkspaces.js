@@ -14,7 +14,7 @@ function workspaceError(status, message, code = "agent_workspace_error") {
 }
 
 function makeWorkspaceId() {
-  return `aw_${crypto.randomUUID().replaceAll("-", "").slice(0, 16)}`;
+  return `aw_${crypto.randomUUID().replaceAll("-", "")}`;
 }
 
 function nowIso() {
@@ -35,13 +35,35 @@ function actorOwnsWorkspace(workspace, actor) {
 
 function eligibleDefaultAgent(agent, actor) {
   if (!agent || agent.enabled === false || agent.document || agent.resource_for_agent_id) return false;
-  if (!agent.workspace_id) return true;
+  if (!agent.workspace_id) {
+    return agent.system_managed === true && agent.visibility === "global";
+  }
   return String(agent.workspace_id) === String(actor?.workspace_id || "")
     && String(agent.created_by || "") === String(actor?.user_id || "");
 }
 
+function agentCanJoinWorkspace(agent, workspace) {
+  if (!agent || agent.document || agent.resource_for_agent_id) return false;
+  if (!agent.workspace_id) {
+    return agent.system_managed === true && agent.visibility === "global";
+  }
+  if (String(agent.workspace_id) !== String(workspace?.workspace_id || "")) return false;
+  return agent.visibility !== "private" || agent.created_by === workspace?.created_by;
+}
+
+function uniqueWorkspaceAgent(data, id, workspace) {
+  const candidates = (data.agents || [])
+    .filter((agent) => agent?.id === id)
+    .filter((agent) => agentCanJoinWorkspace(agent, workspace));
+  return candidates.length === 1 ? candidates[0] : null;
+}
+
 function defaultAgentIds(data, actor) {
   const candidates = (data.agents || []).filter((agent) => eligibleDefaultAgent(agent, actor));
+  const counts = new Map();
+  for (const candidate of candidates) {
+    counts.set(candidate.id, (counts.get(candidate.id) || 0) + 1);
+  }
   candidates.sort((left, right) => {
     const leftOwned = left.created_by === actor?.user_id ? 1 : 0;
     const rightOwned = right.created_by === actor?.user_id ? 1 : 0;
@@ -49,7 +71,10 @@ function defaultAgentIds(data, actor) {
       || Number(left.system_managed !== true) - Number(right.system_managed !== true)
       || String(left.title || left.id).localeCompare(String(right.title || right.id));
   });
-  return [...new Set(candidates.map((agent) => agent.id).filter(Boolean))]
+  return [...new Set(candidates
+    .filter((agent) => counts.get(agent.id) === 1)
+    .map((agent) => agent.id)
+    .filter(Boolean))]
     .slice(0, AGENT_WORKSPACE_MAX_AGENTS);
 }
 
@@ -92,6 +117,18 @@ export function normalizeAgentWorkspaceCollections(data) {
     }
     return true;
   });
+  const agentsById = new Map();
+  for (const agent of data.agents || []) {
+    if (!agent?.id) continue;
+    const candidates = agentsById.get(agent.id) || [];
+    candidates.push(agent);
+    agentsById.set(agent.id, candidates);
+  }
+  for (const workspace of data.agentWorkspaces) {
+    workspace.agent_ids = (workspace.agent_ids || []).filter((id) => (
+      (agentsById.get(id) || []).filter((agent) => agentCanJoinWorkspace(agent, workspace)).length === 1
+    ));
+  }
   data.agentWorkspaceRatings = data.agentWorkspaceRatings
     .filter((rating) => rating && typeof rating === "object")
     .map((rating) => {
@@ -180,7 +217,10 @@ export function listAgentWorkspaces(data, actor) {
 
 export function publicAgentWorkspace(workspace, data = null) {
   const availableIds = data
-    ? new Set((data.agents || []).filter((agent) => agent.enabled !== false).map((agent) => agent.id))
+    ? new Set((workspace.agent_ids || []).filter((id) => {
+      const agent = uniqueWorkspaceAgent(data, id, workspace);
+      return agent && agent.enabled !== false;
+    }))
     : null;
   const agentIds = [...new Set(workspace.agent_ids || [])];
   return {
@@ -290,17 +330,8 @@ export function setAgentWorkspaceMembers(data, workspaceId, actor, agentIds) {
       "agent_workspace_capacity_reserved"
     );
   }
-  const agentsById = new Map((data.agents || []).map((agent) => [agent.id, agent]));
   for (const id of ids) {
-    const agent = agentsById.get(id);
-    const accessible = agent && (
-      !agent.workspace_id
-      || (
-        String(agent.workspace_id) === String(actor.workspace_id)
-        && (agent.visibility !== "private" || agent.created_by === actor.user_id)
-      )
-    );
-    if (!accessible || agent.document || agent.resource_for_agent_id) {
+    if (!uniqueWorkspaceAgent(data, id, workspace)) {
       throw workspaceError(404, `Agent not found: ${id}.`, "agent_workspace_agent_not_found");
     }
   }
@@ -351,6 +382,11 @@ export function commitAgentWorkspaceReservation(data, workspaceId, actor, reserv
   }
   if (merged.length > AGENT_WORKSPACE_MAX_AGENTS) {
     throw workspaceError(409, `A workspace can contain at most ${AGENT_WORKSPACE_MAX_AGENTS} agents.`, "agent_workspace_capacity_exceeded");
+  }
+  for (const id of ids) {
+    if (!uniqueWorkspaceAgent(data, id, workspace)) {
+      throw workspaceError(404, `Agent not found: ${id}.`, "agent_workspace_agent_not_found");
+    }
   }
   workspace.agent_ids = merged;
   workspace.reservations.splice(reservationIndex, 1);

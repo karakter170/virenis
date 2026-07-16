@@ -1119,6 +1119,11 @@ function normalizeWorkflowProposal(raw, context) {
 function workflowCandidates(data, session, actor, intent, agentWorkspaceId = null) {
   const workspace = [];
   const marketplace = [];
+  const agentIdCounts = new Map();
+  for (const agent of data.agents || []) {
+    if (!agent?.id) continue;
+    agentIdCounts.set(agent.id, (agentIdCounts.get(agent.id) || 0) + 1);
+  }
   const selectedAgentWorkspace = (data.agentWorkspaces || []).find((candidate) => (
     candidate.agent_workspace_id === agentWorkspaceId
     && String(candidate.workspace_id || "") === String(actor.workspace_id || "")
@@ -1153,7 +1158,11 @@ function workflowCandidates(data, session, actor, intent, agentWorkspaceId = nul
     );
     if (agent.document && !sessionDocument) continue;
     const accessibleWorkspaceAgent = (
-      !agent.workspace_id
+      (
+        !agent.workspace_id
+        && agent.system_managed === true
+        && agent.visibility === "global"
+      )
       || (
         String(agent.workspace_id) === String(actor.workspace_id)
         && (agent.visibility !== "private" || agent.created_by === actor.user_id)
@@ -1162,7 +1171,7 @@ function workflowCandidates(data, session, actor, intent, agentWorkspaceId = nul
     const selectedForWorkspace = !selectedAgentIds
       || selectedAgentIds.has(agent.id)
       || sessionDocument;
-    if (accessibleWorkspaceAgent && selectedForWorkspace) {
+    if (accessibleWorkspaceAgent && selectedForWorkspace && agentIdCounts.get(agent.id) === 1) {
       workspace.push(candidateFromWorkspaceAgent(agent, intent));
     }
     if (!agent.document && agent.marketplace?.published === true && agent.marketplace?.snapshot) {

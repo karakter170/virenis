@@ -130,6 +130,111 @@ afterEach(async () => {
 });
 
 describe("agent workspaces", () => {
+  it("quarantines unscoped legacy agents unless they are explicit global system catalog entries", async () => {
+    await app.locals.store.mutate((data) => {
+      data.agents.push(
+        {
+          id: "legacy_unscoped_private_agent",
+          title: "Alice legacy private agent",
+          visibility: "private",
+          created_by: "alice",
+          system_managed: false,
+          enabled: true
+        },
+        {
+          id: "legacy_unscoped_global_user_agent",
+          title: "Malformed global user agent",
+          visibility: "global",
+          created_by: "alice",
+          system_managed: false,
+          enabled: true
+        },
+        {
+          id: "legacy_unscoped_private_system_agent",
+          title: "Malformed private system agent",
+          visibility: "private",
+          created_by: "system",
+          system_managed: true,
+          enabled: true
+        }
+      );
+      return null;
+    });
+
+    const bob = await listWorkspaces("bob");
+    const bobAgentIds = bob.body.workspaces[0].agent_ids;
+    expect(bobAgentIds).toContain("finance_reasoning_lora");
+    expect(bobAgentIds).not.toContain("legacy_unscoped_private_agent");
+    expect(bobAgentIds).not.toContain("legacy_unscoped_global_user_agent");
+    expect(bobAgentIds).not.toContain("legacy_unscoped_private_system_agent");
+
+    const alice = await listWorkspaces("alice");
+    const aliceAgentIds = alice.body.workspaces[0].agent_ids;
+    expect(aliceAgentIds).not.toContain("legacy_unscoped_private_agent");
+    expect(aliceAgentIds).not.toContain("legacy_unscoped_global_user_agent");
+    expect(aliceAgentIds).not.toContain("legacy_unscoped_private_system_agent");
+  });
+
+  it("cannot add legacy or ambiguous agent identities and prunes injected membership", async () => {
+    const workspace = await createWorkspace("Isolation lab");
+    await app.locals.store.mutate((data) => {
+      data.agents.push(
+        {
+          id: "legacy_unscoped_membership_agent",
+          title: "Legacy unscoped membership agent",
+          visibility: "global",
+          created_by: "alice",
+          system_managed: false,
+          enabled: true
+        },
+        {
+          id: "ambiguous_membership_agent",
+          title: "First ambiguous membership agent",
+          workspace_id: "tenant_shared",
+          visibility: "private",
+          created_by: "alice",
+          enabled: true
+        },
+        {
+          id: "ambiguous_membership_agent",
+          title: "Second ambiguous membership agent",
+          workspace_id: "tenant_shared",
+          visibility: "private",
+          created_by: "alice",
+          enabled: true
+        }
+      );
+      const stored = data.agentWorkspaces.find((item) => (
+        item.agent_workspace_id === workspace.agent_workspace_id
+      ));
+      stored.agent_ids = ["legacy_unscoped_membership_agent", "ambiguous_membership_agent"];
+      return null;
+    });
+
+    const detail = await request(app)
+      .get(`/api/agent-workspaces/${workspace.agent_workspace_id}`)
+      .set("Authorization", as("alice"))
+      .expect(200);
+    expect(detail.body.agent_ids).toEqual([]);
+    expect(detail.body.agents).toEqual([]);
+
+    for (const agentId of ["legacy_unscoped_membership_agent", "ambiguous_membership_agent"]) {
+      const rejected = await request(app)
+        .patch(`/api/agent-workspaces/${workspace.agent_workspace_id}`)
+        .set("Authorization", as("alice"))
+        .send({ agent_ids: [agentId] })
+        .expect(404);
+      expect(rejected.body.error).toBe("agent_workspace_agent_not_found");
+    }
+
+    const trustedCatalogMember = await request(app)
+      .patch(`/api/agent-workspaces/${workspace.agent_workspace_id}`)
+      .set("Authorization", as("alice"))
+      .send({ agent_ids: ["finance_reasoning_lora"] })
+      .expect(200);
+    expect(trustedCatalogMember.body.agent_ids).toEqual(["finance_reasoning_lora"]);
+  });
+
   it("creates an isolated General workspace for every user and protects ownership", async () => {
     const alice = await listWorkspaces("alice");
     const bob = await listWorkspaces("bob");

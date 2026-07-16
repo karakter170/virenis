@@ -8,7 +8,13 @@ import {
   settleRunCredits,
   verifyBillingState
 } from "../server/billing.js";
-import { normalizedBillingAvailable, syncNormalizedBilling } from "../server/normalizedBilling.js";
+import {
+  assertNormalizedBillingWorkspacePrivacy,
+  normalizedBillingAvailable,
+  normalizedBillingContentReceipt,
+  normalizedBillingPseudonym,
+  syncNormalizedBilling
+} from "../server/normalizedBilling.js";
 
 const SQL_PATH = path.resolve("../../deploy/sql/billing.sql");
 
@@ -21,6 +27,8 @@ describe("normalized billing migration", () => {
     }
     expect(sql).toContain("ALTER TABLE tcar_billing.%I FORCE ROW LEVEL SECURITY");
     expect(sql).toContain("workspace_id = tcar_billing.current_workspace_id()");
+    expect(sql).toContain("DROP POLICY IF EXISTS %I ON tcar_billing.%I");
+    expect(sql).toContain("AS PERMISSIVE FOR ALL TO PUBLIC");
     expect(sql).toContain("trigger_name := immutable_table || '_immutable_guard'");
     expect(sql).toContain("'pricing_versions',");
     expect(sql).toContain("'ledger_entries',");
@@ -35,18 +43,36 @@ describe("normalized billing migration", () => {
   });
 
   it("fails closed unless every table, RLS policy, and trigger is present", async () => {
+    const healthyStatus = {
+      tables: 6,
+      forced_rls: 6,
+      policies: 6,
+      policy_total: 6,
+      columns: 42,
+      triggers: 8,
+      trigger_names: 8
+    };
     const healthy = {
-      query: async () => ({ rows: [{ tables: 6, forced_rls: 6, policies: 6, triggers: 8 }] })
+      query: async (sql) => {
+        expect(sql).toContain("permissive='PERMISSIVE'");
+        expect(sql).toContain("trigger.tgtype=expected.trigger_type");
+        expect(sql).toContain("procedure_namespace.nspname='tcar_billing'");
+        expect(sql).toContain("information_schema.columns");
+        return { rows: [healthyStatus] };
+      }
     };
     expect(await normalizedBillingAvailable(healthy)).toBe(true);
     for (const patch of [
       { tables: 5 },
       { forced_rls: 5 },
       { policies: 5 },
-      { triggers: 7 }
+      { policy_total: 7 },
+      { columns: 41 },
+      { triggers: 7 },
+      { trigger_names: 7 }
     ]) {
       const incomplete = {
-        query: async () => ({ rows: [{ tables: 6, forced_rls: 6, policies: 6, triggers: 8, ...patch }] })
+        query: async () => ({ rows: [{ ...healthyStatus, ...patch }] })
       };
       expect(await normalizedBillingAvailable(incomplete)).toBe(false);
     }
@@ -66,7 +92,15 @@ describe("normalized billing migration", () => {
         provider_reported: true,
         complete: true,
         call_count: 1,
-        calls: [{ component: "final_synthesis", prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 }],
+        calls: [{
+          component: "agent:private_agent:step:private_step",
+          model: "private-model-label",
+          agent_id: "private_agent",
+          step_id: "private_step",
+          prompt_tokens: 100,
+          completion_tokens: 50,
+          total_tokens: 150
+        }],
         totals: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 },
         missing_usage: []
       });
@@ -97,10 +131,93 @@ describe("normalized billing migration", () => {
       )).join("\n");
       expect(parameterText).not.toContain(actor.user_id);
       expect(parameterText).not.toContain(admin.user_id);
+      expect(parameterText).not.toContain("run_projection");
+      expect(parameterText).not.toContain("checkout_projection");
+      expect(parameterText).not.toContain("event_projection");
+      expect(parameterText).not.toContain("private-model-label");
+      expect(parameterText).not.toContain("private_agent");
+      expect(parameterText).not.toContain("private_step");
+
+      const fundingInsert = client.calls.find(({ sql: statement }) => (
+        statement.includes("INSERT INTO tcar_billing.funding_events")
+      ));
+      expect(fundingInsert.params).toHaveLength(14);
+      expect(Math.max(...[...fundingInsert.sql.matchAll(/\$(\d+)/g)].map((match) => Number(match[1])))).toBe(14);
+      expect(fundingInsert.params[3]).toBe("future_gateway");
+      expect(fundingInsert.params[4]).toMatch(/^external_reference_sha256_[a-f0-9]{64}$/);
+      expect(fundingInsert.params[5]).toMatch(/^provider_event_sha256_[a-f0-9]{64}$/);
+      expect(fundingInsert.params[6]).toMatch(/^funding_event_identity_sha256_[a-f0-9]{64}$/);
     } finally {
       if (previousWelcome === undefined) delete process.env.APP_BILLING_WELCOME_CREDITS;
       else process.env.APP_BILLING_WELCOME_CREDITS = previousWelcome;
     }
+  });
+
+  it("uses workspace-scoped pseudonyms and content-only receipts", () => {
+    const first = normalizedBillingPseudonym("external_reference", "workspace_one", "checkout@example.com");
+    expect(first).toMatch(/^external_reference_sha256_[a-f0-9]{64}$/);
+    expect(first).not.toContain("checkout");
+    expect(normalizedBillingPseudonym("external_reference", "workspace_one", "checkout@example.com")).toBe(first);
+    expect(normalizedBillingPseudonym("external_reference", "workspace_two", "checkout@example.com")).not.toBe(first);
+
+    const receipt = normalizedBillingContentReceipt("ledger metadata", {
+      reason: "Customer requested a medical-account refund",
+      email: "private@example.com"
+    });
+    expect(receipt).toEqual({
+      schema_version: "virenis-billing-minimized-v1",
+      kind: "ledger_metadata",
+      content_digest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+      redacted: true
+    });
+    expect(JSON.stringify(receipt)).not.toMatch(/medical-account|private@example/);
+  });
+
+  it("checks all legacy billing privacy classes for one active workspace", async () => {
+    const calls = [];
+    const client = {
+      async query(sql, params) {
+        calls.push({ sql, params });
+        return { rowCount: 0, rows: [] };
+      }
+    };
+
+    await assertNormalizedBillingWorkspacePrivacy(client, "workspace_private");
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].params).toEqual(["workspace_private"]);
+    expect(calls[0].sql).toContain("account_sha256_");
+    expect(calls[0].sql).toContain("external_reference_sha256_");
+    expect(calls[0].sql).toContain("reason_sha256_");
+    expect(calls[0].sql).toContain("virenis-billing-minimized-v1");
+    expect(calls[0].sql).toContain("jsonb_array_elements(usage.component_costs)");
+  });
+
+  it("fails before every insert when a later active workspace contains legacy billing data", async () => {
+    const calls = [];
+    const client = {
+      async query(sql, params = []) {
+        calls.push({ sql, params });
+        if (sql.includes("set_config('tcar.workspace_id'")) return { rowCount: 1, rows: [{}] };
+        if (sql.includes("SELECT category")) {
+          return params[0] === "workspace_two"
+            ? { rowCount: 1, rows: [{ category: "external_identifier" }] }
+            : { rowCount: 0, rows: [] };
+        }
+        throw new Error(`Unexpected query before privacy gate completed: ${sql}`);
+      }
+    };
+
+    await expect(syncNormalizedBilling(client, {
+      users: [
+        { workspace_id: "workspace_one", status: "active" },
+        { workspace_id: "workspace_two", status: "active" }
+      ]
+    })).rejects.toMatchObject({
+      code: "NORMALIZED_BILLING_LEGACY_PRIVACY_MIGRATION_REQUIRED",
+      message: expect.stringContaining("shadow-table rebuild")
+    });
+    expect(calls.some(({ sql }) => /\bINSERT\s+INTO\b/i.test(sql))).toBe(false);
   });
 });
 

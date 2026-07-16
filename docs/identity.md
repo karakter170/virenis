@@ -173,6 +173,102 @@ Authenticated Clerk users can use:
 - `POST /api/admin/users/:user_id/revoke-sessions` — revokes active Clerk
   sessions for that user.
 
+### Resumable account deletion
+
+Account deletion is a durable, fail-closed saga in the current single-web-
+process deployment. After exact confirmation (or a verified Clerk
+`user.deleted` webhook), Virenis first changes the local user to `deleting`,
+records `deletion_started_at` and a random `deletion_id`, and writes a hashed
+provider tombstone. Profile webhooks and Clerk synchronization cannot reactivate
+that state. All authenticated operations are rejected with
+`account_deletion_in_progress`; only `DELETE /api/account` may resume it.
+
+The web process also tracks authenticated requests by the matching local Clerk
+identity, including configured bearer/basic actors that use the same exact
+`user_id` and `workspace_id`. Deletion drains requests that started before the
+marker with a bounded timeout, rebuilds a fresh tenant-qualified resource
+graph, and then performs idempotent external cleanup. Successful external
+cleanup steps have durable per-deletion receipts, so a transient provider or
+Runtime failure leaves the marker intact and a retry resumes instead of
+repeating completed steps. Each per-resource receipt is namespaced by a
+canonical digest of the exact external-resource snapshot. A credential or
+runtime registration changed under the same ID therefore receives a new purge,
+while only the exact already-purged version may be skipped. Clerk deletion
+treats provider `404` as success.
+Local product data is removed in one exact store transaction, followed by
+managed document-file cleanup. That transaction copies the relative document
+roots into the hashed deletion tombstone as a short-lived cleanup outbox. The
+roots are cleared only after filesystem removal succeeds, so a retried Clerk
+deletion webhook can finish cleanup even after the user record and provider
+session have already been deleted.
+
+Managed MCP OAuth callbacks share the deletion boundary. A pending callback is
+invalidated by the marker; if token exchange was already in flight, its final
+store transaction fails and no connection is inserted. The issued credential is
+first persisted in an encrypted revocation outbox and then revoked. A transient
+revocation failure retains that outbox for the deletion recovery worker; the
+account cannot finish deletion until revocation succeeds. An exchange left in
+`exchanging`/`account_deleting` without an outbox also blocks deletion and
+requires retry or operator remediation rather than being treated as clean. If
+the connection committed just before the marker, it is part of the fresh
+deletion graph and is revoked by the deletion saga.
+
+Some providers do not expose a generic RFC-style revocation endpoint. Virenis
+does not silently claim success for those providers: deletion stays marked and
+fail-closed until a supported provider-specific deauthorization is available.
+GitHub uses its application-token check/delete API with OAuth-app Basic
+authentication; both stored access and refresh credentials are invalidated.
+Slack uses `auth.revoke` for both credentials and accepts only the provider's
+documented inactive-token outcomes on a retry. This makes a crash after remote
+success resumable without treating an ambiguous authentication failure as
+proof of revocation. Other providers continue to use their advertised RFC-style
+endpoint; an unsupported provider remains fail-closed rather than reporting a
+local-only deletion as complete.
+
+Startup and a bounded periodic worker scan durable deletion markers and
+document-cleanup outboxes. It retries the complete saga or filesystem cleanup
+under the same per-account coordinator, stores only bounded error codes and
+attempt timestamps, and applies durable exponential backoff. The default scan
+interval is 60 seconds and the default batch is 25. No credential or provider
+error body is written to logs.
+
+Request tracking and deletion single-flight coordination are process-local by
+design and match the documented single-web-process MVP topology. PostgreSQL
+deployments hold a dedicated advisory lock and refuse a second web process for
+the same operational store, preventing accidental unsupported scaling.
+Horizontal web scaling requires replacing those two coordination pieces with a
+shared lease/request registry before it is supported.
+
+Workspace model-output settings participate in the same tenant-qualified graph
+as conversations, agents, documents, and MCP data. They are included in account
+export and removed by exact object identity during deletion; ownerless settings
+under a colliding legacy workspace are quarantined and block destructive
+traversal.
+
+Account export and deletion cover the operational product store, including
+WorldGraph artifacts. Production may additionally retain append-only normalized
+provenance receipts. Rows written by the current privacy projection contain
+digests and workspace-scoped pseudonyms instead of arbitrary payloads, but they
+are still pseudonymous records and are not included in the current JSON export.
+Any database written by an older projection must pass the legacy-ledger privacy
+migration gate described in `docs/virenis_outcomes.md`; immutable legacy rows do
+not become content-free merely by deploying newer application code. The runtime
+gate covers workspaces present in the active operational snapshot. A migration
+administrator must separately inventory orphaned ledger workspaces across RLS
+boundaries before launch.
+
+The operational account export includes the user's billing account, ledger
+entries, reservations, usage records, and funding events. Account deletion
+removes those operational records. A separate normalized accounting projection
+may be retained when required for accounting, tax, payment reconciliation,
+fraud prevention, or another documented legal obligation. It preserves amounts,
+statuses, timestamps, pricing facts, aggregate token usage, and integrity hashes;
+raw provider references, run/resource identifiers, and free-form metadata are
+replaced with workspace-scoped pseudonyms or digests. These retained rows are
+pseudonymous, not anonymous, and are not currently included in the account JSON
+export. See [Normalized billing privacy](billing-privacy.md) for the migration
+gate, orphan-workspace inventory, and launch requirements.
+
 Viewer identities remain read-only for product data but may access their own
 export and account-deletion controls. Users cannot demote or suspend their own
 active administrator session, and the final active Virenis administrator cannot

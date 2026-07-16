@@ -493,6 +493,29 @@ export async function completeManagedMcpOAuth({
       updated_at: nowIso()
     };
     await store.mutate((data) => {
+      const currentState = (data.mcpOauthStates || [])
+        .find((item) => item.oauth_state_id === transaction.oauth_state_id);
+      if (!currentState || currentState.status !== "exchanging") {
+        const deleting = currentState?.status === "account_deleting";
+        throw mcpError(
+          409,
+          deleting
+            ? "Account deletion started while authorization was in progress. The new credential was revoked and was not stored."
+            : "OAuth transaction state changed unexpectedly.",
+          deleting ? "account_deletion_in_progress" : "mcp_oauth_state_changed"
+        );
+      }
+      const localOwner = (data.users || []).find((item) => (
+        item.user_id === transaction.created_by
+        && item.workspace_id === transaction.workspace_id
+      ));
+      if (localOwner?.status === "deleting") {
+        throw mcpError(
+          409,
+          "Account deletion started while authorization was in progress. The new credential was revoked and was not stored.",
+          "account_deletion_in_progress"
+        );
+      }
       data.mcpConnections ||= [];
       const index = data.mcpConnections.findIndex((item) => item.connection_id === connectionId);
       if (index < 0 && data.mcpConnections.some((item) =>
@@ -504,11 +527,6 @@ export async function completeManagedMcpOAuth({
       }
       if (index >= 0) data.mcpConnections[index] = completed;
       else data.mcpConnections.push(completed);
-      const currentState = (data.mcpOauthStates || [])
-        .find((item) => item.oauth_state_id === transaction.oauth_state_id);
-      if (!currentState || currentState.status !== "exchanging") {
-        throw mcpError(409, "OAuth transaction state changed unexpectedly.", "mcp_oauth_state_changed");
-      }
       currentState.status = "completed";
       currentState.connection_id = connectionId;
       currentState.completed_at = nowIso();
@@ -522,15 +540,99 @@ export async function completeManagedMcpOAuth({
     };
   } catch (error) {
     if (credential) {
-      await revokeManagedCredential(provider, credential, env).catch(() => undefined);
+      await persistMcpOAuthRevocationOutbox({
+        store,
+        transaction,
+        credential,
+        key
+      });
+      try {
+        await revokePendingMcpOAuthState(
+          store.read((data) => (data.mcpOauthStates || [])
+            .find((item) => item.oauth_state_id === transaction.oauth_state_id)),
+          { key, store, env }
+        );
+      } catch {
+        // The encrypted outbox is intentionally retained. Account deletion and
+        // the recovery worker must fail closed until remote revocation succeeds
+        // or an operator resolves an unsupported provider deauthorization.
+      }
     }
-    await setOauthTransactionStatus(store, transaction.oauth_state_id, "failed");
+    const revocationPending = store.read((data) => (data.mcpOauthStates || [])
+      .some((item) => item.oauth_state_id === transaction.oauth_state_id && item.status === "revocation_pending"));
+    if (!revocationPending) await setOauthTransactionStatus(store, transaction.oauth_state_id, "failed");
     error.oauth_redirect = true;
     error.oauth_reason = "failed";
     error.oauth_clear_cookie = true;
     error.oauth_resume_context = transaction.resume_context || null;
     throw error;
   }
+}
+
+export async function revokePendingMcpOAuthState(state, {
+  key,
+  store,
+  env = process.env
+} = {}) {
+  if (!key) throw mcpError(503, "MCP credential encryption is not configured.", "mcp_key_missing");
+  if (!state?.oauth_state_id || !state.revocation_envelope) {
+    throw mcpError(409, "OAuth revocation outbox is unavailable.", "mcp_oauth_revocation_outbox_missing");
+  }
+  const payload = decryptMcpValue(
+    state.revocation_envelope,
+    key,
+    mcpOAuthRevocationAad(state)
+  );
+  const credential = payload?.credential;
+  const provider = managedMcpProviderForCredential(state.provider_id, credential, env);
+  try {
+    await revokeManagedCredential(provider, credential, env);
+  } catch (error) {
+    await store?.mutate((data) => {
+      const current = (data.mcpOauthStates || []).find((item) => item.oauth_state_id === state.oauth_state_id);
+      if (!current?.revocation_envelope) return null;
+      current.status = "revocation_pending";
+      current.revocation_attempts = Math.max(0, Number(current.revocation_attempts) || 0) + 1;
+      current.revocation_last_attempt_at = nowIso();
+      current.revocation_last_error_code = String(error?.code || "mcp_oauth_revocation_failed").slice(0, 120);
+      return current;
+    });
+    throw error;
+  }
+  await store?.mutate((data) => {
+    const current = (data.mcpOauthStates || []).find((item) => item.oauth_state_id === state.oauth_state_id);
+    if (!current) return null;
+    if (digest(current.revocation_envelope) !== digest(state.revocation_envelope)) {
+      throw mcpError(409, "OAuth revocation outbox changed during cleanup.", "mcp_oauth_revocation_outbox_changed");
+    }
+    current.status = "revoked";
+    current.revoked_at = nowIso();
+    current.revocation_last_attempt_at = current.revoked_at;
+    delete current.revocation_envelope;
+    delete current.revocation_last_error_code;
+    return current;
+  });
+  return true;
+}
+
+async function persistMcpOAuthRevocationOutbox({ store, transaction, credential, key }) {
+  const envelope = encryptMcpValue(
+    { credential },
+    key,
+    mcpOAuthRevocationAad(transaction)
+  );
+  return store.mutate((data) => {
+    const current = (data.mcpOauthStates || []).find((item) => item.oauth_state_id === transaction.oauth_state_id);
+    if (!current) {
+      throw mcpError(503, "OAuth revocation could not be durably queued.", "mcp_oauth_revocation_outbox_missing");
+    }
+    current.status = "revocation_pending";
+    current.revocation_envelope = envelope;
+    current.revocation_queued_at = nowIso();
+    current.revocation_attempts = Math.max(0, Number(current.revocation_attempts) || 0);
+    delete current.verifier_envelope;
+    return current;
+  });
 }
 
 export async function revokeMcpConnection(connection, { key, env = process.env }) {
@@ -764,7 +866,7 @@ export async function executeMcpGatewayCall({ store, body, key }) {
     throw mcpError(413, "MCP tool arguments are too large.", "mcp_arguments_too_large");
   }
   const snapshot = store.read();
-  const agent = snapshot.agents.find((item) => item.id === body?.agent_id && item.enabled !== false);
+  const agent = uniqueExecutableAgent(snapshot, body?.agent_id);
   assertAgentExecutionScope(agent, context);
   if (!(agent.tools || []).includes(alias)) {
     throw mcpError(403, "Agent tool allowlist does not contain this MCP alias.", "mcp_tool_forbidden");
@@ -882,7 +984,7 @@ export async function decideMcpApproval({ store, approvalId, actor, decision, ke
     });
   }
   if (decision !== "approve") throw mcpError(400, "decision must be approve or deny.", "mcp_decision_invalid");
-  const agent = snapshot.agents.find((item) => item.id === approval.agent_id && item.enabled !== false);
+  const agent = uniqueExecutableAgent(snapshot, approval.agent_id);
   assertAgentExecutionScope(agent, { ...approval, user_id: actor.user_id });
   if (!(agent.tools || []).includes(approval.tool_alias)) {
     throw mcpError(409, "The agent no longer allows this MCP action.", "mcp_approval_stale");
@@ -977,12 +1079,28 @@ function validatePinnedSchema(boundTool, tool) {
 
 function assertAgentExecutionScope(agent, context) {
   if (!agent) throw mcpError(404, "Agent not found.", "mcp_agent_not_found");
+  if (!agent.workspace_id && !(agent.system_managed === true && agent.visibility === "global")) {
+    throw mcpError(403, "Agent has no trusted execution scope.", "mcp_workspace_forbidden");
+  }
   if (agent.workspace_id && agent.workspace_id !== context.workspace_id) {
     throw mcpError(403, "Agent is outside this execution workspace.", "mcp_workspace_forbidden");
   }
   if (agent.created_by && agent.created_by !== context.user_id) {
     throw mcpError(403, "Agent is outside this execution identity.", "mcp_actor_forbidden");
   }
+}
+
+function uniqueExecutableAgent(data, agentId) {
+  const matches = (data.agents || []).filter((item) => item.id === agentId && item.enabled !== false);
+  if (matches.length === 0) {
+    throw mcpError(404, "Agent not found.", "mcp_agent_not_found");
+  }
+  if (matches.length !== 1) {
+    // An identifier is an authorization boundary here. Never let persistence
+    // order decide which tenant's agent receives an external-tool capability.
+    throw mcpError(409, "Agent identity is ambiguous.", "mcp_agent_identity_ambiguous");
+  }
+  return matches[0];
 }
 
 async function appendMcpAudit(store, input) {
@@ -1411,6 +1529,10 @@ function mcpApprovalResultAad(approval) {
 
 function mcpOAuthStateAad(transaction) {
   return `mcp-oauth-state:v1:${transaction.workspace_id}:${transaction.created_by}:${transaction.provider_id}:${transaction.oauth_state_id}`;
+}
+
+function mcpOAuthRevocationAad(transaction) {
+  return `mcp-oauth-revocation:v1:${transaction.workspace_id}:${transaction.created_by}:${transaction.provider_id}:${transaction.oauth_state_id}`;
 }
 
 function mcpOAuthClientAad(record) {

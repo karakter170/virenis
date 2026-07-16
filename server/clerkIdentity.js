@@ -18,7 +18,10 @@ const MAX_IDENTITY_DELETION_TOMBSTONES = 50_000;
 const DISPLAY_NAME_MAX_CHARS = 80;
 const EMAIL_MAX_CHARS = 254;
 const VALID_ROLES = new Set(["admin", "user", "viewer"]);
-const VALID_STATUSES = new Set(["active", "suspended"]);
+const VALID_STATUSES = new Set(["active", "suspended", "deleting"]);
+const ACTIVE_RUN_STATUSES = new Set(["queued", "claimed", "planning", "running", "synthesizing"]);
+const DEFAULT_DELETION_DRAIN_TIMEOUT_MS = 5_000;
+const MAX_DELETION_PURGE_RECEIPTS = 10_000;
 
 export function clerkPublishableKey(env = process.env) {
   return String(env.CLERK_PUBLISHABLE_KEY || env.VITE_CLERK_PUBLISHABLE_KEY || "").trim();
@@ -162,6 +165,8 @@ export function createClerkIdentityManager({
   if (!store) throw new TypeError("Clerk identity manager requires a store.");
   if (enabled && !client) throw new TypeError("Clerk identity manager requires a Clerk backend client.");
   const provisioning = new Map();
+  const deletionInflight = new Map();
+  const authenticatedRequests = new Map();
 
   async function provision(clerkUserId) {
     const existingTask = provisioning.get(clerkUserId);
@@ -203,6 +208,10 @@ export function createClerkIdentityManager({
       )) {
         throw identityError(409, "identity_link_conflict", "This email is already linked to another Virenis identity.");
       }
+      // A provider update may race an account-deletion retry or arrive out of
+      // order after Clerk has accepted deletion. Deletion is a one-way local
+      // state transition: only the deletion saga may advance it.
+      if (user?.status === "deleting") return null;
       const isNew = !user;
       if (!user) {
         const administrator = configuredAdminUserIds(env).has(profile.clerk_user_id)
@@ -288,7 +297,7 @@ export function createClerkIdentityManager({
       };
     },
 
-    async resolveAuthenticated(authState) {
+    async resolveAuthenticated(authState, { allowAccountDeletion = false } = {}) {
       if (!enabled || !authState?.isAuthenticated || !authState.userId) return null;
       let user = store.read((data) => data.users.find((candidate) => candidate.clerk_user_id === authState.userId));
       if (!user) {
@@ -296,7 +305,17 @@ export function createClerkIdentityManager({
         user = store.read((data) => data.users.find((candidate) => candidate.clerk_user_id === authState.userId));
       }
       if (!user) throw identityError(401, "identity_not_provisioned", "The Clerk account could not be linked to a Virenis workspace.");
-      if (user.status !== "active") throw identityError(403, "account_suspended", "This account has been suspended. Contact support.");
+      if (user.status === "deleting") {
+        if (!allowAccountDeletion) {
+          throw identityError(
+            409,
+            "account_deletion_in_progress",
+            "Account deletion is in progress. Only the account deletion request may be retried."
+          );
+        }
+      } else if (user.status !== "active") {
+        throw identityError(403, "account_suspended", "This account has been suspended. Contact support.");
+      }
       return actorFromUser(user, authState.sessionId);
     },
 
@@ -310,9 +329,213 @@ export function createClerkIdentityManager({
 
     syncClerkUser,
 
+    /**
+     * Register a request after authentication. Exact configured identities
+     * are resolved to their local Clerk owner too. This deliberately does a
+     * second synchronous status check so a request that authenticated just
+     * before the deletion marker cannot slip past it unnoticed.
+     */
+    beginAuthenticatedRequest(actor, { allowAccountDeletion = false } = {}) {
+      if (!actor?.user_id || !actor?.workspace_id) return () => undefined;
+      const matches = store.read((data) => (data.users || []).filter((user) => (
+        user.user_id === actor.user_id
+        && user.workspace_id === actor.workspace_id
+        && Boolean(user.clerk_user_id)
+        && (!actor.clerk_user_id || user.clerk_user_id === actor.clerk_user_id)
+      )));
+      if (matches.length === 0) {
+        if (actor.auth_type === "clerk") {
+          throw identityError(401, "account_deleted", "This Virenis account has been deleted.");
+        }
+        return () => undefined;
+      }
+      if (matches.length !== 1) {
+        throw identityError(
+          409,
+          "account_legacy_scope_ambiguous",
+          "Authenticated tenant coordinates match more than one Clerk identity. Repair the legacy identity collision before continuing."
+        );
+      }
+      const current = matches[0];
+      if (current.status === "deleting") {
+        if (allowAccountDeletion && actor.auth_type === "clerk") return () => undefined;
+        throw identityError(
+          409,
+          "account_deletion_in_progress",
+          "Account deletion is in progress. Only the account deletion request may be retried."
+        );
+      }
+      if (current.status !== "active") {
+        throw identityError(403, "account_suspended", "This account has been suspended. Contact support.");
+      }
+      // The deletion request is coordinated separately and must not wait on
+      // itself while draining requests that started before its marker.
+      if (allowAccountDeletion && actor.auth_type === "clerk") return () => undefined;
+      const requestId = makeId("identityreq");
+      let releaseRequest;
+      const settled = new Promise((resolve) => { releaseRequest = resolve; });
+      const entry = { request_id: requestId, started_at: Date.now(), settled };
+      const clerkUserId = current.clerk_user_id;
+      const requests = authenticatedRequests.get(clerkUserId) || new Map();
+      requests.set(requestId, entry);
+      authenticatedRequests.set(clerkUserId, requests);
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        requests.delete(requestId);
+        if (requests.size === 0 && authenticatedRequests.get(clerkUserId) === requests) {
+          authenticatedRequests.delete(clerkUserId);
+        }
+        releaseRequest();
+      };
+    },
+
+    async drainAuthenticatedRequests(actor, { timeoutMs = deletionDrainTimeoutMs(env) } = {}) {
+      requireClerkActor(actor);
+      const pending = [...(authenticatedRequests.get(actor.clerk_user_id)?.values() || [])]
+        .map((entry) => entry.settled);
+      if (pending.length === 0) return { drained: true, pending: 0 };
+      let timer;
+      const timeout = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(identityError(
+          503,
+          "account_deletion_drain_timeout",
+          "Account deletion is waiting for earlier requests to finish. Retry shortly; the deletion marker remains active."
+        )), timeoutMs);
+        timer.unref?.();
+      });
+      try {
+        await Promise.race([Promise.allSettled(pending), timeout]);
+      } finally {
+        clearTimeout(timer);
+      }
+      return { drained: true, pending: pending.length };
+    },
+
+    runAccountDeletion(clerkUserId, operation) {
+      const normalizedId = String(clerkUserId || "");
+      if (!normalizedId) throw identityError(400, "invalid_clerk_user", "Clerk user id is required for deletion.");
+      const existing = deletionInflight.get(normalizedId);
+      if (existing) return existing;
+      const task = Promise.resolve().then(operation);
+      deletionInflight.set(normalizedId, task);
+      return task.finally(() => {
+        if (deletionInflight.get(normalizedId) === task) deletionInflight.delete(normalizedId);
+      });
+    },
+
     actorForClerkUserId(clerkUserId) {
       const user = store.read((data) => data.users.find((candidate) => candidate.clerk_user_id === clerkUserId));
       return user ? actorFromUser(user, null) : null;
+    },
+
+    pendingDocumentCleanupForClerkUserId(clerkUserId) {
+      const providerUserHash = hashClerkUserId(clerkUserId);
+      const tombstone = store.read((data) => (data.identityDeletionTombstones || []).find((item) => (
+        item.provider === "clerk" && item.provider_user_hash === providerUserHash
+      )));
+      if (!tombstone || !Array.isArray(tombstone.pending_document_roots)) return null;
+      return {
+        deletion_id: tombstone.deletion_id || null,
+        document_roots: [...tombstone.pending_document_roots]
+      };
+    },
+
+    async completeDocumentCleanup(clerkUserId, deletionId) {
+      const providerUserHash = hashClerkUserId(clerkUserId);
+      return store.mutate((data) => {
+        const tombstone = (data.identityDeletionTombstones || []).find((item) => (
+          item.provider === "clerk" && item.provider_user_hash === providerUserHash
+        ));
+        if (!tombstone) return false;
+        if (!deletionId || !timingSafeIdentityEqual(tombstone.deletion_id, deletionId)) {
+          throw identityError(409, "account_deletion_changed", "Account deletion cleanup state changed.");
+        }
+        delete tombstone.pending_document_roots;
+        tombstone.document_cleanup_completed_at = nowIso();
+        return true;
+      });
+    },
+
+    listAccountDeletionRecoveryCandidates({ limit = 25, at = Date.now() } = {}) {
+      const maximum = Math.max(1, Math.min(Number(limit) || 25, 100));
+      const data = store.read();
+      const candidates = [];
+      const activeHashes = new Set();
+      for (const user of data.users || []) {
+        if (user.status !== "deleting" || !user.clerk_user_id || !user.deletion_id) continue;
+        const providerUserHash = hashClerkUserId(user.clerk_user_id);
+        activeHashes.add(providerUserHash);
+        if (Date.parse(user.deletion_recovery_next_at || "") > at) continue;
+        candidates.push({
+          kind: "account",
+          provider_user_hash: providerUserHash,
+          deletion_id: user.deletion_id,
+          actor: actorFromUser(user, null),
+          started_at: user.deletion_started_at || user.updated_at || user.created_at || null
+        });
+      }
+      for (const tombstone of data.identityDeletionTombstones || []) {
+        if (
+          activeHashes.has(tombstone.provider_user_hash)
+          || !Array.isArray(tombstone.pending_document_roots)
+          || !tombstone.deletion_id
+          || Date.parse(tombstone.deletion_recovery_next_at || "") > at
+        ) continue;
+        candidates.push({
+          kind: "document_cleanup",
+          provider_user_hash: tombstone.provider_user_hash,
+          deletion_id: tombstone.deletion_id,
+          document_roots: [...tombstone.pending_document_roots],
+          started_at: tombstone.deletion_started_at || tombstone.deleted_at || null
+        });
+      }
+      return candidates
+        .sort((left, right) => Date.parse(left.started_at || 0) - Date.parse(right.started_at || 0))
+        .slice(0, maximum);
+    },
+
+    async completeDocumentCleanupByTombstone(providerUserHash, deletionId) {
+      return store.mutate((data) => {
+        const tombstone = (data.identityDeletionTombstones || []).find((item) => (
+          item.provider === "clerk" && item.provider_user_hash === providerUserHash
+        ));
+        if (!tombstone) return false;
+        if (!deletionId || !timingSafeIdentityEqual(tombstone.deletion_id, deletionId)) {
+          throw identityError(409, "account_deletion_changed", "Account deletion cleanup state changed.");
+        }
+        delete tombstone.pending_document_roots;
+        tombstone.document_cleanup_completed_at = nowIso();
+        return true;
+      });
+    },
+
+    async recordAccountDeletionRecovery(candidate, { error = null } = {}) {
+      return store.mutate((data) => {
+        const user = candidate?.actor?.clerk_user_id
+          ? (data.users || []).find((item) => item.clerk_user_id === candidate.actor.clerk_user_id)
+          : null;
+        const tombstone = (data.identityDeletionTombstones || []).find((item) => (
+          item.provider === "clerk" && item.provider_user_hash === candidate?.provider_user_hash
+        ));
+        const target = user || tombstone;
+        if (!target || !timingSafeIdentityEqual(target.deletion_id, candidate?.deletion_id)) return false;
+        if (!error) {
+          delete target.deletion_recovery_attempts;
+          delete target.deletion_recovery_last_attempt_at;
+          delete target.deletion_recovery_last_error_code;
+          delete target.deletion_recovery_next_at;
+          return true;
+        }
+        const attempts = Math.max(0, Number(target.deletion_recovery_attempts) || 0) + 1;
+        const delayMs = Math.min(60 * 60 * 1000, 5_000 * (2 ** Math.min(attempts - 1, 9)));
+        target.deletion_recovery_attempts = attempts;
+        target.deletion_recovery_last_attempt_at = nowIso();
+        target.deletion_recovery_last_error_code = String(error?.code || "account_deletion_recovery_failed").slice(0, 120);
+        target.deletion_recovery_next_at = new Date(Date.now() + delayMs).toISOString();
+        return true;
+      });
     },
 
     exportAccount(actor) {
@@ -322,45 +545,136 @@ export function createClerkIdentityManager({
       return buildAccountExport(data, user);
     },
 
-    async validateAccountDeletion(actor, body = {}) {
+    validateAccountDeletionConfirmation(actor, body = {}) {
       requireClerkActor(actor);
       if (String(body.confirmation || "") !== "DELETE") {
         throw identityError(400, "confirmation_required", "Type DELETE exactly to confirm account deletion.");
       }
+      return true;
+    },
+
+    async beginAccountDeletion(actor, { providerInitiated = false } = {}) {
+      requireClerkActor(actor);
       return store.mutate((data) => {
         const user = registeredUserForActor(data, actor);
         if (!user) throw identityError(404, "account_not_found", "Registered account not found.");
-        if (user.role === "admin" && activeRegisteredAdmins(data).length <= 1) {
+        const resuming = user.status === "deleting";
+        if (!providerInitiated && !resuming && user.role === "admin" && activeRegisteredAdmins(data).length <= 1) {
           throw identityError(409, "last_admin", "The last active administrator cannot delete their account.");
         }
-        const accountIds = new Set((data.billingAccounts || [])
-          .filter((account) => account.user_id === user.user_id && account.workspace_id === user.workspace_id)
-          .map((account) => account.account_id));
-        const hasActiveReservation = (data.billingReservations || []).some((reservation) => (
-          accountIds.has(reservation.account_id) && reservation.status === "active"
-        ));
-        const ownedSessionIds = new Set((data.sessions || [])
-          .filter((session) => ownsWorkspaceItem(session, user))
-          .map((session) => session.session_id));
-        const hasActiveLegacyRun = (data.runs || []).some((run) => (
-          (ownedSessionIds.has(run.session_id) || ownsWorkspaceItem(run, user))
-          && ["queued", "claimed", "planning", "running", "synthesizing"].includes(run.status)
-        ));
-        if (hasActiveReservation || hasActiveLegacyRun) {
+        if (!providerInitiated && !resuming && user.status !== "active") {
+          throw identityError(403, "account_suspended", "This account has been suspended. Contact support.");
+        }
+        const accountGraph = buildAccountResourceGraph(data, user);
+        const ambiguousCount = accountGraphAmbiguousCount(accountGraph);
+        if (ambiguousCount > 0) {
           throw identityError(
             409,
-            "account_has_active_runs",
-            "Wait for active requests to finish before deleting this account."
+            "account_legacy_scope_ambiguous",
+            `Account deletion is blocked because ${ambiguousCount} legacy ${ambiguousCount === 1 ? "record has" : "records have"} ambiguous tenant ownership. Ask an administrator to repair or remove the quarantined records, then try again.`
           );
         }
         const now = nowIso();
-        for (const account of data.billingAccounts || []) {
-          if (accountIds.has(account.account_id)) {
-            account.status = "closing";
-            account.updated_at = now;
+        if (!resuming) {
+          user.status = "deleting";
+          user.deletion_started_at = now;
+          user.deletion_id = makeId("deletion");
+          user.deletion_external_purges = [];
+          user.updated_at = now;
+          appendIdentityAudit(data, {
+            action: providerInitiated
+              ? "identity.clerk_account_deletion_started_by_provider"
+              : "identity.clerk_account_deletion_started",
+            target_user_id: user.user_id,
+            actor_user_id: user.user_id,
+            deletion_id: user.deletion_id,
+            at: now
+          });
+        }
+        upsertDeletionTombstone(data, user, {
+          deletionId: user.deletion_id,
+          deletionStartedAt: user.deletion_started_at || now,
+          status: "deleting"
+        });
+        // Pending callbacks are unauthenticated browser redirects. Moving the
+        // state out of pending/exchanging makes their credential commit fail
+        // atomically; an already-exchanged credential is revoked in mcp.js.
+        for (const state of accountGraph.mcpOauthStates.records) {
+          if (["pending", "exchanging"].includes(state.status)) {
+            state.status = "account_deleting";
+            state.failed_at = now;
+            delete state.verifier_envelope;
           }
         }
-        return accountOwnedResources(data, user);
+        for (const account of accountGraph.billingAccounts.records) {
+          account.status = "closing";
+          account.updated_at = now;
+        }
+        return {
+          deletion_id: user.deletion_id,
+          deletion_started_at: user.deletion_started_at,
+          resumed: resuming
+        };
+      });
+    },
+
+    async prepareAccountDeletion(actor, deletionId) {
+      requireClerkActor(actor);
+      return store.mutate((data) => {
+        const user = registeredUserForActor(data, actor);
+        assertDeletingUser(user, deletionId);
+        const graph = buildAccountResourceGraph(data, user);
+        const ambiguousCount = accountGraphAmbiguousCount(graph);
+        if (ambiguousCount > 0) {
+          throw identityError(
+            409,
+            "account_legacy_scope_ambiguous",
+            `Account deletion is blocked because ${ambiguousCount} legacy ${ambiguousCount === 1 ? "record has" : "records have"} ambiguous tenant ownership.`
+          );
+        }
+        if (
+          graph.billingReservations.records.some((reservation) => reservation.status === "active")
+          || graph.runs.records.some((run) => ACTIVE_RUN_STATUSES.has(run.status))
+        ) {
+          throw identityError(
+            409,
+            "account_has_active_runs",
+            "Wait for active requests to finish, then retry account deletion. The deletion marker remains active."
+          );
+        }
+        if (hasUnresolvedAccountOAuth(graph)) {
+          throw identityError(
+            409,
+            "account_oauth_revocation_unresolved",
+            "An OAuth exchange or revocation is unresolved. Retry shortly; persistent failures require provider deauthorization or operator remediation."
+          );
+        }
+        const resources = accountOwnedResources(data, user, graph);
+        return {
+          ...resources,
+          deletion_id: user.deletion_id,
+          resource_revision: deletionResourceRevision(resources),
+          completed_external_purges: [...(user.deletion_external_purges || [])]
+        };
+      });
+    },
+
+    async markDeletionExternalPurge(actor, deletionId, purgeKey) {
+      requireClerkActor(actor);
+      const key = String(purgeKey || "").slice(0, 512);
+      if (!key) throw identityError(400, "deletion_purge_key_required", "Deletion purge receipt key is required.");
+      return store.mutate((data) => {
+        const user = registeredUserForActor(data, actor);
+        assertDeletingUser(user, deletionId);
+        user.deletion_external_purges ||= [];
+        if (!user.deletion_external_purges.includes(key)) {
+          if (user.deletion_external_purges.length >= MAX_DELETION_PURGE_RECEIPTS) {
+            throw identityError(503, "account_deletion_purge_limit", "Account deletion has too many external purge receipts. Contact support.");
+          }
+          user.deletion_external_purges.push(key);
+          user.updated_at = nowIso();
+        }
+        return true;
       });
     },
 
@@ -383,40 +697,66 @@ export function createClerkIdentityManager({
       }
     },
 
-    async deleteAccount(actor) {
+    async deleteAccount(actor, { deletionId, resourceRevision } = {}) {
       return store.mutate((data) => {
         const user = registeredUserForActor(data, actor);
         if (!user) return null;
-        const accountIds = new Set((data.billingAccounts || [])
-          .filter((account) => account.user_id === user.user_id && account.workspace_id === user.workspace_id)
-          .map((account) => account.account_id));
-        if ((data.billingReservations || []).some((reservation) => (
-          accountIds.has(reservation.account_id) && reservation.status === "active"
-        ))) {
+        assertDeletingUser(user, deletionId);
+        const accountGraph = buildAccountResourceGraph(data, user);
+        const ambiguousCount = accountGraphAmbiguousCount(accountGraph);
+        if (ambiguousCount > 0) {
+          throw identityError(
+            409,
+            "account_legacy_scope_ambiguous",
+            `Account deletion is blocked because ${ambiguousCount} legacy ${ambiguousCount === 1 ? "record has" : "records have"} ambiguous tenant ownership.`
+          );
+        }
+        if (
+          accountGraph.billingReservations.records.some((reservation) => reservation.status === "active")
+          || accountGraph.runs.records.some((run) => ACTIVE_RUN_STATUSES.has(run.status))
+        ) {
           throw identityError(
             409,
             "account_has_active_runs",
             "Wait for active requests to finish before deleting this account."
           );
         }
-        const providerUserHash = hashClerkUserId(user.clerk_user_id);
-        const result = deleteAccountData(data, user);
-        data.identityDeletionTombstones ||= [];
-        if (!data.identityDeletionTombstones.some((item) =>
-          item.provider === "clerk" && item.provider_user_hash === providerUserHash
-        )) {
-          data.identityDeletionTombstones.push({
-            provider: "clerk",
-            provider_user_hash: providerUserHash,
-            deleted_at: nowIso()
-          });
-          if (data.identityDeletionTombstones.length > MAX_IDENTITY_DELETION_TOMBSTONES) {
-            data.identityDeletionTombstones.splice(
-              0,
-              data.identityDeletionTombstones.length - MAX_IDENTITY_DELETION_TOMBSTONES
-            );
-          }
+        if (hasUnresolvedAccountOAuth(accountGraph)) {
+          throw identityError(
+            409,
+            "account_oauth_revocation_unresolved",
+            "An OAuth exchange or revocation is unresolved. Account deletion remains fail-closed."
+          );
         }
+        const currentResources = accountOwnedResources(data, user, accountGraph);
+        const currentRevision = deletionResourceRevision(currentResources);
+        if (!resourceRevision || currentRevision !== resourceRevision) {
+          throw identityError(
+            503,
+            "account_deletion_resource_changed",
+            "Account resources changed during deletion. Retry so the fresh resource set can be purged safely."
+          );
+        }
+        if (!(user.deletion_external_purges || []).includes(`snapshot:${currentRevision}`)) {
+          throw identityError(
+            503,
+            "account_deletion_purge_incomplete",
+            "External account resources have not finished purging. Retry account deletion."
+          );
+        }
+        const providerUserHash = hashClerkUserId(user.clerk_user_id);
+        const pendingDocumentRoots = accountGraph.documents.records
+          .map((item) => String(item.document_root || ""))
+          .filter(Boolean);
+        const result = deleteAccountData(data, user);
+        upsertDeletionTombstone(data, { clerk_user_id: actor.clerk_user_id }, {
+          providerUserHash,
+          deletionId,
+          deletionStartedAt: user.deletion_started_at,
+          status: "deleted",
+          deletedAt: nowIso(),
+          pendingDocumentRoots
+        });
         return result;
       });
     },
@@ -437,6 +777,13 @@ export function createClerkIdentityManager({
       const snapshot = store.read();
       const user = snapshot.users.find((candidate) => candidate.user_id === userId);
       if (!user?.clerk_user_id) throw identityError(404, "user_not_found", "Clerk user not found.");
+      if (user.status === "deleting") {
+        throw identityError(
+          409,
+          "account_deletion_in_progress",
+          "This account is being deleted and cannot be reactivated or changed. Retry the deletion instead."
+        );
+      }
       const nextRole = patch.role === undefined ? user.role : normalizeRole(patch.role);
       const nextStatus = patch.status === undefined ? user.status : normalizeStatus(patch.status);
       if (user.user_id === actor.user_id && (nextRole !== "admin" || nextStatus !== "active")) {
@@ -466,6 +813,13 @@ export function createClerkIdentityManager({
       return store.mutate((data) => {
         const current = data.users.find((candidate) => candidate.user_id === userId);
         if (!current) throw identityError(404, "user_not_found", "Clerk user not found.");
+        if (current.status === "deleting") {
+          throw identityError(
+            409,
+            "account_deletion_in_progress",
+            "This account is being deleted and cannot be reactivated or changed. Retry the deletion instead."
+          );
+        }
         if (current.role === "admin" && (nextRole !== "admin" || nextStatus !== "active") && activeRegisteredAdmins(data).length <= 1) {
           throw identityError(409, "last_admin", "The last active administrator cannot be demoted or suspended.");
         }
@@ -582,145 +936,468 @@ function publicUser(user) {
   };
 }
 
+function tenantScopeStatus(item, user) {
+  const workspaceId = String(item?.workspace_id || "");
+  const owners = [item?.created_by, item?.user_id, item?.actor_user_id]
+    .filter((value) => value !== undefined && value !== null && String(value) !== "")
+    .map(String);
+  if (!workspaceId) {
+    if (owners.length === 0) return "unscoped";
+    if (owners.some((owner) => owner !== String(user.user_id || ""))) return "foreign";
+    return user.user_identity_collision === true ? "owner_ambiguous" : "owned";
+  }
+  if (workspaceId !== String(user.workspace_id || "")) return "foreign";
+  if (owners.length > 0) {
+    if (owners.some((owner) => owner !== String(user.user_id || ""))) return "foreign";
+    return user.workspace_identity_collision === true && user.user_identity_collision === true
+      ? "scope_ambiguous"
+      : "owned";
+  }
+  return user.workspace_identity_collision === true ? "workspace_ambiguous" : "owned";
+}
+
+function relationOwnership(item, relation) {
+  const value = item?.[relation.record_field];
+  if (value === undefined || value === null || String(value) === "") return "none";
+  const matches = (relation.records || []).filter((candidate) => (
+    String(candidate?.[relation.parent_field]) === String(value)
+  ));
+  if (matches.length === 0) return "none";
+  const selected = relation.selected instanceof Set
+    ? relation.selected
+    : new Set(relation.selected || []);
+  const ownedCount = matches.filter((candidate) => selected.has(candidate)).length;
+  if (ownedCount === matches.length) return "owned";
+  if (ownedCount === 0) return "foreign";
+  return "ambiguous";
+}
+
+function selectTenantCollection(records, user, relations = []) {
+  const selected = [];
+  const quarantined = [];
+  for (const item of records || []) {
+    if (item?.identity_scope_quarantine_admin_only?.reason === "ambiguous_legacy_tenant_reference") {
+      quarantined.push(item);
+      continue;
+    }
+    const scope = tenantScopeStatus(item, user);
+    if (scope === "owned") {
+      selected.push(item);
+      continue;
+    }
+    if (scope === "foreign") continue;
+    const statuses = relations.map((relation) => relationOwnership(item, relation));
+    const hasOwnedProof = statuses.includes("owned");
+    const hasForeignContradiction = statuses.includes("foreign");
+    const hasAmbiguity = statuses.includes("ambiguous");
+    if (hasOwnedProof && !hasForeignContradiction) {
+      selected.push(item);
+    } else if (
+      scope === "workspace_ambiguous"
+      || scope === "owner_ambiguous"
+      || scope === "scope_ambiguous"
+      || hasAmbiguity
+      || (hasOwnedProof && hasForeignContradiction)
+    ) {
+      quarantined.push(item);
+    }
+  }
+  return { records: selected, selected: new Set(selected), quarantined };
+}
+
+function relation(recordField, records, selected, parentField) {
+  return {
+    record_field: recordField,
+    records,
+    selected,
+    parent_field: parentField
+  };
+}
+
+function buildAccountResourceGraph(data, user) {
+  const ambiguous = {};
+  const collidingWorkspaceUsers = (data.users || []).filter((candidate) => (
+    candidate !== user
+    && candidate.status !== "deleted"
+    && String(candidate.workspace_id || "") === String(user.workspace_id || "")
+  ));
+  const tenantUser = {
+    ...user,
+    workspace_identity_collision: collidingWorkspaceUsers.length > 0,
+    user_identity_collision: (data.users || []).some((candidate) => (
+      candidate !== user
+      && candidate.status !== "deleted"
+      && String(candidate.user_id || "") === String(user.user_id || "")
+    ))
+  };
+  if (collidingWorkspaceUsers.length > 0) {
+    ambiguous.workspace_identity_collision = collidingWorkspaceUsers.length;
+  }
+  if (tenantUser.user_identity_collision) {
+    ambiguous.user_identity_collision = (data.users || []).filter((candidate) => (
+      candidate !== user
+      && candidate.status !== "deleted"
+      && String(candidate.user_id || "") === String(user.user_id || "")
+    )).length;
+  }
+  const collect = (name, records, relations = []) => {
+    const result = selectTenantCollection(records, tenantUser, relations);
+    if (result.quarantined.length > 0) {
+      ambiguous[name] = Number(ambiguous[name] || 0) + result.quarantined.length;
+    }
+    return result;
+  };
+
+  const billingAccounts = collect("billing_accounts", data.billingAccounts || []);
+  const workspaceModelSettings = collect("workspace_model_settings", data.workspaceModelSettings || []);
+  const sessions = collect("chat_sessions", data.sessions || []);
+  const agents = collect("agents", data.agents || []);
+  const documents = collect("documents", data.documents || []);
+  const agentWorkspaces = collect("agent_workspaces", data.agentWorkspaces || []);
+  const mcpConnections = collect("mcp_connections", data.mcpConnections || []);
+  const runs = collect("runs", data.runs || [], [
+    relation("session_id", data.sessions || [], sessions.selected, "session_id")
+  ]);
+  const workflows = collect("workflows", data.workflows || [], [
+    relation("session_id", data.sessions || [], sessions.selected, "session_id")
+  ]);
+  const checkpoints = collect("conversation_checkpoints", data.conversationCheckpoints || [], [
+    relation("workflow_id", data.workflows || [], workflows.selected, "workflow_id"),
+    relation("session_id", data.sessions || [], sessions.selected, "session_id")
+  ]);
+  const messages = collect("messages", data.messages || [], [
+    relation("session_id", data.sessions || [], sessions.selected, "session_id"),
+    relation("run_id", data.runs || [], runs.selected, "run_id"),
+    relation("message_id", data.runs || [], runs.selected, "user_message_id"),
+    relation("message_id", data.runs || [], runs.selected, "assistant_message_id"),
+    relation("workflow_id", data.workflows || [], workflows.selected, "workflow_id"),
+    relation("checkpoint_id", data.conversationCheckpoints || [], checkpoints.selected, "checkpoint_id")
+  ]);
+  const runSteps = collect("run_steps", data.runSteps || [], [
+    relation("run_id", data.runs || [], runs.selected, "run_id")
+  ]);
+  const executions = collect("executions", data.executionRecords || [], [
+    relation("run_id", data.runs || [], runs.selected, "run_id")
+  ]);
+  const worldGraphArtifacts = collect("world_graph_artifacts", data.worldGraphArtifacts || [], [
+    relation("origin_run_id", data.runs || [], runs.selected, "run_id")
+  ]);
+  const worldGraphEvents = collect("world_graph_events", data.worldGraphEvents || [], [
+    relation("run_id", data.runs || [], runs.selected, "run_id")
+  ]);
+  const outcomeContracts = collect("outcome_contracts", data.outcomeContracts || [], [
+    relation("run_id", data.runs || [], runs.selected, "run_id")
+  ]);
+  const agentEvents = collect("agent_events", data.agentEvents || [], [
+    relation("agent_id", data.agents || [], agents.selected, "id")
+  ]);
+  const runtimeLifecycleIntents = collect("runtime_lifecycle_intents", data.runtimeLifecycleIntents || [], [
+    relation("agent_id", data.agents || [], agents.selected, "id"),
+    relation("document_id", data.documents || [], documents.selected, "document_id")
+  ]);
+  const validationRuns = collect("validation_runs", data.validationRuns || []);
+  const billingLedgerEntries = collect("billing_ledger_entries", data.billingLedgerEntries || [], [
+    relation("account_id", data.billingAccounts || [], billingAccounts.selected, "account_id")
+  ]);
+  const billingReservations = collect("billing_reservations", data.billingReservations || [], [
+    relation("account_id", data.billingAccounts || [], billingAccounts.selected, "account_id"),
+    relation("run_id", data.runs || [], runs.selected, "run_id")
+  ]);
+  const billingUsageRecords = collect("billing_usage_records", data.billingUsageRecords || [], [
+    relation("account_id", data.billingAccounts || [], billingAccounts.selected, "account_id"),
+    relation("run_id", data.runs || [], runs.selected, "run_id")
+  ]);
+  const billingFundingEvents = collect("billing_funding_events", data.billingFundingEvents || [], [
+    relation("account_id", data.billingAccounts || [], billingAccounts.selected, "account_id")
+  ]);
+  const mcpOauthClients = collect("mcp_oauth_clients", data.mcpOauthClients || []);
+  const mcpOauthStates = collect("mcp_oauth_states", data.mcpOauthStates || [], [
+    relation("connection_id", data.mcpConnections || [], mcpConnections.selected, "connection_id")
+  ]);
+  const mcpApprovals = collect("mcp_approvals", data.mcpApprovals || [], [
+    relation("connection_id", data.mcpConnections || [], mcpConnections.selected, "connection_id"),
+    relation("run_id", data.runs || [], runs.selected, "run_id")
+  ]);
+  const mcpToolCalls = collect("mcp_tool_calls", data.mcpToolCalls || [], [
+    relation("connection_id", data.mcpConnections || [], mcpConnections.selected, "connection_id"),
+    relation("run_id", data.runs || [], runs.selected, "run_id")
+  ]);
+  const matchingIdentityEvents = (data.identityAuditEvents || []).filter((item) => (
+    item.target_user_id === user.user_id || item.actor_user_id === user.user_id
+  ));
+  const identityEvents = tenantUser.user_identity_collision ? [] : matchingIdentityEvents;
+  if (tenantUser.user_identity_collision && matchingIdentityEvents.length > 0) {
+    ambiguous.identity_audit_events = matchingIdentityEvents.length;
+  }
+
+  const marketplaceRatingRecords = collect("marketplace_ratings", data.marketplaceRatings || []);
+  const agentWorkspaceRatingRecords = collect("agent_workspace_ratings", data.agentWorkspaceRatings || []);
+  const marketplaceRatings = marketplaceRatingRecords.records;
+  const agentWorkspaceRatings = agentWorkspaceRatingRecords.records;
+  // Nested marketplace IDs need explicit readers rather than relationOwnership's
+  // flat parent-field lookup.
+  const uniquelyReferencesOwnedListing = (rating, parents, selected, kind) => {
+    const matches = parents.filter((parent) => parent.marketplace?.listing_id === rating.listing_id);
+    if (matches.length === 0) return false;
+    const ownedCount = matches.filter((parent) => selected.has(parent)).length;
+    if (ownedCount > 0 && ownedCount < matches.length) {
+      ambiguous[`${kind}_ratings`] = Number(ambiguous[`${kind}_ratings`] || 0) + 1;
+      return false;
+    }
+    return ownedCount === matches.length;
+  };
+  const marketplaceRatingsToDelete = [...new Set([
+    ...marketplaceRatings,
+    ...(data.marketplaceRatings || []).filter((rating) => uniquelyReferencesOwnedListing(
+      rating,
+      data.agents || [],
+      agents.selected,
+      "marketplace"
+    ))
+  ])];
+  const agentWorkspaceRatingsToDelete = [...new Set([
+    ...agentWorkspaceRatings,
+    ...(data.agentWorkspaceRatings || []).filter((rating) => uniquelyReferencesOwnedListing(
+      rating,
+      data.agentWorkspaces || [],
+      agentWorkspaces.selected,
+      "agent_workspace"
+    ))
+  ])];
+
+  return {
+    billingAccounts,
+    workspaceModelSettings,
+    billingLedgerEntries,
+    billingReservations,
+    billingUsageRecords,
+    billingFundingEvents,
+    sessions,
+    messages,
+    runs,
+    runSteps,
+    agents,
+    agentEvents,
+    documents,
+    agentWorkspaces,
+    workflows,
+    checkpoints,
+    executions,
+    worldGraphArtifacts,
+    worldGraphEvents,
+    outcomeContracts,
+    runtimeLifecycleIntents,
+    validationRuns,
+    marketplaceRatings,
+    marketplaceRatingsToDelete,
+    agentWorkspaceRatings,
+    agentWorkspaceRatingsToDelete,
+    mcpConnections,
+    mcpOauthClients,
+    mcpOauthStates,
+    mcpApprovals,
+    mcpToolCalls,
+    identityEvents,
+    ambiguous
+  };
+}
+
+function accountGraphAmbiguousCount(graph) {
+  return Object.values(graph?.ambiguous || {}).reduce((sum, count) => sum + Number(count || 0), 0);
+}
+
+function hasUnresolvedAccountOAuth(graph) {
+  return (graph?.mcpOauthStates?.records || []).some((state) => (
+    ["exchanging", "account_deleting"].includes(state.status)
+    || (state.status === "revocation_pending" && !state.revocation_envelope)
+  ));
+}
+
+function safeAccountExportRun(run) {
+  const {
+    expert_outputs: _expertOutputs,
+    runtime_result_admin_only: _runtimeResult,
+    error_admin_only: _error,
+    ...safe
+  } = run || {};
+  return stripPrivateExecutionFields(safe);
+}
+
+function safeAccountExportRunStep(step) {
+  const {
+    agent_reasoning: _reasoning,
+    raw_text_admin_only: _rawText,
+    prompt_preview_admin_only: _promptPreview,
+    model_calls_admin_only: _modelCalls,
+    approved_sources: _approvedSources,
+    ...safe
+  } = step || {};
+  return stripPrivateExecutionFields(safe);
+}
+
+function stripPrivateExecutionFields(value) {
+  if (Array.isArray(value)) return value.map(stripPrivateExecutionFields);
+  if (!value || typeof value !== "object") return value;
+  const result = {};
+  for (const [key, child] of Object.entries(value)) {
+    if (
+      key.endsWith("_admin_only")
+      || ["agent_reasoning", "approved_sources", "expert_outputs", "model_calls", "prompt_preview"].includes(key)
+    ) continue;
+    result[key] = stripPrivateExecutionFields(child);
+  }
+  return result;
+}
+
 function buildAccountExport(data, user) {
   const workspaceId = user.workspace_id;
   const userId = user.user_id;
-  const sessions = data.sessions.filter((item) => ownsWorkspaceItem(item, user));
-  const sessionIds = new Set(sessions.map((item) => item.session_id));
-  const runs = data.runs.filter((item) => sessionIds.has(item.session_id) || ownsWorkspaceItem(item, user));
-  const runIds = new Set(runs.map((item) => item.run_id));
-  const agents = data.agents.filter((item) => ownsWorkspaceItem(item, user));
-  const agentIds = new Set(agents.map((item) => item.id));
-  const documents = data.documents.filter((item) => ownsWorkspaceItem(item, user));
-  const workflows = data.workflows.filter((item) => ownsWorkspaceItem(item, user) || sessionIds.has(item.session_id));
-  const workflowIds = new Set(workflows.map((item) => item.workflow_id));
-  const billingAccounts = (data.billingAccounts || []).filter((item) => ownsWorkspaceItem(item, user));
-  const billingAccountIds = new Set(billingAccounts.map((item) => item.account_id));
-  return stripSecrets({
-    export_version: 2,
+  const graph = buildAccountResourceGraph(data, user);
+  return stripSecrets(stripPrivateExecutionFields({
+    export_version: 3,
     exported_at: nowIso(),
-    retention_note: "Append-only integrity receipts may be retained in de-identified form for security, provenance, and abuse prevention.",
+    retention_note: "Content-free provenance receipts and minimized normalized billing records may be retained under documented security, accounting, tax, payment-reconciliation, fraud-prevention, chargeback, or legal-hold obligations. They contain workspace-scoped pseudonyms, digests, and necessary accounting facts; they are not anonymous and are not included in this JSON export. Legacy normalized databases require approved privacy migration and cross-tenant administrator inventory.",
+    retained_provenance: {
+      projection: "virenis-ledger-content-free-v1",
+      included_in_export: false,
+      identity_form: "workspace-scoped pseudonyms",
+      payload_form: "digests only",
+      anonymous: false,
+      operator_inventory_required: true,
+      legacy_migration_status: "unknown until administrator inventory; migration is required only if legacy rows are found"
+    },
+    retained_billing: {
+      projection: "virenis-billing-minimized-v1",
+      included_in_export: false,
+      identity_form: "opaque tenant partition key plus workspace-scoped pseudonyms and SHA-256 digests",
+      retained_partition_keys: "raw workspace_id and global pricing-version IDs; deployments must keep these opaque and non-personal",
+      retained_facts: "recorded amounts, balances, transaction status/timestamps, provider name, pricing facts, aggregate usage, and integrity hashes; aggregates are not an independent repricing dataset",
+      raw_fields_excluded: "raw user/account/run/ledger/provider-event identifiers, agent/step/model labels, and free-form metadata",
+      retention_basis: "operator policy and legal basis are required; normalized-ledger expiry is not enforced by the application",
+      anonymous: false,
+      operator_inventory_required: true,
+      legacy_migration_status: "unknown until administrator inventory; migration is required only if legacy rows are found"
+    },
+    privacy_filter: {
+      schema_version: "tenant-qualified-export-v1",
+      ambiguous_legacy_records_omitted: accountGraphAmbiguousCount(graph),
+      omitted_by_collection: graph.ambiguous
+    },
     account: publicUser(user),
     billing: {
-      accounts: billingAccounts,
-      ledger_entries: (data.billingLedgerEntries || []).filter((item) => billingAccountIds.has(item.account_id)),
-      reservations: (data.billingReservations || []).filter((item) => billingAccountIds.has(item.account_id)),
-      usage_records: (data.billingUsageRecords || []).filter((item) => billingAccountIds.has(item.account_id)),
-      funding_events: (data.billingFundingEvents || []).filter((item) => billingAccountIds.has(item.account_id))
+      accounts: graph.billingAccounts.records,
+      ledger_entries: graph.billingLedgerEntries.records,
+      reservations: graph.billingReservations.records,
+      usage_records: graph.billingUsageRecords.records,
+      funding_events: graph.billingFundingEvents.records
     },
     workspace: { workspace_id: workspaceId, owner_user_id: userId },
-    identity_events: data.identityAuditEvents.filter((item) => item.target_user_id === userId || item.actor_user_id === userId),
+    model_settings: graph.workspaceModelSettings.records,
+    identity_events: graph.identityEvents,
     authentication: { provider: "clerk", provider_user_id: user.clerk_user_id },
     chats: {
-      sessions,
-      messages: data.messages.filter((item) => sessionIds.has(item.session_id)),
-      runs,
-      run_steps: data.runSteps.filter((item) => runIds.has(item.run_id))
+      sessions: graph.sessions.records,
+      messages: graph.messages.records,
+      runs: graph.runs.records.map(safeAccountExportRun),
+      run_steps: graph.runSteps.records.map(safeAccountExportRunStep)
     },
-    agents,
-    agent_events: data.agentEvents.filter((item) => agentIds.has(item.agent_id) || (item.actor_user_id === userId && item.workspace_id === workspaceId)),
-    documents,
-    agent_workspaces: (data.agentWorkspaces || []).filter((item) => ownsWorkspaceItem(item, user)),
-    workflows,
-    conversation_checkpoints: data.conversationCheckpoints.filter((item) => workflowIds.has(item.workflow_id) || sessionIds.has(item.session_id)),
-    executions: data.executionRecords.filter((item) => runIds.has(item.run_id) || ownsWorkspaceItem(item, user)),
-    outcome_contracts: data.outcomeContracts.filter((item) => runIds.has(item.run_id) || ownsWorkspaceItem(item, user)),
-    marketplace_ratings: data.marketplaceRatings.filter((item) => item.created_by === userId && item.workspace_id === workspaceId),
-    agent_workspace_ratings: (data.agentWorkspaceRatings || []).filter((item) => item.created_by === userId && item.workspace_id === workspaceId),
+    agents: graph.agents.records,
+    agent_events: graph.agentEvents.records,
+    documents: graph.documents.records,
+    agent_workspaces: graph.agentWorkspaces.records,
+    workflows: graph.workflows.records,
+    conversation_checkpoints: graph.checkpoints.records,
+    validation_runs: graph.validationRuns.records,
+    executions: graph.executions.records,
+    world_graph: {
+      artifacts: graph.worldGraphArtifacts.records,
+      events: graph.worldGraphEvents.records
+    },
+    outcome_contracts: graph.outcomeContracts.records,
+    marketplace_ratings: graph.marketplaceRatings,
+    agent_workspace_ratings: graph.agentWorkspaceRatings,
     mcp: {
-      connections: data.mcpConnections.filter((item) => ownsWorkspaceItem(item, user)),
-      approvals: data.mcpApprovals.filter((item) => ownsWorkspaceItem(item, user)),
-      tool_calls: data.mcpToolCalls.filter((item) => ownsWorkspaceItem(item, user))
+      connections: graph.mcpConnections.records,
+      approvals: graph.mcpApprovals.records,
+      tool_calls: graph.mcpToolCalls.records
     }
-  });
+  }));
 }
 
 function deleteAccountData(data, user) {
   const { user_id: userId, workspace_id: workspaceId } = user;
-  const sessions = data.sessions.filter((item) => ownsWorkspaceItem(item, user));
-  const sessionIds = new Set(sessions.map((item) => item.session_id));
-  const runs = data.runs.filter((item) => sessionIds.has(item.session_id) || ownsWorkspaceItem(item, user));
-  const runIds = new Set(runs.map((item) => item.run_id));
-  const agents = data.agents.filter((item) => ownsWorkspaceItem(item, user));
-  const agentIds = new Set(agents.map((item) => item.id));
-  const listingIds = new Set(agents.map((item) => item.marketplace?.listing_id).filter(Boolean));
-  const documents = data.documents.filter((item) => ownsWorkspaceItem(item, user));
-  const documentIds = new Set(documents.map((item) => item.document_id));
-  const agentWorkspaces = (data.agentWorkspaces || []).filter((item) => ownsWorkspaceItem(item, user));
-  const agentWorkspaceListingIds = new Set(agentWorkspaces.map((item) => item.marketplace?.listing_id).filter(Boolean));
-  const workflows = data.workflows.filter((item) => ownsWorkspaceItem(item, user) || sessionIds.has(item.session_id));
-  const workflowIds = new Set(workflows.map((item) => item.workflow_id));
-  const connections = data.mcpConnections.filter((item) => ownsWorkspaceItem(item, user));
-  const connectionIds = new Set(connections.map((item) => item.connection_id));
-  const billingAccountIds = new Set((data.billingAccounts || [])
-    .filter((item) => ownsWorkspaceItem(item, user))
-    .map((item) => item.account_id));
+  const graph = buildAccountResourceGraph(data, user);
+  const removeExact = (collection, selection) => {
+    const selected = selection instanceof Set ? selection : new Set(selection || []);
+    return (collection || []).filter((item) => !selected.has(item));
+  };
 
-  data.users = data.users.filter((item) => item.user_id !== userId);
-  data.billingAccounts = (data.billingAccounts || []).filter((item) => !billingAccountIds.has(item.account_id));
-  data.billingLedgerEntries = (data.billingLedgerEntries || []).filter((item) => !billingAccountIds.has(item.account_id));
-  data.billingReservations = (data.billingReservations || []).filter((item) => !billingAccountIds.has(item.account_id));
-  data.billingUsageRecords = (data.billingUsageRecords || []).filter((item) => !billingAccountIds.has(item.account_id));
-  data.billingFundingEvents = (data.billingFundingEvents || []).filter((item) => !billingAccountIds.has(item.account_id));
-  data.sessions = data.sessions.filter((item) => !sessionIds.has(item.session_id));
-  data.messages = data.messages.filter((item) => !sessionIds.has(item.session_id));
-  data.runs = data.runs.filter((item) => !runIds.has(item.run_id));
-  data.runSteps = data.runSteps.filter((item) => !runIds.has(item.run_id));
-  data.executionRecords = data.executionRecords.filter((item) => !runIds.has(item.run_id) && !ownsWorkspaceItem(item, user));
-  data.outcomeContracts = data.outcomeContracts.filter((item) => !runIds.has(item.run_id) && !ownsWorkspaceItem(item, user));
-  data.agentEvents = data.agentEvents.filter((item) => !agentIds.has(item.agent_id) && !(item.actor_user_id === userId && item.workspace_id === workspaceId));
-  data.runtimeLifecycleIntents = data.runtimeLifecycleIntents.filter((item) => !agentIds.has(item.agent_id) && !documentIds.has(item.document_id));
-  data.marketplaceRatings = data.marketplaceRatings.filter((item) =>
-    !(item.created_by === userId && item.workspace_id === workspaceId) && !listingIds.has(item.listing_id)
-  );
-  data.agentWorkspaceRatings = (data.agentWorkspaceRatings || []).filter((item) =>
-    !(item.created_by === userId && item.workspace_id === workspaceId)
-    && !agentWorkspaceListingIds.has(item.listing_id)
-  );
-  data.agentWorkspaces = (data.agentWorkspaces || []).filter((item) => !ownsWorkspaceItem(item, user));
-  data.mcpConnections = data.mcpConnections.filter((item) => !connectionIds.has(item.connection_id));
-  data.mcpOauthClients = data.mcpOauthClients.filter((item) => !ownsWorkspaceItem(item, user));
-  data.mcpOauthStates = data.mcpOauthStates.filter((item) => !connectionIds.has(item.connection_id) && !ownsWorkspaceItem(item, user));
-  data.mcpApprovals = data.mcpApprovals.filter((item) => !connectionIds.has(item.connection_id) && !ownsWorkspaceItem(item, user));
-  data.mcpToolCalls = data.mcpToolCalls.filter((item) => !connectionIds.has(item.connection_id) && !ownsWorkspaceItem(item, user));
-  data.workflows = data.workflows.filter((item) => !workflowIds.has(item.workflow_id));
-  data.conversationCheckpoints = data.conversationCheckpoints.filter((item) => !workflowIds.has(item.workflow_id) && !sessionIds.has(item.session_id));
-  data.agents = data.agents.filter((item) => !agentIds.has(item.id));
-  data.documents = data.documents.filter((item) => !documentIds.has(item.document_id));
-  data.validationRuns = data.validationRuns.filter((item) => !ownsWorkspaceItem(item, user));
-  data.identityAuditEvents = data.identityAuditEvents.filter((item) =>
-    item.target_user_id !== userId && item.actor_user_id !== userId
-  );
+  data.users = data.users.filter((item) => item !== user);
+  data.billingAccounts = removeExact(data.billingAccounts, graph.billingAccounts.selected);
+  data.workspaceModelSettings = removeExact(data.workspaceModelSettings, graph.workspaceModelSettings.selected);
+  data.billingLedgerEntries = removeExact(data.billingLedgerEntries, graph.billingLedgerEntries.selected);
+  data.billingReservations = removeExact(data.billingReservations, graph.billingReservations.selected);
+  data.billingUsageRecords = removeExact(data.billingUsageRecords, graph.billingUsageRecords.selected);
+  data.billingFundingEvents = removeExact(data.billingFundingEvents, graph.billingFundingEvents.selected);
+  data.sessions = removeExact(data.sessions, graph.sessions.selected);
+  data.messages = removeExact(data.messages, graph.messages.selected);
+  data.runs = removeExact(data.runs, graph.runs.selected);
+  data.runSteps = removeExact(data.runSteps, graph.runSteps.selected);
+  data.executionRecords = removeExact(data.executionRecords, graph.executions.selected);
+  data.worldGraphArtifacts = removeExact(data.worldGraphArtifacts, graph.worldGraphArtifacts.selected);
+  data.worldGraphEvents = removeExact(data.worldGraphEvents, graph.worldGraphEvents.selected);
+  data.outcomeContracts = removeExact(data.outcomeContracts, graph.outcomeContracts.selected);
+  data.agentEvents = removeExact(data.agentEvents, graph.agentEvents.selected);
+  data.runtimeLifecycleIntents = removeExact(data.runtimeLifecycleIntents, graph.runtimeLifecycleIntents.selected);
+  data.marketplaceRatings = removeExact(data.marketplaceRatings, graph.marketplaceRatingsToDelete);
+  data.agentWorkspaceRatings = removeExact(data.agentWorkspaceRatings, graph.agentWorkspaceRatingsToDelete);
+  data.agentWorkspaces = removeExact(data.agentWorkspaces, graph.agentWorkspaces.selected);
+  data.mcpConnections = removeExact(data.mcpConnections, graph.mcpConnections.selected);
+  data.mcpOauthClients = removeExact(data.mcpOauthClients, graph.mcpOauthClients.selected);
+  data.mcpOauthStates = removeExact(data.mcpOauthStates, graph.mcpOauthStates.selected);
+  data.mcpApprovals = removeExact(data.mcpApprovals, graph.mcpApprovals.selected);
+  data.mcpToolCalls = removeExact(data.mcpToolCalls, graph.mcpToolCalls.selected);
+  data.workflows = removeExact(data.workflows, graph.workflows.selected);
+  data.conversationCheckpoints = removeExact(data.conversationCheckpoints, graph.checkpoints.selected);
+  data.agents = removeExact(data.agents, graph.agents.selected);
+  data.documents = removeExact(data.documents, graph.documents.selected);
+  data.validationRuns = removeExact(data.validationRuns, graph.validationRuns.selected);
+  data.identityAuditEvents = removeExact(data.identityAuditEvents, graph.identityEvents);
 
   return {
     deleted_user_id: userId,
     deleted_workspace_id: workspaceId,
-    document_roots: documents.map((item) => item.document_root).filter(Boolean),
+    document_roots: graph.documents.records.map((item) => item.document_root).filter(Boolean),
     deleted_counts: {
-      chat_sessions: sessionIds.size,
-      runs: runIds.size,
-      agents: agentIds.size,
-      documents: documentIds.size,
-      agent_workspaces: agentWorkspaces.length,
-      workflows: workflowIds.size,
-      mcp_connections: connectionIds.size
+      chat_sessions: graph.sessions.records.length,
+      runs: graph.runs.records.length,
+      agents: graph.agents.records.length,
+      documents: graph.documents.records.length,
+      agent_workspaces: graph.agentWorkspaces.records.length,
+      workflows: graph.workflows.records.length,
+      mcp_connections: graph.mcpConnections.records.length
     }
   };
 }
 
-function accountOwnedResources(data, user) {
+function accountOwnedResources(data, user, graph = buildAccountResourceGraph(data, user)) {
+  const ambiguousCount = accountGraphAmbiguousCount(graph);
+  if (ambiguousCount > 0) {
+    throw identityError(
+      409,
+      "account_legacy_scope_ambiguous",
+      `Account resource cleanup is blocked because ${ambiguousCount} legacy ${ambiguousCount === 1 ? "record has" : "records have"} ambiguous tenant ownership.`
+    );
+  }
   return {
-    agents: data.agents.filter((item) => ownsWorkspaceItem(item, user)),
-    documents: data.documents.filter((item) => ownsWorkspaceItem(item, user)),
-    agent_workspaces: (data.agentWorkspaces || []).filter((item) => ownsWorkspaceItem(item, user)),
-    mcp_connections: data.mcpConnections.filter((item) => ownsWorkspaceItem(item, user))
+    agents: graph.agents.records,
+    documents: graph.documents.records,
+    agent_workspaces: graph.agentWorkspaces.records,
+    mcp_connections: graph.mcpConnections.records,
+    mcp_oauth_revocations: graph.mcpOauthStates.records.filter((state) => (
+      state.status === "revocation_pending" && Boolean(state.revocation_envelope)
+    ))
   };
-}
-
-function ownsWorkspaceItem(item, user) {
-  if (!item || String(item.workspace_id || "") !== String(user.workspace_id || "")) return false;
-  const owner = item.created_by || item.user_id || item.actor_user_id;
-  return !owner || String(owner) === String(user.user_id);
 }
 
 function stripSecrets(value) {
@@ -767,6 +1444,107 @@ function activeRegisteredAdmins(data) {
   return data.users.filter((user) => user.role === "admin" && user.status === "active" && user.clerk_user_id);
 }
 
+function deletionDrainTimeoutMs(env) {
+  const configured = Number(env.APP_ACCOUNT_DELETION_DRAIN_TIMEOUT_MS || DEFAULT_DELETION_DRAIN_TIMEOUT_MS);
+  if (!Number.isFinite(configured)) return DEFAULT_DELETION_DRAIN_TIMEOUT_MS;
+  return Math.max(25, Math.min(Math.trunc(configured), 30_000));
+}
+
+function assertDeletingUser(user, deletionId) {
+  if (!user) throw identityError(404, "account_not_found", "Registered account not found.");
+  if (user.status !== "deleting" || !user.deletion_id) {
+    throw identityError(409, "account_deletion_not_started", "Account deletion has not been started.");
+  }
+  if (!deletionId || !timingSafeIdentityEqual(user.deletion_id, deletionId)) {
+    throw identityError(409, "account_deletion_changed", "Account deletion state changed. Start the request again.");
+  }
+}
+
+function deletionResourceRevision(resources = {}) {
+  const normalized = {
+    agents: (resources.agents || []).map((item) => ({
+      id: item.id,
+      record_digest: deletionRecordDigest(item)
+    })).sort((left, right) => String(left.id).localeCompare(String(right.id))),
+    documents: (resources.documents || []).map((item) => ({
+      document_id: item.document_id,
+      record_digest: deletionRecordDigest(item)
+    })).sort((left, right) => String(left.document_id).localeCompare(String(right.document_id))),
+    mcp_connections: (resources.mcp_connections || []).map((item) => ({
+      connection_id: item.connection_id,
+      record_digest: deletionRecordDigest(item)
+    })).sort((left, right) => String(left.connection_id).localeCompare(String(right.connection_id))),
+    mcp_oauth_revocations: (resources.mcp_oauth_revocations || []).map((item) => ({
+      oauth_state_id: item.oauth_state_id,
+      record_digest: deletionRecordDigest(item)
+    })).sort((left, right) => String(left.oauth_state_id).localeCompare(String(right.oauth_state_id)))
+  };
+  return crypto.createHash("sha256")
+    .update(JSON.stringify(normalized), "utf8")
+    .digest("hex");
+}
+
+function deletionRecordDigest(value) {
+  return crypto.createHash("sha256")
+    .update(JSON.stringify(canonicalDeletionValue(value)), "utf8")
+    .digest("hex");
+}
+
+function canonicalDeletionValue(value) {
+  if (Array.isArray(value)) return value.map(canonicalDeletionValue);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(Object.keys(value)
+    .filter((key) => value[key] !== undefined)
+    .sort()
+    .map((key) => [key, canonicalDeletionValue(value[key])]));
+}
+
+function upsertDeletionTombstone(data, user, {
+  providerUserHash = null,
+  deletionId = null,
+  deletionStartedAt = null,
+  status = "deleting",
+  deletedAt = null,
+  pendingDocumentRoots = null
+} = {}) {
+  data.identityDeletionTombstones ||= [];
+  const hash = providerUserHash || hashClerkUserId(user?.clerk_user_id);
+  let tombstone = data.identityDeletionTombstones.find((item) => (
+    item.provider === "clerk" && item.provider_user_hash === hash
+  ));
+  if (!tombstone) {
+    tombstone = { provider: "clerk", provider_user_hash: hash };
+    data.identityDeletionTombstones.push(tombstone);
+  }
+  tombstone.status = status;
+  tombstone.deletion_id = deletionId || tombstone.deletion_id || null;
+  tombstone.deletion_started_at = deletionStartedAt || tombstone.deletion_started_at || nowIso();
+  if (deletedAt) tombstone.deleted_at = deletedAt;
+  if (Array.isArray(pendingDocumentRoots)) {
+    tombstone.pending_document_roots = [...new Set(pendingDocumentRoots
+      .map((value) => String(value || ""))
+      .filter(Boolean))].slice(0, 10_000);
+  }
+  while (data.identityDeletionTombstones.length > MAX_IDENTITY_DELETION_TOMBSTONES) {
+    const removable = data.identityDeletionTombstones.findIndex((item) => (
+      (item.status === "deleted" || Boolean(item.deleted_at))
+      && !Array.isArray(item.pending_document_roots)
+    ));
+    // Never discard an active deletion marker or a filesystem cleanup outbox
+    // merely to satisfy the soft retention cap. Operator remediation is safer
+    // than making cleanup irrecoverable.
+    if (removable < 0) break;
+    data.identityDeletionTombstones.splice(removable, 1);
+  }
+  return tombstone;
+}
+
+function timingSafeIdentityEqual(left, right) {
+  const leftDigest = crypto.createHash("sha256").update(String(left || ""), "utf8").digest();
+  const rightDigest = crypto.createHash("sha256").update(String(right || ""), "utf8").digest();
+  return crypto.timingSafeEqual(leftDigest, rightDigest);
+}
+
 function configuredAdminEmails(env) {
   return new Set(String(env.APP_AUTH_ADMIN_EMAILS || "")
     .split(",")
@@ -799,7 +1577,7 @@ function normalizeRole(value) {
 
 function normalizeStatus(value) {
   const status = String(value || "").trim().toLowerCase();
-  if (!VALID_STATUSES.has(status)) throw identityError(400, "invalid_status", "Status must be active or suspended.");
+  if (!["active", "suspended"].includes(status)) throw identityError(400, "invalid_status", "Status must be active or suspended.");
   return status;
 }
 

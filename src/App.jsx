@@ -1,6 +1,7 @@
 import {
   AlertCircle,
   Archive,
+  ArrowDown,
   ArrowLeft,
   ArrowRight,
   ArrowUp,
@@ -925,6 +926,7 @@ function Workspace({ onHome, onSignedOut }) {
       const stub = {
         run_id: queued.run_id,
         session_id: session.session_id,
+        agent_workspace_id: session.agent_workspace_id || null,
         query: content,
         status: queued.status || "queued",
         expert_outputs: [],
@@ -1001,6 +1003,66 @@ function Workspace({ onHome, onSignedOut }) {
     if (!canWrite) return;
     setDraft(run?.query || "");
     setFocusComposer((value) => value + 1);
+  }
+
+  async function rerunTrackedAnswer(run, { runFresh = false } = {}) {
+    const content = String(run?.query || "").trim();
+    if (!content || !session || !canWrite || sendInFlightRef.current) return false;
+    sendInFlightRef.current = true;
+    setError("");
+    nearBottomRef.current = true;
+    const optimisticId = `local_${runFresh ? "fresh" : "selective"}_${Date.now()}`;
+    setMessages((items) => [...items, {
+      message_id: optimisticId,
+      role: "user",
+      content,
+      created_at: new Date().toISOString()
+    }]);
+    try {
+      const queued = await api.post(`/api/chat/sessions/${encodeURIComponent(session.session_id)}/messages`, {
+        content,
+        attachments: [],
+        options: {
+          ...(run?.execution_options || {}),
+          show_route_details: true,
+          run_fresh: runFresh
+        }
+      }, { idempotencyKey: mutationIdempotencyKey(runFresh ? "fresh-message" : "selective-message") });
+      setDetailsRunId(null);
+      setMessages((items) => items.map((message) => message.message_id === optimisticId
+        ? { ...message, message_id: queued.message_id, run_id: queued.run_id }
+        : message));
+      const stub = {
+        run_id: queued.run_id,
+        session_id: session.session_id,
+        agent_workspace_id: session.agent_workspace_id || null,
+        query: content,
+        status: queued.status || "queued",
+        expert_outputs: [],
+        sources: [],
+        outcome_contracts: [],
+        world_graph: { kept: 0, refreshed: 0, total: 0, decisions: [] },
+        events: []
+      };
+      setActiveRun(stub);
+      setRunsById((current) => ({ ...current, [queued.run_id]: stub }));
+      subscribeRun(queued.run_id, session.session_id);
+      return true;
+    } catch (rerunError) {
+      setMessages((items) => items.filter((message) => message.message_id !== optimisticId));
+      setError(friendlyError(rerunError));
+      return false;
+    } finally {
+      sendInFlightRef.current = false;
+    }
+  }
+
+  function refreshTrackedAnswer(run) {
+    return rerunTrackedAnswer(run, { runFresh: false });
+  }
+
+  function runEveryAgentFresh(run) {
+    return rerunTrackedAnswer(run, { runFresh: true });
   }
 
   async function copyText(text) {
@@ -1510,6 +1572,7 @@ function Workspace({ onHome, onSignedOut }) {
           mcpApprovals={mcpApprovals}
           resumeWorkflowId={connectionResumeWorkflowId}
           sessionId={session?.session_id}
+          latestRun={activeRun}
           initialView={resourceView}
           togglingAgentId={togglingAgentId}
           onViewChange={setResourceView}
@@ -1598,6 +1661,8 @@ function Workspace({ onHome, onSignedOut }) {
           onSettleOutcome={beginSettlement}
           onDisputeOutcome={(contractId) => beginOutcomeLifecycle(contractId, "dispute")}
           onCorrectOutcome={(contractId) => beginOutcomeLifecycle(contractId, "correct")}
+          onRefreshTracked={refreshTrackedAnswer}
+          onRunFresh={runEveryAgentFresh}
         />
       )}
 
@@ -2534,6 +2599,10 @@ export function RunReceipt({ run, onClick }) {
   const pending = run.outcome_contracts?.filter((contract) => contract.status === "pending").length || 0;
   const parts = [];
   if (!["completed", "failed"].includes(run.status)) parts.push(runStatusLabel(run.status));
+  if (run.world_graph?.total > 0) {
+    if (run.world_graph.kept > 0) parts.push(`${run.world_graph.kept} ${run.world_graph.kept === 1 ? "work item" : "work items"} kept`);
+    if (run.world_graph.refreshed > 0) parts.push(`${run.world_graph.refreshed} ${run.world_graph.refreshed === 1 ? "work item" : "work items"} refreshed`);
+  }
   if (agentCount) parts.push(`${agentCount} ${agentCount === 1 ? "agent" : "agents"}`);
   if (run.elapsed_sec != null) parts.push(`${Number(run.elapsed_sec).toFixed(1)}s`);
   if (run.usage_receipt && (run.usage_receipt.provider_reported === true || Number(run.usage_receipt.total_tokens) > 0)) {
@@ -2574,7 +2643,8 @@ export function UsageReceipt({ receipt, agents = [], expertOutputs = [], include
       completion_tokens: usage.completion_tokens || 0,
       total_tokens: usage.total_tokens || 0,
       charged_credits: usage.charged_credits || "0",
-      reported: usage.reported === true
+      reported: usage.reported === true,
+      reused_zero_cost: output.execution_mode === "reused"
     });
   }
   const finalOutputAccounted = components.some((component) => (
@@ -2614,11 +2684,15 @@ export function UsageReceipt({ receipt, agents = [], expertOutputs = [], include
               <span className="usage-kind-dot" aria-hidden="true" />
               <span>
                 <strong>{usageComponentLabel(component, agents)}</strong>
-                <small>{component.reported === false
+                <small>{component.reused_zero_cost
+                  ? "Kept from earlier · no agent model call"
+                  : component.reported === false
                   ? "Provider token usage was not reported for this output"
                   : `${formatTokenCount(component.prompt_tokens)} input · ${formatTokenCount(component.completion_tokens)} output · ${formatCreditDisplay(component.charged_credits)}`}</small>
               </span>
-              <em>{component.reported === false ? "Not reported" : `${formatTokenCount(component.total_tokens)} tokens`}</em>
+              <em>{component.reused_zero_cost
+                ? "0 calls"
+                : component.reported === false ? "Not reported" : `${formatTokenCount(component.total_tokens)} tokens`}</em>
             </div>
           ))}
         </div>
@@ -2915,6 +2989,7 @@ function ResourcesSheet({
   mcpApprovals,
   resumeWorkflowId,
   sessionId,
+  latestRun,
   initialView,
   togglingAgentId,
   onViewChange,
@@ -2948,6 +3023,10 @@ function ResourcesSheet({
   const [view, setView] = useState(initialView || "agents");
   const canWrite = !auth?.is_viewer;
   const activeWorkspaceAgents = agentsForWorkspace(agents, activeAgentWorkspace);
+  const workspaceLatestRun = latestRun
+    && String(latestRun.agent_workspace_id || "") === String(activeAgentWorkspace?.agent_workspace_id || "")
+    ? latestRun
+    : null;
   function changeView(next) {
     setView(next);
     onViewChange(next);
@@ -2995,6 +3074,7 @@ function ResourcesSheet({
           <AgentGraph
             agents={activeWorkspaceAgents}
             auth={auth}
+            run={workspaceLatestRun}
             storageKey={`virenis:agent-graph:${auth?.workspace_id || "workspace"}:${activeAgentWorkspace?.agent_workspace_id || "general"}`}
             onConnect={onConnectAgents}
             onDisconnect={onDisconnectAgents}
@@ -3534,7 +3614,7 @@ export function graphConnections(agents) {
       if (id) connect(id, agent.id, "handoff");
     }
   }
-  return [...edges.values()].slice(0, 240);
+  return [...edges.values()];
 }
 
 export function graphConnectionInputs(inputs = [], sourceId, connected = true) {
@@ -3565,19 +3645,35 @@ export function graphConnectionWouldCycle(edges = [], sourceId, destinationId) {
   return false;
 }
 
-export function graphPositionFromPointer(bounds, clientX, clientY) {
+export function graphPositionForCanvas(bounds, position, nodeBounds = {}) {
   const width = Number(bounds?.width);
   const height = Number(bounds?.height);
   if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
     return null;
   }
-  const x = ((Number(clientX) - Number(bounds.left || 0)) / width) * 900;
-  const y = ((Number(clientY) - Number(bounds.top || 0)) / height) * 560;
+  const x = Number(position?.x);
+  const y = Number(position?.y);
   if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+  const renderedNodeWidth = Math.max(0, Number(nodeBounds?.width) || 148);
+  const renderedNodeHeight = Math.max(0, Number(nodeBounds?.height) || 60);
+  const horizontalInset = Math.min(450, ((renderedNodeWidth / 2 + 6) / width) * 900);
+  const verticalInset = Math.min(280, ((renderedNodeHeight / 2 + 6) / height) * 560);
   return {
-    x: Math.max(64, Math.min(836, x)),
-    y: Math.max(44, Math.min(516, y))
+    x: Math.max(horizontalInset, Math.min(900 - horizontalInset, x)),
+    y: Math.max(verticalInset, Math.min(560 - verticalInset, y))
   };
+}
+
+export function graphPositionFromPointer(bounds, clientX, clientY, nodeBounds = {}) {
+  const width = Number(bounds?.width);
+  const height = Number(bounds?.height);
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+    return null;
+  }
+  return graphPositionForCanvas(bounds, {
+    x: ((Number(clientX) - Number(bounds.left || 0)) / width) * 900,
+    y: ((Number(clientY) - Number(bounds.top || 0)) / height) * 560
+  }, nodeBounds);
 }
 
 export function graphEdgePath(from, to) {
@@ -3588,9 +3684,8 @@ export function graphEdgePath(from, to) {
   return `M ${from.x} ${from.y} C ${from.x + direction * bend + verticalOffset} ${from.y}, ${to.x - direction * bend + verticalOffset} ${to.y}, ${to.x} ${to.y}`;
 }
 
-function graphTone(agentId) {
-  return [...String(agentId || "agent")]
-    .reduce((value, character) => value + character.charCodeAt(0), 0) % 6;
+function graphTone(visibleIndex) {
+  return Math.max(0, Number(visibleIndex) || 0) % 6;
 }
 
 export function initialGraphPositions(agents) {
@@ -3607,6 +3702,19 @@ export function initialGraphPositions(agents) {
     (connectionCounts.get(right.id) || 0) - (connectionCounts.get(left.id) || 0)
       || String(left.title || left.id).localeCompare(String(right.title || right.id))
   );
+  if (ordered.length > 10) {
+    const columns = Math.min(5, Math.ceil(Math.sqrt(ordered.length * 1.3)));
+    const rows = Math.ceil(ordered.length / columns);
+    ordered.forEach((agent, index) => {
+      const column = index % columns;
+      const row = Math.floor(index / columns);
+      positions[agent.id] = {
+        x: 64 + ((column + 0.5) / columns) * 772,
+        y: 44 + ((row + 0.5) / rows) * 472
+      };
+    });
+    return positions;
+  }
   positions[ordered[0].id] = { x: centerX, y: centerY };
   const goldenAngle = Math.PI * (3 - Math.sqrt(5));
   ordered.slice(1).forEach((agent, index) => {
@@ -3618,6 +3726,22 @@ export function initialGraphPositions(agents) {
     };
   });
   return positions;
+}
+
+export function worldGraphAgentStatuses(decisions = []) {
+  const statuses = new Map();
+  for (const decision of Array.isArray(decisions) ? decisions : []) {
+    const adapter = String(decision?.adapter || "");
+    if (!adapter || !["kept", "refreshed"].includes(decision?.action)) continue;
+    const current = statuses.get(adapter) || { kept: 0, refreshed: 0, total: 0, action: "" };
+    current[decision.action] += 1;
+    current.total += 1;
+    current.action = current.kept > 0 && current.refreshed > 0
+      ? "mixed"
+      : current.refreshed > 0 ? "refreshed" : "kept";
+    statuses.set(adapter, current);
+  }
+  return statuses;
 }
 
 export function storedGraphPositions(storageKey) {
@@ -3637,10 +3761,10 @@ export function storedGraphPositions(storageKey) {
   }
 }
 
-export function AgentGraph({ agents, auth, storageKey, onConnect, onDisconnect }) {
+export function AgentGraph({ agents, auth, storageKey, onConnect, onDisconnect, run = null }) {
   const eligibleGraphAgents = agents
     .filter((agent) => !agent.document && !agent.resource_for_agent_id && agent.enabled !== false);
-  const graphAgents = eligibleGraphAgents.slice(0, 120);
+  const graphAgents = eligibleGraphAgents.slice(0, 25);
   const graphAgentIds = graphAgents.map((agent) => agent.id).join("|");
   const [positions, setPositions] = useState(() => ({
     ...initialGraphPositions(graphAgents),
@@ -3651,14 +3775,27 @@ export function AgentGraph({ agents, auth, storageKey, onConnect, onDisconnect }
   const [connectFromId, setConnectFromId] = useState(null);
   const [connectionBusy, setConnectionBusy] = useState(false);
   const [graphError, setGraphError] = useState("");
+  const [moveAnnouncement, setMoveAnnouncement] = useState("");
   const canvasRef = useRef(null);
+  const inspectorRef = useRef(null);
   const dragStateRef = useRef(null);
   const draggedRef = useRef(false);
-  const edges = graphConnections(graphAgents);
+  const allEdges = graphConnections(eligibleGraphAgents);
+  const visibleAgentIds = new Set(graphAgents.map((agent) => agent.id));
+  const edges = allEdges.filter((edge) => visibleAgentIds.has(edge.from) && visibleAgentIds.has(edge.to));
   const focusedAgent = graphAgents.find((agent) => agent.id === focusedId);
   const focusedEdges = focusedId
-    ? edges.filter((edge) => edge.from === focusedId || edge.to === focusedId)
+    ? allEdges.filter((edge) => edge.from === focusedId || edge.to === focusedId)
     : [];
+  const latestStatuses = worldGraphAgentStatuses(run?.world_graph?.decisions || []);
+  const latestWorkCounts = [...latestStatuses.values()].reduce((counts, status) => ({
+    kept: counts.kept + status.kept,
+    refreshed: counts.refreshed + status.refreshed
+  }), { kept: 0, refreshed: 0 });
+  const latestGraphAvailable = run?.status === "completed"
+    && ["unchecked", "current"].includes(run?.world_graph?.validity)
+    && Number(run?.world_graph?.total || 0) > 0
+    && latestWorkCounts.kept + latestWorkCounts.refreshed > 0;
 
   useEffect(() => {
     setPositions({
@@ -3667,7 +3804,42 @@ export function AgentGraph({ agents, auth, storageKey, onConnect, onDisconnect }
     });
     setFocusedId(null);
     setConnectFromId(null);
+    setMoveAnnouncement("");
   }, [graphAgentIds, storageKey]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return undefined;
+    const keepVisible = () => {
+      const bounds = canvas.getBoundingClientRect();
+      const nodeBounds = canvas.querySelector(".graph-node")?.getBoundingClientRect() || {};
+      setPositions((current) => {
+        let changed = false;
+        const next = { ...current };
+        for (const agent of graphAgents) {
+          const safe = graphPositionForCanvas(bounds, current[agent.id] || { x: 450, y: 278 }, nodeBounds);
+          if (!safe) continue;
+          if (safe.x !== current[agent.id]?.x || safe.y !== current[agent.id]?.y) changed = true;
+          next[agent.id] = safe;
+        }
+        return changed ? next : current;
+      });
+    };
+    keepVisible();
+    if (typeof ResizeObserver === "undefined") {
+      window.addEventListener("resize", keepVisible);
+      return () => window.removeEventListener("resize", keepVisible);
+    }
+    const observer = new ResizeObserver(keepVisible);
+    observer.observe(canvas);
+    return () => observer.disconnect();
+  }, [graphAgentIds]);
+
+  useEffect(() => {
+    if (!focusedId || connectMode || !inspectorRef.current) return undefined;
+    const frame = window.requestAnimationFrame(() => inspectorRef.current?.focus());
+    return () => window.cancelAnimationFrame(frame);
+  }, [connectMode, focusedId]);
 
   useEffect(() => {
     if (typeof window === "undefined" || !storageKey) return;
@@ -3702,7 +3874,8 @@ export function AgentGraph({ agents, auth, storageKey, onConnect, onDisconnect }
     const nextPosition = graphPositionFromPointer(
       canvasRef.current?.getBoundingClientRect(),
       event.clientX,
-      event.clientY
+      event.clientY,
+      event.currentTarget.getBoundingClientRect()
     );
     if (!nextPosition) return;
     setPositions((current) => ({
@@ -3721,16 +3894,52 @@ export function AgentGraph({ agents, auth, storageKey, onConnect, onDisconnect }
   }
 
   function resetLayout() {
-    setPositions(initialGraphPositions(graphAgents));
+    const canvas = canvasRef.current;
+    const bounds = canvas?.getBoundingClientRect();
+    const nodeBounds = canvas?.querySelector(".graph-node")?.getBoundingClientRect() || {};
+    const initial = initialGraphPositions(graphAgents);
+    setPositions(Object.fromEntries(graphAgents.map((agent) => [
+      agent.id,
+      graphPositionForCanvas(bounds, initial[agent.id], nodeBounds) || initial[agent.id]
+    ])));
     setFocusedId(null);
     setConnectFromId(null);
     setGraphError("");
+    setMoveAnnouncement("Agent layout reset.");
+  }
+
+  function moveFocused(deltaX, deltaY, direction) {
+    if (!focusedId) return;
+    setPositions((current) => {
+      const position = current[focusedId] || { x: 450, y: 278 };
+      const canvas = canvasRef.current;
+      const nextPosition = graphPositionForCanvas(
+        canvas?.getBoundingClientRect(),
+        { x: position.x + deltaX, y: position.y + deltaY },
+        canvas?.querySelector(".graph-node")?.getBoundingClientRect() || {}
+      ) || position;
+      return {
+        ...current,
+        [focusedId]: nextPosition
+      };
+    });
+    setMoveAnnouncement(`${formatAgentName(focusedId, agents)} moved ${direction}.`);
   }
 
   function toggleConnectMode() {
     setConnectMode((current) => !current);
     setConnectFromId(null);
     setGraphError("");
+  }
+
+  function closeInspector() {
+    const agentId = focusedId;
+    setFocusedId(null);
+    window.requestAnimationFrame(() => {
+      [...(canvasRef.current?.querySelectorAll("[data-graph-agent]") || [])]
+        .find((node) => node.dataset.graphAgent === agentId)
+        ?.focus();
+    });
   }
 
   async function chooseNode(agent) {
@@ -3756,11 +3965,11 @@ export function AgentGraph({ agents, auth, storageKey, onConnect, onDisconnect }
       setGraphError("Choose an agent you can edit as the destination.");
       return;
     }
-    if (edges.some((edge) => edge.from === connectFromId && edge.to === agent.id && edge.kind === "handoff")) {
+    if (allEdges.some((edge) => edge.from === connectFromId && edge.to === agent.id && edge.kind === "handoff")) {
       setGraphError("Those agents already have a handoff connection.");
       return;
     }
-    if (graphConnectionWouldCycle(edges, connectFromId, agent.id)) {
+    if (graphConnectionWouldCycle(allEdges, connectFromId, agent.id)) {
       setGraphError("That handoff would create a circular workflow. Choose another direction.");
       return;
     }
@@ -3780,7 +3989,7 @@ export function AgentGraph({ agents, auth, storageKey, onConnect, onDisconnect }
 
   async function removeConnection(edge) {
     if (edge.kind !== "handoff" || connectionBusy) return;
-    const target = graphAgents.find((agent) => agent.id === edge.to);
+    const target = eligibleGraphAgents.find((agent) => agent.id === edge.to);
     if (!canManageAgent(target, auth)) {
       setGraphError("You can remove connections only from agents you can edit.");
       return;
@@ -3800,8 +4009,8 @@ export function AgentGraph({ agents, auth, storageKey, onConnect, onDisconnect }
     <section className="resource-section graph-section" aria-labelledby="graph-heading">
       <div className="graph-heading-row">
         <div className="section-heading graph-title">
-          <div><span className="section-eyebrow">TEAM MAP</span><h3 id="graph-heading">Connect how agents think together.</h3><p>Arrange the map, then draw a handoff from one specialist to the next.</p></div>
-          <span className="graph-count">{graphAgents.length}{eligibleGraphAgents.length > graphAgents.length ? ` of ${eligibleGraphAgents.length}` : ""} agents · {edges.length} connections</span>
+          <div><span className="section-eyebrow">CURRENT TEAM MAP</span><h3 id="graph-heading">Map how agents work together.</h3><p>Arrange the current team, then draw a configured handoff from one specialist to the next.</p></div>
+          <span className="graph-count">{graphAgents.length}{eligibleGraphAgents.length > graphAgents.length ? ` of ${eligibleGraphAgents.length}` : ""} {eligibleGraphAgents.length === 1 ? "agent" : "agents"} · {edges.length} visible {edges.length === 1 ? "connection" : "connections"}</span>
         </div>
         <div className="graph-toolbar" aria-label="Graph tools">
           <button type="button" className={connectMode ? "active" : ""} onClick={toggleConnectMode} disabled={auth?.is_viewer || graphAgents.length < 2 || connectionBusy}>
@@ -3811,13 +4020,31 @@ export function AgentGraph({ agents, auth, storageKey, onConnect, onDisconnect }
         </div>
       </div>
       <div className={`graph-guidance ${connectMode ? "active" : ""}`} role="status" aria-live="polite">
-        <span>{connectMode ? connectFromId ? "Now choose the destination agent." : "Choose the agent that will send its work." : "Drag agents to organize the map. Select an agent to inspect its connections."}</span>
+        <span>{connectMode ? connectFromId ? "Now choose the destination agent." : "Choose the agent that will send its work." : "Drag agents to organize the map, or select one and use the move controls. Select an agent to inspect its connections."}</span>
+        <span className="graph-scroll-hint">On a small screen, scroll the map sideways.</span>
         {connectFromId && <strong>From: {formatAgentName(connectFromId, agents)}</strong>}
         {graphError && <em>{graphError}</em>}
       </div>
+      {eligibleGraphAgents.length > graphAgents.length && (
+        <div className="graph-limit-note" role="note">
+          <AlertCircle size={15} aria-hidden="true" />
+          <span>Showing 25 of {eligibleGraphAgents.length} agents to keep the map readable. Lines involving hidden agents are omitted; select a visible agent to inspect all of its configured connections, or manage the full team in Agents.</span>
+        </div>
+      )}
+      {latestGraphAvailable && (
+        <div className="graph-run-summary" role="status">
+          <Check size={15} aria-hidden="true" />
+          <div>
+            <strong>Latest answer history — bubble labels only</strong>
+            <span>{latestWorkCounts.kept} {latestWorkCounts.kept === 1 ? "work item" : "work items"} kept from earlier · {latestWorkCounts.refreshed} refreshed now</span>
+            <small>Lines show the current configured team links, not that answer's execution path.</small>
+          </div>
+        </div>
+      )}
       <div className={`graph-workspace ${focusedAgent && !connectMode ? "has-inspector" : ""}`}>
-        <div className={`agent-graph ${connectMode ? "is-connecting" : ""}`} ref={canvasRef}>
-        <svg viewBox="0 0 900 560" preserveAspectRatio="none" role="img" aria-label="Interactive agent mind map">
+        <div className="graph-canvas-scroll" role="region" aria-label="Scrollable agent map" tabIndex="0">
+        <div className={`agent-graph ${connectMode ? "is-connecting" : ""}`} ref={canvasRef} role="group" aria-label="Current agent team map. Select an agent to inspect its configured connections.">
+        <svg viewBox="0 0 900 560" preserveAspectRatio="none" role="group" aria-label="Current configured handoff and knowledge links">
           <defs>
             <marker id="graph-arrow-handoff" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
               <path d="M0,0 L7,3.5 L0,7 Z" />
@@ -3830,32 +4057,31 @@ export function AgentGraph({ agents, auth, storageKey, onConnect, onDisconnect }
             const path = graphEdgePath(positions[edge.from], positions[edge.to]);
             if (!path) return null;
             const related = focusedId && (edge.from === focusedId || edge.to === focusedId);
+            const edgeLabel = edge.kind === "knowledge"
+              ? `${formatAgentName(edge.from, agents)} provides knowledge to ${formatAgentName(edge.to, agents)}`
+              : `${formatAgentName(edge.from, agents)} hands work to ${formatAgentName(edge.to, agents)}`;
             return (
-              <g className={`graph-edge ${edge.kind} ${related ? "related" : ""}`} key={`${edge.from}-${edge.to}-${edge.kind}`}>
+              <g className={`graph-edge ${edge.kind} ${related ? "related" : ""}`} key={`${edge.from}-${edge.to}-${edge.kind}`} role="img" aria-label={edgeLabel}>
                 <path className="edge-line" d={path} markerEnd={`url(#graph-arrow-${edge.kind})`} vectorEffect="non-scaling-stroke" />
-                <path
-                  className="edge-hit"
-                  d={path}
-                  vectorEffect="non-scaling-stroke"
-                  role="button"
-                  tabIndex="0"
-                  aria-label={`${formatAgentName(edge.from, agents)} sends work to ${formatAgentName(edge.to, agents)}`}
-                  onClick={() => setFocusedId(edge.to)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter" || event.key === " ") setFocusedId(edge.to);
-                  }}
-                />
               </g>
             );
           })}
         </svg>
-        {graphAgents.map((agent) => {
+        {graphAgents.map((agent, visibleIndex) => {
           const position = positions[agent.id] || { x: 450, y: 278 };
-          const connectionCount = edges.filter((edge) => edge.from === agent.id || edge.to === agent.id).length;
+          const connectionCount = allEdges.filter((edge) => edge.from === agent.id || edge.to === agent.id).length;
+          const latestStatus = latestStatuses.get(agent.id);
+          const latestStatusText = latestStatus?.action === "mixed"
+            ? `Latest answer: ${latestStatus.kept} kept, ${latestStatus.refreshed} refreshed`
+            : latestStatus?.action === "kept"
+              ? `Latest answer: ${latestStatus.total} ${latestStatus.total === 1 ? "work item" : "work items"} kept`
+              : latestStatus?.action === "refreshed"
+                ? `Latest answer: ${latestStatus.total} ${latestStatus.total === 1 ? "work item" : "work items"} refreshed`
+                : "";
           return (
             <button
               type="button"
-              className={`graph-node tone-${graphTone(agent.id)} ${focusedId === agent.id ? "focused" : ""} ${connectFromId === agent.id ? "connection-source" : ""} ${agent.session_active === false ? "inactive" : ""}`}
+              className={`graph-node tone-${graphTone(visibleIndex)} ${focusedId === agent.id ? "focused" : ""} ${connectFromId === agent.id ? "connection-source" : ""} ${agent.session_active === false ? "inactive" : ""} ${latestStatus?.action ? `world-${latestStatus.action}` : ""}`}
               style={{ left: `${(position.x / 900) * 100}%`, top: `${(position.y / 560) * 100}%` }}
               key={agent.id}
               onPointerDown={(event) => beginNodeDrag(event, agent.id)}
@@ -3864,27 +4090,40 @@ export function AgentGraph({ agents, auth, storageKey, onConnect, onDisconnect }
               onPointerCancel={endNodeDrag}
               onClick={() => chooseNode(agent)}
               title={agentFacingText(agent.capability || agent.title)}
+              aria-pressed={focusedId === agent.id}
+              data-graph-agent={agent.id}
             >
               <span>{formatAgentName(agent.id, agents)}</span>
-              <small>{connectionCount ? `${connectionCount} connection${connectionCount === 1 ? "" : "s"}` : "Ready to connect"}</small>
+              <small>{latestStatusText || (connectionCount ? `${connectionCount} configured connection${connectionCount === 1 ? "" : "s"}` : "Ready to connect")}</small>
             </button>
           );
         })}
         {graphAgents.length === 0 && <p className="graph-empty">Create an agent to start mapping your team.</p>}
         </div>
+        </div>
         {focusedAgent && !connectMode && (
-          <aside className="graph-inspector" aria-label={`${formatAgentName(focusedId, agents)} connections`}>
-            <header><span>SELECTED AGENT</span><button type="button" aria-label="Close agent details" onClick={() => setFocusedId(null)}><X size={14} /></button></header>
+          <aside ref={inspectorRef} tabIndex="-1" className="graph-inspector" aria-label={`${formatAgentName(focusedId, agents)} connections`}>
+            <header><span>SELECTED AGENT</span><button type="button" aria-label="Close agent details" onClick={closeInspector}><X size={14} /></button></header>
             <strong>{formatAgentName(focusedId, agents)}</strong>
             <p>{agentFacingText(focusedAgent.capability, "No capability description yet.")}</p>
+            <div className="graph-move-controls" role="group" aria-label="Move selected agent without dragging">
+              <button type="button" onClick={() => moveFocused(-36, 0, "left")} aria-label="Move selected agent left"><ArrowLeft size={14} /></button>
+              <button type="button" onClick={() => moveFocused(0, -30, "up")} aria-label="Move selected agent up"><ArrowUp size={14} /></button>
+              <button type="button" onClick={() => moveFocused(0, 30, "down")} aria-label="Move selected agent down"><ArrowDown size={14} /></button>
+              <button type="button" onClick={() => moveFocused(36, 0, "right")} aria-label="Move selected agent right"><ArrowRight size={14} /></button>
+            </div>
+            <span className="sr-only" role="status" aria-live="polite">{moveAnnouncement}</span>
             <div className="graph-relations">
               {focusedEdges.map((edge) => {
                 const incoming = edge.to === focusedId;
                 const otherId = incoming ? edge.from : edge.to;
-                const removable = edge.kind === "handoff" && canManageAgent(graphAgents.find((agent) => agent.id === edge.to), auth);
+                const removable = edge.kind === "handoff" && canManageAgent(eligibleGraphAgents.find((agent) => agent.id === edge.to), auth);
+                const relationship = edge.kind === "knowledge"
+                  ? incoming ? "Knowledge from" : "Knowledge for"
+                  : incoming ? "Receives from" : "Sends to";
                 return (
                   <div key={`${edge.from}-${edge.to}-${edge.kind}`}>
-                    <span><small>{incoming ? "Receives from" : "Sends to"}</small><b>{formatAgentName(otherId, agents)}</b><i>{edge.kind === "handoff" ? "Handoff" : "Knowledge"}</i></span>
+                    <span><small>{relationship}</small><b>{formatAgentName(otherId, agents)}</b><i>{edge.kind === "handoff" ? "Handoff" : "Knowledge"}</i></span>
                     {removable && <button type="button" onClick={() => removeConnection(edge)} disabled={connectionBusy} aria-label={`Remove connection with ${formatAgentName(otherId, agents)}`}><X size={13} /></button>}
                   </div>
                 );
@@ -3895,7 +4134,7 @@ export function AgentGraph({ agents, auth, storageKey, onConnect, onDisconnect }
         )}
       </div>
       <div className="graph-legend">
-        <span className="palette"><i /><i /><i /></span><span>Color distinguishes agents</span>
+        <span className="palette"><i /><i /><i /></span><span>Names identify agents; color helps scan the map</span>
         <span><i className="handoff" />Editable handoff</span><span><i className="knowledge" />Knowledge link</span>
       </div>
     </section>
@@ -4579,6 +4818,223 @@ function RankTieBreakNote({ tieBreak, adapter, agents }) {
   );
 }
 
+export function WorldGraphChanges({ run, agents, canWrite, onRefreshTracked, onRunFresh }) {
+  const graph = run?.world_graph || {};
+  const [currentCheck, setCurrentCheck] = useState(null);
+  const [checkBusy, setCheckBusy] = useState(false);
+  const [checkError, setCheckError] = useState("");
+  const [actionBusy, setActionBusy] = useState("");
+  const [actionError, setActionError] = useState("");
+  const decisions = Array.isArray(graph.decisions) ? graph.decisions : [];
+  const refreshed = decisions.filter((item) => item.action === "refreshed");
+  const kept = decisions.filter((item) => item.action === "kept");
+  const hasCompletedChangeRecord = run?.status === "completed"
+    && ["unchecked", "current"].includes(graph.validity)
+    && Number(graph.total || 0) > 0
+    && decisions.length > 0;
+  const planById = new Map((run?.plan?.steps || []).map((step) => [step.id, step]));
+
+  useEffect(() => {
+    setCurrentCheck(null);
+    setCheckBusy(false);
+    setCheckError("");
+    setActionBusy("");
+    setActionError("");
+  }, [run?.run_id]);
+
+  useEffect(() => {
+    if (!currentCheck?.checked_at) return undefined;
+    const checkedAt = Date.parse(currentCheck.checked_at);
+    if (!Number.isFinite(checkedAt)) return undefined;
+    const timer = window.setTimeout(() => {
+      setCurrentCheck(null);
+      setCheckError("The previous change check expired. Check again before refreshing work.");
+    }, Math.max(0, checkedAt + 60_000 - Date.now()));
+    return () => window.clearTimeout(timer);
+  }, [currentCheck?.checked_at]);
+
+  async function checkWhatChanged() {
+    if (!run?.run_id || checkBusy) return;
+    setCheckBusy(true);
+    setCurrentCheck(null);
+    setCheckError("");
+    setActionError("");
+    try {
+      const result = await api.post(`/api/chat/runs/${encodeURIComponent(run.run_id)}/worldgraph/check`, {});
+      setCurrentCheck(result);
+    } catch (checkFailure) {
+      setCheckError(friendlyError(checkFailure));
+    } finally {
+      setCheckBusy(false);
+    }
+  }
+
+  async function startRefresh(runFresh) {
+    if (actionBusy || checkBusy) return;
+    const callback = runFresh ? onRunFresh : onRefreshTracked;
+    if (typeof callback !== "function") return;
+    setActionBusy(runFresh ? "fresh" : "selective");
+    setActionError("");
+    try {
+      const started = await callback(run);
+      if (started === false) {
+        setActionError("The refresh could not be started. Your change check was preserved; please try again.");
+      }
+    } catch (refreshFailure) {
+      setActionError(friendlyError(refreshFailure));
+    } finally {
+      setActionBusy("");
+    }
+  }
+  const row = (decision) => {
+    const step = planById.get(decision.step_id);
+    const isKept = decision.action === "kept";
+    return (
+      <li className={isKept ? "kept" : "refreshed"} key={decision.step_id || decision.adapter}>
+        <span className="world-change-icon" aria-hidden="true">{isKept ? <Check size={15} /> : <RefreshCw size={15} />}</span>
+        <span>
+          <strong>{formatAgentName(decision.adapter, agents)}</strong>
+          <small>{isKept ? "Work item kept from earlier" : "Work item refreshed now"}</small>
+          <p>{decision.plain_reason || (isKept ? "Its validated inputs are unchanged." : "This agent checked its part of the answer now.")}</p>
+          {step?.task && <em>Work item: {agentFacingText(step.task)}</em>}
+          {step?.depends_on?.length > 0 && (
+            <em>Uses {step.depends_on.map((id) => formatAgentName(planById.get(id)?.adapter || id, agents)).join(", ")}</em>
+          )}
+        </span>
+      </li>
+    );
+  };
+  if (!hasCompletedChangeRecord) {
+    const unavailableCopy = run?.status === "failed"
+      ? "This run did not finish, so no current change record can be proven."
+      : run && !["completed", "failed"].includes(run.status)
+        ? "Change tracking will appear after this answer finishes."
+        : "This answer does not include a verified change record.";
+    return (
+      <section className="detail-section world-changes" aria-labelledby="world-changes-heading">
+        <div className="world-unavailable-card">
+          <span><AlertCircle size={18} aria-hidden="true" /></span>
+          <div>
+            <strong id="world-changes-heading">Change tracking is unavailable</strong>
+            <p>{unavailableCopy}</p>
+          </div>
+        </div>
+        {canWrite && run?.status === "completed" && (
+          <>
+            <div className="world-run-disclosure">
+              <AlertCircle size={15} aria-hidden="true" />
+              <span>A fresh run still uses Router planning and final answer synthesis. Billing may reserve the full-run maximum first, then settle only the provider work actually used.</span>
+            </div>
+            <button type="button" className="text-button secondary world-run-fresh" onClick={() => startRefresh(true)} disabled={Boolean(actionBusy)}>
+              {actionBusy === "fresh" ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}
+              {actionBusy === "fresh" ? "Starting fresh run" : "Run all work fresh"}
+            </button>
+            {actionError && <p className="form-error world-action-error" role="alert">{actionError}</p>}
+          </>
+        )}
+      </section>
+    );
+  }
+  return (
+    <section className="detail-section world-changes" aria-labelledby="world-changes-heading">
+      <div className="world-current-card" role="status" aria-live="polite">
+        <span><Check size={18} aria-hidden="true" /></span>
+        <div>
+          <strong id="world-changes-heading">Change record ready</strong>
+          <p>When this answer ran, {kept.length} validated {kept.length === 1 ? "work item was" : "work items were"} kept and {refreshed.length} {refreshed.length === 1 ? "work item was" : "work items were"} refreshed.</p>
+        </div>
+      </div>
+      <div
+        className="world-change-map"
+        role="img"
+        aria-label={`Router checked inputs and evidence. ${kept.length} work items were kept from earlier and ${refreshed.length} were refreshed now. The answer was combined.`}
+      >
+        <Network size={17} aria-hidden="true" />
+        <span>Router checked inputs and evidence</span>
+        <ChevronRight size={14} aria-hidden="true" />
+        <span>{kept.length} work items kept · {refreshed.length} refreshed</span>
+        <ChevronRight size={14} aria-hidden="true" />
+        <span>Answer combined</span>
+      </div>
+      <div className="world-check-panel">
+        <div>
+          <strong>Has anything changed since then?</strong>
+          <p>Check agent instructions, source revisions, conversation inputs, and live-tool rules without calling a model.</p>
+        </div>
+        <button type="button" className="text-button secondary" onClick={checkWhatChanged} disabled={checkBusy || Boolean(actionBusy)} aria-busy={checkBusy}>
+          {checkBusy ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}
+          {checkBusy ? "Checking" : currentCheck ? "Check again" : "Check what changed"}
+        </button>
+      </div>
+      {checkError && <p className="form-error world-check-error" role="alert">{checkError}</p>}
+      {currentCheck?.availability === "ready" && (
+        <div className={`world-check-result ${currentCheck.validity === "current" ? "current" : "needs-refresh"}`} role="status" aria-live="polite">
+          <span aria-hidden="true">{currentCheck.validity === "current" ? <Check size={17} /> : <RefreshCw size={17} />}</span>
+          <div>
+            <strong>{currentCheck.validity === "current"
+              ? "Nothing needs to rerun"
+              : `${currentCheck.wake_count} ${currentCheck.wake_count === 1 ? "work item may need" : "work items may need"} to run again`}</strong>
+            <p>{currentCheck.validity === "current"
+              ? `${currentCheck.keep_count} validated ${currentCheck.keep_count === 1 ? "result is" : "results are"} still usable.`
+              : `${currentCheck.keep_count} ${currentCheck.keep_count === 1 ? "work item can stay" : "work items can stay"} asleep. This preview used no model calls.`}</p>
+            {currentCheck.validity !== "current" && (
+              <ul>
+                {(currentCheck.decisions || []).filter((item) => item.projected_action === "wake").map((item) => (
+                  <li key={item.step_id || item.adapter}>
+                    <b>{formatAgentName(item.adapter, agents)}</b><span>{item.plain_reason}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
+            {currentCheck.conservative && <small>The live run may keep more work if a refreshed result is unchanged.</small>}
+            {currentCheck.checked_at && (
+              <time className="world-checked-at" dateTime={currentCheck.checked_at}>Checked {formatDate(currentCheck.checked_at, { includeTime: true })}. Recheck after any later change.</time>
+            )}
+          </div>
+        </div>
+      )}
+      {refreshed.length > 0 && (
+        <div className="world-change-group">
+          <h4>Refreshed now</h4>
+          <ul>{refreshed.map(row)}</ul>
+        </div>
+      )}
+      {kept.length > 0 && (
+        <div className="world-change-group">
+          <h4>Kept from earlier</h4>
+          <ul>{kept.map(row)}</ul>
+        </div>
+      )}
+      {!decisions.length && <p className="muted-empty">Change tracking is not available for this answer.</p>}
+      <div className="world-safety-note">
+        <AlertCircle size={15} aria-hidden="true" />
+        <span>Live information, tool actions, and approval-based actions are always checked again. Nothing external is repeated automatically.</span>
+      </div>
+      {canWrite && run?.status === "completed" && (
+        <>
+          <div className="world-run-disclosure">
+            <AlertCircle size={15} aria-hidden="true" />
+            <span>A refresh still runs Router planning and final answer synthesis. Billing may reserve the full-run maximum first, then settle only the provider work actually used.</span>
+          </div>
+          <div className="world-run-actions">
+            {currentCheck?.validity === "needs_refresh" && (
+              <button type="button" className="text-button primary" onClick={() => startRefresh(false)} disabled={Boolean(actionBusy) || checkBusy}>
+                {actionBusy === "selective" ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}
+                {actionBusy === "selective" ? "Starting refresh" : "Refresh affected work"}
+              </button>
+            )}
+            <button type="button" className="text-button secondary world-run-fresh" onClick={() => startRefresh(true)} disabled={Boolean(actionBusy) || checkBusy}>
+              {actionBusy === "fresh" ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}
+              {actionBusy === "fresh" ? "Starting fresh run" : "Run all agents anyway"}
+            </button>
+          </div>
+          {actionError && <p className="form-error world-action-error" role="alert">{actionError}</p>}
+        </>
+      )}
+    </section>
+  );
+}
+
 export function RunDetailsSheet({
   run,
   agents,
@@ -4588,24 +5044,58 @@ export function RunDetailsSheet({
   onCreateOutcome,
   onSettleOutcome,
   onDisputeOutcome,
-  onCorrectOutcome
+  onCorrectOutcome,
+  onRefreshTracked,
+  onRunFresh
 }) {
-  const [view, setView] = useState("agents");
+  const hasCurrentWorldGraph = run?.status === "completed"
+    && ["unchecked", "current"].includes(run?.world_graph?.validity)
+    && Number(run?.world_graph?.total || 0) > 0
+    && (run?.world_graph?.decisions || []).length > 0;
+  const [view, setView] = useState(hasCurrentWorldGraph ? "changes" : "agents");
+  const userSelectedViewRef = useRef(false);
+  const viewedRunIdRef = useRef(run?.run_id || null);
   const routeSelections = new Map((run?.plan?.routing?.selected || []).map((item) => [item.adapter, item]));
   const contracts = run?.outcome_contracts || [];
   const hasOutcome = contracts.length > 0;
+
+  useEffect(() => {
+    if (!run?.run_id) return;
+    if (viewedRunIdRef.current !== run.run_id) {
+      viewedRunIdRef.current = run.run_id;
+      userSelectedViewRef.current = false;
+    }
+    if (!userSelectedViewRef.current) setView(hasCurrentWorldGraph ? "changes" : "agents");
+  }, [hasCurrentWorldGraph, run?.run_id]);
+
+  function selectView(nextView) {
+    userSelectedViewRef.current = true;
+    setView(nextView);
+  }
+
   return (
     <ModalSurface title="Answer details" description={run ? runStatusLabel(run.status) : "Loading details"} side="right" onClose={onClose}>
       <div className="sheet-body details-sheet-body">
         {!run && <div className="center-state"><LoaderCircle className="spin" size={19} />Loading details</div>}
         {run && (
           <>
-            <div className="view-switch four-up" aria-label="Answer detail view">
-              <button type="button" aria-pressed={view === "agents"} onClick={() => setView("agents")}>Agents</button>
-              <button type="button" aria-pressed={view === "sources"} onClick={() => setView("sources")}>Sources</button>
-              <button type="button" aria-pressed={view === "outcomes"} onClick={() => setView("outcomes")}>Results</button>
-              <button type="button" aria-pressed={view === "activity"} onClick={() => setView("activity")}>Activity</button>
+            <div className="view-switch five-up" aria-label="Answer detail view">
+              <button type="button" aria-pressed={view === "changes"} onClick={() => selectView("changes")}>Changes</button>
+              <button type="button" aria-pressed={view === "agents"} onClick={() => selectView("agents")}>Agents</button>
+              <button type="button" aria-pressed={view === "sources"} onClick={() => selectView("sources")}>Sources</button>
+              <button type="button" aria-pressed={view === "outcomes"} onClick={() => selectView("outcomes")}>Results</button>
+              <button type="button" aria-pressed={view === "activity"} onClick={() => selectView("activity")}>Activity</button>
             </div>
+
+            {view === "changes" && (
+              <WorldGraphChanges
+                run={run}
+                agents={agents}
+                canWrite={canWrite}
+                onRefreshTracked={onRefreshTracked}
+                onRunFresh={onRunFresh}
+              />
+            )}
 
             {view === "agents" && (
               <section className="detail-section" aria-labelledby="used-agents-heading">
@@ -4631,7 +5121,7 @@ export function RunDetailsSheet({
                           <span className="status-dot ready" aria-hidden="true" />
                           <span>
                             <strong>{formatAgentName(route.adapter, agents)}</strong>
-                            <small>{selection?.reason || route.task || "Completed its part of the answer"}</small>
+                            <small>{route.execution_mode === "reused" ? "Kept from earlier" : selection?.reason || route.task || "Completed its part of the answer"}</small>
                           </span>
                           {tieBreak
                             ? <em>Past results</em>

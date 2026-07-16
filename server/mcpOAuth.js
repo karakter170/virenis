@@ -90,11 +90,12 @@ const PROVIDER_DEFINITIONS = Object.freeze([
     endpoint_url: "https://api.githubcopilot.com/mcp/",
     authorization_url: "https://github.com/login/oauth/authorize",
     token_url: "https://github.com/login/oauth/access_token",
-    revocation_url: "",
+    revocation_url: "https://api.github.com/applications",
+    revocation_mode: "github_application_tokens",
     scopes: ["repo", "read:org", "read:user", "user:email"],
     required_scopes: [],
     include_resource_indicator: false,
-    allowed_hosts: ["api.githubcopilot.com", "github.com"],
+    allowed_hosts: ["api.githubcopilot.com", "github.com", "api.github.com"],
     credential_group: "GITHUB",
     scope_parameter: "scope",
     token_response_style: "standard",
@@ -115,7 +116,8 @@ const PROVIDER_DEFINITIONS = Object.freeze([
     endpoint_url: "https://mcp.slack.com/mcp",
     authorization_url: "https://slack.com/oauth/v2_user/authorize",
     token_url: "https://slack.com/api/oauth.v2.user.access",
-    revocation_url: "",
+    revocation_url: "https://slack.com/api/auth.revoke",
+    revocation_mode: "slack_auth_revoke",
     scopes: [
       "search:read.public",
       "search:read.private",
@@ -353,6 +355,7 @@ export function snapshotManagedMcpProvider(provider) {
     authorization_url: provider.authorization_url,
     token_url: provider.token_url,
     revocation_url: provider.revocation_url || "",
+    revocation_mode: provider.revocation_mode || "rfc7009",
     client_id: provider.client_id,
     client_secret: provider.client_secret || "",
     redirect_uri: provider.redirect_uri,
@@ -391,7 +394,8 @@ export function restoreManagedMcpProvider(providerId, snapshot, env = process.en
     token_url: cleanMetadataUrl(snapshot.token_url, provider, env, "token endpoint"),
     revocation_url: snapshot.revocation_url
       ? cleanMetadataUrl(snapshot.revocation_url, provider, env, "revocation endpoint")
-      : "",
+      : provider.revocation_url || "",
+    revocation_mode: provider.revocation_mode || "rfc7009",
     client_id: cleanCredential(snapshot.client_id, `${provider.name} OAuth client id`, 4096),
     client_secret: cleanCredential(snapshot.client_secret, `${provider.name} OAuth client secret`, 16 * 1024),
     redirect_uri: redirectUri,
@@ -481,6 +485,57 @@ export async function revokeManagedCredential(provider, credential, env = proces
       `${provider.name} does not expose an OAuth revocation endpoint. Remove access from your ${provider.name} security settings.`,
       "mcp_oauth_revocation_unsupported"
     );
+  }
+  if (provider.revocation_mode === "github_application_tokens") {
+    const tokens = uniqueCredentialTokens(credential, "GitHub");
+    const clientId = cleanCredential(provider.client_id, "GitHub OAuth client id", 4096);
+    const clientSecret = cleanCredential(provider.client_secret, "GitHub OAuth client secret", 16 * 1024);
+    if (!clientId || !clientSecret) {
+      throw oauthError(503, "GitHub OAuth deauthorization is not configured.", "mcp_oauth_client_invalid");
+    }
+    const endpoint = new URL(provider.revocation_url);
+    endpoint.pathname = `${endpoint.pathname.replace(/\/+$/, "")}/${encodeURIComponent(clientId)}/token`;
+    const headers = {
+      Accept: "application/vnd.github+json",
+      Authorization: `Basic ${Buffer.from(`${clientId}:${clientSecret}`, "utf8").toString("base64")}`,
+      "X-GitHub-Api-Version": "2022-11-28"
+    };
+    for (const token of tokens) {
+      // Checking first makes deletion retry-safe. GitHub documents 404 from the
+      // check endpoint as an invalid token, which is the desired end state if a
+      // prior DELETE succeeded but its local receipt was not committed.
+      const check = await oauthJsonRequest(endpoint.toString(), {
+        env,
+        method: "POST",
+        json: { access_token: token },
+        acceptedStatusCodes: [404],
+        headers
+      });
+      if (check?.provider_status === 404) continue;
+      await oauthJsonRequest(endpoint.toString(), {
+        env,
+        method: "DELETE",
+        json: { access_token: token },
+        allowEmpty: true,
+        headers
+      });
+    }
+    return true;
+  }
+  if (provider.revocation_mode === "slack_auth_revoke") {
+    const tokens = uniqueCredentialTokens(credential, "Slack");
+    for (const token of tokens) {
+      const response = await oauthFormRequest(
+        provider.revocation_url,
+        new URLSearchParams({ token }),
+        { env }
+      );
+      const alreadyInactive = ["account_inactive", "token_expired", "token_revoked"].includes(response?.error);
+      if ((response?.ok !== true || response?.revoked !== true) && !alreadyInactive) {
+        throw oauthError(502, "Slack did not confirm token revocation.", "mcp_oauth_provider_error");
+      }
+    }
+    return true;
   }
   const token = cleanToken(credential?.refresh_token || credential?.access_token, "OAuth revocation token", { required: true });
   const body = new URLSearchParams({ token, token_type_hint: credential?.refresh_token ? "refresh_token" : "access_token" });
@@ -646,7 +701,9 @@ async function oauthJsonRequest(endpoint, {
   json,
   body = json === undefined ? "" : JSON.stringify(json),
   contentType = json === undefined ? "" : "application/json",
-  allowEmpty = false
+  allowEmpty = false,
+  acceptedStatusCodes = [],
+  headers: extraHeaders = {}
 }) {
   const url = new URL(normalizeProviderUrl(endpoint, env));
   const transport = url.protocol === "https:" ? https : http;
@@ -655,7 +712,8 @@ async function oauthJsonRequest(endpoint, {
   return new Promise((resolve, reject) => {
     const headers = {
       Accept: "application/json",
-      "User-Agent": "Virenis-MCP-OAuth/2.0"
+      "User-Agent": "Virenis-MCP-OAuth/2.0",
+      ...extraHeaders
     };
     if (body) {
       headers["Content-Type"] = contentType;
@@ -679,6 +737,10 @@ async function oauthJsonRequest(endpoint, {
       });
       response.on("end", () => {
         const responseBody = Buffer.concat(chunks).toString("utf8");
+        if (acceptedStatusCodes.includes(response.statusCode)) {
+          resolve({ provider_status: response.statusCode });
+          return;
+        }
         if (response.statusCode < 200 || response.statusCode >= 300) {
           reject(oauthError(502, "OAuth provider rejected the request.", "mcp_oauth_provider_error"));
           return;
@@ -702,6 +764,12 @@ async function oauthJsonRequest(endpoint, {
       : oauthError(502, "OAuth provider could not be reached.", "mcp_oauth_connection_failed")));
     request.end(body);
   });
+}
+
+function uniqueCredentialTokens(credential, providerName) {
+  const accessToken = cleanToken(credential?.access_token, `${providerName} OAuth access token`, { required: true });
+  const refreshToken = cleanToken(credential?.refresh_token, `${providerName} OAuth refresh token`, { required: false });
+  return [...new Set([accessToken, refreshToken].filter(Boolean))];
 }
 
 function oauthRedirectOrigin(env) {

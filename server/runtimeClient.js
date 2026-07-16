@@ -662,14 +662,15 @@ function invalidRuntimeAuditPage(detail) {
   return error;
 }
 
-export function executeRuntimeChat({ query, sharedMemory = [], options = {}, executionContext = {} }) {
+export function executeRuntimeChat({ query, sharedMemory = [], options = {}, executionContext = {}, worldGraph = null }) {
   return runtimeRequest("/chat/execute", {
     method: "POST",
     body: {
       query,
       shared_memory: sharedMemory,
       execution_context: executionContext,
-      options
+      options,
+      ...(worldGraph ? { world_graph: worldGraph } : {})
     },
     timeoutMs: Number(process.env.TCAR_RUNTIME_CHAT_TIMEOUT_MS || DEFAULT_TIMEOUT_MS)
   });

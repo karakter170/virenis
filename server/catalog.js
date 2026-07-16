@@ -535,6 +535,17 @@ export const seedAgents = [
   }
 ];
 
+// The built-in catalog is the only class of intentionally unscoped agent.
+// Stamp the exported fixtures once so callers keep stable array/object identity
+// while every store receives explicit provenance metadata. User-created and
+// adopted agents are always workspace-scoped by the web application.
+for (const agent of seedAgents) {
+  agent.workspace_id = null;
+  agent.visibility = "global";
+  agent.system_managed = true;
+  agent.created_by ||= "router-system";
+}
+
 export const approvedSourceSnippets = {
   "sources/tcar_dummy_loras/refund_policy/refund_policy.md": {
     title: "Refund Policy Source",

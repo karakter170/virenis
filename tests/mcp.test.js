@@ -238,6 +238,100 @@ describe("governed MCP phase 1", () => {
     ]);
   });
 
+  it("never executes MCP for an unscoped, cross-workspace, or ambiguous agent record", async () => {
+    const connection = await request(app)
+      .post("/api/mcp/connections")
+      .send({ name: "Execution scope proof", endpoint_url: server.url, auth: { type: "none" } })
+      .expect(201);
+    await request(app)
+      .post("/api/agents")
+      .send({
+        id: "mcp_scope_proof_agent",
+        title: "MCP scope proof agent",
+        capability: "Search only within its authorized execution scope.",
+        boundary: "Never cross an execution boundary.",
+        mcp_bindings: [{
+          connection_id: connection.body.connection_id,
+          tool_names: ["search_notes"]
+        }]
+      })
+      .expect(201);
+    const storedAgent = app.locals.store.read().agents
+      .find((item) => item.id === "mcp_scope_proof_agent");
+    const alias = storedAgent.mcp_bindings[0].tools[0].alias;
+    const gatewayHeaders = { "X-Virenis-MCP-Gateway-Key": process.env.APP_MCP_GATEWAY_KEY };
+    const context = {
+      run_id: "run_mcp_scope_proof",
+      session_id: "session_mcp_scope_proof",
+      workspace_id: "workspace_default",
+      user_id: "user_local",
+      role: "user"
+    };
+    const call = () => request(app)
+      .post("/api/internal/mcp/tools/call")
+      .set(gatewayHeaders)
+      .send({
+        agent_id: storedAgent.id,
+        tool_alias: alias,
+        arguments: { query: "must not run" },
+        execution_context: context
+      });
+
+    await app.locals.store.mutate((data) => {
+      const agent = data.agents.find((item) => item.id === storedAgent.id);
+      delete agent.workspace_id;
+      agent.system_managed = false;
+      return null;
+    });
+    const unscoped = await call().expect(403);
+    expect(unscoped.body.error).toBe("mcp_workspace_forbidden");
+    expect(toolCalls).toHaveLength(0);
+
+    await app.locals.store.mutate((data) => {
+      const agent = data.agents.find((item) => item.id === storedAgent.id);
+      agent.workspace_id = "another_workspace";
+      return null;
+    });
+    const crossWorkspace = await call().expect(403);
+    expect(crossWorkspace.body.error).toBe("mcp_workspace_forbidden");
+    expect(toolCalls).toHaveLength(0);
+
+    await app.locals.store.mutate((data) => {
+      const agent = data.agents.find((item) => item.id === storedAgent.id);
+      agent.workspace_id = context.workspace_id;
+      data.agents.push({ ...agent, title: "Duplicate execution identity" });
+      return null;
+    });
+    const ambiguous = await call().expect(409);
+    expect(ambiguous.body.error).toBe("mcp_agent_identity_ambiguous");
+    expect(toolCalls).toHaveLength(0);
+  });
+
+  it("does not let a foreign injected binding disclose or block a connection deletion", async () => {
+    const connection = await request(app)
+      .post("/api/mcp/connections")
+      .send({ name: "Scoped deletion proof", endpoint_url: server.url, auth: { type: "none" } })
+      .expect(201);
+    await app.locals.store.mutate((data) => {
+      data.agents.push({
+        id: "foreign_connection_binding",
+        title: "Foreign confidential binding",
+        workspace_id: "another_workspace",
+        visibility: "private",
+        created_by: "another_user",
+        enabled: true,
+        mcp_bindings: [{ connection_id: connection.body.connection_id, tools: [] }]
+      });
+      return null;
+    });
+
+    const deleted = await request(app)
+      .delete(`/api/mcp/connections/${connection.body.connection_id}`)
+      .expect(200);
+    expect(deleted.body).toMatchObject({ ok: true, connection_id: connection.body.connection_id });
+    expect(JSON.stringify(deleted.body)).not.toContain("Foreign confidential");
+  });
+
   it("recovers a saved tool decision without executing the external action twice", async () => {
     const connection = await request(app)
       .post("/api/mcp/connections")

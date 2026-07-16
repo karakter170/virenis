@@ -7,7 +7,7 @@ import { normalizedBillingAvailable, syncNormalizedBilling } from "./normalizedB
 import { normalizedLedgerAvailable, syncNormalizedLedger } from "./normalizedLedger.js";
 import { ensureGeneralAgentWorkspace, normalizeAgentWorkspaceCollections } from "./agentWorkspaces.js";
 
-const { Pool } = pg;
+const { Client, Pool } = pg;
 
 function clone(value) {
   if (typeof globalThis.structuredClone === "function") {
@@ -41,7 +41,7 @@ function mergeSeedCatalog(agents, seedAgents) {
 function initialData(seedAgents) {
   const now = new Date().toISOString();
   return {
-    version: 13,
+    version: 14,
     created_at: now,
     users: [],
     billingAccounts: [],
@@ -58,6 +58,8 @@ function initialData(seedAgents) {
     runs: [],
     runSteps: [],
     executionRecords: [],
+    worldGraphArtifacts: [],
+    worldGraphEvents: [],
     outcomeContracts: [],
     agentEvents: [],
     runtimeLifecycleIntents: [],
@@ -153,6 +155,7 @@ export class PostgresStore {
     }
     this.tableName = tableName;
     this.storeKey = storeKey;
+    this.connectionString = connectionString;
     this.seedAgents = seedAgents;
     this.data = initialData(seedAgents);
     this.txQueue = Promise.resolve();
@@ -163,6 +166,11 @@ export class PostgresStore {
     });
     this.normalizedLedger = false;
     this.normalizedBilling = false;
+    this.instanceLockClient = null;
+    const lockDigest = crypto.createHash("sha256")
+      .update(`virenis-single-web-process-v1\0${tableName}\0${storeKey}`, "utf8")
+      .digest();
+    this.instanceLockKeys = [lockDigest.readInt32BE(0), lockDigest.readInt32BE(4)];
   }
 
   async init() {
@@ -203,6 +211,7 @@ export class PostgresStore {
         );
       }
     }
+    await this.acquireInstanceLock();
     const client = await this.pool.connect();
     const seedData = initialData(this.seedAgents);
     let initializedData;
@@ -239,6 +248,7 @@ export class PostgresStore {
       this.data = initializedData;
     } catch (error) {
       await client.query("ROLLBACK").catch(() => undefined);
+      await this.releaseInstanceLock();
       throw error;
     } finally {
       client.release();
@@ -320,7 +330,41 @@ export class PostgresStore {
 
   async close() {
     await this.txQueue;
+    await this.releaseInstanceLock();
     await this.pool.end();
+  }
+
+  async acquireInstanceLock() {
+    if (this.instanceLockClient) return;
+    const client = new Client({ connectionString: this.connectionString });
+    try {
+      await client.connect();
+      const result = await client.query(
+        "SELECT pg_try_advisory_lock($1::int, $2::int) AS acquired",
+        this.instanceLockKeys
+      );
+      if (result.rows[0]?.acquired !== true) {
+        throw new Error(
+          `Another Virenis web process already owns Postgres store ${this.storeKey}. `
+          + "The current MVP requires exactly one web process; stop the other replica before retrying."
+        );
+      }
+      this.instanceLockClient = client;
+    } catch (error) {
+      await client.end().catch(() => undefined);
+      throw error;
+    }
+  }
+
+  async releaseInstanceLock() {
+    const client = this.instanceLockClient;
+    if (!client) return;
+    this.instanceLockClient = null;
+    try {
+      await client.query("SELECT pg_advisory_unlock($1::int, $2::int)", this.instanceLockKeys);
+    } finally {
+      await client.end();
+    }
   }
 }
 
@@ -361,7 +405,9 @@ function normalizeData(value, seedAgents) {
     "mcpApprovals",
     "mcpToolCalls",
     "workflows",
-    "conversationCheckpoints"
+    "conversationCheckpoints",
+    "worldGraphArtifacts",
+    "worldGraphEvents"
   ]) {
     data[collection] = Array.isArray(data[collection]) ? data[collection] : [];
   }
@@ -442,7 +488,7 @@ export function nowIso() {
 }
 
 export function makeId(prefix) {
-  return `${prefix}_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;
+  return `${prefix}_${crypto.randomUUID().replaceAll("-", "")}`;
 }
 
 function assertBillingStateIntegrity(data) {

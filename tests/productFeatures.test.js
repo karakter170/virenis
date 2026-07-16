@@ -19,6 +19,7 @@ import {
   RunReceipt,
   ToolApprovalCheckpoint,
   UsageReceipt,
+  WorldGraphChanges,
   WorkflowDraftCard,
   agentPayloadFromForm,
   agentsForWorkspace,
@@ -27,10 +28,12 @@ import {
   graphConnectionWouldCycle,
   graphConnections,
   graphEdgePath,
+  graphPositionForCanvas,
   graphPositionFromPointer,
   initialGraphPositions,
   progressiveRevealPlan,
   storedGraphPositions,
+  worldGraphAgentStatuses,
   workflowRequirementConnections
 } from "../src/App.jsx";
 import LandingPage from "../src/LandingPage.jsx";
@@ -231,6 +234,68 @@ describe("Agent Studio product surfaces", () => {
     expect(markup).toContain("Closing evidence");
   });
 
+  it("shows a completed unchecked change record without falsely calling it current", () => {
+    const markup = renderToStaticMarkup(createElement(WorldGraphChanges, {
+      run: {
+        run_id: "run_recorded",
+        status: "completed",
+        plan: { steps: [{ id: "s1", adapter: "research_agent", task: "Research", depends_on: [] }] },
+        world_graph: {
+          validity: "unchecked",
+          total: 1,
+          kept: 1,
+          refreshed: 0,
+          decisions: [{
+            step_id: "s1",
+            adapter: "research_agent",
+            action: "kept",
+            plain_reason: "Its inputs were unchanged when this answer ran."
+          }]
+        }
+      },
+      agents: [{ id: "research_agent", title: "Research Agent" }],
+      canWrite: true
+    }));
+    expect(markup).toContain("Change record ready");
+    expect(markup).toContain("Check what changed");
+    expect(markup).not.toContain("This answer is current");
+  });
+
+  it("describes WorldGraph decisions as work items when one agent owns multiple steps", () => {
+    const run = {
+      run_id: "run_duplicate_agent_steps",
+      status: "completed",
+      plan: {
+        steps: [
+          { id: "draft", adapter: "writer_agent", task: "Draft the answer", depends_on: [] },
+          { id: "revise", adapter: "writer_agent", task: "Revise the answer", depends_on: ["draft"] }
+        ]
+      },
+      world_graph: {
+        validity: "unchecked",
+        total: 2,
+        kept: 99,
+        refreshed: 99,
+        decisions: [
+          { step_id: "draft", adapter: "writer_agent", action: "kept", plain_reason: "The draft was unchanged." },
+          { step_id: "revise", adapter: "writer_agent", action: "refreshed", plain_reason: "The revision changed." }
+        ]
+      }
+    };
+    const markup = renderToStaticMarkup(createElement(WorldGraphChanges, {
+      run,
+      agents: [{ id: "writer_agent", title: "Writer" }],
+      canWrite: true
+    }));
+    const statuses = worldGraphAgentStatuses(run.world_graph.decisions);
+
+    expect(statuses.get("writer_agent")).toEqual({ kept: 1, refreshed: 1, total: 2, action: "mixed" });
+    expect(markup).toContain("1 validated work item was kept and 1 work item was refreshed");
+    expect(markup).toContain("Work item: Draft the answer");
+    expect(markup).toContain("Work item: Revise the answer");
+    expect(markup).not.toContain("99 agents");
+  });
+
   it("progressively reveals new answers while server rendering and reduced motion retain the full text", () => {
     expect(progressiveRevealPlan(40)).toMatchObject({ charactersPerFrame: 1 });
     expect(progressiveRevealPlan(12000).charactersPerFrame).toBeGreaterThan(1);
@@ -270,6 +335,33 @@ describe("Agent Studio product surfaces", () => {
     expect(markup).toContain("Final answer");
     expect(markup.match(/Not reported/g)).toHaveLength(2);
     expect(markup).toContain("Provider token usage was not reported for this output");
+  });
+
+  it("labels a reused agent as zero-call work instead of missing provider usage", () => {
+    const markup = renderToStaticMarkup(createElement(UsageReceipt, {
+      agents: [{ id: "writer_agent", title: "Writer Agent" }],
+      expertOutputs: [{ id: "step_writer", adapter: "writer_agent", execution_mode: "reused", token_usage: {} }],
+      receipt: {
+        provider_reported: true,
+        complete: true,
+        prompt_tokens: 60,
+        completion_tokens: 15,
+        total_tokens: 75,
+        charged_credits: "0.01",
+        components: [{
+          component_key: "final",
+          component: "final_synthesis",
+          kind: "final_output",
+          prompt_tokens: 60,
+          completion_tokens: 15,
+          total_tokens: 75,
+          charged_credits: "0.01"
+        }]
+      }
+    }));
+    expect(markup).toContain("Kept from earlier · no agent model call");
+    expect(markup).toContain("0 calls");
+    expect(markup).not.toContain("Provider token usage was not reported for this output");
   });
 
   it("shows a reviewable workflow graph with agent provenance and connection consent", () => {
@@ -487,6 +579,29 @@ describe("Agent Studio product surfaces", () => {
     expect(markup).not.toMatch(/LoRA|adapter model/i);
   });
 
+  it("shows mixed per-work-item history without presenting current links as run edges", () => {
+    const markup = renderToStaticMarkup(createElement(AgentGraph, {
+      agents: [{ id: "writer_agent", title: "Writer", enabled: true }],
+      run: {
+        status: "completed",
+        world_graph: {
+          validity: "unchecked",
+          total: 2,
+          decisions: [
+            { step_id: "draft", adapter: "writer_agent", action: "kept" },
+            { step_id: "revise", adapter: "writer_agent", action: "refreshed" }
+          ]
+        }
+      },
+      storageKey: ""
+    }));
+
+    expect(markup).toContain("world-mixed");
+    expect(markup).toContain("Latest answer: 1 kept, 1 refreshed");
+    expect(markup).toContain("1 work item kept from earlier · 1 refreshed now");
+    expect(markup).toContain("Lines show the current configured team links, not that answer&#x27;s execution path.");
+  });
+
   it("keeps the complete active API-agent catalog available to the session picker", () => {
     const specialists = Array.from({ length: 9 }, (_, index) => ({
       id: `specialist_${index}`,
@@ -549,6 +664,38 @@ describe("Agent Studio product surfaces", () => {
     }
   });
 
+  it("uses a collision-free visible grid and discloses agents outside the map limit", () => {
+    const visibleAgents = Array.from({ length: 25 }, (_, index) => ({ id: `node_${index}`, title: `Agent ${index}`, enabled: true }));
+    const positions = initialGraphPositions(visibleAgents);
+    for (let left = 0; left < visibleAgents.length; left += 1) {
+      for (let right = left + 1; right < visibleAgents.length; right += 1) {
+        const first = positions[visibleAgents[left].id];
+        const second = positions[visibleAgents[right].id];
+        expect(Math.abs(first.x - second.x) >= 148 || Math.abs(first.y - second.y) >= 60).toBe(true);
+      }
+    }
+
+    const markup = renderToStaticMarkup(createElement(AgentGraph, {
+      agents: [...visibleAgents, ...Array.from({ length: 5 }, (_, index) => ({ id: `hidden_${index}`, title: `Hidden ${index}`, enabled: true }))],
+      storageKey: ""
+    }));
+    expect(markup).toContain("25 of 30 agents");
+    expect(markup).toContain("Lines involving hidden agents are omitted");
+    expect(markup.match(/class="graph-node tone-/g)).toHaveLength(25);
+  });
+
+  it("does not silently truncate visible graph connections", () => {
+    const agents = Array.from({ length: 25 }, (_, index) => ({
+      id: `connected_${index}`,
+      consumes: Array.from({ length: 25 }, (_, sourceIndex) => sourceIndex)
+        .filter((sourceIndex) => sourceIndex !== index)
+        .map((sourceIndex) => `agent:connected_${sourceIndex}:output`)
+    }));
+    const connections = graphConnections(agents);
+    expect(connections.length).toBeGreaterThan(240);
+    expect(connections).toHaveLength(600);
+  });
+
   it("adds and removes persisted agent handoff inputs without disturbing other context", () => {
     const existing = ["user_request", "shared_memory"];
     expect(graphConnectionInputs(existing, "research_agent", true)).toEqual([
@@ -586,6 +733,34 @@ describe("Agent Studio product surfaces", () => {
     expect(movedSource).toEqual({ x: 400, y: 300 });
     expect(movedPath).not.toEqual(originalPath);
     expect(movedPath).toMatch(/^M 400 300 C /);
+  });
+
+  it("keeps a rendered bubble fully inside a narrow graph canvas", () => {
+    const bounds = { left: 0, top: 0, width: 360, height: 420 };
+    const nodeBounds = { width: 132, height: 60 };
+    const fromPointer = graphPositionFromPointer(bounds, 0, 0, nodeBounds);
+    const restored = graphPositionForCanvas(bounds, { x: -500, y: 9000 }, nodeBounds);
+    const horizontalInset = ((nodeBounds.width / 2 + 6) / bounds.width) * 900;
+    const verticalInset = ((nodeBounds.height / 2 + 6) / bounds.height) * 560;
+
+    expect(fromPointer).toEqual({ x: horizontalInset, y: verticalInset });
+    expect(restored).toEqual({ x: horizontalInset, y: 560 - verticalInset });
+  });
+
+  it("labels handoff and knowledge links accurately without focusable SVG paths", () => {
+    const markup = renderToStaticMarkup(createElement(AgentGraph, {
+      agents: [
+        { id: "source_agent", title: "Source", enabled: true },
+        { id: "consumer_agent", title: "Consumer", enabled: true, consumes: ["agent:source_agent:output"] },
+        { id: "knowledge_agent", title: "Knowledge", enabled: true, resources: ["agent:source_agent"] }
+      ],
+      storageKey: ""
+    }));
+    const svg = markup.match(/<svg viewBox="0 0 900 560"[\s\S]*?<\/svg>/)?.[0] || "";
+    expect(svg).toContain("Source hands work to Consumer");
+    expect(svg).toContain("Source provides knowledge to Knowledge");
+    expect(svg).not.toContain('role="button"');
+    expect(svg).not.toContain('tabindex="0"');
   });
 
   it("restores persisted graph positions defensively and clamps unsafe coordinates", () => {
@@ -782,5 +957,17 @@ describe("Agent Studio product surfaces", () => {
     expect(compactControl).toContain("height: 16px");
     expect(compactControl).toContain("min-height: 16px");
     expect(compactControl).toContain("padding: 0");
+  });
+
+  it("keeps graph status labels readable and the mobile graph vertically reachable", () => {
+    const styles = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
+    const nodeStatus = styles.match(/\.graph-node small\s*\{([\s\S]*?)\}/)?.[1] || "";
+    const narrowGraph = styles.match(/@media \(max-width: 760px\)\s*\{([\s\S]*?)\.app-shell/)?.[1] || "";
+    expect(nodeStatus).toContain("font-size: 11px");
+    expect(nodeStatus).toContain("color: var(--graph-node-color)");
+    expect(narrowGraph).toContain("overflow-y: auto !important");
+    expect(styles).toMatch(/\.graph-canvas-scroll\s*\{[\s\S]*?overflow-x: auto;/);
+    expect(styles).toMatch(/\.agent-graph\s*\{[\s\S]*?min-width: 800px;/);
+    expect(styles).toContain(".graph-node.world-mixed");
   });
 });

@@ -24,6 +24,12 @@ import {
 } from "./billing.js";
 import { createStore, makeId, nowIso } from "./store.js";
 import {
+  previewWorldGraphRun,
+  pruneExpiredWorldGraphData,
+  publicWorldGraphRun,
+  publicWorldGraphSnapshot
+} from "./worldGraph.js";
+import {
   modelOutputSettingsForWorkspace,
   updateModelOutputSettings
 } from "./modelSettings.js";
@@ -46,6 +52,7 @@ import {
   processChatRun,
   runtimeHealth,
   sanitizeToolCalls,
+  scopedRoutingContext,
   validateUserMessage
 } from "./tcarEngine.js";
 import {
@@ -114,6 +121,7 @@ import {
   publicMcpConnection,
   publicMcpTemplates,
   refreshMcpConnection,
+  revokePendingMcpOAuthState,
   revokeMcpConnection,
   resolveAgentMcpBindings
 } from "./mcp.js";
@@ -216,7 +224,8 @@ export async function createApp({
   workflowComposer = null,
   conversationContinuator = null,
   validationProcessor = processValidationRun,
-  clerkAdapter = null
+  clerkAdapter = null,
+  documentRootPurger = purgeLocalDocumentRoots
 } = {}) {
   realityRankMinVerifiedSamples();
   const useApiRuntimeCatalog = realRuntimeEnabled() && process.env.NODE_ENV !== "test";
@@ -226,6 +235,7 @@ export async function createApp({
   });
   const store = createStore({ dbPath, seedAgents: configuredSeedAgents });
   await store.init();
+  await store.mutate((data) => pruneExpiredWorldGraphData(data));
   await store.mutate((data) => activePricingVersion(data));
   const workflowStartupRecovery = autoRun
     ? await recoverInterruptedWorkflowActivations({ store })
@@ -240,6 +250,104 @@ export async function createApp({
     enabled: resolvedClerkAdapter.enabled
   });
   const mcpCredentialKey = await ensureMcpCredentialKey({ dbPath });
+  const performAccountDeletion = async ({ actor, providerInitiated = false }) => (
+    identityManager.runAccountDeletion(actor.clerk_user_id, async () => {
+      const started = await identityManager.beginAccountDeletion(actor, { providerInitiated });
+      await identityManager.drainAuthenticatedRequests(actor);
+
+      let resources = null;
+      let stable = false;
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        resources = await identityManager.prepareAccountDeletion(actor, started.deletion_id);
+        const snapshotKey = `snapshot:${resources.resource_revision}`;
+        const completed = new Set(resources.completed_external_purges || []);
+        if (!completed.has(snapshotKey)) {
+          await purgeExternalAccountResources({
+            resources,
+            actor,
+            mcpCredentialKey,
+            accountStore: store,
+            resourceRevision: resources.resource_revision,
+            completedPurgeKeys: completed,
+            onPurgeComplete: (purgeKey) => identityManager.markDeletionExternalPurge(
+              actor,
+              started.deletion_id,
+              purgeKey
+            )
+          });
+          await identityManager.markDeletionExternalPurge(actor, started.deletion_id, snapshotKey);
+        }
+        const verified = await identityManager.prepareAccountDeletion(actor, started.deletion_id);
+        if (verified.resource_revision === resources.resource_revision) {
+          resources = verified;
+          stable = true;
+          break;
+        }
+      }
+      if (!stable) {
+        const error = new Error("Account resources kept changing during deletion. Retry shortly; the deletion marker remains active.");
+        error.status = 503;
+        error.code = "account_deletion_resource_changed";
+        throw error;
+      }
+
+      if (!providerInitiated) await identityManager.deleteProviderAccount(actor);
+      const result = await identityManager.deleteAccount(actor, {
+        deletionId: started.deletion_id,
+        resourceRevision: resources.resource_revision
+      });
+      const documentRoots = result?.document_roots
+        || (resources.documents || []).map((document) => document.document_root).filter(Boolean);
+      await documentRootPurger(uploadRoot, documentRoots);
+      await identityManager.completeDocumentCleanup(
+        actor.clerk_user_id,
+        started.deletion_id
+      );
+      return { result, resources };
+    })
+  );
+  let accountDeletionRecoveryInflight = null;
+  const recoverPendingAccountDeletions = () => {
+    if (accountDeletionRecoveryInflight) return accountDeletionRecoveryInflight;
+    const task = (async () => {
+      const candidates = identityManager.listAccountDeletionRecoveryCandidates({
+        limit: Number(process.env.APP_ACCOUNT_DELETION_RECOVERY_BATCH || 25)
+      });
+      const results = [];
+      for (const candidate of candidates) {
+        try {
+          if (candidate.kind === "account") {
+            await performAccountDeletion({ actor: candidate.actor, providerInitiated: false });
+          } else {
+            await identityManager.runAccountDeletion(
+              `tombstone:${candidate.provider_user_hash}`,
+              async () => {
+                await documentRootPurger(uploadRoot, candidate.document_roots || []);
+                await identityManager.completeDocumentCleanupByTombstone(
+                  candidate.provider_user_hash,
+                  candidate.deletion_id
+                );
+              }
+            );
+          }
+          await identityManager.recordAccountDeletionRecovery(candidate);
+          results.push({ kind: candidate.kind, ok: true });
+        } catch (error) {
+          await identityManager.recordAccountDeletionRecovery(candidate, { error }).catch(() => undefined);
+          console.error("account deletion recovery failed.", {
+            kind: candidate.kind,
+            code: String(error?.code || "account_deletion_recovery_failed").slice(0, 120)
+          });
+          results.push({ kind: candidate.kind, ok: false, code: error?.code || "account_deletion_recovery_failed" });
+        }
+      }
+      return { attempted: candidates.length, results };
+    })();
+    accountDeletionRecoveryInflight = task;
+    return task.finally(() => {
+      if (accountDeletionRecoveryInflight === task) accountDeletionRecoveryInflight = null;
+    });
+  };
   publicMcpTemplates();
   if (useApiRuntimeCatalog) {
     const hasLegacySeedRecords = store.read((data) =>
@@ -376,10 +484,45 @@ export async function createApp({
   };
   const app = express();
 
+  const configuredRetentionSweepMs = Number(process.env.WEB_WORLD_GRAPH_RETENTION_SWEEP_MS || 3_600_000);
+  const retentionSweepMs = Number.isFinite(configuredRetentionSweepMs)
+    ? Math.max(60_000, Math.min(configuredRetentionSweepMs, 24 * 60 * 60 * 1000))
+    : 3_600_000;
+  const retentionTimer = setInterval(() => {
+    void store.mutate((data) => pruneExpiredWorldGraphData(data)).catch((error) => {
+      console.error("WorldGraph retention sweep failed.", error);
+    });
+  }, retentionSweepMs);
+  retentionTimer.unref?.();
+  const configuredDeletionRecoveryMs = Number(process.env.APP_ACCOUNT_DELETION_RECOVERY_INTERVAL_MS || 60_000);
+  const deletionRecoveryMs = Number.isFinite(configuredDeletionRecoveryMs)
+    ? Math.max(5_000, Math.min(configuredDeletionRecoveryMs, 60 * 60 * 1000))
+    : 60_000;
+  const scheduleAccountDeletionRecovery = () => {
+    void recoverPendingAccountDeletions().catch((error) => {
+      console.error("account deletion recovery cycle failed.", {
+        code: String(error?.code || "account_deletion_recovery_cycle_failed").slice(0, 120)
+      });
+    });
+  };
+  const deletionRecoveryTimer = autoRun
+    ? setInterval(scheduleAccountDeletionRecovery, deletionRecoveryMs)
+    : null;
+  deletionRecoveryTimer?.unref?.();
+  if (autoRun) setImmediate(scheduleAccountDeletionRecovery);
+  const closeStore = store.close.bind(store);
+  store.close = async (...args) => {
+    clearInterval(retentionTimer);
+    if (deletionRecoveryTimer) clearInterval(deletionRecoveryTimer);
+    await accountDeletionRecoveryInflight?.catch(() => undefined);
+    return closeStore(...args);
+  };
+
   app.locals.store = store;
   app.locals.bus = bus;
   app.locals.rateBuckets = rateLimiter.buckets;
   app.locals.clerkAdapter = resolvedClerkAdapter;
+  app.locals.identityManager = identityManager;
   app.locals.eventStreams = eventStreams;
   app.locals.closeEventStreams = (options) => closeEventStreams(eventStreams, options);
   app.locals.backgroundTasks = backgroundTasks;
@@ -388,6 +531,9 @@ export async function createApp({
   app.locals.scheduleValidationRun = scheduleValidationRun;
   app.locals.workerInstanceId = workerInstanceId;
   app.locals.mcpCredentialKey = mcpCredentialKey;
+  app.locals.worldGraphRetentionSweepMs = retentionSweepMs;
+  app.locals.accountDeletionRecoveryIntervalMs = deletionRecoveryMs;
+  app.locals.recoverPendingAccountDeletions = recoverPendingAccountDeletions;
   app.locals.drainBackgroundTasks = (options) => drainBackgroundTasks(backgroundTasks, options);
   configureTrustProxy(app);
   app.disable("x-powered-by");
@@ -441,8 +587,9 @@ export async function createApp({
         await deleteClerkAccountFromWebhook({
           clerkUserId: event.data.id,
           identityManager,
-          mcpCredentialKey,
-          uploadRoot
+          performAccountDeletion,
+          uploadRoot,
+          documentRootPurger
         });
       }
       res.json({ ok: true });
@@ -542,6 +689,7 @@ export async function createApp({
 
   app.use(rateLimiter.middleware);
   app.use(optionalApplicationAuth(identityManager, resolvedClerkAdapter));
+  app.use(trackAuthenticatedIdentityRequest(identityManager));
   app.use(attachRequestIdentity);
   app.use(originGuard);
   app.use(requireWritableRole);
@@ -827,21 +975,33 @@ export async function createApp({
   app.delete("/api/account", async (req, res, next) => {
     res.setHeader("Cache-Control", "no-store");
     try {
-      const resources = await identityManager.validateAccountDeletion(req.auth, req.body);
-      await purgeExternalAccountResources({
-        resources,
-        actor: req.auth,
-        mcpCredentialKey
-      });
-      await identityManager.deleteProviderAccount(req.auth);
-      const result = await identityManager.deleteAccount(req.auth);
-      const documentRoots = result?.document_roots
-        || (resources.documents || []).map((document) => document.document_root).filter(Boolean);
-      await purgeLocalDocumentRoots(uploadRoot, documentRoots);
+      identityManager.validateAccountDeletionConfirmation(req.auth, req.body);
+      const { result, resources } = await performAccountDeletion({ actor: req.auth });
       res.json({
         ok: true,
         deleted_counts: result?.deleted_counts || deletedAccountResourceCounts(resources),
-        retention_note: "Append-only integrity receipts may be retained in de-identified form for security and provenance."
+        retention_note: "Content-free provenance receipts and minimized normalized billing records may be retained under documented security, accounting, tax, payment-reconciliation, fraud-prevention, chargeback, or legal-hold obligations. They contain workspace-scoped pseudonyms, digests, and necessary accounting facts; they are not anonymous and are not included in this JSON export. Legacy normalized databases require approved privacy migration and cross-tenant administrator inventory.",
+        retained_provenance: {
+          projection: "virenis-ledger-content-free-v1",
+          included_in_export: false,
+          identity_form: "workspace-scoped pseudonyms",
+          payload_form: "digests only",
+          anonymous: false,
+          operator_inventory_required: true,
+          legacy_migration_status: "unknown until administrator inventory; migration is required only if legacy rows are found"
+        },
+        retained_billing: {
+          projection: "virenis-billing-minimized-v1",
+          included_in_export: false,
+          identity_form: "opaque tenant partition key plus workspace-scoped pseudonyms and SHA-256 digests",
+          retained_partition_keys: "raw workspace_id and global pricing-version IDs; deployments must keep these opaque and non-personal",
+          retained_facts: "recorded amounts, balances, transaction status/timestamps, provider name, pricing facts, aggregate usage, and integrity hashes; aggregates are not an independent repricing dataset",
+          raw_fields_excluded: "raw user/account/run/ledger/provider-event identifiers, agent/step/model labels, and free-form metadata",
+          retention_basis: "operator policy and legal basis are required; normalized-ledger expiry is not enforced by the application",
+          anonymous: false,
+          operator_inventory_required: true,
+          legacy_migration_status: "unknown until administrator inventory; migration is required only if legacy rows are found"
+        }
       });
     } catch (error) {
       next(error);
@@ -945,7 +1105,8 @@ export async function createApp({
         .find((item) => item.connection_id === req.params.connection_id));
       assertMcpConnectionMutation(current, req);
       const boundAgents = store.read((data) => data.agents.filter((agent) =>
-        (agent.mcp_bindings || []).some((binding) => binding.connection_id === current.connection_id)
+        String(agent.workspace_id || "") === String(current.workspace_id || "")
+        && (agent.mcp_bindings || []).some((binding) => binding.connection_id === current.connection_id)
       ));
       if (boundAgents.length) throwStatus(409, `Remove this connection from ${boundAgents.length} agent${boundAgents.length === 1 ? "" : "s"} first.`);
       let revoked = false;
@@ -1061,7 +1222,10 @@ export async function createApp({
       if (realRuntimeEnabled()) {
         const payload = await fetchRuntimeModels();
         const baseModelId = payload.base_model || BASE_MODEL;
-        const localById = new Map(data.agents.map((agent) => [agent.id, agent]));
+        const localCounts = countResourceIds(data.agents, "id");
+        const localById = new Map(data.agents
+          .filter((agent) => agent?.id && localCounts.get(agent.id) === 1)
+          .map((agent) => [agent.id, agent]));
         const response = {
           models: (payload.models || [])
             .filter((model) => runtimeModelVisibleToRequest(model, baseModelId, localById, req))
@@ -1203,7 +1367,7 @@ export async function createApp({
       const snapshot = store.read();
       const session = findAccessibleSession(snapshot, req.params.session_id, req);
       assertSessionMutationAccess(session, req);
-      const agent = snapshot.agents.find((item) => item.id === req.params.agent_id);
+      const agent = uniqueStoredAgent(snapshot, req.params.agent_id, { allowMissing: true });
       if (!agent || !agentVisibleToRequest(agent, req) || !agentAvailableForSession(agent, session.session_id)) {
         throwStatus(404, "Agent not found.");
       }
@@ -1547,7 +1711,13 @@ export async function createApp({
       const data = store.read();
       const run = findAccessibleRun(data, req.params.run_id, req);
       const steps = run.plan?.steps || [];
-      const agents = new Map(data.agents.map((agent) => [agent.id, agent]));
+      const session = data.sessions.find((item) => item.session_id === run.session_id);
+      const agentIdCounts = countResourceIds(data.agents, "id");
+      const agents = new Map(data.agents
+        .filter((agent) => agent?.id && agentIdCounts.get(agent.id) === 1)
+        .filter((agent) => agentVisibleToRequest(agent, req))
+        .filter((agent) => agentAvailableForSession(agent, session?.session_id || null))
+        .map((agent) => [agent.id, agent]));
       res.json({
         nodes: steps.map((step) => ({
           id: step.id,
@@ -1560,6 +1730,41 @@ export async function createApp({
         edges: steps.flatMap((step) => (step.depends_on || []).map((source) => ({ source, target: step.id }))),
         batches: run.parallel?.batches || []
       });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/api/chat/runs/:run_id/worldgraph", (req, res, next) => {
+    try {
+      const data = store.read();
+      const run = findAccessibleRun(data, req.params.run_id, req);
+      res.setHeader("Cache-Control", "private, no-store");
+      res.json(publicWorldGraphSnapshot({ data, run, actor: req.auth }));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/chat/runs/:run_id/worldgraph/check", async (req, res, next) => {
+    try {
+      const data = store.read();
+      const run = findAccessibleRun(data, req.params.run_id, req);
+      let runtimeComponentProvenance = null;
+      if (realRuntimeEnabled()) {
+        try {
+          const health = await fetchRuntimeHealth();
+          runtimeComponentProvenance = health?.component_provenance || null;
+        } catch {
+          // A check must remain available during a runtime outage, but it must
+          // fail closed: missing provenance projects the affected agents awake.
+          runtimeComponentProvenance = null;
+        }
+      }
+      const currentData = store.read();
+      const currentRun = findAccessibleRun(currentData, run.run_id, req);
+      res.setHeader("Cache-Control", "private, no-store");
+      res.json(currentWorldGraphPreview(currentData, currentRun, { runtimeComponentProvenance }));
     } catch (error) {
       next(error);
     }
@@ -1688,8 +1893,7 @@ export async function createApp({
   app.get("/api/admin/agents/:agent_id/runtime-audit", async (req, res, next) => {
     try {
       requireAdmin(req);
-      const agent = store.read().agents.find((item) => item.id === req.params.agent_id);
-      if (!agent || !agentVisibleToRequest(agent, req)) throwStatus(404, "Agent not found.");
+      const agent = findAccessibleAgent(store.read(), req.params.agent_id, req);
       const binding = agent.runtime_registration_audit_binding;
       const agentSpec = agent.runtime_registration_agent_spec;
       if (!binding) throwStatus(409, "Agent has no bound TCAR Runtime registration receipt.");
@@ -1875,7 +2079,9 @@ export async function createApp({
     try {
       const data = store.read();
       const workspaceId = requestWorkspaceId(req, req.query.workspace_id);
+      const agentIdCounts = countResourceIds(data.agents, "id");
       const ranks = data.agents
+        .filter((agent) => agent?.id && agentIdCounts.get(agent.id) === 1)
         .filter((agent) => agentVisibleToRequest(agent, req))
         .map((agent) => realityRankForAgent(data, {
           agent,
@@ -1902,8 +2108,15 @@ export async function createApp({
         ? activeAgentWorkspaceForSession(data, requestedSession)
         : null;
       const requestedAgentWorkspaceIds = new Set(requestedAgentWorkspace?.agent_ids || []);
-      const runtimeAgents = realRuntimeEnabled() ? (await fetchRuntimeAgents()).agents || [] : data.agents;
-      const localById = new Map(data.agents.map((agent) => [agent.id, agent]));
+      const useRuntimeCatalog = realRuntimeEnabled();
+      const runtimeAgents = useRuntimeCatalog ? (await fetchRuntimeAgents()).agents || [] : data.agents;
+      const localCounts = countResourceIds(data.agents, "id");
+      const localById = new Map(data.agents
+        .filter((agent) => agent?.id && localCounts.get(agent.id) === 1)
+        .map((agent) => [agent.id, agent]));
+      const runtimeCounts = countResourceIds(runtimeAgents, "id");
+      const metricSteps = agentMetricRunStepsForRequest(data, req);
+      const metricsByAgent = aggregateAgentStepMetrics(metricSteps);
       const q = String(req.query.q || "").toLowerCase();
       const tool = req.query.tool;
       const mounted = req.query.mounted;
@@ -1922,7 +2135,8 @@ export async function createApp({
       });
       const offset = normalizeListOffset(req.query.offset);
       const visibleAgents = runtimeAgents
-      .map((agent) => mergeRuntimeAgentMetadata(agent, localById))
+      .filter((agent) => agent?.id && runtimeCounts.get(agent.id) === 1)
+      .map((agent) => useRuntimeCatalog ? mergeRuntimeAgentMetadata(agent, localById) : agent)
       .filter((agent) => agentVisibleToRequest(agent, req))
       .filter((agent) => agentAvailableForSession(agent, requestedSession?.session_id || null))
       .filter((agent) => !q || `${agent.id} ${agent.title} ${agent.capability}`.toLowerCase().includes(q))
@@ -1934,29 +2148,30 @@ export async function createApp({
       .filter((agent) => stageMax === null || Number(agent.stage || 0) <= stageMax);
       const agents = visibleAgents
       .slice(offset, offset + limit)
-      .map((agent) => ({
-        ...agent,
-        item_type: agentItemType(agent),
-        agent_workspace_member: requestedAgentWorkspace
-          ? requestedAgentWorkspaceIds.has(agent.id)
-          : null,
-        session_active: requestedSession
-          ? !new Set(requestedSession.inactive_agent_ids || []).has(agent.id)
-          : agent.enabled !== false && agent.mounted !== false,
-        agent_revision: agentRevision(agent),
-        reality_rank: realityRankForAgent(data, {
-          agent,
-          workspaceId: req.auth.workspace_id
-        }),
-        usage_count: data.runSteps.filter((step) => step.adapter === agent.id).length,
-        average_latency: average(data.runSteps.filter((step) => step.adapter === agent.id).map((step) => step.elapsed_sec || 0)),
-        policy_violation_count: data.runSteps
-          .filter((step) => step.adapter === agent.id)
-          .reduce((total, step) => total + (step.policy_violations?.length || 0), 0),
-        last_validation_status: agent.mount_pending ? "pending_mount" : agent.enabled === false ? "archived" : "valid",
-        last_edited_by: agent.last_edited_by || "system",
-        last_edited_at: agent.last_edited_at || null
-      }))
+      .map((agent) => {
+        const metrics = metricsByAgent.get(agent.id) || { usage_count: 0, elapsed: [], policy_violation_count: 0 };
+        return {
+          ...agent,
+          item_type: agentItemType(agent),
+          agent_workspace_member: requestedAgentWorkspace
+            ? requestedAgentWorkspaceIds.has(agent.id)
+            : null,
+          session_active: requestedSession
+            ? !new Set(requestedSession.inactive_agent_ids || []).has(agent.id)
+            : agent.enabled !== false && agent.mounted !== false,
+          agent_revision: agentRevision(agent),
+          reality_rank: realityRankForAgent(data, {
+            agent,
+            workspaceId: req.auth.workspace_id
+          }),
+          usage_count: metrics.usage_count,
+          average_latency: average(metrics.elapsed),
+          policy_violation_count: metrics.policy_violation_count,
+          last_validation_status: agent.mount_pending ? "pending_mount" : agent.enabled === false ? "archived" : "valid",
+          last_edited_by: agent.last_edited_by || "system",
+          last_edited_at: agent.last_edited_at || null
+        };
+      })
       .map((agent) => redactAgentForRequest(agent, req));
       res.json({
         agents,
@@ -2277,7 +2492,7 @@ export async function createApp({
   app.get("/api/agents/:agent_id", async (req, res, next) => {
     try {
       if (realRuntimeEnabled()) {
-        const localAgent = store.read().agents.find((item) => item.id === req.params.agent_id);
+        const localAgent = uniqueStoredAgent(store.read(), req.params.agent_id, { allowMissing: true });
         let runtimeResult;
         try {
           runtimeResult = await fetchRuntimeAgent(req.params.agent_id);
@@ -2318,11 +2533,7 @@ export async function createApp({
         return;
       }
       const data = store.read();
-      const agent = data.agents.find((item) => item.id === req.params.agent_id);
-      if (!agent) {
-        throwStatus(404, "Agent not found.");
-      }
-      assertAgentAccess(agent, req);
+      const agent = findAccessibleAgent(data, req.params.agent_id, req);
       res.json(redactAgentForRequest({
         ...agent,
         agent_revision: agentRevision(agent),
@@ -2364,9 +2575,7 @@ export async function createApp({
         subjectChain
       });
       const visibility = agentVisibilityForRequest(req, req.body.visibility, "private");
-      const workspaceId = visibility === "global"
-        ? null
-        : requestWorkspaceId(req, req.body.workspace_id);
+      const workspaceId = requestWorkspaceId(req, req.body.workspace_id);
       const createdBy = normalizeAdoptedAgentOwner(req.body.created_by, req.auth.user_id);
       const adopted = await store.mutate((data) => {
         if (data.agents.some((agent) => agent.id === runtimeAgent.id)) {
@@ -2414,10 +2623,7 @@ export async function createApp({
   app.get("/api/agents/:agent_id/reality-rank", (req, res, next) => {
     try {
       const data = store.read();
-      const agent = data.agents.find((item) => item.id === req.params.agent_id);
-      if (!agent || !agentVisibleToRequest(agent, req)) {
-        throwStatus(404, "Agent not found.");
-      }
+      const agent = findAccessibleAgent(data, req.params.agent_id, req);
       res.json(realityRankForAgent(data, {
         agent,
         workspaceId: requestWorkspaceId(req, req.query.workspace_id),
@@ -2432,11 +2638,11 @@ export async function createApp({
   app.get("/api/agents/:agent_id/events", (req, res, next) => {
     try {
       const data = store.read();
-      const agent = data.agents.find((item) => item.id === req.params.agent_id);
-      if (!agent || !agentVisibleToRequest(agent, req)) {
-        throwStatus(404, "Agent not found.");
-      }
-      const events = (data.agentEvents || []).filter((event) => event.agent_id === agent.id);
+      const agent = findAccessibleAgent(data, req.params.agent_id, req);
+      const events = (data.agentEvents || []).filter((event) => (
+        event.agent_id === agent.id
+        && String(event.workspace_id || "") === String(agent.workspace_id || "")
+      ));
       res.json({
         agent_id: agent.id,
         agent_revision: agentRevision(agent),
@@ -2657,7 +2863,7 @@ export async function createApp({
   app.patch("/api/agents/:agent_id", async (req, res, next) => {
     let lifecycleIntent = null;
     try {
-      const localAgent = store.read().agents.find((item) => item.id === req.params.agent_id);
+      const localAgent = uniqueStoredAgent(store.read(), req.params.agent_id, { allowMissing: true });
       assertAgentMutationAccess(localAgent, req);
       if (realRuntimeEnabled() && !localAgent) {
         throwStatus(409, "Adopt the runtime-only agent before editing it through virenis.");
@@ -2706,7 +2912,7 @@ export async function createApp({
         const updated = await persistRuntimeLifecycleCompletion(() => store.mutate((data) => {
           const activeIntent = (data.runtimeLifecycleIntents || [])
             .find((candidate) => candidate.intent_id === lifecycleIntent.intent_id);
-          const existing = data.agents.find((item) => item.id === req.params.agent_id);
+          const existing = uniqueStoredAgent(data, req.params.agent_id, { allowMissing: true });
           if (!activeIntent) return existing || runtimeAgent;
           if (existing) {
             Object.assign(existing, runtimeAgent, {
@@ -2752,7 +2958,7 @@ export async function createApp({
         return;
       }
       const updated = await store.mutate((data) => {
-        const agent = data.agents.find((item) => item.id === req.params.agent_id);
+        const agent = uniqueStoredAgent(data, req.params.agent_id, { allowMissing: true });
         if (!agent) {
           throwStatus(404, "Agent not found.");
         }
@@ -2793,7 +2999,7 @@ export async function createApp({
     let runtimeMutationCommitted = false;
     try {
       const snapshot = store.read();
-      const localAgent = snapshot.agents.find((item) => item.id === req.params.agent_id);
+      const localAgent = uniqueStoredAgent(snapshot, req.params.agent_id, { allowMissing: true });
       assertAgentMutationAccess(localAgent, req);
       assertArchivedAgentCanBeDeleted(snapshot, localAgent);
 
@@ -2854,7 +3060,7 @@ export async function createApp({
   app.delete("/api/agents/:agent_id", async (req, res, next) => {
     let lifecycleIntent = null;
     try {
-      const localAgent = store.read().agents.find((item) => item.id === req.params.agent_id);
+      const localAgent = uniqueStoredAgent(store.read(), req.params.agent_id, { allowMissing: true });
       assertAgentMutationAccess(localAgent, req);
       if (realRuntimeEnabled() && !localAgent) {
         throwStatus(409, "Adopt the runtime-only agent before archiving it through virenis.");
@@ -2874,7 +3080,7 @@ export async function createApp({
         await persistRuntimeLifecycleCompletion(() => store.mutate((data) => {
           const activeIntent = (data.runtimeLifecycleIntents || [])
             .find((candidate) => candidate.intent_id === lifecycleIntent.intent_id);
-          const existing = data.agents.find((item) => item.id === req.params.agent_id);
+          const existing = uniqueStoredAgent(data, req.params.agent_id, { allowMissing: true });
           if (!activeIntent) return existing;
           if (existing) {
             existing.enabled = false;
@@ -2916,7 +3122,7 @@ export async function createApp({
         return;
       }
       const archived = await store.mutate((data) => {
-        const agent = data.agents.find((item) => item.id === req.params.agent_id);
+        const agent = uniqueStoredAgent(data, req.params.agent_id, { allowMissing: true });
         if (!agent) {
           throwStatus(404, "Agent not found.");
         }
@@ -2946,7 +3152,7 @@ export async function createApp({
       const snapshot = store.read();
       const resourceForAgentId = String(req.body.resource_for_agent_id || "").trim() || null;
       if (resourceForAgentId) {
-        const parentAgent = snapshot.agents.find((item) => item.id === resourceForAgentId);
+        const parentAgent = uniqueStoredAgent(snapshot, resourceForAgentId, { allowMissing: true });
         assertAgentMutationAccess(parentAgent, req);
         if (parentAgent?.document) {
           throwStatus(400, "Knowledge can be attached only to a standard agent.");
@@ -4232,10 +4438,11 @@ function optionalApplicationAuth(identityManager, clerkAdapter) {
       if (clerkAdapter.enabled) {
         const clerkAuth = clerkAdapter.getAuth(req);
         req.clerkAuth = clerkAuth;
+        const allowAccountDeletion = req.method === "DELETE" && req.path === "/api/account";
         const clerkIdentity = await identityManager.resolveAuthenticated({
           ...clerkAuth,
           isAuthenticated: Boolean(clerkAuth?.userId)
-        });
+        }, { allowAccountDeletion });
         if (clerkIdentity) {
           req.auth = clerkIdentity;
           next();
@@ -4254,6 +4461,36 @@ function optionalApplicationAuth(identityManager, clerkAdapter) {
         return;
       }
       authenticationRequired(req, res, { basicConfigured, identityConfigured });
+    } catch (error) {
+      next(error);
+    }
+  };
+}
+
+function trackAuthenticatedIdentityRequest(identityManager) {
+  return function trackRequest(req, res, next) {
+    if (!req.auth) {
+      next();
+      return;
+    }
+    const allowAccountDeletion = req.auth.auth_type === "clerk"
+      && req.method === "DELETE"
+      && req.path === "/api/account";
+    try {
+      const release = identityManager.beginAuthenticatedRequest(req.auth, { allowAccountDeletion });
+      if (!allowAccountDeletion) {
+        let released = false;
+        const finish = () => {
+          if (released) return;
+          released = true;
+          res.off("finish", finish);
+          res.off("close", finish);
+          release();
+        };
+        res.once("finish", finish);
+        res.once("close", finish);
+      }
+      next();
     } catch (error) {
       next(error);
     }
@@ -4315,9 +4552,29 @@ function bearerTokenIdentity(header, configured = parseConfiguredApiTokens()) {
   return null;
 }
 
-async function purgeExternalAccountResources({ resources, actor, mcpCredentialKey }) {
+async function purgeExternalAccountResources({
+  resources,
+  actor,
+  mcpCredentialKey,
+  accountStore,
+  resourceRevision,
+  completedPurgeKeys = new Set(),
+  onPurgeComplete = async () => undefined
+}) {
+  const purgeKey = (suffix) => revisionBoundExternalPurgeKey(resourceRevision, suffix);
+  for (const state of resources.mcp_oauth_revocations || []) {
+    const receiptKey = purgeKey(`mcp-oauth-revocation:${state.oauth_state_id}`);
+    if (completedPurgeKeys.has(receiptKey)) continue;
+    await revokePendingMcpOAuthState(state, { key: mcpCredentialKey, store: accountStore });
+    await onPurgeComplete(receiptKey);
+    completedPurgeKeys.add(receiptKey);
+  }
   for (const connection of resources.mcp_connections || []) {
+    const receiptKey = purgeKey(`mcp:${connection.connection_id}`);
+    if (completedPurgeKeys.has(receiptKey)) continue;
     await revokeMcpConnection(connection, { key: mcpCredentialKey });
+    await onPurgeComplete(receiptKey);
+    completedPurgeKeys.add(receiptKey);
   }
   if (!realRuntimeEnabled()) return;
   const auditContext = {
@@ -4331,13 +4588,19 @@ async function purgeExternalAccountResources({ resources, actor, mcpCredentialKe
   );
   for (const agent of standaloneAgents) {
     if (agent.enabled === false) continue;
+    const receiptKey = purgeKey(`runtime-agent-archive:${agent.id}`);
+    if (completedPurgeKeys.has(receiptKey)) continue;
     try {
       await archiveRuntimeAgent(agent.id, auditContext);
     } catch (error) {
       if (![404, 409].includes(Number(error?.status))) throw error;
     }
+    await onPurgeComplete(receiptKey);
+    completedPurgeKeys.add(receiptKey);
   }
   for (const document of resources.documents || []) {
+    const receiptKey = purgeKey(`runtime-document:${document.agent_id}:${document.runtime_registration_id || "default"}`);
+    if (completedPurgeKeys.has(receiptKey)) continue;
     try {
       await deleteRuntimeDocument(
         document.agent_id,
@@ -4347,32 +4610,57 @@ async function purgeExternalAccountResources({ resources, actor, mcpCredentialKe
     } catch (error) {
       if (Number(error?.status) !== 404) throw error;
     }
+    await onPurgeComplete(receiptKey);
+    completedPurgeKeys.add(receiptKey);
   }
   for (const agent of standaloneAgents) {
+    const receiptKey = purgeKey(`runtime-agent-delete:${agent.id}`);
+    if (completedPurgeKeys.has(receiptKey)) continue;
     try {
       await deleteArchivedRuntimeAgent(agent.id, auditContext);
     } catch (error) {
       if (Number(error?.status) !== 404) throw error;
     }
+    await onPurgeComplete(receiptKey);
+    completedPurgeKeys.add(receiptKey);
   }
+}
+
+function revisionBoundExternalPurgeKey(resourceRevision, suffix) {
+  const revision = String(resourceRevision || "");
+  if (!/^[0-9a-f]{64}$/.test(revision)) {
+    const error = new Error("Account deletion resource revision is invalid.");
+    error.status = 503;
+    error.code = "account_deletion_revision_invalid";
+    throw error;
+  }
+  return `revision:${revision}:${String(suffix || "")}`;
 }
 
 async function deleteClerkAccountFromWebhook({
   clerkUserId,
   identityManager,
-  mcpCredentialKey,
-  uploadRoot
+  performAccountDeletion,
+  uploadRoot,
+  documentRootPurger
 }) {
   const actor = identityManager.actorForClerkUserId(clerkUserId);
-  if (!actor) return { ok: true, already_deleted: true };
-  const resources = identityManager.resourcesForActor(actor);
-  if (!resources) return { ok: true, already_deleted: true };
-  await purgeExternalAccountResources({ resources, actor, mcpCredentialKey });
-  const result = await identityManager.deleteAccount(actor);
-  const documentRoots = result?.document_roots
-    || (resources.documents || []).map((document) => document.document_root).filter(Boolean);
-  await purgeLocalDocumentRoots(uploadRoot, documentRoots);
+  if (!actor) {
+    await identityManager.runAccountDeletion(deletedClerkCoordinatorKey(clerkUserId), async () => {
+      const pending = identityManager.pendingDocumentCleanupForClerkUserId(clerkUserId);
+      if (!pending) return null;
+      await documentRootPurger(uploadRoot, pending.document_roots);
+      await identityManager.completeDocumentCleanup(clerkUserId, pending.deletion_id);
+      return pending;
+    });
+    return { ok: true, already_deleted: true };
+  }
+  const { result } = await performAccountDeletion({ actor, providerInitiated: true });
   return { ok: true, already_deleted: !result };
+}
+
+function deletedClerkCoordinatorKey(clerkUserId) {
+  return `tombstone:${crypto.createHash("sha256").update(`clerk:${String(clerkUserId || "")}`, "utf8").digest("hex")}`;
 }
 
 function deletedAccountResourceCounts(resources = {}) {
@@ -4559,6 +4847,9 @@ function canAccessWorkspace(req, workspaceId) {
 }
 
 function canAccessResource(req, resource = {}) {
+  if (!resource.workspace_id) {
+    return resource.system_managed === true && resource.visibility === "global";
+  }
   if (!canAccessWorkspace(req, resource.workspace_id)) {
     return false;
   }
@@ -4582,7 +4873,10 @@ function agentVisibilityForRequest(req, requested, adminDefault = "global") {
 function agentOwnershipForRequest(req, body = {}) {
   const visibility = agentVisibilityForRequest(req, body.visibility, "global");
   return {
-    workspace_id: isAdmin(req) && visibility === "global" ? null : requestWorkspaceId(req, body.workspace_id),
+    // Cross-tenant sharing is an explicit Marketplace operation. Even an
+    // administrator-created global/team agent remains attached to a workspace;
+    // only the signed-in product catalog is intentionally unscoped.
+    workspace_id: requestWorkspaceId(req, body.workspace_id),
     visibility,
     created_by: req.auth.user_id
   };
@@ -4625,11 +4919,12 @@ function ownedAgentSourcePath(agentId) {
   return `sources/router_agents/${agentId}/source.md`;
 }
 
-function activeAgentDependents(data, agentId) {
-  const resourceToken = `agent:${agentId}`;
-  const handoffToken = `agent:${agentId}:output`;
+function activeAgentDependents(data, agent) {
+  const resourceToken = `agent:${agent.id}`;
+  const handoffToken = `agent:${agent.id}:output`;
   return data.agents.filter((candidate) =>
-    candidate.id !== agentId
+    candidate.id !== agent.id
+    && String(candidate.workspace_id || "") === String(agent.workspace_id || "")
     && candidate.enabled !== false
     && (
       (candidate.resources || []).includes(resourceToken)
@@ -4649,7 +4944,7 @@ function assertArchivedAgentCanBeDeleted(data, agent) {
   if (agent.document || agent.resource_for_agent_id) {
     throwStatus(409, "Document agents must be removed from the Knowledge tab.");
   }
-  const dependents = activeAgentDependents(data, agent.id);
+  const dependents = activeAgentDependents(data, agent);
   if (dependents.length) {
     const names = dependents.slice(0, 3).map((candidate) => candidate.title || candidate.id).join(", ");
     throwStatus(409, `Disconnect this agent from active agents before deleting it: ${names}.`);
@@ -5038,11 +5333,11 @@ function mergeRuntimeAgentMetadata(agent, localById) {
 }
 
 function agentVisibleToRequest(agent, req) {
-  if (agent.runtime_only && !isAdmin(req)) {
-    return false;
-  }
-  if (!agent.workspace_id) {
-    return true;
+  if (agent.runtime_only) {
+    // Unadopted Runtime records are administrative inventory, never tenant
+    // routing candidates. Admin visibility is needed for the explicit adoption
+    // flow and does not grant execution or mutation ownership.
+    return isAdmin(req);
   }
   return canAccessResource(req, agent);
 }
@@ -5225,6 +5520,19 @@ function findAccessibleDocument(data, documentId, req) {
   return doc;
 }
 
+function uniqueStoredAgent(data, agentId, { allowMissing = false } = {}) {
+  const matches = (data.agents || []).filter((agent) => agent.id === agentId);
+  if (matches.length === 0 && allowMissing) return null;
+  if (matches.length !== 1) throwStatus(404, "Agent not found.");
+  return matches[0];
+}
+
+function findAccessibleAgent(data, agentId, req) {
+  const agent = uniqueStoredAgent(data, agentId);
+  if (!agentVisibleToRequest(agent, req)) throwStatus(404, "Agent not found.");
+  return agent;
+}
+
 function findAccessibleExecution(data, executionId, req) {
   const record = (data.executionRecords || []).find((item) => item.execution_id === executionId);
   if (!record || !canAccessResource(req, record)) {
@@ -5294,6 +5602,56 @@ function assertDocumentMutationAccess(document, req) {
   }
 }
 
+function currentWorldGraphPreview(data, run, { runtimeComponentProvenance = null } = {}) {
+  const session = data.sessions.find((item) => item.session_id === run.session_id) || null;
+  if (!session) {
+    return previewWorldGraphRun({
+      data,
+      run,
+      session: null,
+      agents: [],
+      documents: [],
+      sharedMemory: [],
+      options: run.execution_options || {}
+    });
+  }
+  const agentWorkspace = (data.agentWorkspaces || []).find((workspace) => (
+    workspace.agent_workspace_id === session.agent_workspace_id
+    && String(workspace.workspace_id || "") === String(session.workspace_id || "")
+    && workspace.created_by === session.created_by
+  )) || null;
+  const scoped = scopedRoutingContext({
+    session,
+    agents: data.agents,
+    documents: data.documents,
+    agentWorkspace
+  });
+  const refreshOptions = normalizeChatOptions(publicRunExecutionOptions(run.execution_options), {
+    outputSettings: modelOutputSettingsForWorkspace(data, session.workspace_id)
+  });
+  return previewWorldGraphRun({
+    data,
+    run,
+    session,
+    agents: scoped.agents,
+    documents: scoped.documents,
+    sharedMemory: normalizeSharedMemory(session.shared_memory || []),
+    options: refreshOptions,
+    runtimeComponentProvenance,
+    targetAgentWorkspaceId: session.agent_workspace_id || null
+  });
+}
+
+function publicRunExecutionOptions(options = {}) {
+  const allowed = [
+    "show_route_details", "planner_mode", "planner_max_tokens", "max_routing_adapters",
+    "parallel_workers", "max_tokens", "refiner_max_tokens", "temperature"
+  ];
+  return Object.fromEntries(allowed
+    .filter((key) => Object.hasOwn(options || {}, key))
+    .map((key) => [key, options[key]]));
+}
+
 function readRunResult(store, runId, req) {
   const data = store.read();
   const run = findAccessibleRun(data, runId, req);
@@ -5314,6 +5672,7 @@ function readRunResult(store, runId, req) {
   return {
     run_id: run.run_id,
     session_id: run.session_id,
+    agent_workspace_id: run.agent_workspace_id || null,
     status: run.status,
     query: run.query,
     final_answer: run.final_answer || "",
@@ -5327,6 +5686,8 @@ function readRunResult(store, runId, req) {
       })),
     sources: (run.sources || []).map((source) => redactSourceForRequest(source, req)),
     policy_events: run.policy_events || [],
+    world_graph: publicWorldGraphRun(run),
+    execution_options: publicRunExecutionOptions(run.execution_options),
     token_accounting: run.token_accounting || null,
     usage_receipt: usageReceipt,
     billing: run.billing || null,
@@ -5882,6 +6243,7 @@ function normalizeChatOptions(options = {}, { outputSettings = null } = {}) {
   }
   const clientKeys = new Set([
     "show_route_details",
+    "run_fresh",
     "planner_mode",
     "planner_max_tokens",
     "max_routing_adapters",
@@ -5927,6 +6289,7 @@ function normalizeChatOptions(options = {}, { outputSettings = null } = {}) {
   );
   return {
     show_route_details: options.show_route_details !== false,
+    run_fresh: options.run_fresh === true,
     planner_mode: plannerMode,
     planner_max_tokens: boundedInt(options.planner_max_tokens, Number(process.env.TCAR_PLANNER_MAX_TOKENS || 384), plannerMode === "session" ? 256 : 32, Number(process.env.TCAR_CLIENT_MAX_PLANNER_TOKENS || 512)),
     max_routing_adapters: boundedInt(options.max_routing_adapters, Number(process.env.TCAR_MAX_ROUTING_ADAPTERS || 12), 1, Number(process.env.TCAR_CLIENT_MAX_ROUTING_ADAPTERS || 24)),
@@ -6616,6 +6979,7 @@ async function cleanupDeclinedWorkflowAgents({ store, workflowId, actor }) {
 
 function preflightWorkflowActivation({ workflow, snapshot, actor }) {
   const agentsById = new Map((snapshot.agents || []).map((agent) => [agent.id, agent]));
+  const agentIdCounts = countResourceIds(snapshot.agents || [], "id");
   const connectionsById = new Map((snapshot.mcpConnections || []).map((connection) => [connection.connection_id, connection]));
   for (const node of workflow.nodes.filter((item) => item.type === "agent")) {
     let requiresCreatedAgent = node.source === "generated" || node.source === "marketplace";
@@ -6623,6 +6987,7 @@ function preflightWorkflowActivation({ workflow, snapshot, actor }) {
       const source = agentsById.get(node.agent_id);
       if (
         !source
+        || agentIdCounts.get(node.agent_id) !== 1
         || source.enabled === false
         || source.ready === false
         || source.mounted === false
@@ -6886,7 +7251,9 @@ function workflowAgentId(workflow, node) {
 }
 
 function workflowAgentAccessible(agent, actor) {
-  if (!agent.workspace_id) return true;
+  if (!agent.workspace_id) {
+    return agent.system_managed === true && agent.visibility === "global";
+  }
   if (String(agent.workspace_id) !== String(actor.workspace_id)) return false;
   return agent.visibility !== "private" || agent.created_by === actor.user_id;
 }
@@ -7331,14 +7698,31 @@ function agentWorkspaceListingId(workspace = {}) {
 }
 
 function agentWorkspaceMarketplaceSnapshot(data, workspace) {
-  const members = new Set(workspace.agent_ids || []);
-  const agents = (workspace.agent_ids || []).flatMap((agentId) => {
-    const agent = (data.agents || []).find((candidate) => candidate.id === agentId && candidate.enabled !== false);
-    return agent ? [{ source_agent_id: agent.id, agent: marketplaceAgentSnapshot(agent) }] : [];
+  const selectedAgents = (workspace.agent_ids || []).flatMap((agentId) => {
+    const candidates = (data.agents || []).filter((candidate) => (
+      candidate.id === agentId
+      && candidate.enabled !== false
+      && (
+        (
+          !candidate.workspace_id
+          && candidate.system_managed === true
+          && candidate.visibility === "global"
+        )
+        || (
+          String(candidate.workspace_id || "") === String(workspace.workspace_id || "")
+          && (candidate.visibility !== "private" || candidate.created_by === workspace.created_by)
+        )
+      )
+    ));
+    return candidates.length === 1 ? candidates : [];
   }).slice(0, AGENT_WORKSPACE_MAX_AGENTS);
+  const members = new Set(selectedAgents.map((agent) => agent.id));
+  const agents = selectedAgents.map((agent) => ({
+    source_agent_id: agent.id,
+    agent: marketplaceAgentSnapshot(agent)
+  }));
   const edges = [];
-  for (const target of data.agents || []) {
-    if (!members.has(target.id)) continue;
+  for (const target of selectedAgents) {
     for (const input of target.consumes || []) {
       const sourceId = String(input).match(/^agent:([a-z0-9_]+):output$/)?.[1];
       if (sourceId && members.has(sourceId) && sourceId !== target.id) {
@@ -7884,6 +8268,56 @@ function generateSkillMarkdown(agent) {
 function average(values) {
   if (values.length === 0) return 0;
   return Number((values.reduce((total, value) => total + value, 0) / values.length).toFixed(3));
+}
+
+function countResourceIds(resources, field) {
+  const counts = new Map();
+  for (const resource of resources || []) {
+    const id = resource?.[field];
+    if (!id) continue;
+    counts.set(id, (counts.get(id) || 0) + 1);
+  }
+  return counts;
+}
+
+function agentMetricRunStepsForRequest(data, req) {
+  const sessionsById = new Map();
+  for (const session of data.sessions || []) {
+    const candidates = sessionsById.get(session.session_id) || [];
+    candidates.push(session);
+    sessionsById.set(session.session_id, candidates);
+  }
+  const runIdCounts = countResourceIds(data.runs || [], "run_id");
+  const visibleRunIds = new Set();
+  for (const run of data.runs || []) {
+    if (!run.run_id || runIdCounts.get(run.run_id) !== 1) continue;
+    const sessions = sessionsById.get(run.session_id) || [];
+    if (sessions.length !== 1) continue;
+    const session = sessions[0];
+    if (
+      !run.workspace_id
+      || !run.created_by
+      || String(run.workspace_id) !== String(session.workspace_id || "")
+      || run.created_by !== session.created_by
+      || !canAccessResource(req, session)
+    ) continue;
+    visibleRunIds.add(run.run_id);
+  }
+  return (data.runSteps || []).filter((step) => visibleRunIds.has(step.run_id));
+}
+
+function aggregateAgentStepMetrics(steps) {
+  const metrics = new Map();
+  for (const step of steps || []) {
+    const id = String(step?.adapter || "");
+    if (!id) continue;
+    const current = metrics.get(id) || { usage_count: 0, elapsed: [], policy_violation_count: 0 };
+    current.usage_count += 1;
+    current.elapsed.push(Number(step.elapsed_sec) || 0);
+    current.policy_violation_count += Array.isArray(step.policy_violations) ? step.policy_violations.length : 0;
+    metrics.set(id, current);
+  }
+  return metrics;
 }
 
 function assertMcpGatewayRequest(req) {

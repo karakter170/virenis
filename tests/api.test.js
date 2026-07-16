@@ -8,6 +8,7 @@ import { createApp } from "../server/app.js";
 import { requireRuntimeConfigured, setRuntimeFetchForTests } from "../server/runtimeClient.js";
 import { buildParallelBatches, enrichRuntimeRoutingTrace, normalizeRuntimeRouting, normalizeSharedMemory, planRoutes, sanitizeRuntimeFinalAnswer, sanitizeToolCalls, scopedRoutingContext } from "../server/tcarEngine.js";
 import { chunkDocument, runtimeDocumentRevision } from "../server/documents.js";
+import { appendAgentEvent } from "../server/outcomes.js";
 
 let tmpDir;
 let app;
@@ -148,8 +149,8 @@ describe("runtime and catalog", () => {
       documents: []
     });
 
-    expect(context.allowedAdapters).toEqual(["active_lora", "legacy_active_lora"]);
-    expect(context.agents.map((agent) => agent.id)).toEqual(["active_lora", "legacy_active_lora"]);
+    expect(context.allowedAdapters).toEqual(["active_lora"]);
+    expect(context.agents.map((agent) => agent.id)).toEqual(["active_lora"]);
   });
 
   it("honors session-only agent deactivation in the routing scope", () => {
@@ -161,8 +162,8 @@ describe("runtime and catalog", () => {
         inactive_agent_ids: ["paused_lora"]
       },
       agents: [
-        { id: "paused_lora", enabled: true, mounted: true },
-        { id: "ready_lora", enabled: true, mounted: true }
+        { id: "paused_lora", workspace_id: "workspace_a", visibility: "private", created_by: "alice", enabled: true, mounted: true },
+        { id: "ready_lora", workspace_id: "workspace_a", visibility: "private", created_by: "alice", enabled: true, mounted: true }
       ],
       documents: []
     });
@@ -2271,6 +2272,13 @@ describe("runtime and catalog", () => {
         })
         .expect(201);
 
+      const bobAgentsAfterAdminCreate = await request(app)
+        .get("/api/agents")
+        .set("Authorization", "Bearer token_b")
+        .expect(200);
+      expect(bobAgentsAfterAdminCreate.body.agents.map((agent) => agent.id))
+        .not.toContain("tenant_admin_lora");
+
       await request(app)
         .delete("/api/agents/tenant_private_lora")
         .set("Authorization", "Bearer token_a")
@@ -2281,6 +2289,154 @@ describe("runtime and catalog", () => {
       } else {
         process.env.APP_API_TOKENS_JSON = previousTokens;
       }
+    }
+  });
+
+  it("keeps per-agent metrics and audit events inside the requesting tenant", async () => {
+    const previousTokens = process.env.APP_API_TOKENS_JSON;
+    process.env.APP_API_TOKENS_JSON = JSON.stringify({
+      metric_alice_token: { user_id: "alice", workspace_id: "workspace_a", role: "user" },
+      metric_bob_token: { user_id: "bob", workspace_id: "workspace_b", role: "user" }
+    });
+    try {
+      await app.locals.store.mutate((data) => {
+        const template = data.agents.find((agent) => agent.id === "finance_reasoning_lora");
+        const metricAgent = {
+          ...template,
+          id: "tenant_metric_agent",
+          title: "Tenant metric agent",
+          workspace_id: "workspace_a",
+          visibility: "private",
+          created_by: "alice",
+          system_managed: false
+        };
+        data.agents.push(metricAgent);
+        data.sessions.push(
+          {
+            session_id: "metric_session_alice",
+            workspace_id: "workspace_a",
+            created_by: "alice",
+            visibility: "private"
+          },
+          {
+            session_id: "metric_session_bob",
+            workspace_id: "workspace_b",
+            created_by: "bob",
+            visibility: "private"
+          }
+        );
+        data.runs.push(
+          {
+            run_id: "metric_run_alice",
+            session_id: "metric_session_alice",
+            workspace_id: "workspace_a",
+            created_by: "alice"
+          },
+          {
+            run_id: "metric_run_bob",
+            session_id: "metric_session_bob",
+            workspace_id: "workspace_b",
+            created_by: "bob"
+          }
+        );
+        data.runSteps.push(
+          {
+            step_id: "metric_step_alice",
+            run_id: "metric_run_alice",
+            adapter: metricAgent.id,
+            elapsed_sec: 0.25,
+            policy_violations: ["alice-visible"]
+          },
+          {
+            step_id: "metric_step_bob",
+            run_id: "metric_run_bob",
+            adapter: metricAgent.id,
+            elapsed_sec: 99,
+            policy_violations: ["bob-secret-one", "bob-secret-two"]
+          }
+        );
+        appendAgentEvent(data, {
+          eventType: "agent.metric_alice",
+          agent: metricAgent,
+          actor: { user_id: "alice", role: "user" }
+        });
+        appendAgentEvent(data, {
+          eventType: "agent.metric_bob",
+          agent: { ...metricAgent, workspace_id: "workspace_b", created_by: "bob" },
+          actor: { user_id: "bob", role: "user" }
+        });
+        return null;
+      });
+
+      const list = await request(app)
+        .get("/api/agents")
+        .set("Authorization", "Bearer metric_alice_token")
+        .expect(200);
+      const metricAgent = list.body.agents.find((agent) => agent.id === "tenant_metric_agent");
+      expect(metricAgent).toMatchObject({
+        usage_count: 1,
+        average_latency: 0.25,
+        policy_violation_count: 1
+      });
+
+      const events = await request(app)
+        .get("/api/agents/tenant_metric_agent/events")
+        .set("Authorization", "Bearer metric_alice_token")
+        .expect(200);
+      expect(events.body.events.map((event) => event.event_type)).toEqual(["agent.metric_alice"]);
+      expect(events.body.event_chain_valid).toBe(true);
+      expect(JSON.stringify({ list: metricAgent, events: events.body }))
+        .not.toContain("bob-secret");
+    } finally {
+      if (previousTokens === undefined) delete process.env.APP_API_TOKENS_JSON;
+      else process.env.APP_API_TOKENS_JSON = previousTokens;
+    }
+  });
+
+  it("does not reveal or honor a foreign tenant's injected dependency during deletion", async () => {
+    const previousTokens = process.env.APP_API_TOKENS_JSON;
+    process.env.APP_API_TOKENS_JSON = JSON.stringify({
+      delete_scope_alice: { user_id: "alice", workspace_id: "workspace_a", role: "user" },
+      delete_scope_bob: { user_id: "bob", workspace_id: "workspace_b", role: "user" }
+    });
+    try {
+      await request(app)
+        .post("/api/agents")
+        .set("Authorization", "Bearer delete_scope_alice")
+        .send({
+          id: "alice_scoped_delete_target",
+          title: "Alice scoped delete target",
+          capability: "Proves deletion dependency isolation.",
+          boundary: "Stay in Alice's workspace."
+        })
+        .expect(201);
+      await app.locals.store.mutate((data) => {
+        const template = data.agents.find((agent) => agent.id === "finance_reasoning_lora");
+        data.agents.push({
+          ...template,
+          id: "bob_secret_dependency",
+          title: "Bob confidential dependency title",
+          workspace_id: "workspace_b",
+          visibility: "private",
+          created_by: "bob",
+          system_managed: false,
+          resources: ["agent:alice_scoped_delete_target"]
+        });
+        return null;
+      });
+
+      await request(app)
+        .delete("/api/agents/alice_scoped_delete_target")
+        .set("Authorization", "Bearer delete_scope_alice")
+        .expect(200);
+      const deleted = await request(app)
+        .delete("/api/agents/alice_scoped_delete_target/permanent")
+        .set("Authorization", "Bearer delete_scope_alice")
+        .expect(200);
+      expect(JSON.stringify(deleted.body)).not.toContain("Bob confidential");
+    } finally {
+      if (previousTokens === undefined) delete process.env.APP_API_TOKENS_JSON;
+      else process.env.APP_API_TOKENS_JSON = previousTokens;
     }
   });
 

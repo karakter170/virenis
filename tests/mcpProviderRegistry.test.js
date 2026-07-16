@@ -9,7 +9,11 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { createApp } from "../server/app.js";
 import { decryptMcpValue, encryptMcpValue } from "../server/mcp.js";
-import { publicManagedMcpProviders } from "../server/mcpOAuth.js";
+import {
+  managedMcpProvider,
+  publicManagedMcpProviders,
+  revokeManagedCredential
+} from "../server/mcpOAuth.js";
 
 const TOKEN = "managed-registry-owner-token";
 const SECOND_TOKEN = "managed-registry-second-token";
@@ -27,7 +31,14 @@ const ENV_KEYS = [
   "APP_MCP_SLACK_OAUTH_CLIENT_SECRET",
   "APP_MCP_SLACK_ENDPOINT_URL",
   "APP_MCP_SLACK_AUTHORIZATION_URL",
-  "APP_MCP_SLACK_TOKEN_URL"
+  "APP_MCP_SLACK_TOKEN_URL",
+  "APP_MCP_SLACK_REVOCATION_URL",
+  "APP_MCP_GITHUB_OAUTH_CLIENT_ID",
+  "APP_MCP_GITHUB_OAUTH_CLIENT_SECRET",
+  "APP_MCP_GITHUB_ENDPOINT_URL",
+  "APP_MCP_GITHUB_AUTHORIZATION_URL",
+  "APP_MCP_GITHUB_TOKEN_URL",
+  "APP_MCP_GITHUB_REVOCATION_URL"
 ];
 
 let app;
@@ -58,6 +69,13 @@ beforeEach(async () => {
   process.env.APP_MCP_SLACK_ENDPOINT_URL = `${provider.origin}/slack-mcp`;
   process.env.APP_MCP_SLACK_AUTHORIZATION_URL = `${provider.origin}/slack-authorize`;
   process.env.APP_MCP_SLACK_TOKEN_URL = `${provider.origin}/slack-token`;
+  process.env.APP_MCP_SLACK_REVOCATION_URL = `${provider.origin}/slack-revoke`;
+  process.env.APP_MCP_GITHUB_OAUTH_CLIENT_ID = "github-registry-client";
+  process.env.APP_MCP_GITHUB_OAUTH_CLIENT_SECRET = "github-registry-secret";
+  process.env.APP_MCP_GITHUB_ENDPOINT_URL = `${provider.origin}/github-mcp`;
+  process.env.APP_MCP_GITHUB_AUTHORIZATION_URL = `${provider.origin}/github-authorize`;
+  process.env.APP_MCP_GITHUB_TOKEN_URL = `${provider.origin}/github-token`;
+  process.env.APP_MCP_GITHUB_REVOCATION_URL = `${provider.origin}/github-applications`;
 
   tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "virenis-managed-registry-"));
   app = await createApp({ dbPath: path.join(tmpDir, "db.json"), uploadRoot: tmpDir, autoRun: false });
@@ -229,7 +247,7 @@ describe("managed MCP provider registry", () => {
     expect(provider.revocations).toContain("notion-refresh-dynamic-proof-code");
   });
 
-  it("normalizes Slack user-token responses and warns when remote revocation is unavailable", async () => {
+  it("normalizes Slack user-token responses and remotely revokes access and refresh credentials", async () => {
     const started = await request(app)
       .post("/api/mcp/oauth/start")
       .set(auth())
@@ -265,8 +283,60 @@ describe("managed MCP provider registry", () => {
       .delete(`/api/mcp/connections/${slack.connection_id}`)
       .set(auth())
       .expect(200);
-    expect(removed.body.provider_revoked).toBe(false);
-    expect(removed.body.revocation_warning).toMatch(/local credential was deleted/i);
+    expect(removed.body).toMatchObject({ provider_revoked: true, revocation_warning: null });
+    expect(provider.slackRevocations).toEqual([
+      "xoxp-slack-proof-code",
+      "xoxe-slack-proof-code"
+    ]);
+    await expect(revokeManagedCredential(
+      managedMcpProvider("slack", process.env),
+      { access_token: "xoxp-slack-proof-code", refresh_token: "xoxe-slack-proof-code" },
+      process.env
+    )).resolves.toBe(true);
+    expect(provider.slackRevocations).toEqual([
+      "xoxp-slack-proof-code",
+      "xoxe-slack-proof-code",
+      "xoxp-slack-proof-code",
+      "xoxe-slack-proof-code"
+    ]);
+  });
+
+  it("uses GitHub's application-token API and safely retries already-revoked tokens", async () => {
+    const github = managedMcpProvider("github", process.env);
+    const credential = {
+      access_token: "gho-registry-access",
+      refresh_token: "ghr-registry-refresh"
+    };
+
+    await expect(revokeManagedCredential(github, credential, process.env)).resolves.toBe(true);
+    await expect(revokeManagedCredential(github, credential, process.env)).resolves.toBe(true);
+
+    expect(provider.githubChecks).toEqual([
+      "gho-registry-access",
+      "ghr-registry-refresh",
+      "gho-registry-access",
+      "ghr-registry-refresh"
+    ]);
+    expect(provider.githubRevocations).toEqual([
+      "gho-registry-access",
+      "ghr-registry-refresh"
+    ]);
+    expect(provider.githubAuthorization).toBe(
+      `Basic ${Buffer.from("github-registry-client:github-registry-secret", "utf8").toString("base64")}`
+    );
+  });
+
+  it("fails closed when a provider cannot prove that a credential is inactive", async () => {
+    await expect(revokeManagedCredential(
+      managedMcpProvider("slack", process.env),
+      { access_token: "xoxp-ambiguous-auth" },
+      process.env
+    )).rejects.toMatchObject({ code: "mcp_oauth_provider_error" });
+    await expect(revokeManagedCredential(
+      managedMcpProvider("github", process.env),
+      { access_token: "gho-check-error" },
+      process.env
+    )).rejects.toMatchObject({ code: "mcp_oauth_provider_error" });
   });
 });
 
@@ -279,6 +349,12 @@ function createDynamicProvider() {
     registrations: [],
     tokenRequests: [],
     slackTokenRequests: [],
+    slackRevocations: [],
+    githubChecks: [],
+    githubRevocations: [],
+    githubAuthorization: "",
+    activeSlackTokens: new Set(),
+    activeGithubTokens: new Set(["gho-registry-access", "ghr-registry-refresh"]),
     revocations: [],
     mcpAuthorization: []
   };
@@ -338,6 +414,8 @@ function createDynamicProvider() {
       if (values.client_id !== "slack-registry-client" || values.client_secret !== "slack-registry-secret") {
         return json(response, 200, { ok: false, error: "invalid_client" });
       }
+      state.activeSlackTokens.add(`xoxp-${values.code}`);
+      state.activeSlackTokens.add(`xoxe-${values.code}`);
       return json(response, 200, {
         ok: true,
         authed_user: {
@@ -348,6 +426,30 @@ function createDynamicProvider() {
           scope: "search:read.public,chat:write"
         }
       });
+    }
+    if (incoming.method === "POST" && incoming.url === "/slack-revoke") {
+      const values = new URLSearchParams(await readBody(incoming));
+      const token = values.get("token");
+      state.slackRevocations.push(token);
+      if (token === "xoxp-ambiguous-auth") return json(response, 200, { ok: false, error: "invalid_auth" });
+      if (!state.activeSlackTokens.has(token)) return json(response, 200, { ok: false, error: "token_revoked" });
+      state.activeSlackTokens.delete(token);
+      return json(response, 200, { ok: true, revoked: true });
+    }
+    if (["POST", "DELETE"].includes(incoming.method)
+      && incoming.url === "/github-applications/github-registry-client/token") {
+      const payload = JSON.parse(await readBody(incoming));
+      state.githubAuthorization = incoming.headers.authorization || "";
+      if (incoming.method === "POST") {
+        state.githubChecks.push(payload.access_token);
+        if (payload.access_token === "gho-check-error") return json(response, 422, { message: "Validation failed" });
+        if (!state.activeGithubTokens.has(payload.access_token)) return json(response, 404, { message: "Not Found" });
+        return json(response, 200, { token: payload.access_token });
+      }
+      state.githubRevocations.push(payload.access_token);
+      state.activeGithubTokens.delete(payload.access_token);
+      response.writeHead(204).end();
+      return;
     }
     if (incoming.method === "POST" && ["/mcp", "/slack-mcp"].includes(incoming.url)) {
       state.mcpAuthorization.push(incoming.headers.authorization || "");

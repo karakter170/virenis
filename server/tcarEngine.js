@@ -2,8 +2,14 @@ import { approvedSourceSnippets, BASE_MODEL, DEFAULT_VLLM_BASE_URL } from "./cat
 import { releaseRunReservation, settleRunCredits } from "./billing.js";
 import { makeId, nowIso } from "./store.js";
 import { assertStoredDocumentIntegrity, scoreChunks, slugify } from "./documents.js";
-import { executeRuntimeChat, realRuntimeEnabled } from "./runtimeClient.js";
+import { executeRuntimeChat, realRuntimeEnabled, runtimeApiKey } from "./runtimeClient.js";
 import { agentRevision, digestValue, normalizeSha256Digest, realityRankMap, recordExecution } from "./outcomes.js";
+import {
+  recordWorldGraphRun,
+  selectWorldGraphSeedForStep,
+  worldGraphReplayCandidateIds,
+  worldGraphReplayCapsule
+} from "./worldGraph.js";
 
 const MAX_MESSAGE_CHARS = 12000;
 const DEFAULT_MEMORY_ENTRIES = 40;
@@ -28,6 +34,7 @@ const DOCUMENT_CONTEXT_ARTIFACTS = new Set([
   "approved_sources",
   "evidence_summary"
 ]);
+const CHAT_RUN_SINGLE_FLIGHTS = new Map();
 const STRUCTURED_CONTEXT_ARTIFACTS = new Set([
   "table_context",
   "structured_data",
@@ -385,7 +392,7 @@ export function scopedRoutingContext({ session, agents = [], documents = [], age
   const workspaceAgentIds = agentWorkspace
     ? new Set(Array.isArray(agentWorkspace.agent_ids) ? agentWorkspace.agent_ids : [])
     : null;
-  const visibleAgents = agents.filter((agent) =>
+  const eligibleAgents = agents.filter((agent) =>
     agent.enabled !== false &&
     agent.mounted !== false &&
     agent.runtime_sync_pending !== true &&
@@ -398,6 +405,17 @@ export function scopedRoutingContext({ session, agents = [], documents = [], age
     ) &&
     resourceVisibleToSession(agent, session)
   );
+  const visibleIdCounts = new Map();
+  for (const agent of eligibleAgents) {
+    if (!agent?.id) continue;
+    visibleIdCounts.set(agent.id, (visibleIdCounts.get(agent.id) || 0) + 1);
+  }
+  // An adapter id is the Runtime authority boundary. If two visible records
+  // claim it, the Router cannot prove which contract the provider will run, so
+  // quarantine both instead of relying on insertion order.
+  const visibleAgents = eligibleAgents.filter((agent) => (
+    agent?.id && visibleIdCounts.get(agent.id) === 1
+  ));
   const visibleDocuments = documents.filter((document) =>
     document.enabled !== false &&
     document.runtime_sync_pending !== true &&
@@ -417,7 +435,7 @@ function resourceVisibleToSession(resource = {}, session = {}) {
     return false;
   }
   if (!resource.workspace_id) {
-    return true;
+    return resource.system_managed === true && resource.visibility === "global";
   }
   if (String(resource.workspace_id) !== String(session?.workspace_id || "workspace_default")) {
     return false;
@@ -615,10 +633,54 @@ function nextSharedMemory(existing, additions) {
 }
 
 export async function processChatRun({ store, bus, run_id, options = {} }) {
+  if (options.run_fresh === true || Number(options.temperature || 0) !== 0) {
+    return executeChatRun({ store, bus, run_id, options });
+  }
+  const key = store.read((data) => {
+    const run = data.runs.find((item) => item.run_id === run_id);
+    const session = data.sessions.find((item) => item.session_id === run?.session_id);
+    if (!run || !session) return null;
+    return digestValue({
+      workspace_id: run.workspace_id || session.workspace_id || "",
+      created_by: run.created_by || session.created_by || "",
+      session_id: run.session_id || "",
+      agent_workspace_id: run.agent_workspace_id || "",
+      query: String(run.query || ""),
+      options: {
+        planner_mode: options.planner_mode || "",
+        planner_max_tokens: Number(options.planner_max_tokens) || null,
+        max_routing_adapters: Number(options.max_routing_adapters) || null,
+        parallel_workers: Number(options.parallel_workers) || null,
+        max_tokens: Number(options.max_tokens) || null,
+        refiner_max_tokens: Number(options.refiner_max_tokens) || null,
+        temperature: Number(options.temperature) || 0
+      }
+    });
+  });
+  if (!key) return executeChatRun({ store, bus, run_id, options });
+  return withChatRunSingleFlight(key, () => executeChatRun({ store, bus, run_id, options }));
+}
+
+async function executeChatRun({ store, bus, run_id, options = {} }) {
   if (realRuntimeEnabled()) {
     return processRemoteChatRun({ store, bus, run_id, options });
   }
   return processLocalChatRun({ store, bus, run_id, options });
+}
+
+async function withChatRunSingleFlight(key, operation) {
+  const previous = CHAT_RUN_SINGLE_FLIGHTS.get(key) || Promise.resolve();
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const tail = previous.catch(() => undefined).then(() => gate);
+  CHAT_RUN_SINGLE_FLIGHTS.set(key, tail);
+  await previous.catch(() => undefined);
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (CHAT_RUN_SINGLE_FLIGHTS.get(key) === tail) CHAT_RUN_SINGLE_FLIGHTS.delete(key);
+  }
 }
 
 async function processLocalChatRun({ store, bus, run_id, options = {} }) {
@@ -632,7 +694,9 @@ async function processLocalChatRun({ store, bus, run_id, options = {} }) {
       agentWorkspaces: data.agentWorkspaces || [],
       messages: data.messages,
       outcomeContracts: data.outcomeContracts || [],
-      executionRecords: data.executionRecords || []
+      executionRecords: data.executionRecords || [],
+      worldGraphArtifacts: data.worldGraphArtifacts || [],
+      worldGraphEvents: data.worldGraphEvents || []
     }));
     if (!snapshot.run) {
       throw new Error("Run not found.");
@@ -676,10 +740,24 @@ async function processLocalChatRun({ store, bus, run_id, options = {} }) {
     });
 
     const routeOutputs = [];
+    const worldGraphDecisions = [];
     for (const batch of parallel.batches) {
       const batchSteps = plan.steps.filter((step) => batch.steps.includes(step.id));
       await Promise.all(batchSteps.map(async (step) => {
-        const routeStartedEvent = {
+        const routeStarted = Date.now();
+        const replay = selectWorldGraphSeedForStep({
+          data: snapshot,
+          run: snapshot.run,
+          session: snapshot.session,
+          step,
+          agents: scoped.agents,
+          documents: scoped.documents,
+          sharedMemory: normalizeSharedMemory(snapshot.session?.shared_memory || []),
+          options,
+          resolvedOutputs: routeOutputs,
+          runFresh: options.run_fresh === true
+        });
+        const routeStartedEvent = replay.seed ? null : {
           type: "route.started",
           step_id: step.id,
           adapter: step.adapter,
@@ -688,22 +766,31 @@ async function processLocalChatRun({ store, bus, run_id, options = {} }) {
           model_id: BASE_MODEL,
           batch: batch.batch
         };
-        const routeStarted = Date.now();
-        const result = buildRouteOutput({
-          step,
-          query,
-          agents: scoped.agents,
-          documents: scoped.documents,
-          upstream: routeOutputs,
-          sharedMemory: normalizeSharedMemory(snapshot.session?.shared_memory || [])
-        });
+        worldGraphDecisions.push(replay.decision);
+        const result = replay.seed || {
+          ...buildRouteOutput({
+            step,
+            query,
+            agents: scoped.agents,
+            documents: scoped.documents,
+            upstream: routeOutputs,
+            sharedMemory: normalizeSharedMemory(snapshot.session?.shared_memory || [])
+          }),
+          execution_mode: "refreshed"
+        };
         const elapsed = Number(((Date.now() - routeStarted) / 1000 + 0.015).toFixed(3));
-        routeOutputs.push({ ...result, elapsed_sec: elapsed, parallel_batch: batch.batch, parallel_width: batch.width });
+        routeOutputs.push({
+          ...result,
+          elapsed_sec: replay.seed ? 0 : elapsed,
+          parallel_batch: batch.batch,
+          parallel_width: batch.width
+        });
         const routeCompletedEvent = {
-          type: "route.completed",
+          type: replay.seed ? "route.reused" : "route.completed",
           step_id: step.id,
           adapter: step.adapter,
-          elapsed_sec: elapsed
+          elapsed_sec: replay.seed ? 0 : elapsed,
+          execution_mode: replay.seed ? "reused" : "refreshed"
         };
         await persistCompletedRunRoute({
           store,
@@ -722,6 +809,10 @@ async function processLocalChatRun({ store, bus, run_id, options = {} }) {
             parallel_batch: batch.batch,
             parallel_width: batch.width,
             status: "completed",
+            execution_mode: replay.seed ? "reused" : "refreshed",
+            reused_from_artifact_id: result.reused_from_artifact_id || null,
+            reused_from_run_id: result.reused_from_run_id || null,
+            world_graph_reason: replay.decision.reason,
             agent_reasoning: result.agent_reasoning,
             domain_answer: result.domain_answer,
             handoffs: result.handoffs,
@@ -732,7 +823,7 @@ async function processLocalChatRun({ store, bus, run_id, options = {} }) {
             used_memory: result.used_memory,
             boundary_check: result.boundary_check,
             allowed_tools: result.allowed_tools,
-            tool_executions: result.tool_executions,
+            tool_executions: safeRuntimeToolExecutions(result.tool_executions),
             approved_sources: result.approved_sources,
             policy_violations: result.policy_violations,
             retrieved_context: result.retrieved_context,
@@ -741,7 +832,7 @@ async function processLocalChatRun({ store, bus, run_id, options = {} }) {
             prompt_preview_admin_only: `Adapter ${step.adapter} received task: ${step.task}`,
             started_at: new Date(routeStarted).toISOString(),
             completed_at: nowIso(),
-            elapsed_sec: elapsed
+            elapsed_sec: replay.seed ? 0 : elapsed
           }
         });
       }));
@@ -762,7 +853,10 @@ async function processLocalChatRun({ store, bus, run_id, options = {} }) {
       const session = data.sessions.find((item) => item.session_id === run.session_id);
       run.status = "completed";
       run.final_answer = finalAnswer;
-      run.expert_outputs = routeOutputs;
+      // Route outputs have a single canonical persisted representation in
+      // runSteps. Avoid duplicating raw model envelopes (including hidden
+      // reasoning or tool payloads) on the run record.
+      run.expert_outputs = [];
       run.sources = citations;
       run.policy_events = policyEvents;
       run.token_accounting = {
@@ -774,6 +868,19 @@ async function processLocalChatRun({ store, bus, run_id, options = {} }) {
         totals: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
         missing_usage: ["local_simulator_does_not_call_a_model"]
       };
+      recordWorldGraphRun({
+        data,
+        run,
+        session,
+        plan,
+        outputs: routeOutputs,
+        agents: scoped.agents,
+        documents: scoped.documents,
+        sharedMemory: normalizeSharedMemory(snapshot.session?.shared_memory || []),
+        options,
+        decisions: worldGraphDecisions,
+        createdAt: completedAt
+      });
       settleRunCredits(data, run, run.token_accounting);
       run.assistant_message_id = assistantMessageId;
       run.completed_at = completedAt;
@@ -863,7 +970,9 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
       documents: data.documents,
       agentWorkspaces: data.agentWorkspaces || [],
       outcomeContracts: data.outcomeContracts || [],
-      executionRecords: data.executionRecords || []
+      executionRecords: data.executionRecords || [],
+      worldGraphArtifacts: data.worldGraphArtifacts || [],
+      worldGraphEvents: data.worldGraphEvents || []
     }));
     if (!snapshot.run) {
       throw new Error("Run not found.");
@@ -896,16 +1005,30 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
         { type: "runtime.requested" }
       ]
     });
+    const sharedMemory = normalizeSharedMemory(snapshot.session?.shared_memory || []);
+    const replayCapsule = worldGraphReplayCapsule({
+      data: snapshot,
+      run: snapshot.run,
+      session: snapshot.session,
+      agents: scoped.agents,
+      documents: scoped.documents,
+      sharedMemory,
+      options,
+      runFresh: options.run_fresh === true,
+      signingKey: runtimeApiKey()
+    });
     const result = await executeRuntimeChat({
       query,
-      sharedMemory: normalizeSharedMemory(snapshot.session?.shared_memory || []),
+      sharedMemory,
       executionContext: {
         run_id,
         workspace_id: snapshot.session?.workspace_id || null,
         session_id: snapshot.session?.session_id || null,
+        agent_workspace_id: snapshot.run.agent_workspace_id || snapshot.session?.agent_workspace_id || null,
         user_id: snapshot.run.created_by || snapshot.session?.created_by || null,
         role: snapshot.run.actor_role || null
       },
+      worldGraph: replayCapsule,
       options: {
         planner_mode: options.planner_mode || process.env.TCAR_PLANNER_MODE || "session",
         max_routing_adapters: Number(options.max_routing_adapters) || Number(process.env.TCAR_MAX_ROUTING_ADAPTERS || 12),
@@ -926,38 +1049,88 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
     }
 
     const plan = enrichRuntimeRoutingTrace(
-      normalizeRuntimePlan(result.plan),
+      assertRuntimePlan(normalizeRuntimePlan(result.plan), {
+        allowedAdapters: scoped.allowedAdapters,
+        maxSteps: Number(options.max_routing_adapters) || Number(process.env.TCAR_MAX_ROUTING_ADAPTERS || 12)
+      }),
       agentRankings,
       scoped.agents
     );
-    const parallel = result.parallel || { workers: Number(options.parallel_workers) || 2, batches: [], maxBatchWidth: 0, parallelizable: false };
+    const parallel = buildParallelBatches(
+      plan.steps,
+      Math.max(1, Math.min(Number(options.parallel_workers) || Number(process.env.TCAR_PARALLEL_WORKERS || 2), 32))
+    );
+    const outputs = assertRuntimeRouteCoverage(plan, result.expertOutputs);
+    if (outputs.some((output) => output?.execution_mode === "reused")) {
+      const reportedCalls = Array.isArray(result.tokenAccounting?.calls) ? result.tokenAccounting.calls : [];
+      for (const output of outputs.filter((item) => item?.execution_mode === "reused")) {
+        const stepId = String(output.id || output.step_id || "");
+        const adapter = String(output.adapter || "");
+        const contradictingCall = reportedCalls.some((call) => {
+          const component = String(call?.component || "");
+          const callAdapter = String(call?.agent_id || "");
+          const callStep = String(call?.step_id || "");
+          return (callAdapter === adapter || component.startsWith(`agent:${adapter}:`))
+            && (!callStep || !stepId || callStep === stepId);
+        });
+        if (contradictingCall || (Array.isArray(output.model_calls) && output.model_calls.length > 0)) {
+          const error = new Error(`Runtime reported both reuse and a worker model call for step ${stepId}.`);
+          error.code = "world_graph_reuse_accounting_invalid";
+          throw error;
+        }
+      }
+      // Verify runtime-claimed skips before persisting a route.reused event or
+      // allowing the output into synthesis/history. The validation snapshot is
+      // a clone; recordWorldGraphRun exercises the same exact envelope, source,
+      // payload, provenance, age, and outbound-capsule checks without writing.
+      const validationData = store.read();
+      const validationRun = validationData.runs.find((item) => item.run_id === run_id);
+      const validationSession = validationData.sessions.find((item) => item.session_id === validationRun?.session_id);
+      if (!validationRun || !validationSession) throw new Error("Run disappeared before reuse validation.");
+      recordWorldGraphRun({
+        data: validationData,
+        run: validationRun,
+        session: validationSession,
+        plan,
+        outputs,
+        agents: scoped.agents,
+        documents: scoped.documents,
+        sharedMemory,
+        options,
+        decisions: Array.isArray(result.worldGraph?.decisions) ? result.worldGraph.decisions : [],
+        runtimeProvenance: result.componentProvenance || null,
+        replayCandidateIds: worldGraphReplayCandidateIds(replayCapsule),
+        createdAt: nowIso()
+      });
+    }
     await updateRun(store, bus, run_id, { plan, parallel, status: "running" }, { type: "planner.completed", steps: plan.steps });
 
-    const outputs = Array.isArray(result.expertOutputs) ? result.expertOutputs : [];
-    for (const output of outputs) {
-      const routeStartedEvent = {
+    const completedRoutes = outputs.map((output) => {
+      const reused = output.execution_mode === "reused";
+      const routeStartedEvent = reused ? null : {
         type: "route.started",
         step_id: output.id,
         adapter: output.adapter,
         batch: output.parallel_batch || null
       };
       const routeCompletedEvent = {
-        type: "route.completed",
+        type: reused ? "route.reused" : "route.completed",
         step_id: output.id,
         adapter: output.adapter,
-        elapsed_sec: output.elapsed_sec || null
+        elapsed_sec: output.elapsed_sec ?? null
       };
-      await persistCompletedRunRoute({
-        store,
-        bus,
-        runId: run_id,
+      return {
         startedEvent: routeStartedEvent,
         completedEvent: routeCompletedEvent,
-        runStep: runtimeOutputToRunStep({ run_id, output, parallel })
-      });
-    }
+        runStep: runtimeOutputToRunStep({
+          run_id,
+          output,
+          parallel,
+          step: plan.steps.find((item) => item.id === (output.id || output.step_id))
+        })
+      };
+    });
 
-    await updateRun(store, bus, run_id, { status: "synthesizing" }, { type: "synthesis.started" });
     const citations = runtimeCitations(outputs);
     const policyEvents = outputs.flatMap((output) =>
       (output.policy_violations || []).map((violation) => ({ step_id: output.id, adapter: output.adapter, violation }))
@@ -970,9 +1143,42 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
     await store.mutate((data) => {
       const run = data.runs.find((item) => item.run_id === run_id);
       const session = data.sessions.find((item) => item.session_id === run.session_id);
+      // Validate every runtime-claimed reuse against the current committed
+      // artifact set before persisting any route output or route.reused event.
+      // Store mutations are atomic, so a concurrent contest/prune causes this
+      // entire completion to roll back instead of leaving false route history.
+      recordWorldGraphRun({
+        data,
+        run,
+        session,
+        plan,
+        outputs,
+        agents: scoped.agents,
+        documents: scoped.documents,
+        sharedMemory,
+        options,
+        decisions: Array.isArray(result.worldGraph?.decisions) ? result.worldGraph.decisions : [],
+        // Component provenance binds model and executor bytes. The execution
+        // receipt is audit metadata and intentionally cannot substitute for it.
+        runtimeProvenance: result.componentProvenance || null,
+        replayCandidateIds: worldGraphReplayCandidateIds(replayCapsule),
+        createdAt: completedAt
+      });
+      for (const completedRoute of completedRoutes) {
+        if (completedRoute.startedEvent) {
+          run.events.push({ ...completedRoute.startedEvent, at: completedAt });
+        }
+        const index = data.runSteps.findIndex((item) => (
+          item.run_id === run_id && item.step_id === completedRoute.runStep.step_id
+        ));
+        if (index >= 0) data.runSteps[index] = completedRoute.runStep;
+        else data.runSteps.push(completedRoute.runStep);
+        run.events.push({ ...completedRoute.completedEvent, at: completedAt });
+      }
+      run.events.push({ type: "synthesis.started", at: completedAt });
       run.status = "completed";
       run.final_answer = finalAnswer;
-      run.expert_outputs = outputs;
+      run.expert_outputs = [];
       run.sources = citations;
       run.policy_events = policyEvents;
       run.token_accounting = normalizeArtifactValue(result.tokenAccounting || null);
@@ -1030,6 +1236,11 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
       });
       return run;
     });
+    for (const completedRoute of completedRoutes) {
+      if (completedRoute.startedEvent) bus.publish(run_id, completedRoute.startedEvent);
+      bus.publish(run_id, completedRoute.completedEvent);
+    }
+    bus.publish(run_id, { type: "synthesis.started" });
     bus.publish(run_id, { type: "final.completed", message_id: assistantMessageId, elapsed_sec: elapsedSec });
   } catch (error) {
     const failure = normalizeRunFailure(error, "runtime_failed");
@@ -1189,6 +1400,92 @@ function normalizeRuntimePlan(plan) {
   return { steps: [], adapters: [], edges: [], acyclic: true, routing: null };
 }
 
+function assertRuntimeRouteCoverage(plan, value) {
+  const outputs = Array.isArray(value) ? value : [];
+  const steps = Array.isArray(plan?.steps) ? plan.steps : [];
+  const expected = new Map(steps.map((step) => [String(step.id || ""), step]));
+  const seen = new Set();
+  const fail = (detail) => {
+    const error = new Error(`model_invalid_response: ${detail}`);
+    error.code = "model_invalid_response";
+    throw error;
+  };
+  if (outputs.length !== steps.length) {
+    fail(`runtime returned ${outputs.length} route outputs for ${steps.length} planned steps`);
+  }
+  for (const output of outputs) {
+    if (!output || typeof output !== "object" || Array.isArray(output)) {
+      fail("runtime returned a malformed route output");
+    }
+    const stepId = String(output.id || output.step_id || "");
+    if (!stepId || (output.id && output.step_id && String(output.id) !== String(output.step_id))) {
+      fail("runtime route output has an invalid step identity");
+    }
+    const step = expected.get(stepId);
+    if (!step || seen.has(stepId)) {
+      fail(`runtime route output has an unexpected or duplicate step: ${stepId || "missing"}`);
+    }
+    if (String(output.adapter || "") !== String(step.adapter || "")) {
+      fail(`runtime route output adapter does not match planned step ${stepId}`);
+    }
+    seen.add(stepId);
+  }
+  if (seen.size !== expected.size) fail("runtime omitted a planned route output");
+  const byStep = new Map(outputs.map((output) => [String(output.id || output.step_id), output]));
+  return steps.map((step) => byStep.get(String(step.id)));
+}
+
+function assertRuntimePlan(plan, { allowedAdapters = [], maxSteps = 12 } = {}) {
+  const fail = (detail) => {
+    const error = new Error(`model_invalid_response: ${detail}`);
+    error.code = "model_invalid_response";
+    throw error;
+  };
+  const rawSteps = Array.isArray(plan?.steps) ? plan.steps : [];
+  const routeLimit = Math.max(1, Math.min(Number(maxSteps) || 12, 64));
+  if (rawSteps.length > routeLimit) fail(`runtime plan exceeds the ${routeLimit}-step route limit`);
+  const allowed = new Set((allowedAdapters || []).map(String));
+  const normalizedSteps = rawSteps.map((step) => {
+    if (!step || typeof step !== "object" || Array.isArray(step)) fail("runtime plan contains a malformed step");
+    const id = String(step.id || "");
+    const adapter = String(step.adapter || "");
+    const task = String(step.task || "");
+    if (!/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,119}$/.test(id)) fail("runtime plan contains an invalid step id");
+    if (!adapter || adapter.length > 240 || !allowed.has(adapter)) {
+      fail(`runtime plan selected an unauthorized agent for step ${id}`);
+    }
+    if (task.length > MAX_MESSAGE_CHARS) fail(`runtime task is too large for step ${id}`);
+    if (!Array.isArray(step.depends_on || [])) fail(`runtime dependencies are malformed for step ${id}`);
+    const dependsOn = (step.depends_on || []).map((dependency) => String(dependency || ""));
+    if (
+      dependsOn.length > routeLimit
+      || new Set(dependsOn).size !== dependsOn.length
+      || dependsOn.some((dependency) => !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,119}$/.test(dependency))
+    ) fail(`runtime dependencies are invalid for step ${id}`);
+    return { id, adapter, task, depends_on: dependsOn };
+  });
+  try {
+    buildParallelBatches(normalizedSteps, 1);
+  } catch (cause) {
+    fail(`runtime plan is not a valid acyclic graph: ${cause.message}`);
+  }
+  const routedAdapters = [
+    ...(plan?.routing?.selected || []).map((item) => item?.adapter),
+    ...(plan?.routing?.candidate_adapters || []),
+    ...(plan?.routing?.candidate_trace || []).map((item) => item?.adapter)
+  ].filter(Boolean).map(String);
+  if (routedAdapters.some((adapter) => !allowed.has(adapter))) {
+    fail("runtime routing trace contains an unauthorized agent");
+  }
+  return {
+    ...plan,
+    steps: normalizedSteps,
+    adapters: [...new Set(normalizedSteps.map((step) => step.adapter))],
+    edges: normalizedSteps.flatMap((step) => step.depends_on.map((source) => ({ source, target: step.id }))),
+    acyclic: true
+  };
+}
+
 export function normalizeRuntimeRouting(routing) {
   if (!routing || typeof routing !== "object" || Array.isArray(routing)) {
     return null;
@@ -1287,46 +1584,71 @@ function finiteNonNegativeOrNull(value) {
   return Number.isFinite(number) && number >= 0 ? number : null;
 }
 
-function runtimeOutputToRunStep({ run_id, output, parallel }) {
-  const sections = parseRouteSections(output.text || output.raw_text || "");
+function runtimeOutputToRunStep({ run_id, output, parallel, step = null }) {
+  const reused = output.execution_mode === "reused";
+  // Reused output is authorized replay material, not a new worker turn. Do
+  // not persist free-form runtime narration, prompts, raw text, model calls,
+  // or timing claims that are outside the replay digest.
+  const sections = reused ? parseRouteSections("") : parseRouteSections(output.text || output.raw_text || "");
+  const trustedStep = step || {};
   const batch = output.parallel_batch || findBatchForStep(parallel, output.id);
   const width = output.parallel_width || parallel?.batches?.find((item) => item.batch === batch)?.width || 1;
   return {
     run_step_id: makeId("run_step"),
     run_id,
-    step_id: output.id,
-    adapter: output.adapter,
+    step_id: trustedStep.id || output.id || output.step_id,
+    adapter: trustedStep.adapter || output.adapter,
     agent_revision: normalizeSha256Digest(output.agent_revision),
     adapter_digest: normalizeSha256Digest(output.agent_content_digest || output.adapter_content_digest || output.adapter_digest),
     model_id: output.model_id || null,
-    model_calls_admin_only: normalizeArtifactValue(output.model_calls || []),
-    task: output.task || "",
-    depends_on: output.depends_on || [],
+    model_calls_admin_only: normalizeArtifactValue(reused ? [] : output.model_calls || []),
+    task: trustedStep.task || output.task || "",
+    depends_on: trustedStep.depends_on || output.depends_on || [],
     used_upstream: output.used_upstream || [],
     parallel_batch: batch,
     parallel_width: width,
     status: "completed",
-    agent_reasoning: output.agent_reasoning || sections.agent_reasoning,
+    execution_mode: reused ? "reused" : "refreshed",
+    reused_from_artifact_id: output.reused_from_artifact_id || null,
+    reused_from_run_id: output.reused_from_run_id || null,
+    world_graph_reason: reused ? "inputs_and_evidence_unchanged" : output.world_graph_reason || null,
+    agent_reasoning: reused ? "" : output.agent_reasoning || sections.agent_reasoning,
     domain_answer: output.domain_answer || sections.domain_answer,
-    handoffs: typeof output.handoffs === "string" ? output.handoffs : sections.handoffs,
+    handoffs: reused ? "" : typeof output.handoffs === "string" ? output.handoffs : sections.handoffs,
     handoff_artifacts: normalizeHandoffArtifacts(output.handoff_artifacts || output.handoffs, output),
     artifact_validation: normalizeArtifactValue(output.artifact_validation || {}),
     consumed_artifacts: normalizeArtifactValue(output.consumed_artifacts || []),
     consumption_validation: normalizeArtifactValue(output.consumption_validation || {}),
+    source_validation: normalizeArtifactValue(output.source_validation || {}),
     used_memory: normalizeArtifactValue(output.used_memory || []),
     boundary_check: output.boundary_check || sections.boundary_check,
     allowed_tools: output.allowed_tools || [],
-    tool_executions: normalizeArtifactValue(output.tool_executions || []),
+    tool_executions: safeRuntimeToolExecutions(output.tool_executions),
     approved_sources: output.approved_sources || [],
     policy_violations: output.policy_violations || [],
     retrieved_context: output.retrieved_context || sections.retrieved_context,
     citations: runtimeCitations([output]),
-    raw_text_admin_only: output.raw_text || output.text || "",
-    prompt_preview_admin_only: output.prompt_preview || "",
+    raw_text_admin_only: reused ? "" : output.raw_text || output.text || "",
+    prompt_preview_admin_only: reused ? "" : output.prompt_preview || "",
     started_at: nowIso(),
     completed_at: nowIso(),
-    elapsed_sec: output.elapsed_sec || null
+    elapsed_sec: reused ? 0 : output.elapsed_sec || null
   };
+}
+
+function safeRuntimeToolExecutions(value) {
+  return (Array.isArray(value) ? value : []).slice(0, 64).map((execution) => ({
+    id: boundedText(execution?.id, 120),
+    name: boundedText(execution?.name, 120),
+    result: {
+      ok: execution?.result?.ok === true,
+      available: execution?.result?.available !== false,
+      tool: boundedText(execution?.result?.tool || execution?.name, 120),
+      data_digest: execution?.result?.data === undefined ? null : digestValue(execution.result.data)
+    },
+    arguments_redacted: true,
+    result_data_redacted: true
+  }));
 }
 
 function findBatchForStep(parallel, stepId) {
@@ -1554,7 +1876,7 @@ async function persistCompletedRunRoute({ store, bus, runId, startedEvent, compl
     if (!run) {
       throw new Error("Run not found.");
     }
-    run.events.push({ ...startedEvent, at: nowIso() });
+    if (startedEvent) run.events.push({ ...startedEvent, at: nowIso() });
     const index = data.runSteps.findIndex((item) => item.run_id === runId && item.step_id === runStep.step_id);
     if (index >= 0) {
       data.runSteps[index] = runStep;
@@ -1564,7 +1886,7 @@ async function persistCompletedRunRoute({ store, bus, runId, startedEvent, compl
     run.events.push({ ...completedEvent, at: nowIso() });
     return runStep;
   });
-  bus.publish(runId, startedEvent);
+  if (startedEvent) bus.publish(runId, startedEvent);
   bus.publish(runId, completedEvent);
 }
 

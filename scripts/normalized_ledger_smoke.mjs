@@ -2,7 +2,11 @@
 /* global console, process */
 import pg from "pg";
 
-import { syncNormalizedLedger } from "../server/normalizedLedger.js";
+import {
+  normalizedLedgerActorId,
+  normalizedLedgerLabel,
+  syncNormalizedLedger
+} from "../server/normalizedLedger.js";
 import {
   agentRevisionSnapshot,
   digestValue,
@@ -27,6 +31,8 @@ const uploadDigest = sha("exact uploaded source bytes");
 const extractedTextDigest = sha("exact extracted source text");
 const corpusRevision = sha("exact corpus revision");
 const indexDigest = sha("exact index bytes");
+const ledgerAgentId = normalizedLedgerLabel("agent", agentId);
+const ledgerSourceId = normalizedLedgerLabel("source", `doc_${suffix}`);
 
 const agent = {
   id: agentId,
@@ -296,6 +302,32 @@ try {
     counts[table] = result.rows[0].count;
     if (counts[table] !== 1) throw new Error(`${table} expected exactly one smoke row, received ${counts[table]}`);
   }
+  const privacyProjection = await client.query(
+    `SELECT
+       (SELECT agent_id FROM tcar_ledger.agent_revisions WHERE workspace_id=$1 LIMIT 1) AS revision_agent_id,
+       (SELECT actor_id FROM tcar_ledger.agent_events WHERE workspace_id=$1 LIMIT 1) AS event_actor_id,
+       (SELECT actor_id FROM tcar_ledger.execution_runs WHERE workspace_id=$1 LIMIT 1) AS execution_actor_id,
+       (SELECT chunk_id FROM tcar_ledger.evidence_records WHERE workspace_id=$1 LIMIT 1) AS chunk_id,
+       (SELECT artifact_name FROM tcar_ledger.execution_artifacts WHERE workspace_id=$1 LIMIT 1) AS artifact_name,
+       (SELECT inline_payload FROM tcar_ledger.execution_artifacts WHERE workspace_id=$1 LIMIT 1) AS inline_payload,
+       (SELECT owner_actor_id FROM tcar_ledger.outcome_contracts WHERE workspace_id=$1 LIMIT 1) AS owner_actor_id,
+       (SELECT observed_value FROM tcar_ledger.outcome_observations WHERE workspace_id=$1 LIMIT 1) AS observed_value`,
+    [workspace]
+  );
+  const privacyRow = privacyProjection.rows[0] || {};
+  if (
+    privacyRow.revision_agent_id !== ledgerAgentId
+    || privacyRow.event_actor_id !== normalizedLedgerActorId(workspace, agentEvent.actor_id)
+    || privacyRow.execution_actor_id !== normalizedLedgerActorId(workspace, execution.created_by)
+    || privacyRow.chunk_id !== normalizedLedgerLabel("chunk", citation.chunk_id)
+    || privacyRow.artifact_name !== normalizedLedgerLabel("artifact", step.handoff_artifacts[0].name)
+    || privacyRow.inline_payload !== null
+    || privacyRow.owner_actor_id !== normalizedLedgerActorId(workspace, contract.created_by)
+    || privacyRow.observed_value?.schema_version !== "virenis-ledger-content-free-v1"
+    || privacyRow.observed_value?.redacted !== true
+  ) {
+    throw new Error("normalized ledger privacy projection retained a raw actor, label, or inline payload");
+  }
   const instance = await client.query(
     "SELECT status FROM tcar_ledger.outcome_instances WHERE workspace_id=$1",
     [workspace]
@@ -306,15 +338,20 @@ try {
        FROM tcar_ledger.outcome_contract_versions WHERE workspace_id=$1`,
     [workspace]
   );
-  if (sha(definitionProjection.rows[0]?.definition).slice("sha256:".length) !== definitionProjection.rows[0]?.definition_digest) {
-    throw new Error("stored Outcome Contract definition does not match definition_digest");
+  const definitionReceipt = definitionProjection.rows[0]?.definition;
+  if (
+    definitionReceipt?.schema_version !== "virenis-ledger-content-free-v1"
+    || definitionReceipt?.redacted !== true
+    || definitionReceipt?.content_digest?.slice("sha256:".length) !== definitionProjection.rows[0]?.definition_digest
+  ) {
+    throw new Error("stored Outcome Contract definition was not reduced to its exact digest receipt");
   }
   const agentDigestProjection = await client.query(
     `SELECT encode(manifest_item_digest, 'hex') AS manifest_item_digest,
             encode(adapter_digest, 'hex') AS adapter_digest
        FROM tcar_ledger.agent_revisions
       WHERE workspace_id=$1 AND agent_id=$2 ORDER BY revision_no LIMIT 1`,
-    [workspace, agentId]
+    [workspace, ledgerAgentId]
   );
   if (
     agentDigestProjection.rows[0]?.manifest_item_digest !== agent.manifest_contract_digest.slice("sha256:".length)
@@ -466,12 +503,17 @@ try {
   await syncNormalizedLedger(client, data);
   const revisionProjection = await client.query(
     `SELECT count(*)::int AS revisions,
-            count(DISTINCT revision_snapshot->>'title')::int AS distinct_titles
+            count(DISTINCT revision_snapshot->>'content_digest')::int AS distinct_digests,
+            bool_and(revision_snapshot->>'redacted'='true') AS all_redacted
        FROM tcar_ledger.agent_revisions WHERE workspace_id=$1 AND agent_id=$2`,
-    [workspace, agentId]
+    [workspace, ledgerAgentId]
   );
-  if (revisionProjection.rows[0]?.revisions !== 2 || revisionProjection.rows[0]?.distinct_titles !== 2) {
-    throw new Error("revision-time agent snapshots were not preserved");
+  if (
+    revisionProjection.rows[0]?.revisions !== 2
+    || revisionProjection.rows[0]?.distinct_digests !== 2
+    || revisionProjection.rows[0]?.all_redacted !== true
+  ) {
+    throw new Error("revision-time agent snapshot digest receipts were not preserved");
   }
 
   const validClaim = contract.claim;
@@ -519,16 +561,17 @@ try {
             chunk_count, source_metadata, created_by, created_at
        FROM tcar_ledger.source_revisions
       WHERE workspace_id=$1 AND source_id=$2`,
-    [workspace, document.document_id]
+    [workspace, ledgerSourceId]
   );
   const sourceRow = sourceBeforePurge.rows[0];
   if (
     sourceBeforePurge.rowCount !== 1
     || sourceRow.content_digest !== uploadDigest.slice("sha256:".length)
     || sourceRow.index_digest !== indexDigest.slice("sha256:".length)
-    || sourceRow.source_metadata?.upload_digest !== uploadDigest
-    || sourceRow.source_metadata?.extracted_text_digest !== extractedTextDigest
-    || sourceRow.source_metadata?.corpus_revision !== corpusRevision
+    || sourceRow.source_metadata?.schema_version !== "virenis-ledger-content-free-v1"
+    || sourceRow.source_metadata?.redacted !== true
+    || sourceRow.source_metadata?.content_digest?.slice("sha256:".length) !== sourceRow.metadata_digest
+    || sourceRow.created_by !== normalizedLedgerActorId(workspace, document.created_by)
     || sourceRow.chunk_count !== 1
   ) {
     throw new Error("normalized source revision did not preserve the exact cross-ledger source/index/corpus digests");
@@ -554,7 +597,7 @@ try {
             chunk_count, source_metadata, created_by, created_at
        FROM tcar_ledger.source_revisions
       WHERE workspace_id=$1 AND source_id=$2`,
-    [workspace, document.document_id]
+    [workspace, ledgerSourceId]
   );
   if (
     sourceAfterPurge.rowCount !== 1
@@ -616,16 +659,17 @@ try {
   console.log(JSON.stringify({
     ok: true,
     replay_idempotent: true,
-    definition_digest_matches_payload: true,
+    content_free_privacy_projection: true,
+    definition_digest_receipt_matches_content: true,
     manifest_item_digest_preserved_exactly: true,
     conflicting_replay_rejected: replayConflictRejected,
     same_timestamp_event_chain_preserved: true,
     dispute_rank_revoked: true,
     correction_chain_preserved: true,
-    revision_snapshots_preserved: true,
+    revision_snapshot_digest_receipts_preserved: true,
     invalid_contract_rank_revoked: true,
     repaired_contract_rank_restored: true,
-    source_upload_index_corpus_digests_exact: true,
+    source_upload_index_corpus_digests_exact_and_metadata_redacted: true,
     purged_source_snapshot_rebuild_equal: true,
     actual_rls_isolation: true,
     append_only_update_rejected: true,

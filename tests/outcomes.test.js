@@ -406,18 +406,19 @@ describe("execution provenance and Outcome Contracts", () => {
   });
 
   it("never returns another user's private contract on a same-workspace idempotency collision", async () => {
-    await createAgent(
-      "shared_forecast_lora",
-      "Shared forecast",
-      "shared collision forecast",
-      "Shared collision probability is 0.7."
-    );
     process.env.APP_API_TOKENS_JSON = JSON.stringify({
-      alice_token: { user_id: "alice", workspace_id: "shared_workspace", role: "user" },
+      alice_token: { user_id: "alice", workspace_id: "shared_workspace", role: "admin" },
       bob_token: { user_id: "bob", workspace_id: "shared_workspace", role: "user" }
     });
     const aliceAuth = { Authorization: "Bearer alice_token" };
     const bobAuth = { Authorization: "Bearer bob_token" };
+    await createAgent(
+      "shared_forecast_lora",
+      "Shared forecast",
+      "shared collision forecast",
+      "Shared collision probability is 0.7.",
+      aliceAuth
+    );
     const aliceSession = await createSession("Alice collision", aliceAuth);
     const bobSession = await createSession("Bob collision", bobAuth);
     const query = "Ask @shared_forecast for the shared collision forecast.";

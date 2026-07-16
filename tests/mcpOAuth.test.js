@@ -10,7 +10,11 @@ import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { createApp } from "../server/app.js";
-import { decryptMcpValue, encryptMcpValue } from "../server/mcp.js";
+import {
+  decryptMcpValue,
+  encryptMcpValue,
+  revokePendingMcpOAuthState
+} from "../server/mcp.js";
 
 const OWNER_TOKEN = "oauth-owner-test-token";
 const OTHER_TOKEN = "oauth-other-test-token";
@@ -255,6 +259,75 @@ describe("managed MCP OAuth connections", () => {
     expect(provider.revocations).toContain("refresh-code-partial");
     const listed = await request(app).get("/api/mcp/connections").set(owner()).expect(200);
     expect(listed.body.connections).toEqual([]);
+  });
+
+  it("revokes and stores no credential when account deletion wins the OAuth commit race", async () => {
+    const started = await startOAuth();
+    let releaseTokenResponse;
+    provider.tokenGate = new Promise((resolve) => { releaseTokenResponse = resolve; });
+    provider.tokenReached = new Promise((resolve) => { provider.resolveTokenReached = resolve; });
+
+    const callbackPromise = finishOAuth(started, "code-delete-race");
+    await provider.tokenReached;
+    await app.locals.store.mutate((data) => {
+      const transaction = data.mcpOauthStates.find((item) => item.state_digest === digestForTest(started.state));
+      transaction.status = "account_deleting";
+      transaction.failed_at = new Date().toISOString();
+      delete transaction.verifier_envelope;
+      return transaction;
+    });
+    releaseTokenResponse();
+
+    const callback = await callbackPromise;
+    expect(callback.headers.location).toBe("/app?mcp_oauth=error&reason=failed");
+    expect(provider.revocations).toContain("refresh-code-delete-race");
+    expect(app.locals.store.read().mcpConnections).toEqual([]);
+    const storedText = await fs.readFile(path.join(tmpDir, "db.json"), "utf8");
+    expect(storedText).not.toContain("access-code-delete-race");
+    expect(storedText).not.toContain("refresh-code-delete-race");
+  });
+
+  it("durably queues an exchanged credential when deletion-race revocation fails, then retries it", async () => {
+    const started = await startOAuth();
+    let releaseTokenResponse;
+    provider.failRevoke = true;
+    provider.tokenGate = new Promise((resolve) => { releaseTokenResponse = resolve; });
+    provider.tokenReached = new Promise((resolve) => { provider.resolveTokenReached = resolve; });
+
+    const callbackPromise = finishOAuth(started, "code-delete-revoke-retry");
+    await provider.tokenReached;
+    await app.locals.store.mutate((data) => {
+      const transaction = data.mcpOauthStates.find((item) => item.state_digest === digestForTest(started.state));
+      transaction.status = "account_deleting";
+      transaction.failed_at = new Date().toISOString();
+      delete transaction.verifier_envelope;
+      return transaction;
+    });
+    releaseTokenResponse();
+    const callback = await callbackPromise;
+    expect(callback.headers.location).toBe("/app?mcp_oauth=error&reason=failed");
+
+    const pending = app.locals.store.read().mcpOauthStates.find((item) => item.state_digest === digestForTest(started.state));
+    expect(pending).toMatchObject({
+      status: "revocation_pending",
+      revocation_attempts: 1,
+      revocation_last_error_code: "mcp_oauth_provider_error"
+    });
+    expect(pending.revocation_envelope).toMatchObject({ algorithm: "aes-256-gcm" });
+    const storedBeforeRetry = await fs.readFile(path.join(tmpDir, "db.json"), "utf8");
+    expect(storedBeforeRetry).not.toContain("access-code-delete-revoke-retry");
+    expect(storedBeforeRetry).not.toContain("refresh-code-delete-revoke-retry");
+
+    provider.failRevoke = false;
+    await revokePendingMcpOAuthState(pending, {
+      key: app.locals.mcpCredentialKey,
+      store: app.locals.store
+    });
+    const revoked = app.locals.store.read().mcpOauthStates.find((item) => item.oauth_state_id === pending.oauth_state_id);
+    expect(revoked.status).toBe("revoked");
+    expect(revoked.revocation_envelope).toBeUndefined();
+    expect(revoked.revoked_at).toBeTruthy();
+    expect(provider.revocations.filter((token) => token === "refresh-code-delete-revoke-retry")).toHaveLength(2);
   });
 
   it("keeps personal connections owner-only and refreshes an expired token once across concurrent calls", async () => {
@@ -518,13 +591,19 @@ function createSyntheticManagedProvider() {
     refreshCount: 0,
     failRefresh: false,
     failRevoke: false,
-    partialScope: false
+    partialScope: false,
+    tokenGate: null,
+    tokenReached: null,
+    resolveTokenReached: null
   };
   state.server = http.createServer(async (incoming, response) => {
     if (incoming.method === "POST" && incoming.url === "/token") {
       const form = new URLSearchParams(await readBody(incoming));
       const values = Object.fromEntries(form.entries());
       state.tokenRequests.push(values);
+      state.resolveTokenReached?.();
+      state.resolveTokenReached = null;
+      if (state.tokenGate) await state.tokenGate;
       if (values.client_id !== "gmail-oauth-test-client" || values.client_secret !== "gmail-oauth-test-client-secret") {
         return json(response, 401, { error: "invalid_client" });
       }

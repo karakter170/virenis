@@ -81,7 +81,10 @@ export function appendAgentEvent(data, {
   occurredAt = nowIso()
 }) {
   data.agentEvents ||= [];
-  const previous = [...data.agentEvents].reverse().find((event) => event.agent_id === agent.id);
+  const previous = [...data.agentEvents].reverse().find((event) => (
+    event.agent_id === agent.id
+    && String(event.workspace_id || "") === String(agent.workspace_id || "")
+  ));
   const event = {
     event_id: makeId("agent_event"),
     schema_version: "virenis-agent-event-v1",
