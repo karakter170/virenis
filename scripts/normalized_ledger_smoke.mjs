@@ -4,6 +4,7 @@ import pg from "pg";
 
 import {
   normalizedLedgerActorId,
+  normalizedLedgerAvailable,
   normalizedLedgerLabel,
   syncNormalizedLedger
 } from "../server/normalizedLedger.js";
@@ -31,8 +32,8 @@ const uploadDigest = sha("exact uploaded source bytes");
 const extractedTextDigest = sha("exact extracted source text");
 const corpusRevision = sha("exact corpus revision");
 const indexDigest = sha("exact index bytes");
-const ledgerAgentId = normalizedLedgerLabel("agent", agentId);
-const ledgerSourceId = normalizedLedgerLabel("source", `doc_${suffix}`);
+const ledgerAgentId = normalizedLedgerLabel("agent", workspace, agentId);
+const ledgerSourceId = normalizedLedgerLabel("source", workspace, `doc_${suffix}`);
 
 const agent = {
   id: agentId,
@@ -285,6 +286,9 @@ const data = {
 const client = new Client({ connectionString });
 await client.connect();
 try {
+  if (!await normalizedLedgerAvailable(client)) {
+    throw new Error("normalized ledger schema, RLS policies, or triggers failed exact attestation");
+  }
   await client.query("BEGIN");
   await syncNormalizedLedger(client, data);
   await syncNormalizedLedger(client, data);
@@ -319,8 +323,8 @@ try {
     privacyRow.revision_agent_id !== ledgerAgentId
     || privacyRow.event_actor_id !== normalizedLedgerActorId(workspace, agentEvent.actor_id)
     || privacyRow.execution_actor_id !== normalizedLedgerActorId(workspace, execution.created_by)
-    || privacyRow.chunk_id !== normalizedLedgerLabel("chunk", citation.chunk_id)
-    || privacyRow.artifact_name !== normalizedLedgerLabel("artifact", step.handoff_artifacts[0].name)
+    || privacyRow.chunk_id !== normalizedLedgerLabel("chunk", workspace, citation.chunk_id)
+    || privacyRow.artifact_name !== normalizedLedgerLabel("artifact", workspace, step.handoff_artifacts[0].name)
     || privacyRow.inline_payload !== null
     || privacyRow.owner_actor_id !== normalizedLedgerActorId(workspace, contract.created_by)
     || privacyRow.observed_value?.schema_version !== "virenis-ledger-content-free-v1"
@@ -646,13 +650,29 @@ try {
 
   const policyResult = await client.query(
     `SELECT count(*)::int AS count FROM pg_policies WHERE schemaname='tcar_ledger'
-       AND policyname LIKE '%_workspace_isolation'`
+       AND policyname=tablename || '_workspace_isolation'
+       AND permissive='PERMISSIVE' AND cmd='ALL'
+       AND roles=ARRAY['public']::name[]
+       AND regexp_replace(COALESCE(qual,''), '\\s+', '', 'g')='(workspace_id=tcar_ledger.current_workspace_id())'
+       AND regexp_replace(COALESCE(with_check,''), '\\s+', '', 'g')='(workspace_id=tcar_ledger.current_workspace_id())'`
+  );
+  const policyTotal = await client.query(
+    `SELECT count(*)::int AS count FROM pg_policies WHERE schemaname='tcar_ledger'
+       AND tablename=ANY($1::text[])`,
+    [[
+      "workspaces", "agent_revisions", "agent_events", "execution_runs",
+      "source_revisions", "execution_steps", "execution_events", "evidence_records",
+      "execution_artifacts", "artifact_evidence", "outcome_contracts",
+      "outcome_contract_versions", "outcome_instances", "outcome_observations",
+      "outcome_settlements", "outcome_disputes", "settlement_metric_scores",
+      "settlement_observations", "reality_rank_snapshots"
+    ]]
   );
   const forcedResult = await client.query(
     `SELECT count(*)::int AS count FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
       WHERE n.nspname='tcar_ledger' AND c.relrowsecurity AND c.relforcerowsecurity`
   );
-  if (policyResult.rows[0].count < 19 || forcedResult.rows[0].count < 19) {
+  if (policyResult.rows[0].count !== 19 || policyTotal.rows[0].count !== 19 || forcedResult.rows[0].count < 19) {
     throw new Error("normalized ledger RLS policies are incomplete");
   }
 
@@ -674,6 +694,7 @@ try {
     actual_rls_isolation: true,
     append_only_update_rejected: true,
     workspace_policies: policyResult.rows[0].count,
+    workspace_policy_total: policyTotal.rows[0].count,
     forced_rls_tables: forcedResult.rows[0].count,
     counts
   }, null, 2));

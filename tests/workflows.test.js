@@ -1538,6 +1538,469 @@ describe("explicit workflow Auto-Composer", () => {
     expect(app.locals.store.read().agents.filter((agent) => agent.workflow_origin?.workflow_id === workflow.workflow_id)).toHaveLength(1);
   });
 
+  it.each([
+    { kind: "generated", crashPoint: "before_remote", anchorHex: "1", registrationHex: "a" },
+    {
+      kind: "generated",
+      crashPoint: "after_remote",
+      anchorHex: "2",
+      registrationHex: "b",
+      pauseStartupCleanup: true
+    },
+    { kind: "marketplace", crashPoint: "before_remote", anchorHex: "3", registrationHex: "c" },
+    {
+      kind: "marketplace",
+      crashPoint: "after_remote",
+      anchorHex: "4",
+      registrationHex: "d",
+      retryAfterStartupOutage: true
+    }
+  ])("reconciles a $kind provisional anchor $crashPoint across restart and recreates it", async ({
+    kind,
+    crashPoint,
+    anchorHex,
+    registrationHex,
+    retryAfterStartupOutage = false,
+    pauseStartupCleanup = false
+  }) => {
+    const session = await createSession();
+    const queued = await sendMessage(session.session_id, `/agent prepare a ${kind} restart recovery proof`);
+    await waitForRun(queued.body.run_id);
+    const workflow = (await getSession(session.session_id)).body.workflows[0];
+    const provisionalAgentId = `${kind}_restart_anchor_${anchorHex}`;
+    const registrationId = `registration_${registrationHex.repeat(48)}`;
+    const anchorId = `workflow_registration_${anchorHex.repeat(32)}`;
+    const listingId = `listing_${"f".repeat(16)}`;
+    await app.locals.store.mutate((data) => {
+      const current = data.workflows.find((item) => item.workflow_id === workflow.workflow_id);
+      const node = current.nodes.find((item) => item.type === "agent");
+      current.approved_at = new Date().toISOString();
+      current.status = "activating";
+      current.revision += 1;
+      current.activation_claim_id = `activation_crashed_${anchorHex}`;
+      current.activation_claimed_at = new Date().toISOString();
+      if (kind === "generated") {
+        Object.assign(node, {
+          source: "generated",
+          candidate_id: null,
+          agent_id: null,
+          listing_id: null,
+          generated_agent: {
+            id_hint: provisionalAgentId,
+            title: "Restart Recovery Agent",
+            capability: "Recreates a safely reconciled generated agent after restart.",
+            boundary: "Use only the declared restart recovery task.",
+            consumes: ["user_request"],
+            produces: ["recovery_output"],
+            routing_cues: ["restart recovery"],
+            tools: []
+          }
+        });
+      } else {
+        Object.assign(node, {
+          source: "marketplace",
+          candidate_id: `marketplace:${listingId}`,
+          agent_id: null,
+          listing_id: listingId,
+          generated_agent: { id_hint: provisionalAgentId }
+        });
+        data.agents.push({
+          ...agentRecord({
+            id: "published_restart_recovery_agent",
+            title: "Publisher-only source",
+            capability: "Private publisher source that is not copied directly.",
+            created_by: "publisher",
+            workspace_id: "workspace_market"
+          }),
+          marketplace: {
+            published: true,
+            listing_id: listingId,
+            published_by: "publisher",
+            publisher_workspace_id: "workspace_market",
+            description: "Restart-safe Marketplace specialist.",
+            snapshot: {
+              title: "Marketplace Restart Recovery Agent",
+              capability: "Recreates a safely reconciled Marketplace agent after restart.",
+              consumes: ["user_request"],
+              produces: ["recovery_output"],
+              routing_cues: ["restart recovery"],
+              tools: [],
+              connector_requirements: []
+            }
+          }
+        });
+      }
+      data.agents.push({
+        ...agentRecord({
+          id: provisionalAgentId,
+          title: "Non-routable crash anchor",
+          capability: "Records exact cleanup ownership while registration is incomplete.",
+          created_by: "alice",
+          workspace_id: "workspace_team"
+        }),
+        ready: false,
+        runtime_sync_pending: true,
+        ...(kind === "generated" ? {
+          workflow_origin: {
+            workflow_id: current.workflow_id,
+            node_id: node.id,
+            source: "generated"
+          }
+        } : {
+          marketplace_origin: {
+            listing_id: listingId,
+            source_agent_id: "published_restart_recovery_agent",
+            publisher_user_id: "publisher",
+            copied_at: new Date().toISOString()
+          }
+        }),
+        workflow_registration_anchor: {
+          schema_version: "workflow-runtime-registration-anchor-v1",
+          anchor_id: anchorId,
+          registration_id: registrationId,
+          agent_id: provisionalAgentId,
+          kind,
+          workflow_id: current.workflow_id,
+          workflow_node_id: node.id,
+          listing_id: kind === "marketplace" ? listingId : null,
+          workspace_id: "workspace_team",
+          created_by: "alice",
+          requested_role: "user",
+          created_at: new Date().toISOString()
+        }
+      });
+      return current;
+    });
+
+    const visibleBeforeRestart = await request(app)
+      .get("/api/agents?limit=100")
+      .set(auth("workflow_alice"))
+      .expect(200);
+    expect(JSON.stringify(visibleBeforeRestart.body)).not.toContain(registrationId);
+
+    await app.locals.drainBackgroundTasks({ timeoutMs: 5000 });
+    await app.locals.store.close();
+    app = null;
+    const previousRuntime = {
+      TCAR_ENGINE_MODE: process.env.TCAR_ENGINE_MODE,
+      TCAR_RUNTIME_API_URL: process.env.TCAR_RUNTIME_API_URL,
+      TCAR_RUNTIME_API_KEY: process.env.TCAR_RUNTIME_API_KEY
+    };
+    process.env.TCAR_ENGINE_MODE = "real";
+    process.env.TCAR_RUNTIME_API_URL = "http://runtime.workflow-restart.test";
+    process.env.TCAR_RUNTIME_API_KEY = "workflow-restart-recovery-test-key";
+    let crashedRegistrationExists = crashPoint === "after_remote";
+    let cleanupAttempts = 0;
+    let startupCleanupObserved;
+    const startupCleanupStarted = new Promise((resolve) => { startupCleanupObserved = resolve; });
+    let releaseStartupCleanup;
+    const startupCleanupGate = new Promise((resolve) => { releaseStartupCleanup = resolve; });
+    const calls = [];
+    const restoreFetch = setRuntimeFetchForTests(async (url, options = {}) => {
+      const pathName = new URL(url).pathname;
+      const method = options.method || "GET";
+      const body = options.body ? JSON.parse(options.body) : {};
+      calls.push({ method, pathName, body });
+      if (method === "DELETE" && pathName === `/agents/${provisionalAgentId}`) {
+        cleanupAttempts += 1;
+        if (pauseStartupCleanup && cleanupAttempts === 1) {
+          startupCleanupObserved();
+          await startupCleanupGate;
+        }
+        if (retryAfterStartupOutage && cleanupAttempts === 1) {
+          return Response.json({ detail: "synthetic startup Runtime outage" }, { status: 503 });
+        }
+        if (!crashedRegistrationExists) {
+          return Response.json({ detail: "not found" }, { status: 404 });
+        }
+        expect(body).toMatchObject({
+          registration_id: registrationId,
+          purge_registration: true
+        });
+        crashedRegistrationExists = false;
+        return Response.json({
+          ok: true,
+          status: "purged",
+          id: provisionalAgentId,
+          agent: { id: provisionalAgentId, enabled: false, mounted: false },
+          enabled: false,
+          mounted: false,
+          purged: true,
+          requires_vllm_reload: false
+        });
+      }
+      if (method === "POST" && pathName === "/agents") {
+        expect(body.id).toBe(provisionalAgentId);
+        expect(body.registration_id).not.toBe(registrationId);
+        return Response.json({
+          ok: true,
+          status: "added",
+          id: body.id,
+          registration_id: body.registration_id,
+          result: { status: "added", id: body.id },
+          agent: {
+            ...body,
+            enabled: true,
+            mounted: true,
+            registration_kind: "agent",
+            registration_cleanup_allowed: true
+          },
+          mounted: true,
+          requires_vllm_reload: false
+        });
+      }
+      return Response.json({ detail: "not found" }, { status: 404 });
+    });
+    try {
+      const boot = createApp({ dbPath, uploadRoot: tmpDir, workflowComposer: composer });
+      app = pauseStartupCleanup
+        ? await Promise.race([
+            boot,
+            new Promise((_, reject) => setTimeout(() => reject(new Error("startup waited for Runtime cleanup")), 1000))
+          ])
+        : await boot;
+      if (pauseStartupCleanup) {
+        expect(app.locals.workflowRegistrationStartupRecovery).toMatchObject({
+          pending: 1,
+          scheduled: true
+        });
+        await startupCleanupStarted;
+        releaseStartupCleanup();
+      }
+      await app.locals.workflowRegistrationStartupRecoveryPromise;
+      if (retryAfterStartupOutage) {
+        expect(app.locals.workflowRegistrationStartupRecovery).toMatchObject({
+          attempted: 1,
+          reconciled: 0,
+          pending: 1,
+          results: [{
+            agent_id: provisionalAgentId,
+            anchor_id: anchorId,
+            status: "pending"
+          }]
+        });
+      } else {
+        expect(app.locals.workflowRegistrationStartupRecovery).toMatchObject({
+          attempted: 1,
+          reconciled: 1,
+          pending: 0,
+          results: [{
+            agent_id: provisionalAgentId,
+            anchor_id: anchorId,
+            status: "reconciled",
+            remote_state: crashPoint === "after_remote" ? "purged" : "absent"
+          }]
+        });
+      }
+      expect(app.locals.store.read((data) => data.agents.some((agent) => (
+        agent.id === provisionalAgentId
+        && agent.runtime_sync_pending === true
+      )))).toBe(retryAfterStartupOutage);
+      const recovered = await request(app)
+        .get(`/api/workflows/${workflow.workflow_id}`)
+        .set(auth("workflow_alice"))
+        .expect(200);
+      expect(recovered.body.status).toBe("activation_failed");
+      const resumed = await request(app)
+        .post(`/api/workflows/${workflow.workflow_id}/resume`)
+        .set(auth("workflow_alice"))
+        .send({})
+        .expect(200);
+      expect(resumed.body.status).toBe("active");
+      const recreated = app.locals.store.read((data) => data.agents.find((agent) => (
+        agent.id === provisionalAgentId
+        && agent.created_by === "alice"
+        && agent.workspace_id === "workspace_team"
+      )));
+      expect(recreated).toMatchObject({ ready: true });
+      expect(recreated.runtime_sync_pending).toBeUndefined();
+      expect(recreated.workflow_registration_anchor).toBeUndefined();
+      expect(calls.map((call) => `${call.method} ${call.pathName}`)).toEqual([
+        ...(retryAfterStartupOutage ? [`DELETE /agents/${provisionalAgentId}`] : []),
+        `DELETE /agents/${provisionalAgentId}`,
+        "POST /agents"
+      ]);
+    } finally {
+      releaseStartupCleanup();
+      restoreFetch();
+      for (const [key, value] of Object.entries(previousRuntime)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
+  it("atomically owns a promoted Marketplace copy and resumes after the next persistence step crashes", async () => {
+    const listingId = `listing_${"e".repeat(16)}`;
+    await app.locals.store.mutate((data) => {
+      data.agents.push({
+        ...agentRecord({
+          id: "published_atomic_promotion_agent",
+          title: "Publisher atomic source",
+          capability: "Publisher-only source content.",
+          created_by: "publisher",
+          workspace_id: "workspace_market"
+        }),
+        marketplace: {
+          published: true,
+          listing_id: listingId,
+          published_by: "publisher",
+          publisher_workspace_id: "workspace_market",
+          description: "Atomic promotion recovery specialist.",
+          snapshot: {
+            title: "Atomic Promotion Agent",
+            capability: "Proves a Marketplace copy survives an interrupted workflow activation.",
+            consumes: ["user_request"],
+            produces: ["promotion_proof"],
+            routing_cues: ["atomic promotion"],
+            tools: [],
+            connector_requirements: []
+          }
+        }
+      });
+      return true;
+    });
+    composer.mockImplementationOnce(async () => ({
+      title: "Atomic Marketplace promotion",
+      nodes: [{
+        id: "atomic_marketplace",
+        type: "agent",
+        title: "Atomic Promotion Agent",
+        task: "Prove the Marketplace promotion is restart-safe.",
+        candidate_id: `marketplace:${listingId}`,
+        produces: ["promotion_proof"]
+      }],
+      edges: []
+    }));
+    const session = await createSession();
+    const queued = await sendMessage(session.session_id, "/agent prove an atomic Marketplace promotion");
+    await waitForRun(queued.body.run_id);
+    let workflow = (await getSession(session.session_id)).body.workflows[0];
+    expect(workflow.nodes.find((node) => node.type === "agent")).toMatchObject({
+      source: "marketplace",
+      listing_id: listingId
+    });
+
+    const previousRuntime = {
+      TCAR_ENGINE_MODE: process.env.TCAR_ENGINE_MODE,
+      TCAR_RUNTIME_API_URL: process.env.TCAR_RUNTIME_API_URL,
+      TCAR_RUNTIME_API_KEY: process.env.TCAR_RUNTIME_API_KEY
+    };
+    process.env.TCAR_ENGINE_MODE = "real";
+    process.env.TCAR_RUNTIME_API_URL = "http://runtime.atomic-promotion.test";
+    process.env.TCAR_RUNTIME_API_KEY = "atomic-promotion-restart-test-key";
+    const calls = [];
+    let registeredAgentId = "";
+    const restoreFetch = setRuntimeFetchForTests(async (url, options = {}) => {
+      const pathName = new URL(url).pathname;
+      const method = options.method || "GET";
+      const body = options.body ? JSON.parse(options.body) : {};
+      calls.push({ method, pathName, body });
+      if (method === "POST" && pathName === "/agents") {
+        registeredAgentId = body.id;
+        return Response.json({
+          ok: true,
+          status: "added",
+          id: body.id,
+          registration_id: body.registration_id,
+          result: { status: "added", id: body.id },
+          agent: {
+            ...body,
+            enabled: true,
+            mounted: true,
+            registration_kind: "agent",
+            registration_cleanup_allowed: true
+          },
+          mounted: true,
+          requires_vllm_reload: false
+        });
+      }
+      return Response.json({ detail: "unexpected Runtime call" }, { status: 500 });
+    });
+    const store = app.locals.store;
+    const originalSaveNow = store.saveNow.bind(store);
+    let promotionSaved = false;
+    let postPromotionFailureInjected = false;
+    store.saveNow = async () => {
+      const promoted = registeredAgentId && store.read((data) => data.agents.find((agent) => (
+        agent.id === registeredAgentId
+        && agent.ready === true
+        && agent.runtime_sync_pending === true
+        && agent.marketplace_origin?.listing_id === listingId
+        && agent.workflow_origin?.workflow_id === workflow.workflow_id
+        && agent.workflow_origin?.node_id === "atomic_marketplace"
+      )));
+      if (promoted && !promotionSaved) {
+        await originalSaveNow();
+        promotionSaved = true;
+        return;
+      }
+      if (promotionSaved && !postPromotionFailureInjected) {
+        postPromotionFailureInjected = true;
+        throw new Error("synthetic crash after atomic Marketplace promotion");
+      }
+      return originalSaveNow();
+    };
+    try {
+      await request(app)
+        .post(`/api/workflows/${workflow.workflow_id}/decision`)
+        .set(auth("workflow_alice"))
+        .send({ decision: "approve", revision: workflow.revision })
+        .expect(500);
+      expect(promotionSaved).toBe(true);
+      expect(postPromotionFailureInjected).toBe(true);
+      expect(calls.map((call) => `${call.method} ${call.pathName}`)).toEqual(["POST /agents"]);
+      const interruptedAgent = store.read((data) => data.agents.find((agent) => agent.id === registeredAgentId));
+      expect(interruptedAgent).toMatchObject({
+        ready: true,
+        runtime_sync_pending: true,
+        workflow_origin: {
+          workflow_id: workflow.workflow_id,
+          node_id: "atomic_marketplace",
+          source: "marketplace",
+          listing_id: listingId
+        }
+      });
+      expect(interruptedAgent.workflow_registration_anchor).toBeUndefined();
+
+      store.saveNow = originalSaveNow;
+      await app.locals.drainBackgroundTasks({ timeoutMs: 5000 });
+      await app.locals.store.close();
+      app = await createApp({ dbPath, uploadRoot: tmpDir, workflowComposer: composer });
+      expect(app.locals.workflowRegistrationStartupRecovery).toMatchObject({
+        attempted: 0,
+        reconciled: 0,
+        pending: 0
+      });
+      workflow = (await request(app)
+        .get(`/api/workflows/${workflow.workflow_id}`)
+        .set(auth("workflow_alice"))
+        .expect(200)).body;
+      expect(workflow.status).toBe("activation_failed");
+      const resumed = await request(app)
+        .post(`/api/workflows/${workflow.workflow_id}/resume`)
+        .set(auth("workflow_alice"))
+        .send({})
+        .expect(200);
+      expect(resumed.body.status).toBe("active");
+      expect(calls.map((call) => `${call.method} ${call.pathName}`)).toEqual(["POST /agents"]);
+      const activeAgent = app.locals.store.read((data) => data.agents.find((agent) => agent.id === registeredAgentId));
+      expect(activeAgent.ready).toBe(true);
+      expect(activeAgent.runtime_sync_pending).toBeUndefined();
+      expect(resumed.body.activation.node_agents).toContainEqual(expect.objectContaining({
+        node_id: "atomic_marketplace",
+        agent_id: registeredAgentId
+      }));
+    } finally {
+      store.saveNow = originalSaveNow;
+      restoreFetch();
+      for (const [key, value] of Object.entries(previousRuntime)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
   it("composes an unclaimed queued slash command once after a process restart", async () => {
     await app.locals.drainBackgroundTasks({ timeoutMs: 5000 });
     await app.locals.store.close();

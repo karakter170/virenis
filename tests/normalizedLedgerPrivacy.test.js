@@ -1,15 +1,60 @@
+import fs from "node:fs/promises";
+import path from "node:path";
+
 import { describe, expect, it } from "vitest";
 
 import {
   assertNormalizedLedgerWorkspacePrivacy,
   findWorkspaceAgent,
+  normalizedLedgerAvailable,
   normalizedLedgerActorId,
   normalizedLedgerContentReceipt,
   normalizedLedgerLabel,
   syncNormalizedLedger
 } from "../server/normalizedLedger.js";
 
+const SQL_PATH = path.resolve("../../deploy/sql/provenance_outcomes.sql");
+
 describe("normalized ledger privacy projection", () => {
+  it("recreates exact tenant policies and rejects policy or trigger drift", async () => {
+    const sql = await fs.readFile(SQL_PATH, "utf8");
+    expect(sql).toContain("DROP POLICY IF EXISTS %I ON tcar_ledger.%I");
+    expect(sql).toContain("AS PERMISSIVE FOR ALL TO PUBLIC");
+
+    const healthyStatus = {
+      tables: 19,
+      forced_rls: 19,
+      policies: 19,
+      policy_total: 19,
+      projection_columns: 1,
+      triggers: 28,
+      trigger_total: 28
+    };
+    const healthy = {
+      query: async (query) => {
+        expect(query).toContain("permissive='PERMISSIVE'");
+        expect(query).toContain("roles=ARRAY['public']::name[]");
+        expect(query).toContain("trigger.tgtype=expected.trigger_type");
+        expect(query).toContain("procedure_namespace.nspname='tcar_ledger'");
+        return { rows: [healthyStatus] };
+      }
+    };
+    expect(await normalizedLedgerAvailable(healthy)).toBe(true);
+    for (const patch of [
+      { tables: 18 },
+      { forced_rls: 18 },
+      { policies: 18 },
+      { policy_total: 20 },
+      { projection_columns: 0 },
+      { triggers: 27 },
+      { trigger_total: 29 }
+    ]) {
+      expect(await normalizedLedgerAvailable({
+        query: async () => ({ rows: [{ ...healthyStatus, ...patch }] })
+      })).toBe(false);
+    }
+  });
+
   it("uses stable workspace-scoped pseudonyms instead of human actor ids", () => {
     const first = normalizedLedgerActorId("workspace_one", "meteye@example.com");
     expect(first).toMatch(/^actor_sha256_[a-f0-9]{64}$/);
@@ -38,11 +83,13 @@ describe("normalized ledger privacy projection", () => {
   });
 
   it("pseudonymizes title-derived durable labels", () => {
-    const agent = normalizedLedgerLabel("agent", "Jane Doe medical records_lora");
-    const chunk = normalizedLedgerLabel("chunk", "Jane_Doe_medical_records_0001");
-    expect(agent).toMatch(/^agent_sha256_[a-f0-9]{64}$/);
-    expect(chunk).toMatch(/^chunk_sha256_[a-f0-9]{64}$/);
+    const agent = normalizedLedgerLabel("agent", "workspace_one", "Jane Doe medical records_lora");
+    const chunk = normalizedLedgerLabel("chunk", "workspace_one", "Jane_Doe_medical_records_0001");
+    expect(agent).toMatch(/^agent_ws2_sha256_[a-f0-9]{64}$/);
+    expect(chunk).toMatch(/^chunk_ws2_sha256_[a-f0-9]{64}$/);
     expect(`${agent} ${chunk}`).not.toMatch(/Jane|medical|records/i);
+    expect(normalizedLedgerLabel("agent", "workspace_two", "Jane Doe medical records_lora")).not.toBe(agent);
+    expect(() => normalizedLedgerLabel("agent", "Jane Doe medical records_lora")).toThrow(/workspace scope/i);
   });
 
   it("never lets an unscoped legacy user agent enter another workspace's projection", () => {
@@ -72,9 +119,9 @@ describe("normalized ledger privacy projection", () => {
     expect(calls[0].params[0]).toBe("workspace_private");
     expect(calls[0].sql).toContain("tcar_ledger.agent_revisions");
     expect(calls[0].sql).toContain("actor_sha256_");
-    expect(calls[0].sql).toContain("source_sha256_");
-    expect(calls[0].sql).toContain("chunk_sha256_");
-    expect(calls[0].sql).toContain("artifact_sha256_");
+    expect(calls[0].sql).toContain("source_ws2_sha256_");
+    expect(calls[0].sql).toContain("chunk_ws2_sha256_");
+    expect(calls[0].sql).toContain("artifact_ws2_sha256_");
     expect(calls[0].sql).toContain("key_sha256_");
     expect(calls[0].sql).toContain("virenis-ledger-content-free-v1");
     expect(calls[0].sql).toContain("Private workspace");

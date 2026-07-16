@@ -12,6 +12,7 @@ import {
   exchangeManagedAuthorizationCode,
   managedMcpProvider,
   managedMcpProviderForCredential,
+  managedRevocationMayInvalidateSiblingCredentials,
   oauthCredentialNeedsRefresh,
   prepareManagedMcpProvider,
   publicManagedMcpProviders,
@@ -31,7 +32,9 @@ const MAX_TOOLS = 250;
 const MCP_ALIAS_RE = /^mcp_[a-f0-9]{8}_[a-z0-9_]{1,42}_[a-f0-9]{6}$/;
 const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
 const OAUTH_STATE_RETENTION_MS = 24 * 60 * 60 * 1000;
+const UNCERTAIN_OAUTH_ATTESTATION_MIN_AGE_MS = 20 * 60 * 1000;
 const oauthRefreshInflight = new Map();
+const mcpConnectionLifecycleTails = new Map();
 const dynamicRegistrationInflight = new Map();
 
 export const MCP_TEMPLATES = Object.freeze([
@@ -195,7 +198,7 @@ export function publicMcpConnection(connection) {
     auth_type: connection.auth_type,
     has_secret: Boolean(connection.credential),
     status: connection.status,
-    reauthorization_required: connection.status === "reauthorization_required",
+    reauthorization_required: ["reauthorization_required", "reauthorization_pending"].includes(connection.status),
     protocol_version: connection.protocol_version,
     read_policy: connection.trust_read_annotations ? "allow_declared_reads" : "approve_every_call",
     tools: (connection.tools || []).map(publicMcpTool),
@@ -283,8 +286,15 @@ export async function beginManagedMcpOAuth({ store, actor, body, key, env = proc
   }
   let existingConnection = null;
   if (requestedConnectionId) {
-    existingConnection = store.read((data) => (data.mcpConnections || [])
-      .find((item) => item.connection_id === requestedConnectionId));
+    const matchingConnections = store.read((data) => (data.mcpConnections || [])
+      .filter((item) => (
+        item.connection_id === requestedConnectionId
+        && item.workspace_id === actor.workspace_id
+      )));
+    if (matchingConnections.length > 1) {
+      throw mcpError(409, "MCP connection identity is ambiguous and must be repaired before reauthorization.", "mcp_connection_ambiguous");
+    }
+    [existingConnection] = matchingConnections;
     if (!existingConnection || existingConnection.workspace_id !== actor.workspace_id) {
       throw mcpError(404, "MCP connection not found.", "mcp_connection_not_found");
     }
@@ -294,14 +304,43 @@ export async function beginManagedMcpOAuth({ store, actor, body, key, env = proc
     if (existingConnection.provider_id !== provider.id || existingConnection.connection_mode !== "managed") {
       throw mcpError(409, "This connection cannot be reauthorized with that provider.", "mcp_provider_mismatch");
     }
+    if (!["reauthorization_required", "reauthorization_pending"].includes(existingConnection.status)) {
+      throw mcpError(409, "Disconnect this active provider account before authorizing a different grant.", "mcp_reauthorization_not_required");
+    }
+    const uncertainOutcome = store.read((data) => (data.mcpOauthStates || []).some((state) => (
+      state.source_connection_id === existingConnection.connection_id
+      && state.workspace_id === existingConnection.workspace_id
+      && state.created_by === existingConnection.created_by
+      && state.provider_id === existingConnection.provider_id
+      && ["exchange_outcome_uncertain", "refresh_outcome_uncertain"].includes(state.status)
+    )));
+    if (uncertainOutcome) {
+      throw mcpError(409, "Provider token state is uncertain. An administrator must verify provider-wide deauthorization before reconnecting.", "mcp_oauth_outcome_uncertain");
+    }
+    existingConnection = await prepareMcpConnectionReauthorization(existingConnection, {
+      store,
+      key,
+      env
+    });
   } else {
-    const duplicate = store.read((data) => (data.mcpConnections || []).some((item) =>
-      item.workspace_id === actor.workspace_id
-      && item.created_by === actor.user_id
-      && item.provider_id === provider.id
+    const duplicate = store.read((data) => (
+      (data.mcpConnections || []).some((item) =>
+        item.workspace_id === actor.workspace_id
+        && item.created_by === actor.user_id
+        && item.provider_id === provider.id
+      )
+      || (data.mcpOauthStates || []).some((item) =>
+        item.workspace_id === actor.workspace_id
+        && item.created_by === actor.user_id
+        && item.provider_id === provider.id
+        && (
+          (item.status === "revocation_pending" && Boolean(item.revocation_envelope))
+          || ["exchange_outcome_uncertain", "refresh_outcome_uncertain"].includes(item.status)
+        )
+      )
     ));
     if (duplicate) {
-      throw mcpError(409, `${provider.name} is already connected. Reconnect or remove the existing account first.`, "mcp_provider_already_connected");
+      throw mcpError(409, `${provider.name} is already connected or is still being securely disconnected.`, "mcp_provider_already_connected");
     }
   }
 
@@ -322,6 +361,9 @@ export async function beginManagedMcpOAuth({ store, actor, body, key, env = proc
     workspace_id: actor.workspace_id,
     created_by: actor.user_id,
     connection_id: existingConnection?.connection_id || null,
+    source_credential_revision_digest: existingConnection?.credential
+      ? digest(existingConnection.credential)
+      : null,
     resume_context: resumeWorkflow ? {
       workflow_id: resumeWorkflow.workflow_id,
       session_id: resumeWorkflow.session_id
@@ -339,16 +381,24 @@ export async function beginManagedMcpOAuth({ store, actor, body, key, env = proc
     mcpOAuthStateAad(transaction)
   );
   await store.mutate((data) => {
-    data.mcpOauthStates = (data.mcpOauthStates || []).filter((item) => {
-      const terminalAt = Date.parse(item.completed_at || item.failed_at || item.expires_at || "");
-      return !Number.isFinite(terminalAt) || terminalAt >= Date.now() - OAUTH_STATE_RETENTION_MS;
-    });
-    if (!requestedConnectionId && (data.mcpConnections || []).some((item) =>
-      item.workspace_id === actor.workspace_id
-      && item.created_by === actor.user_id
-      && item.provider_id === provider.id
+    data.mcpOauthStates = retainedMcpOAuthStates(data.mcpOauthStates, Date.now());
+    if (!requestedConnectionId && (
+      (data.mcpConnections || []).some((item) =>
+        item.workspace_id === actor.workspace_id
+        && item.created_by === actor.user_id
+        && item.provider_id === provider.id
+      )
+      || (data.mcpOauthStates || []).some((item) =>
+        item.workspace_id === actor.workspace_id
+        && item.created_by === actor.user_id
+        && item.provider_id === provider.id
+        && (
+          (item.status === "revocation_pending" && Boolean(item.revocation_envelope))
+          || ["exchange_outcome_uncertain", "refresh_outcome_uncertain"].includes(item.status)
+        )
+      )
     )) {
-      throw mcpError(409, `${provider.name} is already connected. Reconnect or remove the existing account first.`, "mcp_provider_already_connected");
+      throw mcpError(409, `${provider.name} is already connected or is still being securely disconnected.`, "mcp_provider_already_connected");
     }
     for (const pending of data.mcpOauthStates) {
       if (
@@ -357,8 +407,9 @@ export async function beginManagedMcpOAuth({ store, actor, body, key, env = proc
         && pending.provider_id === provider.id
         && ["pending", "exchanging"].includes(pending.status)
       ) {
-        pending.status = "superseded";
+        pending.status = pending.revocation_envelope ? "revocation_pending" : "superseded";
         pending.failed_at = nowIso();
+        if (pending.revocation_envelope) pending.revocation_queued_at ||= pending.failed_at;
         delete pending.verifier_envelope;
       }
     }
@@ -390,16 +441,17 @@ export async function completeManagedMcpOAuth({
     throw mcpError(400, "OAuth state is invalid.", "mcp_oauth_state_invalid");
   }
   const stateDigest = digest(state);
-  const transaction = store.read((data) => (data.mcpOauthStates || [])
-    .find((item) => item.state_digest === stateDigest));
-  if (!transaction || transaction.provider_id !== baseProvider.id) {
+  const matchingTransactions = store.read((data) => (data.mcpOauthStates || [])
+    .filter((item) => item.state_digest === stateDigest && item.provider_id === baseProvider.id));
+  if (matchingTransactions.length !== 1) {
     throw mcpError(400, "OAuth state was not found.", "mcp_oauth_state_invalid");
   }
+  const [transaction] = matchingTransactions;
   if (transaction.status !== "pending") {
     throw mcpError(409, "OAuth state has already been used.", "mcp_oauth_state_replayed");
   }
   if (Date.parse(transaction.expires_at || "") <= Date.now()) {
-    await setOauthTransactionStatus(store, transaction.oauth_state_id, "expired");
+    await setOauthTransactionStatus(store, transaction, "expired");
     throw mcpError(410, "OAuth connection attempt expired. Start again.", "mcp_oauth_state_expired");
   }
   const browserNonce = readCookie(cookieHeader, mcpOAuthCookieName(env));
@@ -407,7 +459,7 @@ export async function completeManagedMcpOAuth({
     throw mcpError(403, "OAuth browser binding did not match.", "mcp_oauth_browser_mismatch");
   }
   await store.mutate((data) => {
-    const current = (data.mcpOauthStates || []).find((item) => item.oauth_state_id === transaction.oauth_state_id);
+    const current = (data.mcpOauthStates || []).find((item) => sameMcpOAuthStateScope(item, transaction));
     if (!current || current.status !== "pending") {
       throw mcpError(409, "OAuth state has already been used.", "mcp_oauth_state_replayed");
     }
@@ -417,7 +469,7 @@ export async function completeManagedMcpOAuth({
   });
 
   if (query?.error) {
-    await setOauthTransactionStatus(store, transaction.oauth_state_id, "denied");
+    await setOauthTransactionStatus(store, transaction, "denied");
     const error = mcpError(400, `${baseProvider.name} account access was not granted.`, "mcp_oauth_denied");
     error.oauth_redirect = true;
     error.oauth_reason = "denied";
@@ -427,6 +479,7 @@ export async function completeManagedMcpOAuth({
   }
 
   let credential;
+  let exchangeAttempted = false;
   let provider = baseProvider;
   try {
     const verifier = decryptMcpValue(
@@ -437,21 +490,45 @@ export async function completeManagedMcpOAuth({
     provider = verifier.provider_snapshot
       ? restoreManagedMcpProvider(normalizedProviderId, verifier.provider_snapshot, env)
       : managedMcpProvider(normalizedProviderId, env);
+    exchangeAttempted = true;
     credential = await exchangeManagedAuthorizationCode(provider, {
       code: query?.code,
       codeVerifier: verifier.code_verifier,
       env
     });
+    const stagedState = await stageMcpOAuthCredential({
+      store,
+      transaction,
+      credential,
+      key
+    });
+    if (stagedState.status !== "exchanging") {
+      throw mcpError(
+        409,
+        stagedState.status === "revocation_pending"
+          ? "OAuth authorization was cancelled while the provider credential was being issued. The credential was queued for revocation."
+          : "OAuth transaction state changed while the provider credential was being issued.",
+        stagedState.status === "revocation_pending"
+          ? "mcp_oauth_revocation_pending"
+          : "mcp_oauth_state_changed"
+      );
+    }
     assertManagedCredentialScopes(provider, credential);
     const currentConnection = transaction.connection_id
       ? store.read((data) => (data.mcpConnections || [])
-        .find((item) => item.connection_id === transaction.connection_id))
+        .find((item) => (
+          item.connection_id === transaction.connection_id
+          && item.workspace_id === transaction.workspace_id
+          && item.created_by === transaction.created_by
+          && item.provider_id === provider.id
+        )))
       : null;
     if (transaction.connection_id && (
       !currentConnection
       || currentConnection.workspace_id !== transaction.workspace_id
       || currentConnection.provider_id !== provider.id
       || currentConnection.created_by !== transaction.created_by
+      || digest(currentConnection.credential) !== transaction.source_credential_revision_digest
     )) {
       throw mcpError(409, "The connection changed while authorization was in progress.", "mcp_oauth_connection_changed");
     }
@@ -483,6 +560,7 @@ export async function completeManagedMcpOAuth({
       last_authorized_at: authorizedAt
     };
     delete candidate.auth_error_at;
+    delete candidate.credential_retired_at;
     const discovery = await discoverMcpTools(candidate, { key, authOverride: credential });
     const completed = {
       ...candidate,
@@ -494,7 +572,7 @@ export async function completeManagedMcpOAuth({
     };
     await store.mutate((data) => {
       const currentState = (data.mcpOauthStates || [])
-        .find((item) => item.oauth_state_id === transaction.oauth_state_id);
+        .find((item) => sameMcpOAuthStateScope(item, transaction));
       if (!currentState || currentState.status !== "exchanging") {
         const deleting = currentState?.status === "account_deleting";
         throw mcpError(
@@ -517,7 +595,24 @@ export async function completeManagedMcpOAuth({
         );
       }
       data.mcpConnections ||= [];
-      const index = data.mcpConnections.findIndex((item) => item.connection_id === connectionId);
+      const matchingIndexes = data.mcpConnections
+        .map((item, itemIndex) => ({ item, itemIndex }))
+        .filter(({ item }) => (
+        item.connection_id === connectionId
+        && item.workspace_id === transaction.workspace_id
+        && item.created_by === transaction.created_by
+        ))
+        .map(({ itemIndex }) => itemIndex);
+      if (matchingIndexes.length > 1) {
+        throw mcpError(409, "MCP connection identity became ambiguous during authorization.", "mcp_connection_ambiguous");
+      }
+      const index = matchingIndexes[0] ?? -1;
+      if (transaction.connection_id && (
+        index < 0
+        || digest(data.mcpConnections[index].credential) !== transaction.source_credential_revision_digest
+      )) {
+        throw mcpError(409, "The connection changed while authorization was in progress.", "mcp_oauth_connection_changed");
+      }
       if (index < 0 && data.mcpConnections.some((item) =>
         item.workspace_id === transaction.workspace_id
         && item.created_by === transaction.created_by
@@ -531,6 +626,9 @@ export async function completeManagedMcpOAuth({
       currentState.connection_id = connectionId;
       currentState.completed_at = nowIso();
       delete currentState.verifier_envelope;
+      delete currentState.revocation_envelope;
+      delete currentState.credential_staged_at;
+      delete currentState.revocation_confirmed_token_ids;
       return completed;
     });
     return {
@@ -549,7 +647,7 @@ export async function completeManagedMcpOAuth({
       try {
         await revokePendingMcpOAuthState(
           store.read((data) => (data.mcpOauthStates || [])
-            .find((item) => item.oauth_state_id === transaction.oauth_state_id)),
+            .find((item) => sameMcpOAuthStateScope(item, transaction))),
           { key, store, env }
         );
       } catch {
@@ -557,10 +655,30 @@ export async function completeManagedMcpOAuth({
         // the recovery worker must fail closed until remote revocation succeeds
         // or an operator resolves an unsupported provider deauthorization.
       }
+      if (managedRevocationMayInvalidateSiblingCredentials(provider)) {
+        await quarantineConnectionsAfterGrantRevocation(store, transaction);
+      }
     }
-    const revocationPending = store.read((data) => (data.mcpOauthStates || [])
-      .some((item) => item.oauth_state_id === transaction.oauth_state_id && item.status === "revocation_pending"));
-    if (!revocationPending) await setOauthTransactionStatus(store, transaction.oauth_state_id, "failed");
+    let finalState = store.read((data) => (data.mcpOauthStates || [])
+      .find((item) => sameMcpOAuthStateScope(item, transaction)));
+    if (!["revocation_pending", "revoked", "revocation_manually_resolved", "account_deleting"].includes(finalState?.status)) {
+      const status = exchangeAttempted
+        && !credential
+        && !oauthFailureOutcomeIsDefinitive(error)
+        ? "exchange_outcome_uncertain"
+        : "failed";
+      finalState = await setOauthTransactionStatus(store, transaction, status);
+      if (status === "exchange_outcome_uncertain" && finalState) {
+        await store.mutate((data) => {
+          const current = (data.mcpOauthStates || []).find((item) => sameMcpOAuthStateScope(item, transaction));
+          if (!current || current.status !== "exchange_outcome_uncertain") return current || null;
+          current.uncertain_started_at = current.exchange_started_at || nowIso();
+          current.uncertain_error_code = String(error?.code || "mcp_oauth_exchange_outcome_uncertain").slice(0, 120);
+          delete current.verifier_envelope;
+          return current;
+        });
+      }
+    }
     error.oauth_redirect = true;
     error.oauth_reason = "failed";
     error.oauth_clear_cookie = true;
@@ -578,31 +696,59 @@ export async function revokePendingMcpOAuthState(state, {
   if (!state?.oauth_state_id || !state.revocation_envelope) {
     throw mcpError(409, "OAuth revocation outbox is unavailable.", "mcp_oauth_revocation_outbox_missing");
   }
+  const durableState = store?.read((data) => (data.mcpOauthStates || [])
+    .find((item) => sameMcpOAuthStateScope(item, state))) || state;
+  if (!durableState.revocation_envelope) {
+    if (["revoked", "revocation_manually_resolved"].includes(durableState.status)) return true;
+    throw mcpError(409, "OAuth revocation outbox is unavailable.", "mcp_oauth_revocation_outbox_missing");
+  }
+  const envelopeDigest = digest(durableState.revocation_envelope);
   const payload = decryptMcpValue(
-    state.revocation_envelope,
+    durableState.revocation_envelope,
     key,
-    mcpOAuthRevocationAad(state)
+    mcpOAuthRevocationAad(durableState)
   );
   const credential = payload?.credential;
-  const provider = managedMcpProviderForCredential(state.provider_id, credential, env);
+  const provider = managedMcpProviderForCredential(durableState.provider_id, credential, env);
   try {
-    await revokeManagedCredential(provider, credential, env);
+    await revokeManagedCredential(provider, credential, env, {
+      completedTokenIds: durableState.revocation_confirmed_token_ids || [],
+      onTokenRevoked: async (tokenId) => {
+        await store?.mutate((data) => {
+          const current = (data.mcpOauthStates || [])
+            .find((item) => sameMcpOAuthStateScope(item, durableState));
+          if (!current?.revocation_envelope || digest(current.revocation_envelope) !== envelopeDigest) {
+            throw mcpError(409, "OAuth revocation outbox changed during cleanup.", "mcp_oauth_revocation_outbox_changed");
+          }
+          current.revocation_confirmed_token_ids = Array.from(new Set([
+            ...(current.revocation_confirmed_token_ids || []),
+            tokenId
+          ])).slice(0, 4);
+          current.revocation_progress_at = nowIso();
+          return current;
+        });
+      }
+    });
   } catch (error) {
     await store?.mutate((data) => {
-      const current = (data.mcpOauthStates || []).find((item) => item.oauth_state_id === state.oauth_state_id);
+      const current = (data.mcpOauthStates || []).find((item) => sameMcpOAuthStateScope(item, durableState));
       if (!current?.revocation_envelope) return null;
       current.status = "revocation_pending";
-      current.revocation_attempts = Math.max(0, Number(current.revocation_attempts) || 0) + 1;
-      current.revocation_last_attempt_at = nowIso();
+      const attempts = Math.max(0, Number(current.revocation_attempts) || 0) + 1;
+      const attemptedAt = nowIso();
+      const retryDelayMs = Math.min(60 * 60 * 1000, 5_000 * (2 ** Math.min(attempts - 1, 9)));
+      current.revocation_attempts = attempts;
+      current.revocation_last_attempt_at = attemptedAt;
+      current.revocation_next_attempt_at = new Date(Date.parse(attemptedAt) + retryDelayMs).toISOString();
       current.revocation_last_error_code = String(error?.code || "mcp_oauth_revocation_failed").slice(0, 120);
       return current;
     });
     throw error;
   }
   await store?.mutate((data) => {
-    const current = (data.mcpOauthStates || []).find((item) => item.oauth_state_id === state.oauth_state_id);
+    const current = (data.mcpOauthStates || []).find((item) => sameMcpOAuthStateScope(item, durableState));
     if (!current) return null;
-    if (digest(current.revocation_envelope) !== digest(state.revocation_envelope)) {
+    if (digest(current.revocation_envelope) !== envelopeDigest) {
       throw mcpError(409, "OAuth revocation outbox changed during cleanup.", "mcp_oauth_revocation_outbox_changed");
     }
     current.status = "revoked";
@@ -610,41 +756,581 @@ export async function revokePendingMcpOAuthState(state, {
     current.revocation_last_attempt_at = current.revoked_at;
     delete current.revocation_envelope;
     delete current.revocation_last_error_code;
+    delete current.revocation_next_attempt_at;
+    delete current.revocation_confirmed_token_ids;
+    delete current.revocation_progress_at;
+    delete current.credential_staged_at;
     return current;
   });
   return true;
 }
 
-async function persistMcpOAuthRevocationOutbox({ store, transaction, credential, key }) {
+async function stageMcpOAuthCredential({ store, transaction, credential, key }) {
   const envelope = encryptMcpValue(
     { credential },
     key,
     mcpOAuthRevocationAad(transaction)
   );
   return store.mutate((data) => {
-    const current = (data.mcpOauthStates || []).find((item) => item.oauth_state_id === transaction.oauth_state_id);
+    const current = (data.mcpOauthStates || [])
+      .find((item) => sameMcpOAuthStateScope(item, transaction));
+    if (!current) {
+      throw mcpError(503, "The issued OAuth credential could not be durably staged.", "mcp_oauth_revocation_outbox_missing");
+    }
+    if (["completed", "revoked", "revocation_manually_resolved"].includes(current.status)) {
+      throw mcpError(409, "OAuth transaction state changed while the provider credential was being issued.", "mcp_oauth_state_changed");
+    }
+    current.revocation_envelope = envelope;
+    current.credential_staged_at = nowIso();
+    current.revocation_attempts = Math.max(0, Number(current.revocation_attempts) || 0);
+    if (current.status !== "exchanging") {
+      current.status = "revocation_pending";
+      current.revocation_queued_at = nowIso();
+    }
+    delete current.verifier_envelope;
+    return current;
+  });
+}
+
+async function persistMcpOAuthRevocationOutbox({ store, transaction, credential, key }) {
+  return store.mutate((data) => {
+    const current = (data.mcpOauthStates || []).find((item) => sameMcpOAuthStateScope(item, transaction));
     if (!current) {
       throw mcpError(503, "OAuth revocation could not be durably queued.", "mcp_oauth_revocation_outbox_missing");
     }
+    if (["revoked", "revocation_manually_resolved"].includes(current.status)) return current;
+    if (!current.revocation_envelope) {
+      current.revocation_envelope = encryptMcpValue(
+        { credential },
+        key,
+        mcpOAuthRevocationAad(current)
+      );
+      current.credential_staged_at = nowIso();
+    }
     current.status = "revocation_pending";
-    current.revocation_envelope = envelope;
-    current.revocation_queued_at = nowIso();
+    current.revocation_queued_at ||= nowIso();
     current.revocation_attempts = Math.max(0, Number(current.revocation_attempts) || 0);
     delete current.verifier_envelope;
     return current;
   });
 }
 
-export async function revokeMcpConnection(connection, { key, env = process.env }) {
-  if (connection?.auth_type !== "oauth2") return false;
-  const credential = decryptMcpValue(
-    connection.credential,
+function mcpConnectionCredentialRevocationOutbox(connection, { key, reason }) {
+  const credential = connectionAuth(connection, key);
+  const queuedAt = nowIso();
+  const outbox = {
+    oauth_state_id: makeId("mcprevoke"),
+    provider_id: connection.provider_id,
+    status: "revocation_pending",
+    workspace_id: connection.workspace_id,
+    created_by: connection.created_by,
+    connection_id: null,
+    source_connection_id: connection.connection_id,
+    created_at: queuedAt,
+    credential_staged_at: queuedAt,
+    revocation_queued_at: queuedAt,
+    revocation_attempts: 0,
+    revocation_reason: String(reason || "connection_credential_retired"),
+    source_credential_revision_digest: digest(connection.credential)
+  };
+  outbox.revocation_envelope = encryptMcpValue(
+    { credential },
     key,
-    mcpConnectionAad(connection.connection_id, connection.workspace_id)
+    mcpOAuthRevocationAad(outbox)
   );
-  const provider = managedMcpProviderForCredential(connection.provider_id, credential, env);
-  await revokeManagedCredential(provider, credential, env);
-  return true;
+  return outbox;
+}
+
+async function prepareMcpConnectionReauthorization(connection, {
+  store,
+  key,
+  env = process.env
+}) {
+  return withMcpConnectionLifecycle(connection, async () => {
+    const matches = store.read((data) => (data.mcpConnections || [])
+      .filter((item) => sameMcpConnectionScope(item, connection)));
+    if (matches.length !== 1) {
+      throw mcpError(409, "MCP connection identity is ambiguous and must be repaired before reauthorization.", "mcp_connection_ambiguous");
+    }
+    const [latest] = matches;
+    if (!["reauthorization_required", "reauthorization_pending"].includes(latest.status)) {
+      throw mcpError(409, "This connection does not require reauthorization.", "mcp_reauthorization_not_required");
+    }
+    const credentialDigest = digest(latest.credential);
+    const retirementStates = store.read((data) => (data.mcpOauthStates || [])
+      .filter((state) => mcpRevocationTargetsCredential(state, latest, credentialDigest)));
+    // A terminal receipt is proof for this exact encrypted credential revision,
+    // regardless of why it was retired. This prevents a provider-wide manual
+    // deauthorization (or an already completed preflight) from being repeated.
+    let outbox = retirementStates.find((state) => (
+      ["revoked", "revocation_manually_resolved"].includes(state.status)
+    )) || retirementStates.find((state) => state.revocation_reason === "reauthorization_preflight");
+    if (!outbox) {
+      outbox = mcpConnectionCredentialRevocationOutbox(latest, {
+        key,
+        reason: "reauthorization_preflight"
+      });
+      await store.mutate((data) => {
+        const current = (data.mcpConnections || []).find((item) => sameMcpConnectionScope(item, latest));
+        if (!current || digest(current.credential) !== credentialDigest) {
+          throw mcpError(409, "MCP credential changed before reauthorization could begin.", "mcp_connection_changed");
+        }
+        data.mcpOauthStates ||= [];
+        data.mcpOauthStates.push(outbox);
+        return outbox;
+      });
+    }
+    if (!["revoked", "revocation_manually_resolved"].includes(outbox.status)) {
+      await revokePendingMcpOAuthState(outbox, { key, store, env });
+    }
+    return store.mutate((data) => {
+      const current = (data.mcpConnections || []).find((item) => sameMcpConnectionScope(item, latest));
+      if (!current || digest(current.credential) !== credentialDigest) {
+        throw mcpError(409, "MCP credential changed while the old provider grant was being revoked.", "mcp_connection_changed");
+      }
+      current.status = "reauthorization_pending";
+      current.credential_retired_at ||= nowIso();
+      current.updated_at = nowIso();
+      return { ...current };
+    });
+  });
+}
+
+export function publicMcpRevocationStatus(state) {
+  if (!state) return null;
+  return {
+    revocation_id: state.oauth_state_id,
+    provider_id: state.provider_id,
+    source_connection_id: state.source_connection_id || null,
+    status: state.status,
+    attempts: Math.max(0, Number(state.revocation_attempts) || 0),
+    queued_at: state.revocation_queued_at
+      || state.credential_staged_at
+      || state.uncertain_started_at
+      || state.exchange_started_at
+      || state.refresh_started_at
+      || null,
+    last_attempt_at: state.revocation_last_attempt_at || null,
+    next_attempt_at: state.revocation_next_attempt_at || null,
+    last_error_code: state.revocation_last_error_code || null,
+    manually_resolved_at: state.manually_resolved_at || null,
+    manual_resolution_required: !state.revocation_envelope
+      && ["account_deleting", "disconnect_cancelled", "superseded", "exchange_outcome_uncertain", "refresh_outcome_uncertain"].includes(state.status)
+  };
+}
+
+export async function disconnectMcpConnectionDurably(connection, {
+  key,
+  store,
+  env = process.env,
+  deletingOwnerId = ""
+} = {}) {
+  if (!store) throw mcpError(503, "Durable MCP disconnect requires the application store.", "mcp_revocation_store_missing");
+  if (connection?.auth_type !== "oauth2") {
+    await withMcpConnectionLifecycle(connection, async () => {
+      await store.mutate((data) => {
+        const matches = (data.mcpConnections || [])
+          .filter((item) => sameMcpConnectionScope(item, connection));
+        if (matches.length !== 1) {
+          throw mcpError(409, "MCP connection identity is ambiguous and must be repaired before deletion.", "mcp_connection_ambiguous");
+        }
+        const [latest] = matches;
+        if (!latest
+          || latest.workspace_id !== connection?.workspace_id
+          || latest.created_by !== connection?.created_by) {
+          throw mcpError(409, "MCP connection changed before it could be disconnected.", "mcp_connection_unavailable");
+        }
+        const boundAgents = (data.agents || []).filter((agent) => (
+          (agent.mcp_bindings || []).some((binding) => mcpBindingTargetsConnection(binding, agent, latest))
+        ));
+        const deletingOwner = String(deletingOwnerId || "").trim();
+        const ownerDeletionAllowsBindings = Boolean(deletingOwner)
+          && deletingOwner === latest.created_by
+          && (data.users || []).some((user) => (
+            user.user_id === deletingOwner
+            && user.workspace_id === latest.workspace_id
+            && user.status === "deleting"
+          ))
+          && boundAgents.every((agent) => agent.created_by === deletingOwner);
+        if (boundAgents.length && !ownerDeletionAllowsBindings) {
+          throw mcpError(
+            409,
+            `Remove this connection from ${boundAgents.length} agent${boundAgents.length === 1 ? "" : "s"} first.`,
+            "mcp_connection_bound"
+          );
+        }
+        data.mcpConnections = (data.mcpConnections || [])
+          .filter((item) => !sameMcpConnectionScope(item, latest));
+        return true;
+      });
+    });
+    return { provider_revoked: false, revocation: null };
+  }
+  const staged = await withMcpConnectionLifecycle(connection, async () => {
+    const scopedConnections = store.read((data) => (data.mcpConnections || [])
+      .filter((item) => sameMcpConnectionScope(item, connection)));
+    if (scopedConnections.length > 1) {
+      throw mcpError(409, "MCP connection identity is ambiguous and must be repaired before deletion.", "mcp_connection_ambiguous");
+    }
+    const [latest] = scopedConnections;
+    if (!latest) {
+      const alreadyDisconnected = store.read((data) => (data.mcpOauthStates || []).find((item) => (
+        item.source_connection_id === connection.connection_id
+        && item.workspace_id === connection.workspace_id
+        && item.created_by === connection.created_by
+        && item.provider_id === connection.provider_id
+        && item.revocation_reason === "connection_disconnected"
+        && ["revocation_pending", "revoked", "revocation_manually_resolved"].includes(item.status)
+      )));
+      if (alreadyDisconnected) return alreadyDisconnected;
+    }
+    if (!latest || latest.workspace_id !== connection.workspace_id || latest.created_by !== connection.created_by) {
+      throw mcpError(409, "MCP connection changed before it could be disconnected.", "mcp_connection_unavailable");
+    }
+    const expectedCredentialDigest = digest(latest.credential);
+    const lifecycleStates = store.read((data) => (data.mcpOauthStates || []).filter((state) => (
+      state.source_connection_id === latest.connection_id
+      && state.workspace_id === latest.workspace_id
+      && state.created_by === latest.created_by
+      && state.provider_id === latest.provider_id
+    )));
+    if (lifecycleStates.some((state) => (
+      ["refreshing", "account_deleting", "exchange_outcome_uncertain", "refresh_outcome_uncertain"].includes(state.status)
+    ))) {
+      throw mcpError(
+        409,
+        "Provider token state is uncertain. An administrator must verify provider-wide deauthorization before this connection can be removed.",
+        "mcp_oauth_outcome_uncertain"
+      );
+    }
+    const retirementProof = lifecycleStates.find((state) => (
+      mcpRevocationTargetsCredential(state, latest, expectedCredentialDigest)
+      && ["revoked", "revocation_manually_resolved"].includes(state.status)
+    ));
+    if (retirementProof) {
+      return store.mutate((data) => {
+        const stored = (data.mcpConnections || [])
+          .find((item) => sameMcpConnectionScope(item, latest));
+        if (!stored || digest(stored.credential) !== expectedCredentialDigest) {
+          throw mcpError(409, "MCP credential changed before disconnect could be committed.", "mcp_connection_changed");
+        }
+        const currentProof = (data.mcpOauthStates || []).find((state) => (
+          mcpRevocationTargetsCredential(state, stored, expectedCredentialDigest)
+          && ["revoked", "revocation_manually_resolved"].includes(state.status)
+        ));
+        if (!currentProof) {
+          throw mcpError(409, "Credential retirement proof changed before disconnect could be committed.", "mcp_oauth_revocation_state_changed");
+        }
+        assertMcpConnectionCanBeRemoved(data, stored, deletingOwnerId);
+        cancelPendingMcpOAuthTransactions(data, stored);
+        data.mcpConnections = (data.mcpConnections || [])
+          .filter((item) => !sameMcpConnectionScope(item, stored));
+        return currentProof;
+      });
+    }
+    const credential = connectionAuth(latest, key);
+    const stagedAt = nowIso();
+    const outbox = {
+      oauth_state_id: makeId("mcprevoke"),
+      provider_id: latest.provider_id,
+      status: "revocation_pending",
+      workspace_id: latest.workspace_id,
+      created_by: latest.created_by,
+      connection_id: null,
+      source_connection_id: latest.connection_id,
+      created_at: stagedAt,
+      credential_staged_at: stagedAt,
+      revocation_queued_at: stagedAt,
+      revocation_attempts: 0,
+      revocation_reason: "connection_disconnected",
+      source_credential_revision_digest: expectedCredentialDigest
+    };
+    outbox.revocation_envelope = encryptMcpValue(
+      { credential },
+      key,
+      mcpOAuthRevocationAad(outbox)
+    );
+    return store.mutate((data) => {
+      data.mcpOauthStates ||= [];
+      const stored = (data.mcpConnections || [])
+        .find((item) => sameMcpConnectionScope(item, latest));
+      if (!stored
+        || stored.workspace_id !== latest.workspace_id
+        || digest(stored.credential) !== expectedCredentialDigest) {
+        throw mcpError(409, "MCP credential changed before disconnect could be committed.", "mcp_connection_changed");
+      }
+      assertMcpConnectionCanBeRemoved(data, stored, deletingOwnerId);
+      data.mcpOauthStates.push(outbox);
+      cancelPendingMcpOAuthTransactions(data, stored, outbox.oauth_state_id);
+      data.mcpConnections = data.mcpConnections
+        .filter((item) => !sameMcpConnectionScope(item, latest));
+      return outbox;
+    });
+  });
+  if (["revoked", "revocation_manually_resolved"].includes(staged.status)) {
+    return { provider_revoked: true, revocation: publicMcpRevocationStatus(staged) };
+  }
+  try {
+    await revokePendingMcpOAuthState(staged, { key, store, env });
+    const revoked = store.read((data) => (data.mcpOauthStates || [])
+      .find((item) => sameMcpOAuthStateScope(item, staged)));
+    return { provider_revoked: true, revocation: publicMcpRevocationStatus(revoked) };
+  } catch {
+    const pending = store.read((data) => (data.mcpOauthStates || [])
+      .find((item) => sameMcpOAuthStateScope(item, staged)));
+    return { provider_revoked: false, revocation: publicMcpRevocationStatus(pending) };
+  }
+}
+
+export async function queueStaleMcpOAuthRevocations({
+  store,
+  includeStrandedExchanges = false,
+  staleBefore = nowIso()
+} = {}) {
+  if (!store) throw mcpError(503, "OAuth revocation recovery requires the application store.", "mcp_revocation_store_missing");
+  const staleBeforeMs = Date.parse(String(staleBefore || ""));
+  const hasRecoveryWork = store.read((data) => (data.mcpOauthStates || []).some((state) => {
+    if (state.revocation_envelope) {
+      if (state.status === "revocation_pending") return true;
+      if (!includeStrandedExchanges
+        || !["exchanging", "account_deleting", "superseded", "failed"].includes(state.status)) return false;
+      const stagedAt = Date.parse(state.credential_staged_at || state.exchange_started_at || "");
+      return Number.isFinite(stagedAt) && Number.isFinite(staleBeforeMs) && stagedAt <= staleBeforeMs;
+    }
+    if (!includeStrandedExchanges || !["exchanging", "refreshing"].includes(state.status)) return false;
+    const stagedAt = Date.parse(state.exchange_started_at || state.refresh_started_at || "");
+    return Number.isFinite(stagedAt) && Number.isFinite(staleBeforeMs) && stagedAt <= staleBeforeMs;
+  }));
+  if (!hasRecoveryWork) return [];
+  return store.mutate((data) => {
+    const queuedIds = [];
+    for (const current of data.mcpOauthStates || []) {
+      if (!current.revocation_envelope) {
+        if (!includeStrandedExchanges || !["exchanging", "refreshing"].includes(current.status)) continue;
+        const startedAt = current.exchange_started_at || current.refresh_started_at || "";
+        const startedAtMs = Date.parse(startedAt);
+        if (!Number.isFinite(startedAtMs) || !Number.isFinite(staleBeforeMs) || startedAtMs > staleBeforeMs) continue;
+        const wasRefresh = current.status === "refreshing";
+        current.status = wasRefresh ? "refresh_outcome_uncertain" : "exchange_outcome_uncertain";
+        current.uncertain_started_at ||= startedAt;
+        current.uncertain_error_code ||= wasRefresh
+          ? "mcp_oauth_refresh_interrupted"
+          : "mcp_oauth_exchange_interrupted";
+        delete current.verifier_envelope;
+        queuedIds.push(current.oauth_state_id);
+        continue;
+      }
+      if (current.status === "revocation_pending") {
+        queuedIds.push(current.oauth_state_id);
+        continue;
+      }
+      if (!includeStrandedExchanges
+        || !["exchanging", "account_deleting", "superseded", "failed"].includes(current.status)) continue;
+      const stagedAt = Date.parse(current.credential_staged_at || current.exchange_started_at || "");
+      if (!Number.isFinite(stagedAt) || !Number.isFinite(staleBeforeMs) || stagedAt > staleBeforeMs) continue;
+      current.status = "revocation_pending";
+      current.revocation_queued_at ||= nowIso();
+      delete current.verifier_envelope;
+      queuedIds.push(current.oauth_state_id);
+    }
+    data.mcpOauthStates = retainedMcpOAuthStates(data.mcpOauthStates, Date.now());
+    return queuedIds;
+  });
+}
+
+export async function recoverMcpOAuthRevocations({
+  store,
+  key,
+  env = process.env,
+  includeStrandedExchanges = false,
+  staleBefore = nowIso(),
+  limit = 100
+} = {}) {
+  if (!store) throw mcpError(503, "OAuth revocation recovery requires the application store.", "mcp_revocation_store_missing");
+  await queueStaleMcpOAuthRevocations({ store, includeStrandedExchanges, staleBefore });
+  const recoveryNow = Date.now();
+  const candidates = store.read((data) => (data.mcpOauthStates || [])
+    .filter((state) => (
+      state.status === "revocation_pending"
+      && Boolean(state.revocation_envelope)
+      && (!Number.isFinite(Date.parse(state.revocation_next_attempt_at || ""))
+        || Date.parse(state.revocation_next_attempt_at) <= recoveryNow)
+    ))
+    .sort((left, right) => {
+      const leftAttempt = Date.parse(left.revocation_last_attempt_at || "");
+      const rightAttempt = Date.parse(right.revocation_last_attempt_at || "");
+      const leftNever = Number.isFinite(leftAttempt) ? 1 : 0;
+      const rightNever = Number.isFinite(rightAttempt) ? 1 : 0;
+      if (leftNever !== rightNever) return leftNever - rightNever;
+      const attemptDifference = (Number.isFinite(leftAttempt) ? leftAttempt : 0)
+        - (Number.isFinite(rightAttempt) ? rightAttempt : 0);
+      if (attemptDifference) return attemptDifference;
+      return String(left.revocation_queued_at || left.created_at || "")
+        .localeCompare(String(right.revocation_queued_at || right.created_at || ""));
+    })
+    .slice(0, Math.max(1, Math.min(500, Number(limit) || 100))));
+  const results = [];
+  for (const candidate of candidates) {
+    const queued = store.read((data) => (data.mcpOauthStates || [])
+      .find((item) => sameMcpOAuthStateScope(item, candidate)));
+    if (!queued?.revocation_envelope || queued.status !== "revocation_pending") continue;
+    try {
+      await revokePendingMcpOAuthState(queued, { key, store, env });
+      results.push({ revocation_id: queued.oauth_state_id, status: "revoked" });
+    } catch (error) {
+      results.push({
+        revocation_id: queued.oauth_state_id,
+        status: "revocation_pending",
+        error_code: String(error?.code || "mcp_oauth_revocation_failed")
+      });
+    }
+  }
+  await store.mutate((data) => {
+    data.mcpOauthStates = retainedMcpOAuthStates(data.mcpOauthStates, Date.now());
+    return true;
+  });
+  return results;
+}
+
+export async function recoverStaleMcpApprovalExecutions({
+  store,
+  staleBefore = new Date(Date.now() - UNCERTAIN_OAUTH_ATTESTATION_MIN_AGE_MS).toISOString()
+} = {}) {
+  if (!store) throw mcpError(503, "MCP approval recovery requires the application store.", "mcp_approval_store_missing");
+  const staleBeforeMs = Date.parse(String(staleBefore || ""));
+  if (!Number.isFinite(staleBeforeMs)) {
+    throw mcpError(400, "MCP approval recovery cutoff is invalid.", "mcp_approval_recovery_cutoff_invalid");
+  }
+  const hasWork = store.read((data) => (data.mcpApprovals || []).some((approval) => {
+    if (approval.status !== "executing") return false;
+    const startedAt = Date.parse(approval.execution_started_at || approval.decided_at || "");
+    return Number.isFinite(startedAt) && startedAt <= staleBeforeMs;
+  }));
+  if (!hasWork) return [];
+  return store.mutate((data) => {
+    const recovered = [];
+    data.mcpToolCalls ||= [];
+    for (const approval of data.mcpApprovals || []) {
+      if (approval.status !== "executing") continue;
+      const startedAt = Date.parse(approval.execution_started_at || approval.decided_at || "");
+      if (!Number.isFinite(startedAt) || startedAt > staleBeforeMs) continue;
+      const recoveredAt = nowIso();
+      approval.status = "execution_outcome_uncertain";
+      approval.outcome_uncertain_at = recoveredAt;
+      approval.outcome_uncertain_reason = "The process stopped while the approved provider action was in flight.";
+      data.mcpToolCalls.push({
+        call_id: makeId("mcpcall"),
+        run_id: approval.run_id,
+        session_id: approval.session_id,
+        workspace_id: approval.workspace_id,
+        created_by: approval.created_by,
+        agent_id: approval.agent_id,
+        connection_id: approval.connection_id,
+        tool_name: approval.tool_name,
+        tool_alias: approval.tool_alias,
+        status: "execution_outcome_uncertain",
+        input_digest: approval.request_digest,
+        output_digest: digest({ status: "execution_outcome_uncertain" }),
+        started_at: approval.execution_started_at || approval.decided_at,
+        completed_at: recoveredAt
+      });
+      recovered.push(approval.approval_id);
+    }
+    return recovered;
+  });
+}
+
+export async function attestMcpOAuthRevocationResolved({
+  store,
+  actor,
+  revocationId,
+  confirmation,
+  evidenceReference,
+  reason
+} = {}) {
+  if (!store) throw mcpError(503, "OAuth revocation resolution requires the application store.", "mcp_revocation_store_missing");
+  if (actor?.role !== "admin") throw mcpError(403, "Administrator access is required.", "mcp_revocation_resolution_forbidden");
+  const evidence = boundedText(evidenceReference, "Evidence reference", 300);
+  const resolutionReason = boundedText(reason, "Resolution reason", 500);
+  return store.mutate((data) => {
+    const matches = (data.mcpOauthStates || []).filter((item) => (
+      item.oauth_state_id === String(revocationId || "")
+      && item.workspace_id === actor.workspace_id
+    ));
+    if (matches.length > 1) {
+      throw mcpError(409, "OAuth revocation identity is ambiguous and must be repaired.", "mcp_revocation_ambiguous");
+    }
+    const [current] = matches;
+    if (!current) {
+      throw mcpError(404, "Pending OAuth revocation was not found.", "mcp_revocation_not_found");
+    }
+    const hasOutbox = Boolean(current.revocation_envelope);
+    const uncertainExchange = !hasOutbox
+      && ["account_deleting", "disconnect_cancelled", "superseded", "exchange_outcome_uncertain", "refresh_outcome_uncertain"].includes(current.status)
+      && Boolean(current.uncertain_started_at || current.exchange_started_at || current.refresh_started_at)
+      && Date.parse(current.uncertain_started_at || current.exchange_started_at || current.refresh_started_at) <= Date.now() - UNCERTAIN_OAUTH_ATTESTATION_MIN_AGE_MS;
+    if (hasOutbox && current.status !== "revocation_pending") {
+      throw mcpError(409, "OAuth revocation is not awaiting resolution.", "mcp_revocation_not_pending");
+    }
+    if (!hasOutbox && !uncertainExchange) {
+      throw mcpError(409, "The uncertain OAuth exchange is still active or is not eligible for manual resolution.", "mcp_revocation_not_pending");
+    }
+    const expectedConfirmation = hasOutbox
+      ? "PROVIDER_ACCESS_REVOKED"
+      : "PROVIDER_APP_ACCESS_REVOKED_AND_VERIFIED";
+    if (confirmation !== expectedConfirmation) {
+      throw mcpError(400, "Confirm that provider access has been revoked.", "mcp_revocation_resolution_confirmation_required");
+    }
+    if (!evidence || !resolutionReason) {
+      throw mcpError(400, "Evidence and a resolution reason are required.", "mcp_revocation_resolution_evidence_required");
+    }
+    const resolvedAt = nowIso();
+    current.status = "revocation_manually_resolved";
+    current.manually_resolved_at = resolvedAt;
+    current.revoked_at = resolvedAt;
+    current.resolved_by = actor.user_id;
+    current.resolution_reason = resolutionReason;
+    current.evidence_reference_digest = digest(evidence);
+    delete current.revocation_envelope;
+    delete current.revocation_confirmed_token_ids;
+    delete current.verifier_envelope;
+    data.identityAuditEvents ||= [];
+    data.identityAuditEvents.push({
+      event_id: makeId("identityevt"),
+      type: "mcp.oauth_revocation.manually_resolved",
+      actor_user_id: actor.user_id,
+      target_user_id: current.created_by,
+      workspace_id: current.workspace_id,
+      oauth_state_id: current.oauth_state_id,
+      provider_id: current.provider_id,
+      evidence_reference_digest: current.evidence_reference_digest,
+      reason: resolutionReason,
+      created_at: resolvedAt
+    });
+    if (data.identityAuditEvents.length > 5000) {
+      data.identityAuditEvents.splice(0, data.identityAuditEvents.length - 5000);
+    }
+    return publicMcpRevocationStatus(current);
+  });
+}
+
+export async function revokeMcpConnection(connection, { key, store, env = process.env } = {}) {
+  if (connection?.auth_type !== "oauth2") return false;
+  return withMcpConnectionLifecycle(connection, async () => {
+    const latest = store?.read((data) => (data.mcpConnections || [])
+      .find((item) => sameMcpConnectionScope(item, connection))) || connection;
+    if (!latest || latest.workspace_id !== connection.workspace_id || latest.created_by !== connection.created_by) {
+      throw mcpError(409, "OAuth connection is unavailable.", "mcp_connection_unavailable");
+    }
+    const credential = decryptMcpValue(
+      latest.credential,
+      key,
+      mcpConnectionAad(latest.connection_id, latest.workspace_id)
+    );
+    const provider = managedMcpProviderForCredential(latest.provider_id, credential, env);
+    await revokeManagedCredential(provider, credential, env);
+    return true;
+  });
 }
 
 export function clearMcpOAuthCookie(env = process.env) {
@@ -652,17 +1338,68 @@ export function clearMcpOAuthCookie(env = process.env) {
 }
 
 export async function refreshMcpConnection(connection, { key, store }) {
-  const discovery = await discoverMcpTools(connection, { key, store });
-  const latest = store?.read((data) => (data.mcpConnections || [])
-    .find((item) => item.connection_id === connection.connection_id)) || connection;
-  return {
-    ...latest,
-    status: "ready",
-    tools: discovery.tools,
-    protocol_version: discovery.protocol_version,
-    last_connected_at: nowIso(),
-    updated_at: nowIso()
-  };
+  const latest = store
+    ? store.read((data) => {
+      const matches = (data.mcpConnections || [])
+        .filter((item) => sameMcpConnectionScope(item, connection));
+      if (matches.length !== 1) {
+        throw mcpError(409, "MCP connection identity is ambiguous or unavailable.", "mcp_connection_ambiguous");
+      }
+      return matches[0];
+    })
+    : connection;
+  if (["reauthorization_required", "reauthorization_pending"].includes(latest.status)) {
+    throw mcpError(409, "This OAuth connection must be authorized again.", "mcp_oauth_reauthorization_required");
+  }
+  if (latest.status !== "ready") {
+    throw mcpError(409, "Reconnect this MCP account before refreshing its tools.", "mcp_connection_unavailable");
+  }
+  const discovery = await discoverMcpTools(latest, { key, store });
+  const commitCredentialDigest = store
+    ? store.read((data) => {
+      const matches = (data.mcpConnections || [])
+        .filter((item) => sameMcpConnectionScope(item, latest));
+      if (matches.length !== 1
+        || matches[0].status !== "ready"
+        || matches[0].endpoint_url !== latest.endpoint_url
+        || matches[0].provider_id !== latest.provider_id
+        || matches[0].created_at !== latest.created_at) {
+        throw mcpError(409, "MCP connection changed during refresh.", "mcp_connection_changed");
+      }
+      return matches[0].credential ? digest(matches[0].credential) : "";
+    })
+    : "";
+  const connectedAt = nowIso();
+  if (!store) {
+    return {
+      ...latest,
+      status: "ready",
+      tools: discovery.tools,
+      protocol_version: discovery.protocol_version,
+      last_connected_at: connectedAt,
+      updated_at: connectedAt
+    };
+  }
+  // Commit discovery fields in place. Replacing a previously-read object here
+  // could overwrite a newer credential rotated by a concurrent OAuth callback.
+  return store.mutate((data) => {
+    const matches = (data.mcpConnections || [])
+      .filter((item) => sameMcpConnectionScope(item, latest));
+    if (matches.length !== 1) {
+      throw mcpError(409, "MCP connection identity changed during refresh.", "mcp_connection_ambiguous");
+    }
+    const [stored] = matches;
+    if (!stored
+      || stored.status !== "ready"
+      || (commitCredentialDigest && digest(stored.credential) !== commitCredentialDigest)) {
+      throw mcpError(409, "MCP connection changed during refresh.", "mcp_connection_changed");
+    }
+    stored.tools = discovery.tools;
+    stored.protocol_version = discovery.protocol_version;
+    stored.last_connected_at = connectedAt;
+    stored.updated_at = connectedAt;
+    return { ...stored };
+  });
 }
 
 export async function discoverMcpTools(connection, { key, store, authOverride } = {}) {
@@ -758,7 +1495,15 @@ export function resolveAgentMcpBindings(rawBindings, data, actor) {
   const aliases = new Set();
   for (const raw of rawBindings.slice(0, 20)) {
     const connectionId = String(raw?.connection_id || "").trim();
-    const connection = (data.mcpConnections || []).find((item) => item.connection_id === connectionId);
+    const matchingConnections = (data.mcpConnections || []).filter((item) => (
+      item.connection_id === connectionId
+      && item.workspace_id === actor.workspace_id
+      && (item.visibility !== "private" || item.created_by === actor.user_id)
+    ));
+    if (matchingConnections.length > 1) {
+      throw mcpError(409, "MCP connection identity is ambiguous and must be repaired before assignment.", "mcp_connection_ambiguous");
+    }
+    const [connection] = matchingConnections;
     if (
       !connection
       || connection.workspace_id !== actor.workspace_id
@@ -791,6 +1536,8 @@ export function resolveAgentMcpBindings(rawBindings, data, actor) {
     });
     bindings.push({
       connection_id: connection.connection_id,
+      connection_workspace_id: connection.workspace_id,
+      connection_created_by: connection.created_by,
       connection_name: connection.name,
       template_id: connection.template_id,
       tools
@@ -849,9 +1596,47 @@ export function publicMcpApproval(approval, key) {
     session_id: approval.session_id,
     created_at: approval.created_at,
     decided_at: approval.decided_at || null,
+    execution_started_at: approval.execution_started_at || null,
+    outcome_uncertain_at: approval.outcome_uncertain_at || null,
+    outcome_uncertain: approval.status === "execution_outcome_uncertain"
+      || approval.failure_code === "mcp_execution_outcome_uncertain",
     checkpoint_id: approval.checkpoint_id || null,
     result: storedResult
   };
+}
+
+export async function acknowledgeUncertainMcpApproval({ store, approvalId, actor, key }) {
+  if (!store) throw mcpError(503, "MCP approval recovery requires the application store.", "mcp_approval_store_missing");
+  return store.mutate((data) => {
+    const matches = (data.mcpApprovals || []).filter((item) => (
+      item.approval_id === String(approvalId || "")
+      && item.workspace_id === actor.workspace_id
+      && item.created_by === actor.user_id
+    ));
+    if (matches.length > 1) {
+      throw mcpError(409, "MCP approval identity is ambiguous and must be repaired.", "mcp_approval_ambiguous");
+    }
+    const [current] = matches;
+    if (!current) throw mcpError(404, "MCP approval not found.", "mcp_approval_not_found");
+    if (current.status !== "execution_outcome_uncertain") {
+      throw mcpError(409, "This MCP action is not awaiting uncertain-outcome acknowledgement.", "mcp_approval_not_uncertain");
+    }
+    const acknowledgedAt = nowIso();
+    current.status = "failed";
+    current.failure_code = "mcp_execution_outcome_uncertain";
+    current.uncertain_acknowledged_at = acknowledgedAt;
+    current.decided_at ||= acknowledgedAt;
+    current.decided_by = actor.user_id;
+    current.result_envelope = encryptMcpValue({
+      result: {
+        outcome: "unknown",
+        replayed: false,
+        message: "The provider action may or may not have completed. Virenis did not replay it. Check the provider before trying it again."
+      }
+    }, key, mcpApprovalResultAad(current));
+    delete current.result;
+    return publicMcpApproval(current, key);
+  });
 }
 
 export async function executeMcpGatewayCall({ store, body, key }) {
@@ -894,9 +1679,19 @@ export async function executeMcpGatewayCall({ store, body, key }) {
 }
 
 async function queueMcpApproval({ store, key, context, agent, connection, tool, boundTool, argumentsValue }) {
-  const requestDigest = digest({ agent_id: agent.id, alias: boundTool.alias, arguments: argumentsValue });
+  const requestDigest = digest({
+    agent_id: agent.id,
+    alias: boundTool.alias,
+    connection_workspace_id: connection.workspace_id,
+    connection_created_by: connection.created_by,
+    arguments: argumentsValue
+  });
   const existing = store.read((data) => (data.mcpApprovals || []).find((item) =>
-    item.status === "pending" && item.run_id === context.run_id && item.request_digest === requestDigest
+    item.status === "pending"
+    && item.run_id === context.run_id
+    && item.workspace_id === context.workspace_id
+    && item.created_by === context.user_id
+    && item.request_digest === requestDigest
   ));
   if (existing) return approvalRequiredResult(existing);
   const approvalId = makeId("mcpapproval");
@@ -906,6 +1701,8 @@ async function queueMcpApproval({ store, key, context, agent, connection, tool, 
     request_digest: requestDigest,
     agent_id: agent.id,
     connection_id: connection.connection_id,
+    connection_workspace_id: connection.workspace_id,
+    connection_created_by: connection.created_by,
     connection_name: connection.name,
     tool_name: tool.name,
     tool_title: tool.title,
@@ -922,7 +1719,11 @@ async function queueMcpApproval({ store, key, context, agent, connection, tool, 
   const queued = await store.mutate((data) => {
     data.mcpApprovals ||= [];
     const concurrent = data.mcpApprovals.find((item) =>
-      item.status === "pending" && item.run_id === context.run_id && item.request_digest === requestDigest
+      item.status === "pending"
+      && item.run_id === context.run_id
+      && item.workspace_id === context.workspace_id
+      && item.created_by === context.user_id
+      && item.request_digest === requestDigest
     );
     if (concurrent) return concurrent;
     data.mcpApprovals.push(approval);
@@ -950,16 +1751,24 @@ function approvalRequiredResult(approval) {
 
 export async function decideMcpApproval({ store, approvalId, actor, decision, key }) {
   const snapshot = store.read();
-  const approval = (snapshot.mcpApprovals || []).find((item) => item.approval_id === approvalId);
-  if (!approval || approval.workspace_id !== actor.workspace_id || approval.created_by !== actor.user_id) {
+  const matchingApprovals = (snapshot.mcpApprovals || []).filter((item) => (
+    item.approval_id === approvalId
+    && item.workspace_id === actor.workspace_id
+    && item.created_by === actor.user_id
+  ));
+  if (matchingApprovals.length > 1) {
+    throw mcpError(409, "MCP approval identity is ambiguous and must be repaired.", "mcp_approval_ambiguous");
+  }
+  const [approval] = matchingApprovals;
+  if (!approval) {
     throw mcpError(404, "MCP approval not found.", "mcp_approval_not_found");
   }
   if (approval.status !== "pending") throw mcpError(409, "MCP approval has already been decided.", "mcp_approval_decided");
   if (decision === "deny") {
     const deniedEnvelope = decryptMcpValue(approval.request_envelope, key, mcpApprovalAad(approval));
     return store.mutate((data) => {
-      const current = data.mcpApprovals.find((item) => item.approval_id === approvalId);
-      if (current.status !== "pending") throw mcpError(409, "MCP approval has already been decided.", "mcp_approval_decided");
+      const current = data.mcpApprovals.find((item) => sameMcpApprovalScope(item, approval));
+      if (!current || current.status !== "pending") throw mcpError(409, "MCP approval has already been decided.", "mcp_approval_decided");
       current.status = "denied";
       current.decided_at = nowIso();
       current.decided_by = actor.user_id;
@@ -990,13 +1799,18 @@ export async function decideMcpApproval({ store, approvalId, actor, decision, ke
     throw mcpError(409, "The agent no longer allows this MCP action.", "mcp_approval_stale");
   }
   const resolved = resolveBoundTool(agent, snapshot, approval.tool_alias, approval.workspace_id);
+  if ((approval.connection_workspace_id && approval.connection_workspace_id !== resolved.connection.workspace_id)
+    || (approval.connection_created_by && approval.connection_created_by !== resolved.connection.created_by)) {
+    throw mcpError(409, "The approved MCP connection identity changed; review the action again.", "mcp_approval_stale");
+  }
   validatePinnedSchema({ ...resolved.boundTool, schema_digest: approval.schema_digest }, resolved.tool);
   const envelope = decryptMcpValue(approval.request_envelope, key, mcpApprovalAad(approval));
   await store.mutate((data) => {
-    const current = data.mcpApprovals.find((item) => item.approval_id === approvalId);
-    if (current.status !== "pending") throw mcpError(409, "MCP approval has already been decided.", "mcp_approval_decided");
+    const current = data.mcpApprovals.find((item) => sameMcpApprovalScope(item, approval));
+    if (!current || current.status !== "pending") throw mcpError(409, "MCP approval has already been decided.", "mcp_approval_decided");
     current.status = "executing";
     current.decided_at = nowIso();
+    current.execution_started_at = current.decided_at;
     current.decided_by = actor.user_id;
     return current;
   });
@@ -1005,7 +1819,7 @@ export async function decideMcpApproval({ store, approvalId, actor, decision, ke
     result = await callMcpTool(resolved.connection, resolved.tool, envelope.arguments, { key, store });
   } catch (error) {
     await store.mutate((data) => {
-      const current = data.mcpApprovals.find((item) => item.approval_id === approvalId);
+      const current = data.mcpApprovals.find((item) => sameMcpApprovalScope(item, approval));
       if (current?.status === "executing") {
         current.status = "failed";
         current.result = { error: "The approved MCP action failed.", code: error.code || "mcp_call_failed" };
@@ -1033,8 +1847,8 @@ export async function decideMcpApproval({ store, approvalId, actor, decision, ke
   }
   const decidedAt = nowIso();
   return store.mutate((data) => {
-    const current = data.mcpApprovals.find((item) => item.approval_id === approvalId);
-    if (current.status !== "executing") throw mcpError(409, "MCP approval execution state changed unexpectedly.", "mcp_approval_state_changed");
+    const current = data.mcpApprovals.find((item) => sameMcpApprovalScope(item, approval));
+    if (!current || current.status !== "executing") throw mcpError(409, "MCP approval execution state changed unexpectedly.", "mcp_approval_state_changed");
     current.status = "executed";
     current.decided_at = decidedAt;
     current.decided_by = actor.user_id;
@@ -1058,10 +1872,26 @@ function resolveBoundTool(agent, data, alias, workspaceId) {
   for (const binding of agent.mcp_bindings || []) {
     const boundTool = (binding.tools || []).find((tool) => tool.alias === alias);
     if (!boundTool) continue;
-    const connection = (data.mcpConnections || []).find((item) =>
-      item.connection_id === binding.connection_id && item.workspace_id === workspaceId && item.status === "ready"
-    );
+    const hasPinnedScope = Boolean(binding.connection_workspace_id && binding.connection_created_by);
+    const expectedWorkspace = String(binding.connection_workspace_id || agent.workspace_id || workspaceId || "");
+    const expectedOwner = String(binding.connection_created_by || agent.created_by || "");
+    if (!expectedOwner || expectedWorkspace !== String(workspaceId || "")) {
+      throw mcpError(409, "MCP binding identity is incomplete; refresh and rebind the agent.", "mcp_binding_scope_invalid");
+    }
+    const matchingConnections = (data.mcpConnections || []).filter((item) => (
+      item.connection_id === binding.connection_id
+      && item.workspace_id === expectedWorkspace
+      && (hasPinnedScope ? item.created_by === expectedOwner : true)
+      && item.status === "ready"
+    ));
+    if (matchingConnections.length > 1) {
+      throw mcpError(409, "MCP connection identity is ambiguous and must be repaired before execution.", "mcp_connection_ambiguous");
+    }
+    const [connection] = matchingConnections;
     if (!connection) throw mcpError(409, "MCP connection is unavailable.", "mcp_connection_unavailable");
+    if (!hasPinnedScope && connection.created_by !== expectedOwner) {
+      throw mcpError(409, "Legacy MCP binding ownership is ambiguous; refresh and rebind the agent.", "mcp_binding_scope_invalid");
+    }
     const tool = (connection.tools || []).find((item) => item.name === boundTool.name);
     if (!tool) throw mcpError(409, "MCP tool is unavailable; refresh and rebind the agent.", "mcp_tool_unavailable");
     return { connection, tool, boundTool };
@@ -1172,26 +2002,35 @@ async function refreshMcpOAuthCredential(connection, { key, store, force }) {
   if (!store) {
     throw mcpError(409, "This OAuth connection must be authorized again.", "mcp_oauth_reauthorization_required");
   }
-  const existing = oauthRefreshInflight.get(connection.connection_id);
+  const lifecycleKey = mcpConnectionScopeKey(connection);
+  const existing = oauthRefreshInflight.get(lifecycleKey);
   if (existing) return existing;
-  const task = (async () => {
-    const latest = store.read((data) => (data.mcpConnections || [])
-      .find((item) => item.connection_id === connection.connection_id));
-    if (!latest || latest.workspace_id !== connection.workspace_id || latest.auth_type !== "oauth2") {
+  const task = withMcpConnectionLifecycle(connection, async () => {
+    const matchingConnections = store.read((data) => (data.mcpConnections || [])
+      .filter((item) => sameMcpConnectionScope(item, connection)));
+    if (matchingConnections.length !== 1) {
+      throw mcpError(409, "OAuth connection identity is ambiguous or unavailable.", "mcp_connection_ambiguous");
+    }
+    const [latest] = matchingConnections;
+    if (latest.workspace_id !== connection.workspace_id
+      || latest.auth_type !== "oauth2"
+      || latest.status !== "ready") {
       throw mcpError(409, "OAuth connection is unavailable.", "mcp_connection_unavailable");
     }
     const currentAuth = connectionAuth(latest, key);
     if (!force && !oauthCredentialNeedsRefresh(currentAuth)) return currentAuth;
     if (!currentAuth.refresh_token) {
-      await markMcpConnectionReauthorization(store, latest.connection_id);
+      await markMcpConnectionReauthorization(store, latest);
       throw mcpError(409, "This OAuth connection must be authorized again.", "mcp_oauth_reauthorization_required");
     }
+    const provider = managedMcpProviderForCredential(latest.provider_id, currentAuth);
+    const refreshIntent = await beginMcpOAuthRefreshIntent(store, latest);
     let refreshed;
     try {
-      const provider = managedMcpProviderForCredential(latest.provider_id, currentAuth);
       refreshed = await refreshManagedAccessToken(provider, currentAuth);
-    } catch {
-      await markMcpConnectionReauthorization(store, latest.connection_id);
+    } catch (error) {
+      await settleMcpOAuthRefreshFailure(store, refreshIntent, error);
+      await markMcpConnectionReauthorization(store, latest);
       throw mcpError(409, "This OAuth connection must be authorized again.", "mcp_oauth_reauthorization_required");
     }
     const encrypted = encryptMcpValue(
@@ -1199,40 +2038,310 @@ async function refreshMcpOAuthCredential(connection, { key, store, force }) {
       key,
       mcpConnectionAad(latest.connection_id, latest.workspace_id)
     );
-    await store.mutate((data) => {
-      const stored = (data.mcpConnections || [])
-        .find((item) => item.connection_id === latest.connection_id);
-      if (!stored || stored.workspace_id !== latest.workspace_id) {
-        throw mcpError(409, "OAuth connection disappeared during refresh.", "mcp_connection_unavailable");
+    const expectedCredentialDigest = digest(latest.credential);
+    const queuedAt = nowIso();
+    const fallbackOutbox = {
+      oauth_state_id: makeId("mcprevoke"),
+      provider_id: latest.provider_id,
+      status: "revocation_pending",
+      workspace_id: latest.workspace_id,
+      created_by: latest.created_by,
+      connection_id: null,
+      source_connection_id: latest.connection_id,
+      created_at: queuedAt,
+      credential_staged_at: queuedAt,
+      revocation_queued_at: queuedAt,
+      revocation_attempts: 0,
+      revocation_reason: "refresh_compare_and_swap_lost",
+      source_credential_revision_digest: expectedCredentialDigest
+    };
+    fallbackOutbox.revocation_envelope = encryptMcpValue(
+      { credential: refreshed },
+      key,
+      mcpOAuthRevocationAad(fallbackOutbox)
+    );
+    const commit = await store.mutate((data) => {
+      data.mcpOauthStates ||= [];
+      const intent = data.mcpOauthStates.find((item) => sameMcpOAuthStateScope(item, refreshIntent));
+      const connectionMatches = (data.mcpConnections || [])
+        .filter((item) => sameMcpConnectionScope(item, latest));
+      const [stored] = connectionMatches;
+      const deletingOwner = (data.users || []).some((user) => (
+        user.user_id === latest.created_by
+        && user.workspace_id === latest.workspace_id
+        && user.status === "deleting"
+      ));
+      const canCommit = intent?.status === "refreshing"
+        && connectionMatches.length === 1
+        && stored.status === "ready"
+        && digest(stored.credential) === expectedCredentialDigest
+        && !deletingOwner;
+      if (!canCommit) {
+        let cleanupState = intent;
+        if (cleanupState && ["refreshing", "account_deleting", "refresh_outcome_uncertain"].includes(cleanupState.status)) {
+          cleanupState.status = "revocation_pending";
+          cleanupState.revocation_reason = "refresh_compare_and_swap_lost";
+          cleanupState.revocation_envelope = encryptMcpValue(
+            { credential: refreshed },
+            key,
+            mcpOAuthRevocationAad(cleanupState)
+          );
+          cleanupState.credential_staged_at = queuedAt;
+          cleanupState.revocation_queued_at = queuedAt;
+          cleanupState.revocation_attempts = Math.max(0, Number(cleanupState.revocation_attempts) || 0);
+        } else {
+          cleanupState = fallbackOutbox;
+          data.mcpOauthStates.push(cleanupState);
+        }
+        return { updated: false, cleanup_state: { ...cleanupState } };
       }
       stored.credential = encrypted;
       stored.status = "ready";
       stored.updated_at = nowIso();
       stored.last_authorized_at = nowIso();
       delete stored.auth_error_at;
-      return stored;
+      data.mcpOauthStates = data.mcpOauthStates.filter((item) => item !== intent);
+      return { updated: true, cleanup_state: null };
     });
+    if (!commit.updated) {
+      if (managedRevocationMayInvalidateSiblingCredentials(provider)) {
+        await quarantineConnectionsAfterGrantRevocation(store, latest);
+      }
+      try {
+        await revokePendingMcpOAuthState(commit.cleanup_state, { key, store });
+      } catch {
+        // The newly issued credential remains encrypted in the durable outbox;
+        // recovery must retry it before deletion can be considered complete.
+      }
+      throw mcpError(409, "OAuth connection changed during refresh. The unused credential was queued for revocation.", "mcp_connection_changed");
+    }
     return refreshed;
-  })();
-  oauthRefreshInflight.set(connection.connection_id, task);
+  });
+  oauthRefreshInflight.set(lifecycleKey, task);
   try {
     return await task;
   } finally {
-    if (oauthRefreshInflight.get(connection.connection_id) === task) {
-      oauthRefreshInflight.delete(connection.connection_id);
+    if (oauthRefreshInflight.get(lifecycleKey) === task) {
+      oauthRefreshInflight.delete(lifecycleKey);
     }
   }
 }
 
-async function markMcpConnectionReauthorization(store, connectionId) {
+function sameMcpConnectionScope(left, right) {
+  return Boolean(left && right)
+    && String(left.connection_id || "") === String(right.connection_id || "")
+    && String(left.workspace_id || "") === String(right.workspace_id || "")
+    && String(left.created_by || "") === String(right.created_by || "");
+}
+
+function mcpRevocationTargetsCredential(state, connection, credentialDigest) {
+  return Boolean(state && connection && credentialDigest)
+    && String(state.source_connection_id || "") === String(connection.connection_id || "")
+    && String(state.workspace_id || "") === String(connection.workspace_id || "")
+    && String(state.created_by || "") === String(connection.created_by || "")
+    && String(state.provider_id || "") === String(connection.provider_id || "")
+    && String(state.source_credential_revision_digest || "") === String(credentialDigest);
+}
+
+function mcpBindingTargetsConnection(binding, agent, connection) {
+  if (!binding || !agent || !connection) return false;
+  const bindingWorkspace = String(binding.connection_workspace_id || agent.workspace_id || "");
+  // Bindings created before connection_created_by existed are safe only for an
+  // agent owned by the same user as the private connection. Never let array
+  // order resolve a legacy identifier collision.
+  const bindingOwner = String(binding.connection_created_by || agent.created_by || "");
+  return String(binding.connection_id || "") === String(connection.connection_id || "")
+    && bindingWorkspace === String(connection.workspace_id || "")
+    && Boolean(bindingOwner)
+    && bindingOwner === String(connection.created_by || "");
+}
+
+function assertMcpConnectionCanBeRemoved(data, connection, deletingOwnerId = "") {
+  const boundAgents = (data.agents || []).filter((agent) => (
+    (agent.mcp_bindings || []).some((binding) => mcpBindingTargetsConnection(binding, agent, connection))
+  ));
+  const deletingOwner = String(deletingOwnerId || "").trim();
+  const ownerDeletionAllowsBindings = Boolean(deletingOwner)
+    && deletingOwner === connection.created_by
+    && (data.users || []).some((user) => (
+      user.user_id === deletingOwner
+      && user.workspace_id === connection.workspace_id
+      && user.status === "deleting"
+    ))
+    && boundAgents.every((agent) => agent.created_by === deletingOwner);
+  if (boundAgents.length && !ownerDeletionAllowsBindings) {
+    throw mcpError(
+      409,
+      `Remove this connection from ${boundAgents.length} agent${boundAgents.length === 1 ? "" : "s"} first.`,
+      "mcp_connection_bound"
+    );
+  }
+}
+
+function cancelPendingMcpOAuthTransactions(data, connection, excludedStateId = "") {
+  for (const oauthState of data.mcpOauthStates || []) {
+    if (oauthState.oauth_state_id === excludedStateId
+      || oauthState.connection_id !== connection.connection_id
+      || oauthState.workspace_id !== connection.workspace_id
+      || oauthState.created_by !== connection.created_by
+      || oauthState.provider_id !== connection.provider_id
+      || !["pending", "exchanging"].includes(oauthState.status)) continue;
+    oauthState.failed_at = nowIso();
+    if (oauthState.revocation_envelope) {
+      oauthState.status = "revocation_pending";
+      oauthState.revocation_queued_at ||= oauthState.failed_at;
+    } else {
+      // If a token exchange is already on the wire, stageMcpOAuthCredential
+      // sees this cancellation and converts the issued credential into a
+      // durable revocation outbox instead of recreating the connection.
+      oauthState.status = "disconnect_cancelled";
+    }
+    delete oauthState.verifier_envelope;
+  }
+}
+
+function sameMcpOAuthStateScope(left, right) {
+  return Boolean(left && right)
+    && String(left.oauth_state_id || "") === String(right.oauth_state_id || "")
+    && String(left.workspace_id || "") === String(right.workspace_id || "")
+    && String(left.created_by || "") === String(right.created_by || "")
+    && String(left.provider_id || "") === String(right.provider_id || "");
+}
+
+function sameMcpApprovalScope(left, right) {
+  return Boolean(left && right)
+    && String(left.approval_id || "") === String(right.approval_id || "")
+    && String(left.workspace_id || "") === String(right.workspace_id || "")
+    && String(left.created_by || "") === String(right.created_by || "");
+}
+
+function mcpConnectionScopeKey(connection) {
+  if (!connection?.connection_id || !connection?.workspace_id || !connection?.created_by) return "";
+  return JSON.stringify([
+    String(connection.workspace_id),
+    String(connection.created_by),
+    String(connection.connection_id)
+  ]);
+}
+
+async function withMcpConnectionLifecycle(connection, operation) {
+  const scopeKey = mcpConnectionScopeKey(connection);
+  if (!scopeKey) return operation();
+  const previous = mcpConnectionLifecycleTails.get(scopeKey) || Promise.resolve();
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const tail = previous.catch(() => undefined).then(() => gate);
+  mcpConnectionLifecycleTails.set(scopeKey, tail);
+  await previous.catch(() => undefined);
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (mcpConnectionLifecycleTails.get(scopeKey) === tail) {
+      mcpConnectionLifecycleTails.delete(scopeKey);
+    }
+  }
+}
+
+async function markMcpConnectionReauthorization(store, target) {
   await store.mutate((data) => {
-    const connection = (data.mcpConnections || []).find((item) => item.connection_id === connectionId);
+    const connection = (data.mcpConnections || []).find((item) => sameMcpConnectionScope(item, target));
     if (connection) {
       connection.status = "reauthorization_required";
       connection.auth_error_at = nowIso();
       connection.updated_at = nowIso();
     }
     return connection || null;
+  });
+}
+
+async function quarantineConnectionsAfterGrantRevocation(store, scope) {
+  const workspaceId = String(scope?.workspace_id || "");
+  const ownerId = String(scope?.created_by || "");
+  const providerId = String(scope?.provider_id || "");
+  if (!workspaceId || !ownerId || !providerId) return [];
+  return store.mutate((data) => {
+    const quarantined = [];
+    for (const connection of data.mcpConnections || []) {
+      if (connection.workspace_id !== workspaceId
+        || connection.created_by !== ownerId
+        || connection.provider_id !== providerId
+        || !["ready", "checking"].includes(connection.status)) continue;
+      connection.status = "reauthorization_required";
+      connection.auth_error_at = nowIso();
+      connection.updated_at = connection.auth_error_at;
+      connection.grant_revocation_race_at = connection.auth_error_at;
+      quarantined.push(connection.connection_id);
+    }
+    return quarantined;
+  });
+}
+
+async function beginMcpOAuthRefreshIntent(store, connection) {
+  const credentialDigest = digest(connection.credential);
+  const startedAt = nowIso();
+  const intent = {
+    oauth_state_id: makeId("mcprefresh"),
+    provider_id: connection.provider_id,
+    status: "refreshing",
+    workspace_id: connection.workspace_id,
+    created_by: connection.created_by,
+    connection_id: null,
+    source_connection_id: connection.connection_id,
+    source_credential_revision_digest: credentialDigest,
+    created_at: startedAt,
+    refresh_started_at: startedAt
+  };
+  return store.mutate((data) => {
+    const matches = (data.mcpConnections || [])
+      .filter((item) => sameMcpConnectionScope(item, connection));
+    if (matches.length !== 1
+      || matches[0].status !== "ready"
+      || digest(matches[0].credential) !== credentialDigest) {
+      throw mcpError(409, "OAuth connection changed before refresh could begin.", "mcp_connection_changed");
+    }
+    if ((data.users || []).some((user) => (
+      user.user_id === connection.created_by
+      && user.workspace_id === connection.workspace_id
+      && user.status === "deleting"
+    ))) {
+      throw mcpError(409, "Account deletion is in progress.", "account_deletion_in_progress");
+    }
+    data.mcpOauthStates ||= [];
+    const unresolved = data.mcpOauthStates.find((state) => (
+      state.source_connection_id === connection.connection_id
+      && state.workspace_id === connection.workspace_id
+      && state.created_by === connection.created_by
+      && state.provider_id === connection.provider_id
+      && state.source_credential_revision_digest === credentialDigest
+      && ["refreshing", "refresh_outcome_uncertain", "account_deleting"].includes(state.status)
+    ));
+    if (unresolved) {
+      throw mcpError(409, "A previous OAuth refresh has an uncertain outcome. Provider access must be verified before continuing.", "mcp_oauth_outcome_uncertain");
+    }
+    data.mcpOauthStates.push(intent);
+    return { ...intent };
+  });
+}
+
+async function settleMcpOAuthRefreshFailure(store, intent, error) {
+  const definitive = oauthFailureOutcomeIsDefinitive(error);
+  return store.mutate((data) => {
+    const current = (data.mcpOauthStates || [])
+      .find((item) => sameMcpOAuthStateScope(item, intent));
+    if (!current || current.revocation_envelope
+      || ["revoked", "revocation_manually_resolved"].includes(current.status)) return current || null;
+    const failedAt = nowIso();
+    if (definitive) {
+      current.status = "failed";
+      current.failed_at = failedAt;
+      current.refresh_error_code = String(error?.code || "mcp_oauth_refresh_failed").slice(0, 120);
+      return current;
+    }
+    current.status = "refresh_outcome_uncertain";
+    current.uncertain_started_at = current.refresh_started_at || failedAt;
+    current.uncertain_error_code = String(error?.code || "mcp_oauth_refresh_outcome_uncertain").slice(0, 120);
+    return current;
   });
 }
 
@@ -1310,48 +2419,96 @@ async function mcpHttpRequest(endpointUrl, { auth, session, payload, allowEmpty 
   const configuredTimeout = Number(process.env.APP_MCP_TIMEOUT_MS || 15000);
   const timeoutMs = Number.isFinite(configuredTimeout) ? Math.max(500, Math.min(configuredTimeout, 60000)) : 15000;
   return new Promise((resolve, reject) => {
+    let settled = false;
+    let responseReceived = false;
+    let deadline;
+    const finish = (operation, value) => {
+      if (settled) return;
+      settled = true;
+      if (deadline) clearTimeout(deadline);
+      operation(value);
+    };
+    const resolveOnce = (value) => finish(resolve, value);
+    const rejectOnce = (error) => finish(reject, error);
+    const connectionError = (error, code = "mcp_connection_failed") => (
+      error?.code?.startsWith?.("mcp_")
+        ? error
+        : mcpError(
+          502,
+          code === "mcp_response_aborted"
+            ? "MCP server closed the response before it was complete."
+            : "MCP connection failed.",
+          code
+        )
+    );
     const request = transport.request(url, {
       method: "POST",
       headers,
       servername: url.hostname,
       lookup: (_hostname, _options, callback) => callback(null, selected.address, selected.family)
     }, (response) => {
+      responseReceived = true;
+      let responseEnded = false;
       if (response.statusCode >= 300 && response.statusCode < 400) {
         response.resume();
-        reject(mcpError(502, "MCP redirects are not followed.", "mcp_redirect_blocked"));
+        rejectOnce(mcpError(502, "MCP redirects are not followed.", "mcp_redirect_blocked"));
         return;
       }
       const chunks = [];
       let total = 0;
       response.on("data", (chunk) => {
+        if (settled) return;
         total += chunk.length;
         if (total > MAX_RPC_BYTES) {
-          request.destroy(mcpError(502, "MCP response exceeded the size limit.", "mcp_response_too_large"));
+          const error = mcpError(502, "MCP response exceeded the size limit.", "mcp_response_too_large");
+          rejectOnce(error);
+          request.destroy(error);
           return;
         }
         chunks.push(chunk);
       });
       response.on("end", () => {
+        responseEnded = true;
+        if (settled) return;
         const responseBody = Buffer.concat(chunks).toString("utf8");
         if (response.statusCode < 200 || response.statusCode >= 300) {
           if (response.statusCode === 401) {
-            reject(mcpError(502, "MCP server rejected the OAuth credential.", "mcp_unauthorized"));
+            rejectOnce(mcpError(502, "MCP server rejected the OAuth credential.", "mcp_unauthorized"));
             return;
           }
-          reject(mcpError(502, `MCP server returned HTTP ${response.statusCode}.`, "mcp_http_error"));
+          rejectOnce(mcpError(502, `MCP server returned HTTP ${response.statusCode}.`, "mcp_http_error"));
           return;
         }
         if (!responseBody.trim() && !allowEmpty) {
-          reject(mcpError(502, "MCP server returned an empty response.", "mcp_empty_response"));
+          rejectOnce(mcpError(502, "MCP server returned an empty response.", "mcp_empty_response"));
           return;
         }
-        resolve({ status: response.statusCode, headers: response.headers, body: responseBody });
+        resolveOnce({ status: response.statusCode, headers: response.headers, body: responseBody });
+      });
+      response.on("aborted", () => {
+        rejectOnce(connectionError(null, "mcp_response_aborted"));
+      });
+      response.on("error", (error) => {
+        rejectOnce(connectionError(error, "mcp_response_aborted"));
+      });
+      response.on("close", () => {
+        if (!responseEnded && !response.complete) {
+          rejectOnce(connectionError(null, "mcp_response_aborted"));
+        }
       });
     });
-    const deadline = setTimeout(() => request.destroy(mcpError(504, "MCP request timed out.", "mcp_timeout")), timeoutMs);
-    request.on("close", () => clearTimeout(deadline));
-    request.setTimeout(timeoutMs, () => request.destroy(mcpError(504, "MCP request timed out.", "mcp_timeout")));
-    request.on("error", (error) => reject(error.code?.startsWith?.("mcp_") ? error : mcpError(502, "MCP connection failed.", "mcp_connection_failed")));
+    const timeout = () => {
+      if (settled) return;
+      const error = mcpError(504, "MCP request timed out.", "mcp_timeout");
+      rejectOnce(error);
+      request.destroy(error);
+    };
+    deadline = setTimeout(timeout, timeoutMs);
+    request.setTimeout(timeoutMs, timeout);
+    request.on("error", (error) => rejectOnce(connectionError(error)));
+    request.on("close", () => {
+      if (!settled && !responseReceived) rejectOnce(connectionError(null));
+    });
     request.end(body);
   });
 }
@@ -1539,9 +2696,41 @@ function mcpOAuthClientAad(record) {
   return `mcp-oauth-client:v1:${record.provider_id}:${record.oauth_client_id}`;
 }
 
-async function setOauthTransactionStatus(store, oauthStateId, status) {
+function retainedMcpOAuthStates(states, now = Date.now()) {
+  const terminalStatuses = new Set([
+    "completed",
+    "denied",
+    "expired",
+    "failed",
+    "superseded",
+    "disconnect_cancelled",
+    "revoked",
+    "revocation_manually_resolved"
+  ]);
+  return (states || []).filter((item) => {
+    // A credential outbox is never age-pruned. It remains until the provider
+    // confirms revocation or an administrator records audited provider proof.
+    if (item.revocation_envelope || !terminalStatuses.has(item.status)) return true;
+    const terminalAt = Date.parse(
+      item.revoked_at
+      || item.manually_resolved_at
+      || item.completed_at
+      || item.failed_at
+      || item.expires_at
+      || ""
+    );
+    return !Number.isFinite(terminalAt) || terminalAt >= now - OAUTH_STATE_RETENTION_MS;
+  });
+}
+
+function oauthFailureOutcomeIsDefinitive(error) {
+  return error?.oauth_definitive_no_credential === true
+    || error?.code === "mcp_oauth_token_rejected";
+}
+
+async function setOauthTransactionStatus(store, target, status) {
   return store.mutate((data) => {
-    const transaction = (data.mcpOauthStates || []).find((item) => item.oauth_state_id === oauthStateId);
+    const transaction = (data.mcpOauthStates || []).find((item) => sameMcpOAuthStateScope(item, target));
     if (!transaction) return null;
     transaction.status = status;
     if (["failed", "denied", "expired"].includes(status)) {

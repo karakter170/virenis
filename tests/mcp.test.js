@@ -9,6 +9,7 @@ import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { createApp } from "../server/app.js";
+import { recoverStaleMcpApprovalExecutions } from "../server/mcp.js";
 
 let app;
 let tmpDir;
@@ -20,8 +21,14 @@ let observedAuthorization;
 let continuationCalls;
 let continuationFailures;
 let toolExecutionFailures;
+let abortedToolQueries;
 const priorEnvironment = {};
-const ENV_KEYS = ["WEB_STORE_DRIVER", "APP_MCP_ALLOW_TEST_HTTP", "APP_MCP_GATEWAY_KEY"];
+const ENV_KEYS = [
+  "WEB_STORE_DRIVER",
+  "APP_MCP_ALLOW_TEST_HTTP",
+  "APP_MCP_GATEWAY_KEY",
+  "APP_API_TOKENS_JSON"
+];
 const executeFile = promisify(execFile);
 
 beforeEach(async () => {
@@ -36,6 +43,7 @@ beforeEach(async () => {
   continuationCalls = [];
   continuationFailures = 0;
   toolExecutionFailures = 0;
+  abortedToolQueries = new Set();
   server = await startSyntheticMcpServer();
   tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "virenis-mcp-"));
   app = await createApp({
@@ -307,6 +315,100 @@ describe("governed MCP phase 1", () => {
     expect(toolCalls).toHaveLength(0);
   });
 
+  it("fails closed for legacy same-workspace connection-id collisions at direct and approved execution", async () => {
+    const connection = await request(app)
+      .post("/api/mcp/connections")
+      .send({ name: "Owner-bound execution proof", endpoint_url: server.url, auth: { type: "none" } })
+      .expect(201);
+    await request(app)
+      .post("/api/agents")
+      .send({
+        id: "mcp_legacy_connection_collision_agent",
+        title: "Legacy connection collision agent",
+        capability: "Use only the owner's exact connected service.",
+        boundary: "Never select a connection by persistence order.",
+        mcp_bindings: [{
+          connection_id: connection.body.connection_id,
+          tool_names: ["search_notes", "create_note"]
+        }]
+      })
+      .expect(201);
+    const storedAgent = app.locals.store.read((data) => data.agents
+      .find((item) => item.id === "mcp_legacy_connection_collision_agent"));
+    const binding = storedAgent.mcp_bindings[0];
+    expect.soft(binding.connection_workspace_id).toBe("workspace_default");
+    expect.soft(binding.connection_created_by).toBe("user_local");
+    const readAlias = binding.tools.find((item) => item.name === "search_notes").alias;
+    const writeAlias = binding.tools.find((item) => item.name === "create_note").alias;
+    const context = {
+      run_id: "run_mcp_legacy_collision_approval",
+      session_id: "session_mcp_legacy_collision",
+      workspace_id: "workspace_default",
+      user_id: "user_local",
+      role: "user"
+    };
+    const gatewayHeaders = { "X-Virenis-MCP-Gateway-Key": process.env.APP_MCP_GATEWAY_KEY };
+    const queued = await request(app)
+      .post("/api/internal/mcp/tools/call")
+      .set(gatewayHeaders)
+      .send({
+        agent_id: storedAgent.id,
+        tool_alias: writeAlias,
+        arguments: { text: "This must never cross owners" },
+        execution_context: context
+      })
+      .expect(200);
+    expect(queued.body.approval_required).toBe(true);
+    const storedApproval = app.locals.store.read((data) => data.mcpApprovals
+      .find((item) => item.approval_id === queued.body.approval_id));
+    expect.soft(storedApproval.connection_workspace_id).toBe("workspace_default");
+    expect.soft(storedApproval.connection_created_by).toBe("user_local");
+
+    await app.locals.store.mutate((data) => {
+      const agent = data.agents.find((item) => item.id === storedAgent.id);
+      const legacyBinding = agent.mcp_bindings[0];
+      delete legacyBinding.connection_workspace_id;
+      delete legacyBinding.connection_created_by;
+      delete legacyBinding.connection_owner_id;
+      const approval = data.mcpApprovals.find((item) => item.approval_id === queued.body.approval_id);
+      delete approval.connection_workspace_id;
+      delete approval.connection_created_by;
+      delete approval.connection_owner_id;
+      const original = data.mcpConnections.find((item) => (
+        item.connection_id === connection.body.connection_id
+        && item.workspace_id === "workspace_default"
+        && item.created_by === "user_local"
+      ));
+      data.mcpConnections.unshift({
+        ...original,
+        name: "Other owner's colliding legacy connection",
+        created_by: "other_workspace_member",
+        visibility: "private"
+      });
+      return true;
+    });
+
+    const direct = await request(app)
+      .post("/api/internal/mcp/tools/call")
+      .set(gatewayHeaders)
+      .send({
+        agent_id: storedAgent.id,
+        tool_alias: readAlias,
+        arguments: { query: "must fail closed" },
+        execution_context: { ...context, run_id: "run_mcp_legacy_collision_read" }
+      });
+    const approved = await request(app)
+      .post(`/api/mcp/approvals/${queued.body.approval_id}`)
+      .send({ decision: "approve" });
+    expect.soft(direct.status).toBe(409);
+    expect.soft(direct.body.error).toBe("mcp_connection_ambiguous");
+    expect.soft(approved.status).toBe(409);
+    expect.soft(approved.body.error).toBe("mcp_connection_ambiguous");
+    expect.soft(toolCalls).toEqual([]);
+    expect.soft(app.locals.store.read((data) => data.mcpApprovals
+      .find((item) => item.approval_id === queued.body.approval_id).status)).toBe("pending");
+  });
+
   it("does not let a foreign injected binding disclose or block a connection deletion", async () => {
     const connection = await request(app)
       .post("/api/mcp/connections")
@@ -454,6 +556,196 @@ describe("governed MCP phase 1", () => {
     expect(continuationCalls).toHaveLength(1);
   });
 
+  it("recovers a stale approved write as uncertain, never replays it, and resumes only after acknowledgement", async () => {
+    const sensitiveArguments = "Create the private crash-recovery note exactly once";
+    const fixture = await queueWriteApproval({
+      agentId: "uncertain_write_recovery_agent",
+      runId: "run_uncertain_write_recovery",
+      sessionId: "session_uncertain_write_recovery",
+      text: sensitiveArguments
+    });
+    const staleStartedAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+    await app.locals.store.mutate((data) => {
+      const approval = data.mcpApprovals.find((item) => item.approval_id === fixture.approvalId);
+      approval.status = "executing";
+      approval.decided_at = staleStartedAt;
+      approval.execution_started_at = staleStartedAt;
+      approval.decided_by = "user_local";
+      return null;
+    });
+
+    await app.locals.store.close();
+    app = await createApp({
+      dbPath: path.join(tmpDir, "db.json"),
+      uploadRoot: tmpDir,
+      conversationContinuator: async (input) => {
+        continuationCalls.push(input);
+        return { content: `Conversation resumed after ${input.decision}: ${input.tool_name}.` };
+      }
+    });
+    expect(app.locals.mcpApprovalStartupRecovery).toEqual([fixture.approvalId]);
+    expect(toolCalls.filter((call) => call.name === "create_note")).toHaveLength(0);
+
+    const rawApproval = app.locals.store.read((data) => data.mcpApprovals
+      .find((item) => item.approval_id === fixture.approvalId));
+    expect(rawApproval).toMatchObject({
+      status: "execution_outcome_uncertain",
+      outcome_uncertain_at: expect.any(String),
+      request_envelope: expect.objectContaining({ algorithm: "aes-256-gcm" })
+    });
+    expect(JSON.stringify(rawApproval)).not.toContain(sensitiveArguments);
+
+    const listed = await request(app).get("/api/mcp/approvals").expect(200);
+    expect(listed.body.approvals).toContainEqual(expect.objectContaining({
+      approval_id: fixture.approvalId,
+      status: "execution_outcome_uncertain",
+      outcome_uncertain: true,
+      arguments: { text: sensitiveArguments },
+      result: null
+    }));
+
+    const acknowledged = await request(app)
+      .post(`/api/mcp/approvals/${fixture.approvalId}/acknowledge-uncertain`)
+      .send({ continue_without_retry: true })
+      .expect(200);
+    expect(acknowledged.body).toMatchObject({
+      approval_id: fixture.approvalId,
+      status: "failed",
+      outcome_uncertain: true,
+      result: {
+        outcome: "unknown",
+        replayed: false
+      },
+      continuation: {
+        status: "resumed",
+        resume_message_id: expect.stringMatching(/^msg_/)
+      }
+    });
+    expect(continuationCalls).toEqual([
+      expect.objectContaining({
+        decision: "uncertain",
+        tool_result: expect.objectContaining({ outcome: "unknown", replayed: false })
+      })
+    ]);
+    expect(toolCalls.filter((call) => call.name === "create_note")).toHaveLength(0);
+
+    const resumedAgain = await request(app)
+      .post(`/api/conversation/checkpoints/${fixture.checkpointId}/resume`)
+      .send({})
+      .expect(200);
+    expect(resumedAgain.body.resume_message_id).toBe(acknowledged.body.continuation.resume_message_id);
+    expect(continuationCalls).toHaveLength(1);
+    expect(toolCalls.filter((call) => call.name === "create_note")).toHaveLength(0);
+  });
+
+  it("leaves a fresh in-flight approved write untouched during crash recovery", async () => {
+    const fixture = await queueWriteApproval({
+      agentId: "fresh_write_execution_agent",
+      runId: "run_fresh_write_execution",
+      sessionId: "session_fresh_write_execution",
+      text: "Do not recover this still-live execution"
+    });
+    const freshStartedAt = new Date().toISOString();
+    await app.locals.store.mutate((data) => {
+      const approval = data.mcpApprovals.find((item) => item.approval_id === fixture.approvalId);
+      approval.status = "executing";
+      approval.decided_at = freshStartedAt;
+      approval.execution_started_at = freshStartedAt;
+      approval.decided_by = "user_local";
+      return null;
+    });
+
+    const recovered = await recoverStaleMcpApprovalExecutions({
+      store: app.locals.store,
+      staleBefore: new Date(Date.now() - 60 * 60 * 1000).toISOString()
+    });
+    expect(recovered).toEqual([]);
+    expect(app.locals.store.read((data) => data.mcpApprovals
+      .find((item) => item.approval_id === fixture.approvalId).status)).toBe("executing");
+    expect(toolCalls.filter((call) => call.name === "create_note")).toHaveLength(0);
+
+    await request(app)
+      .post(`/api/mcp/approvals/${fixture.approvalId}/acknowledge-uncertain`)
+      .send({ continue_without_retry: true })
+      .expect(409);
+    expect(toolCalls.filter((call) => call.name === "create_note")).toHaveLength(0);
+  });
+
+  it("scopes uncertain-write acknowledgement by the exact tenant identity when approval ids collide", async () => {
+    process.env.APP_API_TOKENS_JSON = JSON.stringify({
+      ownerapprovaltoken: {
+        user_id: "approval_owner",
+        workspace_id: "approval_workspace",
+        role: "user"
+      },
+      foreignapprovaltoken: {
+        user_id: "foreign_owner",
+        workspace_id: "foreign_workspace",
+        role: "user"
+      }
+    });
+    const fixture = await queueWriteApproval({
+      agentId: "tenant_scoped_uncertain_agent",
+      runId: "run_tenant_scoped_uncertain",
+      sessionId: "session_tenant_scoped_uncertain",
+      text: "Only the exact tenant can acknowledge this",
+      token: "ownerapprovaltoken",
+      userId: "approval_owner",
+      workspaceId: "approval_workspace"
+    });
+    const staleStartedAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+    await app.locals.store.mutate((data) => {
+      const ownerApproval = data.mcpApprovals.find((item) => item.approval_id === fixture.approvalId);
+      ownerApproval.status = "executing";
+      ownerApproval.decided_at = staleStartedAt;
+      ownerApproval.execution_started_at = staleStartedAt;
+      ownerApproval.decided_by = "approval_owner";
+      data.mcpApprovals.unshift({
+        ...ownerApproval,
+        workspace_id: "foreign_workspace",
+        created_by: "foreign_owner",
+        status: "executing",
+        decided_at: new Date().toISOString(),
+        execution_started_at: new Date().toISOString()
+      });
+      return null;
+    });
+
+    await recoverStaleMcpApprovalExecutions({
+      store: app.locals.store,
+      staleBefore: new Date(Date.now() - 60 * 60 * 1000).toISOString()
+    });
+    const afterRecovery = app.locals.store.read((data) => data.mcpApprovals
+      .filter((item) => item.approval_id === fixture.approvalId));
+    expect(afterRecovery.find((item) => item.created_by === "approval_owner").status)
+      .toBe("execution_outcome_uncertain");
+    expect(afterRecovery.find((item) => item.created_by === "foreign_owner").status)
+      .toBe("executing");
+
+    const foreignAttempt = await request(app)
+      .post(`/api/mcp/approvals/${fixture.approvalId}/acknowledge-uncertain`)
+      .set("Authorization", "Bearer foreignapprovaltoken")
+      .send({ continue_without_retry: true })
+      .expect(409);
+    expect(foreignAttempt.body.error).toBe("mcp_approval_not_uncertain");
+
+    const acknowledged = await request(app)
+      .post(`/api/mcp/approvals/${fixture.approvalId}/acknowledge-uncertain`)
+      .set("Authorization", "Bearer ownerapprovaltoken")
+      .send({ continue_without_retry: true })
+      .expect(200);
+    expect(acknowledged.body).toMatchObject({
+      approval_id: fixture.approvalId,
+      status: "failed",
+      outcome_uncertain: true
+    });
+    const afterAcknowledgement = app.locals.store.read((data) => data.mcpApprovals
+      .filter((item) => item.approval_id === fixture.approvalId));
+    expect(afterAcknowledgement.find((item) => item.created_by === "approval_owner").status).toBe("failed");
+    expect(afterAcknowledgement.find((item) => item.created_by === "foreign_owner").status).toBe("executing");
+    expect(toolCalls.filter((call) => call.name === "create_note")).toHaveLength(0);
+  });
+
   it("pins schemas and rejects a changed tool contract until the agent is rebound", async () => {
     const connection = await request(app)
       .post("/api/mcp/connections")
@@ -515,6 +807,60 @@ describe("governed MCP phase 1", () => {
       })
       .expect(400);
     expect(privateHttps.body.error).toBe("mcp_ssrf_blocked");
+  });
+
+  it("rejects a truncated MCP tool response promptly without recording a successful result", async () => {
+    const connection = await request(app)
+      .post("/api/mcp/connections")
+      .send({
+        name: "Truncated transport proof",
+        endpoint_url: server.url,
+        trust_read_annotations: true,
+        auth: { type: "none" }
+      })
+      .expect(201);
+    await request(app).post("/api/agents").send({
+      id: "mcp_truncated_response_agent",
+      title: "Truncated response agent",
+      capability: "Read only complete MCP responses.",
+      boundary: "Never accept a partial transport response.",
+      mcp_bindings: [{ connection_id: connection.body.connection_id, tool_names: ["search_notes"] }]
+    }).expect(201);
+    const agent = (await request(app).get("/api/agents").expect(200)).body.agents
+      .find((item) => item.id === "mcp_truncated_response_agent");
+    const alias = agent.mcp_bindings[0].tools[0].alias;
+    abortedToolQueries.add("partial-abort");
+    const gatewayRequest = request(app)
+      .post("/api/internal/mcp/tools/call")
+      .set("X-Virenis-MCP-Gateway-Key", process.env.APP_MCP_GATEWAY_KEY)
+      .send({
+        agent_id: agent.id,
+        tool_alias: alias,
+        arguments: { query: "partial-abort" },
+        execution_context: {
+          run_id: "run_mcp_truncated_response",
+          session_id: "session_mcp_truncated_response",
+          workspace_id: "workspace_default",
+          user_id: "user_local",
+          role: "user"
+        }
+      });
+    const outcome = await settleWithin(gatewayRequest);
+    if (outcome.status === "timeout") gatewayRequest.abort();
+
+    expect.soft(outcome.status).toBe("fulfilled");
+    if (outcome.status === "fulfilled") {
+      expect.soft(outcome.value.status).toBeGreaterThanOrEqual(500);
+      expect.soft(outcome.value.body.ok).not.toBe(true);
+      expect.soft(outcome.value.body.data).toBeUndefined();
+    }
+    expect.soft(toolCalls.filter((call) => call.arguments?.query === "partial-abort")).toHaveLength(1);
+    const audits = app.locals.store.read((data) => data.mcpToolCalls
+      .filter((item) => item.run_id === "run_mcp_truncated_response"));
+    expect.soft(audits.some((item) => item.status === "completed")).toBe(false);
+    expect.soft(audits).toEqual([
+      expect.objectContaining({ status: "failed" })
+    ]);
   });
 
   it("runs the complete Python executor → governed web gateway → MCP server path", async () => {
@@ -631,6 +977,20 @@ async function startSyntheticMcpServer() {
       };
     } else if (payload.method === "tools/call") {
       toolCalls.push(payload.params);
+      if (abortedToolQueries.has(payload.params.arguments?.query)) {
+        const body = JSON.stringify({
+          jsonrpc: "2.0",
+          id: payload.id,
+          result: { content: [{ type: "text", text: "This partial result must never be accepted" }] }
+        });
+        response.writeHead(200, {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(body) + 64
+        });
+        response.write(body.slice(0, -1));
+        setTimeout(() => response.destroy(), 10);
+        return;
+      }
       if (toolExecutionFailures > 0) {
         toolExecutionFailures -= 1;
         response.setHeader("Content-Type", "application/json");
@@ -654,4 +1014,87 @@ async function startSyntheticMcpServer() {
   await new Promise((resolve) => synthetic.listen(0, "127.0.0.1", resolve));
   synthetic.url = `http://127.0.0.1:${synthetic.address().port}/mcp`;
   return synthetic;
+}
+
+async function queueWriteApproval({
+  agentId,
+  runId,
+  sessionId,
+  text,
+  token = null,
+  userId = "user_local",
+  workspaceId = "workspace_default"
+}) {
+  let connectionRequest = request(app)
+    .post("/api/mcp/connections");
+  if (token) connectionRequest = connectionRequest.set("Authorization", `Bearer ${token}`);
+  const connection = await connectionRequest
+    .send({
+      name: `${agentId} connection`,
+      endpoint_url: server.url,
+      auth: { type: "none" }
+    })
+    .expect(201);
+
+  let agentRequest = request(app).post("/api/agents");
+  if (token) agentRequest = agentRequest.set("Authorization", `Bearer ${token}`);
+  await agentRequest.send({
+    id: agentId,
+    title: `${agentId} title`,
+    capability: "Create one note after explicit user approval.",
+    boundary: "Never replay an approved write whose outcome is unknown.",
+    mcp_bindings: [{
+      connection_id: connection.body.connection_id,
+      tool_names: ["create_note"]
+    }]
+  }).expect(201);
+
+  const agent = app.locals.store.read((data) => data.agents.find((item) => (
+    item.id === agentId
+    && item.workspace_id === workspaceId
+    && item.created_by === userId
+  )));
+  const alias = agent.mcp_bindings[0].tools.find((item) => item.name === "create_note").alias;
+  const queued = await request(app)
+    .post("/api/internal/mcp/tools/call")
+    .set("X-Virenis-MCP-Gateway-Key", process.env.APP_MCP_GATEWAY_KEY)
+    .send({
+      agent_id: agent.id,
+      tool_alias: alias,
+      arguments: { text },
+      execution_context: {
+        run_id: runId,
+        session_id: sessionId,
+        workspace_id: workspaceId,
+        user_id: userId,
+        role: "user"
+      }
+    })
+    .expect(200);
+  expect(queued.body).toMatchObject({ approval_required: true });
+  const approval = app.locals.store.read((data) => data.mcpApprovals.find((item) => (
+    item.approval_id === queued.body.approval_id
+    && item.workspace_id === workspaceId
+    && item.created_by === userId
+  )));
+  return {
+    approvalId: approval.approval_id,
+    checkpointId: approval.checkpoint_id,
+    alias,
+    connectionId: connection.body.connection_id
+  };
+}
+
+async function settleWithin(promise, timeoutMs = 1_000) {
+  let timer;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve({ status: "timeout" }), timeoutMs);
+  });
+  const settled = Promise.resolve(promise).then(
+    (value) => ({ status: "fulfilled", value }),
+    (error) => ({ status: "rejected", error })
+  );
+  const outcome = await Promise.race([settled, timeout]);
+  clearTimeout(timer);
+  return outcome;
 }

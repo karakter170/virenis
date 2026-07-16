@@ -76,8 +76,18 @@ function normalizedLedgerIdempotencyKey(workspaceId, value) {
     .digest("hex")}`;
 }
 
-export function normalizedLedgerLabel(kind, value) {
-  return `${safeEvent(kind, "value")}_sha256_${privacyDigest(value).toString("hex")}`;
+export function normalizedLedgerLabel(kind, workspaceId, value) {
+  if (arguments.length < 3) {
+    throw new TypeError("Normalized ledger labels require an explicit workspace scope.");
+  }
+  const safeKind = safeEvent(kind, "value");
+  const scopedWorkspace = workspace(workspaceId);
+  return `${safeKind}_ws2_sha256_${privacyDigest({
+    schema_version: "virenis-ledger-label-v2",
+    workspace_id: scopedWorkspace,
+    kind: safeKind,
+    value
+  }).toString("hex")}`;
 }
 
 function contentReceiptPredicate(column, kind) {
@@ -113,29 +123,29 @@ const LEGACY_LEDGER_PRIVACY_GATE_SQL = `
       ) AS present
       UNION ALL
       SELECT 'durable_label', (
-        EXISTS (SELECT 1 FROM tcar_ledger.agent_revisions WHERE workspace_id=$1 AND agent_id !~ '^agent_sha256_[0-9a-f]{64}$')
-        OR EXISTS (SELECT 1 FROM tcar_ledger.agent_events WHERE workspace_id=$1 AND agent_id !~ '^agent_sha256_[0-9a-f]{64}$')
-        OR EXISTS (SELECT 1 FROM tcar_ledger.execution_steps WHERE workspace_id=$1 AND agent_id !~ '^agent_sha256_[0-9a-f]{64}$')
-        OR EXISTS (SELECT 1 FROM tcar_ledger.execution_steps WHERE workspace_id=$1 AND adapter_id IS NOT NULL AND adapter_id !~ '^agent_sha256_[0-9a-f]{64}$')
-        OR EXISTS (SELECT 1 FROM tcar_ledger.source_revisions WHERE workspace_id=$1 AND source_id !~ '^source_sha256_[0-9a-f]{64}$')
-        OR EXISTS (SELECT 1 FROM tcar_ledger.execution_steps WHERE workspace_id=$1 AND logical_step_id !~ '^step_sha256_[0-9a-f]{64}$')
-        OR EXISTS (SELECT 1 FROM tcar_ledger.execution_events WHERE workspace_id=$1 AND logical_step_id IS NOT NULL AND logical_step_id !~ '^step_sha256_[0-9a-f]{64}$')
-        OR EXISTS (SELECT 1 FROM tcar_ledger.evidence_records WHERE workspace_id=$1 AND logical_step_id IS NOT NULL AND logical_step_id !~ '^step_sha256_[0-9a-f]{64}$')
-        OR EXISTS (SELECT 1 FROM tcar_ledger.evidence_records WHERE workspace_id=$1 AND chunk_id IS NOT NULL AND chunk_id !~ '^chunk_sha256_[0-9a-f]{64}$')
-        OR EXISTS (SELECT 1 FROM tcar_ledger.execution_artifacts WHERE workspace_id=$1 AND logical_step_id !~ '^step_sha256_[0-9a-f]{64}$')
-        OR EXISTS (SELECT 1 FROM tcar_ledger.execution_artifacts WHERE workspace_id=$1 AND artifact_name !~ '^artifact_sha256_[0-9a-f]{64}$')
-        OR EXISTS (SELECT 1 FROM tcar_ledger.outcome_contracts WHERE workspace_id=$1 AND contract_key !~ '^contract_sha256_[0-9a-f]{64}$')
-        OR EXISTS (SELECT 1 FROM tcar_ledger.outcome_observations WHERE workspace_id=$1 AND metric_key !~ '^metric_sha256_[0-9a-f]{64}$')
-        OR EXISTS (SELECT 1 FROM tcar_ledger.settlement_metric_scores WHERE workspace_id=$1 AND metric_key !~ '^participant_metric_sha256_[0-9a-f]{64}$')
-        OR EXISTS (SELECT 1 FROM tcar_ledger.reality_rank_snapshots WHERE workspace_id=$1 AND contract_family !~ '^contract_family_sha256_[0-9a-f]{64}$')
-        OR EXISTS (SELECT 1 FROM tcar_ledger.reality_rank_snapshots WHERE workspace_id=$1 AND domain_key !~ '^domain_sha256_[0-9a-f]{64}$')
+        EXISTS (SELECT 1 FROM tcar_ledger.agent_revisions WHERE workspace_id=$1 AND agent_id !~ '^agent_ws2_sha256_[0-9a-f]{64}$')
+        OR EXISTS (SELECT 1 FROM tcar_ledger.agent_events WHERE workspace_id=$1 AND agent_id !~ '^agent_ws2_sha256_[0-9a-f]{64}$')
+        OR EXISTS (SELECT 1 FROM tcar_ledger.execution_steps WHERE workspace_id=$1 AND agent_id !~ '^agent_ws2_sha256_[0-9a-f]{64}$')
+        OR EXISTS (SELECT 1 FROM tcar_ledger.execution_steps WHERE workspace_id=$1 AND adapter_id IS NOT NULL AND adapter_id !~ '^agent_ws2_sha256_[0-9a-f]{64}$')
+        OR EXISTS (SELECT 1 FROM tcar_ledger.source_revisions WHERE workspace_id=$1 AND source_id !~ '^source_ws2_sha256_[0-9a-f]{64}$')
+        OR EXISTS (SELECT 1 FROM tcar_ledger.execution_steps WHERE workspace_id=$1 AND logical_step_id !~ '^step_ws2_sha256_[0-9a-f]{64}$')
+        OR EXISTS (SELECT 1 FROM tcar_ledger.execution_events WHERE workspace_id=$1 AND logical_step_id IS NOT NULL AND logical_step_id !~ '^step_ws2_sha256_[0-9a-f]{64}$')
+        OR EXISTS (SELECT 1 FROM tcar_ledger.evidence_records WHERE workspace_id=$1 AND logical_step_id IS NOT NULL AND logical_step_id !~ '^step_ws2_sha256_[0-9a-f]{64}$')
+        OR EXISTS (SELECT 1 FROM tcar_ledger.evidence_records WHERE workspace_id=$1 AND chunk_id IS NOT NULL AND chunk_id !~ '^chunk_ws2_sha256_[0-9a-f]{64}$')
+        OR EXISTS (SELECT 1 FROM tcar_ledger.execution_artifacts WHERE workspace_id=$1 AND logical_step_id !~ '^step_ws2_sha256_[0-9a-f]{64}$')
+        OR EXISTS (SELECT 1 FROM tcar_ledger.execution_artifacts WHERE workspace_id=$1 AND artifact_name !~ '^artifact_ws2_sha256_[0-9a-f]{64}$')
+        OR EXISTS (SELECT 1 FROM tcar_ledger.outcome_contracts WHERE workspace_id=$1 AND contract_key !~ '^contract_ws2_sha256_[0-9a-f]{64}$')
+        OR EXISTS (SELECT 1 FROM tcar_ledger.outcome_observations WHERE workspace_id=$1 AND metric_key !~ '^metric_ws2_sha256_[0-9a-f]{64}$')
+        OR EXISTS (SELECT 1 FROM tcar_ledger.settlement_metric_scores WHERE workspace_id=$1 AND metric_key !~ '^participant_metric_ws2_sha256_[0-9a-f]{64}$')
+        OR EXISTS (SELECT 1 FROM tcar_ledger.reality_rank_snapshots WHERE workspace_id=$1 AND contract_family !~ '^contract_family_ws2_sha256_[0-9a-f]{64}$')
+        OR EXISTS (SELECT 1 FROM tcar_ledger.reality_rank_snapshots WHERE workspace_id=$1 AND domain_key !~ '^domain_ws2_sha256_[0-9a-f]{64}$')
       ) AS present
       UNION ALL
       SELECT 'dependency_label', EXISTS (
         SELECT 1
           FROM tcar_ledger.execution_steps AS step,
                LATERAL jsonb_array_elements_text(step.depends_on) AS dependency(value)
-         WHERE step.workspace_id=$1 AND dependency.value !~ '^step_sha256_[0-9a-f]{64}$'
+         WHERE step.workspace_id=$1 AND dependency.value !~ '^step_ws2_sha256_[0-9a-f]{64}$'
       ) AS present
       UNION ALL
       SELECT 'metric_definition', EXISTS (
@@ -145,7 +155,7 @@ const LEGACY_LEDGER_PRIVACY_GATE_SQL = `
          WHERE version.workspace_id=$1
            AND CASE
              WHEN jsonb_typeof(metric.value) <> 'object' THEN true
-             ELSE COALESCE(metric.value->>'key', '') !~ '^metric_sha256_[0-9a-f]{64}$'
+             ELSE COALESCE(metric.value->>'key', '') !~ '^metric_ws2_sha256_[0-9a-f]{64}$'
                OR EXISTS (
                  SELECT 1 FROM jsonb_object_keys(metric.value) AS property(name)
                   WHERE property.name NOT IN ('key', 'type', 'weight')
@@ -204,7 +214,38 @@ const LEGACY_LEDGER_PRIVACY_GATE_SQL = `
 
 export async function normalizedLedgerAvailable(client) {
   const result = await client.query(
-    `SELECT
+    `WITH expected_triggers(table_name, trigger_name, function_name, trigger_type) AS (
+       VALUES
+         ('execution_events','execution_events_chain_guard','validate_execution_event_chain',7),
+         ('agent_events','agent_events_chain_guard','validate_agent_event_chain',7),
+         ('outcome_observations','outcome_observations_supersession_guard','validate_observation_supersession',7),
+         ('outcome_settlements','outcome_settlements_chain_guard','validate_settlement_chain',7),
+         ('settlement_observations','settlement_observations_scope_guard','validate_settlement_observation_scope',7),
+         ('outcome_disputes','outcome_disputes_scope_guard','validate_outcome_dispute_scope',7),
+         ('reality_rank_snapshots','reality_rank_chain_guard','validate_reality_rank_chain',7),
+         ('execution_runs','execution_runs_update_guard','guard_execution_run_update',19),
+         ('execution_runs','execution_runs_delete_guard','reject_delete',11),
+         ('outcome_contracts','outcome_contracts_update_guard','guard_outcome_contract_update',19),
+         ('outcome_contracts','outcome_contracts_delete_guard','reject_delete',11),
+         ('outcome_instances','outcome_instances_update_guard','guard_outcome_instance_update',19),
+         ('outcome_instances','outcome_instances_delete_guard','reject_delete',11),
+         ('agent_revisions','agent_revisions_immutable_guard','reject_immutable_change',27),
+         ('agent_events','agent_events_immutable_guard','reject_immutable_change',27),
+         ('source_revisions','source_revisions_immutable_guard','reject_immutable_change',27),
+         ('execution_steps','execution_steps_immutable_guard','reject_immutable_change',27),
+         ('execution_events','execution_events_immutable_guard','reject_immutable_change',27),
+         ('evidence_records','evidence_records_immutable_guard','reject_immutable_change',27),
+         ('execution_artifacts','execution_artifacts_immutable_guard','reject_immutable_change',27),
+         ('artifact_evidence','artifact_evidence_immutable_guard','reject_immutable_change',27),
+         ('outcome_contract_versions','outcome_contract_versions_immutable_guard','reject_immutable_change',27),
+         ('outcome_observations','outcome_observations_immutable_guard','reject_immutable_change',27),
+         ('outcome_settlements','outcome_settlements_immutable_guard','reject_immutable_change',27),
+         ('outcome_disputes','outcome_disputes_immutable_guard','reject_immutable_change',27),
+         ('settlement_metric_scores','settlement_metric_scores_immutable_guard','reject_immutable_change',27),
+         ('settlement_observations','settlement_observations_immutable_guard','reject_immutable_change',27),
+         ('reality_rank_snapshots','reality_rank_snapshots_immutable_guard','reject_immutable_change',27)
+     )
+     SELECT
        (SELECT count(*)::int FROM unnest($1::text[]) AS required(name)
          WHERE to_regclass('tcar_ledger.' || required.name) IS NOT NULL) AS tables,
        (SELECT count(*)::int FROM pg_class AS relation
@@ -213,23 +254,40 @@ export async function normalizedLedgerAvailable(client) {
            AND relation.relrowsecurity AND relation.relforcerowsecurity) AS forced_rls,
        (SELECT count(*)::int FROM pg_policies
          WHERE schemaname='tcar_ledger' AND tablename=ANY($1::text[])
-           AND policyname=tablename || '_workspace_isolation') AS policies,
+           AND policyname=tablename || '_workspace_isolation'
+           AND permissive='PERMISSIVE' AND cmd='ALL'
+           AND roles=ARRAY['public']::name[]
+           AND regexp_replace(COALESCE(qual,''), '\\s+', '', 'g')='(workspace_id=tcar_ledger.current_workspace_id())'
+           AND regexp_replace(COALESCE(with_check,''), '\\s+', '', 'g')='(workspace_id=tcar_ledger.current_workspace_id())') AS policies,
+       (SELECT count(*)::int FROM pg_policies
+         WHERE schemaname='tcar_ledger' AND tablename=ANY($1::text[])) AS policy_total,
        (SELECT count(*)::int FROM information_schema.columns
          WHERE table_schema='tcar_ledger' AND table_name='reality_rank_snapshots'
            AND column_name='projection_state_digest') AS projection_columns,
-       (SELECT count(DISTINCT trigger.tgname)::int FROM pg_trigger AS trigger
-          JOIN pg_class AS relation ON relation.oid=trigger.tgrelid
-          JOIN pg_namespace AS namespace ON namespace.oid=relation.relnamespace
-         WHERE namespace.nspname='tcar_ledger' AND NOT trigger.tgisinternal
-           AND trigger.tgname=ANY($2::text[])) AS triggers`,
-    [REQUIRED_LEDGER_TABLES, REQUIRED_LEDGER_TRIGGERS]
+       (SELECT count(*)::int FROM expected_triggers AS expected
+         JOIN pg_class AS relation ON relation.relname=expected.table_name
+         JOIN pg_namespace AS namespace ON namespace.oid=relation.relnamespace AND namespace.nspname='tcar_ledger'
+         JOIN pg_trigger AS trigger ON trigger.tgrelid=relation.oid
+           AND trigger.tgname=expected.trigger_name AND NOT trigger.tgisinternal
+           AND trigger.tgtype=expected.trigger_type
+         JOIN pg_proc AS procedure ON procedure.oid=trigger.tgfoid AND procedure.proname=expected.function_name
+         JOIN pg_namespace AS procedure_namespace ON procedure_namespace.oid=procedure.pronamespace
+           AND procedure_namespace.nspname='tcar_ledger') AS triggers,
+       (SELECT count(*)::int FROM pg_trigger AS trigger
+         JOIN pg_class AS relation ON relation.oid=trigger.tgrelid
+         JOIN pg_namespace AS namespace ON namespace.oid=relation.relnamespace
+        WHERE namespace.nspname='tcar_ledger' AND relation.relname=ANY($1::text[])
+          AND NOT trigger.tgisinternal) AS trigger_total`,
+    [REQUIRED_LEDGER_TABLES]
   );
   const status = result.rows[0] || {};
   return status.tables === REQUIRED_LEDGER_TABLES.length
     && status.forced_rls === REQUIRED_LEDGER_TABLES.length
     && status.policies === REQUIRED_LEDGER_TABLES.length
+    && status.policy_total === REQUIRED_LEDGER_TABLES.length
     && status.projection_columns === 1
-    && status.triggers === REQUIRED_LEDGER_TRIGGERS.length;
+    && status.triggers === REQUIRED_LEDGER_TRIGGERS.length
+    && status.trigger_total === REQUIRED_LEDGER_TRIGGERS.length;
 }
 
 export async function syncNormalizedLedger(client, data) {
@@ -262,7 +320,7 @@ export async function assertNormalizedLedgerWorkspacePrivacy(client, workspaceId
   );
   if (!result.rowCount) return;
   const error = new Error(
-    `Normalized ledger privacy migration required for ${normalizedLedgerLabel("workspace", workspaceId)} `
+    `Normalized ledger privacy migration required for ${normalizedLedgerLabel("workspace", workspaceId, workspaceId)} `
     + `(${result.rows[0]?.category || "legacy_content"}). Stop application writes, inventory this workspace `
     + "with a migration-only BYPASSRLS role, and complete the approved legacy-ledger privacy migration before retrying."
   );
@@ -286,10 +344,10 @@ async function syncAgentLedger(client, data) {
     const ordered = [...events];
     if (!verifyEventChain(ordered)) {
       throw new Error(
-        `Agent event chain failed integrity verification for ${eventSubject(workspaceId, normalizedLedgerLabel("agent", ordered[0]?.agent_id))}.`
+        `Agent event chain failed integrity verification for ${eventSubject(workspaceId, normalizedLedgerLabel("agent", workspaceId, ordered[0]?.agent_id))}.`
       );
     }
-    const ledgerAgentId = normalizedLedgerLabel("agent", ordered[0]?.agent_id);
+    const ledgerAgentId = normalizedLedgerLabel("agent", workspaceId, ordered[0]?.agent_id);
     await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`${workspaceId}|${ledgerAgentId}`]);
     for (const event of ordered) {
       const revision = normalizedDigest(event.agent_revision) || digest(event);
@@ -397,7 +455,7 @@ async function insertAgentRevision(client, {
 async function syncSourceLedger(client, data) {
   for (const document of data.documents || []) {
     const workspaceId = workspace(document.workspace_id);
-    const documentLabel = normalizedLedgerLabel("source", document.document_id || document.agent_id || "unknown");
+    const documentLabel = normalizedLedgerLabel("source", workspaceId, document.document_id || document.agent_id || "unknown");
     await setWorkspace(client, workspaceId);
     const snapshot = document.source_revision_snapshot && typeof document.source_revision_snapshot === "object"
       ? document.source_revision_snapshot
@@ -429,7 +487,7 @@ async function syncSourceLedger(client, data) {
     const metadataDigest = digest(sourceMetadata);
     const ledgerSourceMetadata = normalizedLedgerContentReceipt("source_metadata", sourceMetadata);
     const sourceId = document.document_id || document.agent_id;
-    const ledgerSourceId = normalizedLedgerLabel("source", sourceId);
+    const ledgerSourceId = normalizedLedgerLabel("source", workspaceId, sourceId);
     const sourceRevisionId = sourceUuid(workspaceId, sourceId, contentDigest);
     const revisionNo = await sourceRevisionNumber(client, workspaceId, ledgerSourceId, contentDigest);
     const createdBy = document.created_by || "system";
@@ -527,7 +585,7 @@ async function syncExecutionLedger(client, data) {
       const step = runSteps.find((item) => item.step_id === participant.step_id) || {};
       const revision = normalizedDigest(participant.agent_revision) || digest(participant);
       const agent = findWorkspaceAgent(data, participant.agent_id, workspaceId) || { id: participant.agent_id };
-      const ledgerAgentId = normalizedLedgerLabel("agent", participant.agent_id);
+      const ledgerAgentId = normalizedLedgerLabel("agent", workspaceId, participant.agent_id);
       const snapshot = revisionSnapshot(participant.agent_revision_snapshot, agent, revision);
       const revisionId = revisionUuid(workspaceId, participant.agent_id, revision);
       await insertAgentRevision(client, {
@@ -542,7 +600,7 @@ async function syncExecutionLedger(client, data) {
         createdAt: record.recorded_at
       });
       const stepId = executionStepUuid(workspaceId, record.run_id, participant.step_id);
-      const ledgerStepId = normalizedLedgerLabel("step", participant.step_id);
+      const ledgerStepId = normalizedLedgerLabel("step", workspaceId, participant.step_id);
       const startedAt = iso(step.started_at || record.started_at || record.recorded_at);
       const completedAt = iso(step.completed_at || record.completed_at || record.recorded_at);
       await client.query(
@@ -568,7 +626,7 @@ async function syncExecutionLedger(client, data) {
           digestOrValue(participant.task_digest, step.task || ""),
           digest({ depends_on: step.depends_on || [], routing: participant.routing || null }),
           digestOrNull(participant.output_digest),
-          JSON.stringify((step.depends_on || []).map((stepIdValue) => normalizedLedgerLabel("step", stepIdValue))),
+          JSON.stringify((step.depends_on || []).map((stepIdValue) => normalizedLedgerLabel("step", workspaceId, stepIdValue))),
           stepStatus(participant.status),
           startedAt,
           completedAt,
@@ -660,9 +718,9 @@ async function syncEvidence(client, data, record, step, executionId, workspaceId
         workspaceId,
         evidenceId,
         executionId,
-        normalizedLedgerLabel("step", step.step_id),
+        normalizedLedgerLabel("step", workspaceId, step.step_id),
         sourceRevisionId,
-        normalizedLedgerLabel("chunk", citation.chunk_id),
+        normalizedLedgerLabel("chunk", workspaceId, citation.chunk_id),
         positiveIntOrNull(citation.page_start),
         positiveIntOrNull(citation.page_end),
         citation.claim ? digest(citation.claim) : null,
@@ -693,7 +751,7 @@ async function syncArtifacts(client, record, step, executionId, stepId, revision
     if (!artifact?.name) continue;
     const artifactId = stableUuid("artifact", workspaceId, record.run_id, step.step_id, artifact.name);
     const inlinePayload = artifact.value === undefined ? null : artifact.value;
-    const ledgerArtifactName = normalizedLedgerLabel("artifact", artifact.name);
+    const ledgerArtifactName = normalizedLedgerLabel("artifact", workspaceId, artifact.name);
     await client.query(
       `INSERT INTO tcar_ledger.execution_artifacts(
          workspace_id, artifact_id, execution_id, execution_step_id, logical_step_id,
@@ -707,7 +765,7 @@ async function syncArtifacts(client, record, step, executionId, stepId, revision
         artifactId,
         executionId,
         stepId,
-        normalizedLedgerLabel("step", step.step_id),
+        normalizedLedgerLabel("step", workspaceId, step.step_id),
         revisionId,
         ledgerArtifactName.slice(0, 240),
         typeof inlinePayload === "object" ? "json" : "text",
@@ -754,7 +812,7 @@ async function syncOutcomeLedger(client, data) {
       [
         workspaceId,
         contractId,
-        normalizedLedgerLabel("contract", contract.contract_id),
+        normalizedLedgerLabel("contract", workspaceId, contract.contract_id),
         "Content-redacted outcome contract",
         "",
         normalizedLedgerActorId(workspaceId, contract.created_by),
@@ -784,7 +842,7 @@ async function syncOutcomeLedger(client, data) {
         contract.schema_version || "virenis-outcome-contract-v2",
         JSON.stringify(normalizedLedgerContentReceipt("outcome_contract_definition", definition)),
         JSON.stringify([{
-          key: normalizedLedgerLabel("metric", contract.resolution?.metric || "outcome"),
+          key: normalizedLedgerLabel("metric", workspaceId, contract.resolution?.metric || "outcome"),
           type: contract.outcome_type,
           weight: 1
         }]),
@@ -836,7 +894,7 @@ async function syncOutcomeLedger(client, data) {
       const observationId = stableUuid("observation", workspaceId, settlement.settlement_id);
       const prior = index > 0 ? contract.settlements[index - 1] : null;
       const verified = settlement.verified_for_rank === true;
-      const metricKey = normalizedLedgerLabel("metric", contract.resolution?.metric || "outcome");
+      const metricKey = normalizedLedgerLabel("metric", workspaceId, contract.resolution?.metric || "outcome");
       const observedValueDigest = digest(settlement.actual_value);
       await client.query(
         `INSERT INTO tcar_ledger.outcome_observations(
@@ -911,7 +969,7 @@ async function syncOutcomeLedger(client, data) {
       );
       await assertImmutableRow(client, "outcome_settlements", "settlement_id", workspaceId, settlementId, expectedSettlement);
       for (const [scoreIndex, score] of (settlement.participant_scores || []).entries()) {
-        const scoreKey = normalizedLedgerLabel("participant_metric", `${scoreIndex + 1}:${score.agent_id}`);
+        const scoreKey = normalizedLedgerLabel("participant_metric", workspaceId, `${scoreIndex + 1}:${score.agent_id}`);
         await client.query(
           `INSERT INTO tcar_ledger.settlement_metric_scores(
              workspace_id, settlement_id, metric_key, normalized_score, metric_weight,
@@ -1071,8 +1129,8 @@ async function syncRealityRankLedger(client, data) {
     const projectionStateDigest = digest(inputSet);
     const agentRevisionId = revisionUuid(workspaceId, agentId, normalizedDigest(revision) || digest(revision));
     const subjectId = String(agentRevisionId);
-    const contractFamily = normalizedLedgerLabel("contract_family", taskType || "decision");
-    const domainKey = normalizedLedgerLabel("domain", domain || "general");
+    const contractFamily = normalizedLedgerLabel("contract_family", workspaceId, taskType || "decision");
+    const domainKey = normalizedLedgerLabel("domain", workspaceId, domain || "general");
     const lockKey = [workspaceId, "agent_revision", subjectId, contractFamily, domainKey, "default", "bayesian-decayed-utility", "v1"].join("|");
     await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [lockKey]);
     const previous = await client.query(
@@ -1344,7 +1402,7 @@ function sourceContentDigest(document) {
   const uploadDigest = normalizedDigest(document.upload_digest);
   if (!contentDigest || !uploadDigest || !contentDigest.equals(uploadDigest)) {
     throw new Error(
-      `Document ${normalizedLedgerLabel("source", document.document_id || document.agent_id || "unknown")} has no verified upload-byte digest.`
+      `Document ${normalizedLedgerLabel("source", workspace(document.workspace_id), document.document_id || document.agent_id || "unknown")} has no verified upload-byte digest.`
     );
   }
   return contentDigest;

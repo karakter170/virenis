@@ -168,6 +168,70 @@ export function createClerkIdentityManager({
   const deletionInflight = new Map();
   const authenticatedRequests = new Map();
 
+  function exactClerkOwner(data, actor, { missingClerkIsDeleted = true } = {}) {
+    if (!actor?.user_id || !actor?.workspace_id) return null;
+    const matches = (data.users || []).filter((user) => (
+      user.user_id === actor.user_id
+      && user.workspace_id === actor.workspace_id
+      && Boolean(user.clerk_user_id)
+      && (!actor.clerk_user_id || user.clerk_user_id === actor.clerk_user_id)
+    ));
+    if (matches.length === 0) {
+      if (missingClerkIsDeleted && actor.auth_type === "clerk") {
+        throw identityError(401, "account_deleted", "This Virenis account has been deleted.");
+      }
+      return null;
+    }
+    if (matches.length !== 1) {
+      throw identityError(
+        409,
+        "account_legacy_scope_ambiguous",
+        "Authenticated tenant coordinates match more than one Clerk identity. Repair the legacy identity collision before continuing."
+      );
+    }
+    return matches[0];
+  }
+
+  function assertOwnerActive(user, { allowAccountDeletion = false, actor = null } = {}) {
+    if (user.status === "deleting") {
+      if (allowAccountDeletion && actor?.auth_type === "clerk") return;
+      throw identityError(
+        409,
+        "account_deletion_in_progress",
+        "Account deletion is in progress. Only the account deletion request may be retried."
+      );
+    }
+    if (user.status !== "active") {
+      throw identityError(403, "account_suspended", "This account has been suspended. Contact support.");
+    }
+  }
+
+  function registerOwnerOperation(user, kind) {
+    const requestId = makeId("identityreq");
+    let releaseRequest;
+    const settled = new Promise((resolve) => { releaseRequest = resolve; });
+    const entry = {
+      request_id: requestId,
+      kind: String(kind || "authenticated_request").slice(0, 80),
+      started_at: Date.now(),
+      settled
+    };
+    const clerkUserId = user.clerk_user_id;
+    const requests = authenticatedRequests.get(clerkUserId) || new Map();
+    requests.set(requestId, entry);
+    authenticatedRequests.set(clerkUserId, requests);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      requests.delete(requestId);
+      if (requests.size === 0 && authenticatedRequests.get(clerkUserId) === requests) {
+        authenticatedRequests.delete(clerkUserId);
+      }
+      releaseRequest();
+    };
+  }
+
   async function provision(clerkUserId) {
     const existingTask = provisioning.get(clerkUserId);
     if (existingTask) return existingTask;
@@ -337,57 +401,66 @@ export function createClerkIdentityManager({
      */
     beginAuthenticatedRequest(actor, { allowAccountDeletion = false } = {}) {
       if (!actor?.user_id || !actor?.workspace_id) return () => undefined;
-      const matches = store.read((data) => (data.users || []).filter((user) => (
-        user.user_id === actor.user_id
-        && user.workspace_id === actor.workspace_id
-        && Boolean(user.clerk_user_id)
-        && (!actor.clerk_user_id || user.clerk_user_id === actor.clerk_user_id)
-      )));
-      if (matches.length === 0) {
-        if (actor.auth_type === "clerk") {
-          throw identityError(401, "account_deleted", "This Virenis account has been deleted.");
-        }
-        return () => undefined;
-      }
-      if (matches.length !== 1) {
-        throw identityError(
-          409,
-          "account_legacy_scope_ambiguous",
-          "Authenticated tenant coordinates match more than one Clerk identity. Repair the legacy identity collision before continuing."
-        );
-      }
-      const current = matches[0];
-      if (current.status === "deleting") {
-        if (allowAccountDeletion && actor.auth_type === "clerk") return () => undefined;
-        throw identityError(
-          409,
-          "account_deletion_in_progress",
-          "Account deletion is in progress. Only the account deletion request may be retried."
-        );
-      }
-      if (current.status !== "active") {
-        throw identityError(403, "account_suspended", "This account has been suspended. Contact support.");
-      }
+      const current = store.read((data) => exactClerkOwner(data, actor));
+      if (!current) return () => undefined;
+      assertOwnerActive(current, { allowAccountDeletion, actor });
       // The deletion request is coordinated separately and must not wait on
       // itself while draining requests that started before its marker.
       if (allowAccountDeletion && actor.auth_type === "clerk") return () => undefined;
-      const requestId = makeId("identityreq");
-      let releaseRequest;
-      const settled = new Promise((resolve) => { releaseRequest = resolve; });
-      const entry = { request_id: requestId, started_at: Date.now(), settled };
-      const clerkUserId = current.clerk_user_id;
-      const requests = authenticatedRequests.get(clerkUserId) || new Map();
-      requests.set(requestId, entry);
-      authenticatedRequests.set(clerkUserId, requests);
-      let released = false;
-      return () => {
-        if (released) return;
-        released = true;
-        requests.delete(requestId);
-        if (requests.size === 0 && authenticatedRequests.get(clerkUserId) === requests) {
-          authenticatedRequests.delete(clerkUserId);
-        }
-        releaseRequest();
+      return registerOwnerOperation(current, "authenticated_request");
+    },
+
+    /**
+     * Background work does not have an HTTP response whose lifetime can be
+     * drained. Register it against the exact durable Clerk owner before the
+     * first await, then recheck the same owner and deletion generation inside
+     * every external-to-local commit. The deletion marker and this in-memory
+     * registration are ordered synchronously in the single web process: work
+     * is either visible to the deletion drain or rejected after the marker.
+     */
+    beginOwnerMutation(actor, { kind = "owner_mutation" } = {}) {
+      if (!actor?.user_id || !actor?.workspace_id) {
+        return {
+          assertActiveInData: () => true,
+          release: () => undefined
+        };
+      }
+      const current = store.read((data) => exactClerkOwner(data, actor));
+      if (!current) {
+        return {
+          assertActiveInData: () => true,
+          release: () => undefined
+        };
+      }
+      assertOwnerActive(current, { actor });
+      const owner = {
+        user_id: current.user_id,
+        workspace_id: current.workspace_id,
+        clerk_user_id: current.clerk_user_id,
+        deletion_generation: String(current.deletion_id || "")
+      };
+      const release = registerOwnerOperation(current, kind);
+      return {
+        assertActiveInData(data) {
+          const matches = (data.users || []).filter((user) => (
+            user.user_id === owner.user_id
+            && user.workspace_id === owner.workspace_id
+            && user.clerk_user_id === owner.clerk_user_id
+          ));
+          if (
+            matches.length !== 1
+            || matches[0].status !== "active"
+            || String(matches[0].deletion_id || "") !== owner.deletion_generation
+          ) {
+            throw identityError(
+              409,
+              "account_deletion_in_progress",
+              "The resource owner changed or began account deletion before this background update could commit."
+            );
+          }
+          return true;
+        },
+        release
       };
     },
 
@@ -600,9 +673,20 @@ export function createClerkIdentityManager({
         // state out of pending/exchanging makes their credential commit fail
         // atomically; an already-exchanged credential is revoked in mcp.js.
         for (const state of accountGraph.mcpOauthStates.records) {
-          if (["pending", "exchanging"].includes(state.status)) {
-            state.status = "account_deleting";
+          if (["pending", "exchanging", "refreshing", "disconnect_cancelled", "superseded"].includes(state.status)) {
             state.failed_at = now;
+            if (state.revocation_envelope) {
+              state.status = "revocation_pending";
+              state.revocation_queued_at ||= now;
+            } else if (state.exchange_started_at || state.refresh_started_at) {
+              // A provider request may already be on the wire. The callback
+              // will stage and queue any credential it receives.
+              state.status = "account_deleting";
+            } else {
+              // No code exchange began, so invalidating the browser state is
+              // sufficient and must not leave deletion blocked forever.
+              state.status = "cancelled";
+            }
             delete state.verifier_envelope;
           }
         }
@@ -1208,7 +1292,7 @@ function accountGraphAmbiguousCount(graph) {
 
 function hasUnresolvedAccountOAuth(graph) {
   return (graph?.mcpOauthStates?.records || []).some((state) => (
-    ["exchanging", "account_deleting"].includes(state.status)
+    ["exchanging", "refreshing", "account_deleting", "disconnect_cancelled", "exchange_outcome_uncertain", "refresh_outcome_uncertain"].includes(state.status)
     || (state.status === "revocation_pending" && !state.revocation_envelope)
   ));
 }
@@ -1301,7 +1385,10 @@ function buildAccountExport(data, user) {
       runs: graph.runs.records.map(safeAccountExportRun),
       run_steps: graph.runSteps.records.map(safeAccountExportRunStep)
     },
-    agents: graph.agents.records,
+    agents: graph.agents.records.map((agent) => {
+      const { workflow_registration_anchor: _workflowRegistrationAnchor, ...safeAgent } = agent;
+      return safeAgent;
+    }),
     agent_events: graph.agentEvents.records,
     documents: graph.documents.records,
     agent_workspaces: graph.agentWorkspaces.records,

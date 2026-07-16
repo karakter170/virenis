@@ -4125,6 +4125,120 @@ summary:focus-visible,
   line-height: 1.45;
 }
 
+.connection-revocation-stack {
+  display: grid;
+  gap: 9px;
+  border: 1px solid #d7c79f;
+  border-radius: 11px;
+  padding: 13px;
+  background: #fffdf7;
+}
+
+.connection-revocation-card {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border: 1px solid #eadfc5;
+  border-radius: 8px;
+  padding: 10px 11px;
+  background: #ffffff;
+}
+
+.connection-revocation-card > div:first-child {
+  min-width: min(220px, 100%);
+  flex: 1 1 220px;
+}
+
+.connection-revocation-card strong,
+.connection-revocation-card small {
+  display: block;
+}
+
+.connection-revocation-card strong {
+  font-size: 11px;
+}
+
+.connection-revocation-card small {
+  margin-top: 3px;
+  color: var(--text-soft);
+  font-size: 9px;
+  line-height: 1.4;
+}
+
+.connection-revocation-card .text-button {
+  flex: 0 0 auto;
+}
+
+.revocation-resolution-form {
+  flex: 1 0 100%;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px;
+  border-top: 1px solid #eadfc5;
+  padding-top: 11px;
+}
+
+.revocation-resolution-form > p,
+.revocation-resolution-form .revocation-confirm {
+  grid-column: 1 / -1;
+}
+
+.revocation-resolution-form > p {
+  margin: 0;
+  color: var(--text-soft);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.revocation-resolution-form label:not(.revocation-confirm) {
+  display: grid;
+  gap: 5px;
+  color: var(--text-soft);
+  font-size: 9px;
+}
+
+.revocation-resolution-form input,
+.revocation-resolution-form textarea {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 8px 9px;
+  color: var(--text);
+  background: #fff;
+  font: inherit;
+}
+
+.revocation-resolution-form textarea {
+  min-height: 66px;
+  resize: vertical;
+}
+
+.revocation-confirm {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--text);
+  font-size: 10px;
+}
+
+.revocation-confirm input {
+  width: 14px;
+  height: 14px;
+}
+
+@media (max-width: 620px) {
+  .revocation-resolution-form {
+    grid-template-columns: 1fr;
+  }
+
+  .revocation-resolution-form > p,
+  .revocation-resolution-form .revocation-confirm {
+    grid-column: auto;
+  }
+}
+
 .managed-connections-block {
   display: grid;
   gap: 11px;

@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import http from "node:http";
 import https from "node:https";
 
@@ -92,6 +93,7 @@ const PROVIDER_DEFINITIONS = Object.freeze([
     token_url: "https://github.com/login/oauth/access_token",
     revocation_url: "https://api.github.com/applications",
     revocation_mode: "github_application_tokens",
+    revocation_scope: "token",
     scopes: ["repo", "read:org", "read:user", "user:email"],
     required_scopes: [],
     include_resource_indicator: false,
@@ -118,6 +120,7 @@ const PROVIDER_DEFINITIONS = Object.freeze([
     token_url: "https://slack.com/api/oauth.v2.user.access",
     revocation_url: "https://slack.com/api/auth.revoke",
     revocation_mode: "slack_auth_revoke",
+    revocation_scope: "token",
     scopes: [
       "search:read.public",
       "search:read.private",
@@ -419,6 +422,10 @@ export function managedMcpProviderForCredential(providerId, credential, env = pr
   return managedMcpProvider(providerId, env);
 }
 
+export function managedRevocationMayInvalidateSiblingCredentials(provider) {
+  return provider?.revocation_scope !== "token";
+}
+
 export function buildManagedAuthorizationUrl(provider, { state, codeChallenge }) {
   const url = new URL(provider.authorization_url);
   url.searchParams.set("response_type", "code");
@@ -478,7 +485,12 @@ export async function refreshManagedAccessToken(provider, credential, env = proc
   return merged;
 }
 
-export async function revokeManagedCredential(provider, credential, env = process.env) {
+export async function revokeManagedCredential(
+  provider,
+  credential,
+  env = process.env,
+  { completedTokenIds = [], onTokenRevoked = async () => undefined } = {}
+) {
   if (!provider.revocation_url) {
     throw oauthError(
       501,
@@ -486,6 +498,7 @@ export async function revokeManagedCredential(provider, credential, env = proces
       "mcp_oauth_revocation_unsupported"
     );
   }
+  const progress = managedRevocationProgress(provider, completedTokenIds, onTokenRevoked);
   if (provider.revocation_mode === "github_application_tokens") {
     const tokens = uniqueCredentialTokens(credential, "GitHub");
     const clientId = cleanCredential(provider.client_id, "GitHub OAuth client id", 4096);
@@ -501,6 +514,7 @@ export async function revokeManagedCredential(provider, credential, env = proces
       "X-GitHub-Api-Version": "2022-11-28"
     };
     for (const token of tokens) {
+      if (progress.has(token)) continue;
       // Checking first makes deletion retry-safe. GitHub documents 404 from the
       // check endpoint as an invalid token, which is the desired end state if a
       // prior DELETE succeeded but its local receipt was not committed.
@@ -511,20 +525,23 @@ export async function revokeManagedCredential(provider, credential, env = proces
         acceptedStatusCodes: [404],
         headers
       });
-      if (check?.provider_status === 404) continue;
-      await oauthJsonRequest(endpoint.toString(), {
-        env,
-        method: "DELETE",
-        json: { access_token: token },
-        allowEmpty: true,
-        headers
-      });
+      if (check?.provider_status !== 404) {
+        await oauthJsonRequest(endpoint.toString(), {
+          env,
+          method: "DELETE",
+          json: { access_token: token },
+          allowEmpty: true,
+          headers
+        });
+      }
+      await progress.confirm(token);
     }
     return true;
   }
   if (provider.revocation_mode === "slack_auth_revoke") {
     const tokens = uniqueCredentialTokens(credential, "Slack");
     for (const token of tokens) {
+      if (progress.has(token)) continue;
       const response = await oauthFormRequest(
         provider.revocation_url,
         new URLSearchParams({ token }),
@@ -534,15 +551,39 @@ export async function revokeManagedCredential(provider, credential, env = proces
       if ((response?.ok !== true || response?.revoked !== true) && !alreadyInactive) {
         throw oauthError(502, "Slack did not confirm token revocation.", "mcp_oauth_provider_error");
       }
+      await progress.confirm(token);
     }
     return true;
   }
   const token = cleanToken(credential?.refresh_token || credential?.access_token, "OAuth revocation token", { required: true });
+  if (progress.has(token)) return true;
   const body = new URLSearchParams({ token, token_type_hint: credential?.refresh_token ? "refresh_token" : "access_token" });
   if (provider.client_id) body.set("client_id", provider.client_id);
   if (provider.client_secret && provider.token_endpoint_auth_method !== "none") body.set("client_secret", provider.client_secret);
   await oauthFormRequest(provider.revocation_url, body, { env, allowEmpty: true });
+  await progress.confirm(token);
   return true;
+}
+
+function managedRevocationProgress(provider, completedTokenIds, onTokenRevoked) {
+  const completed = new Set((Array.isArray(completedTokenIds) ? completedTokenIds : [])
+    .map((value) => String(value || "").trim())
+    .filter(Boolean));
+  const tokenId = (token) => `mcp-token-revocation-v1:${crypto
+    .createHash("sha256")
+    .update(`${provider.id}\0${token}`, "utf8")
+    .digest("hex")}`;
+  return {
+    has(token) {
+      return completed.has(tokenId(token));
+    },
+    async confirm(token) {
+      const id = tokenId(token);
+      if (completed.has(id)) return;
+      await onTokenRevoked(id);
+      completed.add(id);
+    }
+  };
 }
 
 export function oauthCredentialNeedsRefresh(credential, { skewMs = 60_000, now = Date.now() } = {}) {
@@ -579,6 +620,7 @@ function googleProvider({ id, name, category, endpointUrl, description, scopes, 
     authorization_url: GOOGLE_AUTHORIZATION_ENDPOINT,
     token_url: GOOGLE_TOKEN_ENDPOINT,
     revocation_url: GOOGLE_REVOCATION_ENDPOINT,
+    revocation_scope: "provider_grant",
     scopes: Object.freeze(scopes),
     required_scopes: Object.freeze(scopes),
     include_resource_indicator: false,
@@ -611,6 +653,10 @@ function dynamicProvider({ id, name, category, endpointUrl, metadataUrl, descrip
     default_read_policy: "allow_declared_reads",
     permissions_summary: permissionsSummary,
     registration_mode: "dynamic",
+    // RFC 7009 permits the authorization server to invalidate related tokens.
+    // Treat dynamically discovered revocation as grant-scoped unless a future
+    // provider contract explicitly proves token isolation.
+    revocation_scope: "provider_grant",
     endpoint_url: endpointUrl,
     protected_resource_metadata_url: metadataUrl,
     scopes: Object.freeze(scopes),
@@ -657,7 +703,9 @@ function normalizeTokenResponse(raw, { provider, requireRefreshToken }) {
     throw oauthError(502, "OAuth server returned an invalid token response.", "mcp_oauth_token_invalid");
   }
   if (raw.error || raw.ok === false) {
-    throw oauthError(502, "OAuth authorization could not be completed.", "mcp_oauth_token_rejected");
+    const error = oauthError(502, "OAuth authorization could not be completed.", "mcp_oauth_token_rejected");
+    error.oauth_definitive_no_credential = true;
+    throw error;
   }
   const source = provider.token_response_style === "slack" && raw.authed_user?.access_token
     ? { ...raw, ...raw.authed_user, scope: raw.authed_user.scope || raw.authed_user.scopes || raw.scope }
@@ -710,6 +758,28 @@ async function oauthJsonRequest(endpoint, {
   const rawTimeout = Number(env.APP_MCP_OAUTH_TIMEOUT_MS || DEFAULT_OAUTH_TIMEOUT_MS);
   const timeoutMs = Number.isFinite(rawTimeout) ? Math.max(500, Math.min(rawTimeout, 60_000)) : DEFAULT_OAUTH_TIMEOUT_MS;
   return new Promise((resolve, reject) => {
+    let settled = false;
+    let responseReceived = false;
+    let deadline;
+    const finish = (operation, value) => {
+      if (settled) return;
+      settled = true;
+      if (deadline) clearTimeout(deadline);
+      operation(value);
+    };
+    const resolveOnce = (value) => finish(resolve, value);
+    const rejectOnce = (error) => finish(reject, error);
+    const transportError = (error, code = "mcp_oauth_connection_failed") => (
+      error?.code?.startsWith?.("mcp_")
+        ? error
+        : oauthError(
+          502,
+          code === "mcp_oauth_response_aborted"
+            ? "OAuth provider closed the response before it was complete."
+            : "OAuth provider could not be reached.",
+          code
+        )
+    );
     const headers = {
       Accept: "application/json",
       "User-Agent": "Virenis-MCP-OAuth/2.0",
@@ -720,48 +790,79 @@ async function oauthJsonRequest(endpoint, {
       headers["Content-Length"] = Buffer.byteLength(body);
     }
     const request = transport.request(url, { method, headers }, (response) => {
+      responseReceived = true;
+      let responseEnded = false;
       if (response.statusCode >= 300 && response.statusCode < 400) {
         response.resume();
-        reject(oauthError(502, "OAuth redirects are not followed.", "mcp_oauth_redirect_blocked"));
+        rejectOnce(oauthError(502, "OAuth redirects are not followed.", "mcp_oauth_redirect_blocked"));
         return;
       }
       const chunks = [];
       let size = 0;
       response.on("data", (chunk) => {
+        if (settled) return;
         size += chunk.length;
         if (size > MAX_OAUTH_RESPONSE_BYTES) {
-          request.destroy(oauthError(502, "OAuth response exceeded the size limit.", "mcp_oauth_response_too_large"));
+          const error = oauthError(502, "OAuth response exceeded the size limit.", "mcp_oauth_response_too_large");
+          rejectOnce(error);
+          request.destroy(error);
           return;
         }
         chunks.push(chunk);
       });
       response.on("end", () => {
+        responseEnded = true;
+        if (settled) return;
         const responseBody = Buffer.concat(chunks).toString("utf8");
         if (acceptedStatusCodes.includes(response.statusCode)) {
-          resolve({ provider_status: response.statusCode });
+          resolveOnce({ provider_status: response.statusCode });
           return;
         }
         if (response.statusCode < 200 || response.statusCode >= 300) {
-          reject(oauthError(502, "OAuth provider rejected the request.", "mcp_oauth_provider_error"));
+          const error = oauthError(502, "OAuth provider rejected the request.", "mcp_oauth_provider_error");
+          error.provider_status = response.statusCode;
+          error.oauth_definitive_no_credential = response.statusCode >= 400
+            && response.statusCode < 500
+            && ![408, 425, 429].includes(response.statusCode);
+          rejectOnce(error);
           return;
         }
         if (!responseBody.trim() && allowEmpty) {
-          resolve({});
+          resolveOnce({});
           return;
         }
         try {
-          resolve(JSON.parse(responseBody));
+          resolveOnce(JSON.parse(responseBody));
         } catch {
-          reject(oauthError(502, "OAuth provider returned invalid JSON.", "mcp_oauth_json_invalid"));
+          rejectOnce(oauthError(502, "OAuth provider returned invalid JSON.", "mcp_oauth_json_invalid"));
+        }
+      });
+      response.on("aborted", () => {
+        rejectOnce(transportError(null, "mcp_oauth_response_aborted"));
+      });
+      response.on("error", (error) => {
+        rejectOnce(transportError(error, "mcp_oauth_response_aborted"));
+      });
+      response.on("close", () => {
+        if (!responseEnded && !response.complete) {
+          rejectOnce(transportError(null, "mcp_oauth_response_aborted"));
         }
       });
     });
-    const deadline = setTimeout(() => request.destroy(oauthError(504, "OAuth request timed out.", "mcp_oauth_timeout")), timeoutMs);
-    request.on("close", () => clearTimeout(deadline));
-    request.setTimeout(timeoutMs, () => request.destroy(oauthError(504, "OAuth request timed out.", "mcp_oauth_timeout")));
-    request.on("error", (error) => reject(error.code?.startsWith?.("mcp_")
-      ? error
-      : oauthError(502, "OAuth provider could not be reached.", "mcp_oauth_connection_failed")));
+    const timeout = () => {
+      if (settled) return;
+      const error = oauthError(504, "OAuth request timed out.", "mcp_oauth_timeout");
+      rejectOnce(error);
+      request.destroy(error);
+    };
+    deadline = setTimeout(timeout, timeoutMs);
+    request.setTimeout(timeoutMs, timeout);
+    request.on("error", (error) => rejectOnce(transportError(error)));
+    request.on("close", () => {
+      if (!settled && !responseReceived) {
+        rejectOnce(transportError(null));
+      }
+    });
     request.end(body);
   });
 }

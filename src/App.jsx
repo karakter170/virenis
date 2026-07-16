@@ -39,6 +39,7 @@ import {
   Scale,
   Search,
   Settings2,
+  ShieldCheck,
   Slack,
   Sparkles,
   Star,
@@ -1196,7 +1197,11 @@ function Workspace({ onHome, onSignedOut }) {
     setCheckpointBusy(checkpoint.checkpoint_id);
     setError("");
     try {
-      await api.post(`/api/mcp/approvals/${encodeURIComponent(approval.approval_id)}`, { decision });
+      if (decision === "acknowledge_uncertain") {
+        await api.post(`/api/mcp/approvals/${encodeURIComponent(approval.approval_id)}/acknowledge-uncertain`, {});
+      } else {
+        await api.post(`/api/mcp/approvals/${encodeURIComponent(approval.approval_id)}`, { decision });
+      }
       await openSession(checkpoint.session_id || session.session_id);
       await refreshStudioResources(["approvals", "connections"]);
     } catch (approvalError) {
@@ -2440,6 +2445,19 @@ export function ToolApprovalCheckpoint({ checkpoint, approval, busy = false, onD
     );
   }
   if (!approval && checkpoint.status !== "resume_failed") return null;
+  if (approval?.status === "execution_outcome_uncertain") {
+    return (
+      <section className="tool-checkpoint-card error" role="alert" aria-label="External action outcome needs verification">
+        <AlertCircle size={18} />
+        <div>
+          <strong>Check {approval.connection_name || "the provider"} before trying again</strong>
+          <p>The approved {approval.tool_title || approval.tool_name} action was in flight when the process stopped. It may or may not have completed, and Virenis did not replay it.</p>
+          <pre>{JSON.stringify(approval.arguments, null, 2)}</pre>
+        </div>
+        <button type="button" className="text-button primary" disabled={busy} onClick={() => onDecision(checkpoint, approval, "acknowledge_uncertain")}>{busy ? <LoaderCircle className="spin" size={14} /> : <Check size={14} />}I’ll check, continue chat</button>
+      </section>
+    );
+  }
   if (checkpoint.status === "resume_failed") {
     return (
       <section className="tool-checkpoint-card error" role="status">
@@ -3107,6 +3125,7 @@ function ResourcesSheet({
             templates={mcpTemplates}
             approvals={mcpApprovals}
             canWrite={canWrite}
+            isAdmin={auth?.is_admin === true}
             onRefresh={onRefreshConnections}
             resumeWorkflowId={resumeWorkflowId}
             onConnectionChanged={onConnectionChanged}
@@ -3138,6 +3157,7 @@ export function ConnectionsPanel({
   templates = [],
   approvals = [],
   canWrite,
+  isAdmin = false,
   onRefresh,
   resumeWorkflowId = "",
   onConnectionChanged = async () => undefined
@@ -3147,10 +3167,31 @@ export function ConnectionsPanel({
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [revocations, setRevocations] = useState([]);
+  const [resolutionDraft, setResolutionDraft] = useState(null);
   const pendingApprovals = approvals.filter((approval) => approval.status === "pending");
   const recentApprovals = approvals.filter((approval) => approval.status !== "pending").slice(-4).reverse();
   const managedProviders = templates.filter((template) => template.connection_mode === "managed");
   const customTemplates = templates.filter((template) => template.connection_mode !== "managed");
+
+  async function refreshRevocations({ reportError = false } = {}) {
+    try {
+      const result = await api.get("/api/mcp/revocations");
+      setRevocations(result.revocations || []);
+    } catch (revocationError) {
+      if (reportError) setError(friendlyError(revocationError));
+    }
+  }
+
+  useEffect(() => {
+    let active = true;
+    void api.get("/api/mcp/revocations")
+      .then((result) => {
+        if (active) setRevocations(result.revocations || []);
+      })
+      .catch(() => undefined);
+    return () => { active = false; };
+  }, []);
 
   function chooseTemplate(template) {
     setForm((current) => ({
@@ -3228,10 +3269,57 @@ export function ConnectionsPanel({
     setNotice("");
     try {
       const result = await api.delete(`/api/mcp/connections/${encodeURIComponent(connection.connection_id)}`);
-      if (result.revocation_warning) setNotice(result.revocation_warning);
+      setNotice(result.revocation_pending
+        ? `${connection.name} was removed. Provider access is being revoked safely in the background.`
+        : `${connection.name} was disconnected securely.`);
       await onRefresh();
+      await refreshRevocations();
     } catch (deleteError) {
       setError(friendlyError(deleteError));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function retryRevocation(revocation) {
+    setBusy(revocation.revocation_id);
+    setError("");
+    setNotice("");
+    try {
+      await api.post(`/api/mcp/revocations/${encodeURIComponent(revocation.revocation_id)}/retry`, {});
+      setNotice("Provider access was revoked successfully.");
+      await refreshRevocations({ reportError: true });
+    } catch (revocationError) {
+      setError(friendlyError(revocationError));
+      await refreshRevocations();
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function resolveRevocation(event, revocation) {
+    event.preventDefault();
+    if (!resolutionDraft?.confirmed) {
+      setError("Confirm that you removed this app's provider access before recording verification.");
+      return;
+    }
+    setBusy(revocation.revocation_id);
+    setError("");
+    setNotice("");
+    try {
+      await api.post(`/api/admin/mcp/revocations/${encodeURIComponent(revocation.revocation_id)}/resolve`, {
+        confirmation: revocation.manual_resolution_required
+          ? "PROVIDER_APP_ACCESS_REVOKED_AND_VERIFIED"
+          : "PROVIDER_ACCESS_REVOKED",
+        evidence_reference: resolutionDraft.evidence_reference,
+        reason: resolutionDraft.reason
+      });
+      setResolutionDraft(null);
+      setNotice("Provider removal was verified and recorded in the security audit.");
+      await refreshRevocations({ reportError: true });
+      await onRefresh();
+    } catch (resolutionError) {
+      setError(friendlyError(resolutionError));
     } finally {
       setBusy("");
     }
@@ -3264,6 +3352,28 @@ export function ConnectionsPanel({
       {error && <div className="form-error" role="alert">{error}</div>}
       {notice && <div className="connection-notice" role="status">{notice}</div>}
       {resumeWorkflowId && <div className="connection-notice" role="status">This connection will return you to the saved workflow automatically.</div>}
+
+      {revocations.length > 0 && (
+        <div className="connection-revocation-stack" role="status" aria-label="Provider disconnects still being verified">
+          <div className="connections-subheading"><span><ShieldCheck size={15} /></span><div><strong>Finishing secure disconnect</strong><small>The connection is already unavailable to agents. Virenis keeps retrying until the provider confirms that access is revoked.</small></div></div>
+          {revocations.map((revocation) => (
+            <article className="connection-revocation-card" key={revocation.revocation_id}>
+              <div><strong>{templates.find((template) => template.id === revocation.provider_id)?.name || revocation.provider_id || "Connected provider"}</strong><small>{revocation.attempts ? `${revocation.attempts} ${revocation.attempts === 1 ? "attempt" : "attempts"} · ` : ""}{revocation.manual_resolution_required ? "Administrator verification is required" : "No agent can use this connection"}</small></div>
+              {canWrite && !revocation.manual_resolution_required && <button type="button" className="text-button ghost compact" disabled={busy === revocation.revocation_id} onClick={() => retryRevocation(revocation)}>{busy === revocation.revocation_id ? <LoaderCircle className="spin" size={13} /> : <RefreshCw size={13} />}Retry now</button>}
+              {isAdmin && <button type="button" className="text-button ghost compact" disabled={busy === revocation.revocation_id} onClick={() => setResolutionDraft((current) => current?.revocation_id === revocation.revocation_id ? null : { revocation_id: revocation.revocation_id, evidence_reference: "", reason: "", confirmed: false })}><ShieldCheck size={13} />Record provider removal</button>}
+              {isAdmin && resolutionDraft?.revocation_id === revocation.revocation_id && (
+                <form className="revocation-resolution-form" onSubmit={(event) => resolveRevocation(event, revocation)}>
+                  <p><strong>First remove Virenis access in the provider’s security settings.</strong> This does not call the provider again; it records your verified evidence so cleanup can finish safely.</p>
+                  <label><span>Evidence reference</span><input value={resolutionDraft.evidence_reference} onChange={(event) => setResolutionDraft((current) => ({ ...current, evidence_reference: event.target.value }))} required maxLength={300} placeholder="Provider audit event, ticket, or screenshot reference" /></label>
+                  <label><span>Why this proves removal</span><textarea value={resolutionDraft.reason} onChange={(event) => setResolutionDraft((current) => ({ ...current, reason: event.target.value }))} required maxLength={500} placeholder="App access was removed and verified in the provider account." /></label>
+                  <label className="revocation-confirm"><input type="checkbox" checked={resolutionDraft.confirmed} onChange={(event) => setResolutionDraft((current) => ({ ...current, confirmed: event.target.checked }))} /><span>I verified that provider access is revoked for this app.</span></label>
+                  <button type="submit" className="text-button primary compact" disabled={!resolutionDraft.confirmed || busy === revocation.revocation_id}>{busy === revocation.revocation_id ? <LoaderCircle className="spin" size={13} /> : <Check size={13} />}Finish secure cleanup</button>
+                </form>
+              )}
+            </article>
+          ))}
+        </div>
+      )}
 
       {managedProviders.length > 0 && (
         <div className="managed-connections-block">

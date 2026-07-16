@@ -8,7 +8,11 @@ import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { createApp } from "../server/app.js";
-import { decryptMcpValue, encryptMcpValue } from "../server/mcp.js";
+import {
+  decryptMcpValue,
+  encryptMcpValue,
+  revokePendingMcpOAuthState
+} from "../server/mcp.js";
 import {
   managedMcpProvider,
   publicManagedMcpProviders,
@@ -338,6 +342,53 @@ describe("managed MCP provider registry", () => {
       process.env
     )).rejects.toMatchObject({ code: "mcp_oauth_provider_error" });
   });
+
+  it("persists per-token Slack progress so a transient second-token failure never retries the confirmed first token", async () => {
+    const accessToken = "xoxp-progress-access";
+    const refreshToken = "xoxe-progress-refresh";
+    provider.activeSlackTokens.add(accessToken);
+    provider.activeSlackTokens.add(refreshToken);
+    provider.slackTransientFailures.set(refreshToken, 1);
+    const state = {
+      oauth_state_id: "mcpoauth_slack_progress",
+      provider_id: "slack",
+      status: "revocation_pending",
+      workspace_id: "registry_workspace",
+      created_by: "registry_owner",
+      created_at: new Date().toISOString(),
+      revocation_queued_at: new Date().toISOString(),
+      revocation_attempts: 0
+    };
+    state.revocation_envelope = encryptMcpValue(
+      { credential: { type: "oauth2", access_token: accessToken, refresh_token: refreshToken } },
+      app.locals.mcpCredentialKey,
+      `mcp-oauth-revocation:v1:${state.workspace_id}:${state.created_by}:${state.provider_id}:${state.oauth_state_id}`
+    );
+    await app.locals.store.mutate((data) => {
+      data.mcpOauthStates.push(state);
+      return state;
+    });
+
+    await expect(revokePendingMcpOAuthState(state, {
+      key: app.locals.mcpCredentialKey,
+      store: app.locals.store
+    })).rejects.toMatchObject({ code: "mcp_oauth_provider_error" });
+    const pending = app.locals.store.read().mcpOauthStates
+      .find((item) => item.oauth_state_id === state.oauth_state_id);
+    expect(pending.revocation_confirmed_token_ids).toHaveLength(1);
+    expect(provider.slackRevocations).toEqual([accessToken, refreshToken]);
+
+    await expect(revokePendingMcpOAuthState(pending, {
+      key: app.locals.mcpCredentialKey,
+      store: app.locals.store
+    })).resolves.toBe(true);
+    expect(provider.slackRevocations).toEqual([accessToken, refreshToken, refreshToken]);
+    const revoked = app.locals.store.read().mcpOauthStates
+      .find((item) => item.oauth_state_id === state.oauth_state_id);
+    expect(revoked.status).toBe("revoked");
+    expect(revoked.revocation_envelope).toBeUndefined();
+    expect(revoked.revocation_confirmed_token_ids).toBeUndefined();
+  });
 });
 
 function auth(token = TOKEN) {
@@ -354,6 +405,7 @@ function createDynamicProvider() {
     githubRevocations: [],
     githubAuthorization: "",
     activeSlackTokens: new Set(),
+    slackTransientFailures: new Map(),
     activeGithubTokens: new Set(["gho-registry-access", "ghr-registry-refresh"]),
     revocations: [],
     mcpAuthorization: []
@@ -432,6 +484,11 @@ function createDynamicProvider() {
       const token = values.get("token");
       state.slackRevocations.push(token);
       if (token === "xoxp-ambiguous-auth") return json(response, 200, { ok: false, error: "invalid_auth" });
+      const transientFailures = state.slackTransientFailures.get(token) || 0;
+      if (transientFailures > 0) {
+        state.slackTransientFailures.set(token, transientFailures - 1);
+        return json(response, 503, { ok: false, error: "temporarily_unavailable" });
+      }
       if (!state.activeSlackTokens.has(token)) return json(response, 200, { ok: false, error: "token_revoked" });
       state.activeSlackTokens.delete(token);
       return json(response, 200, { ok: true, revoked: true });

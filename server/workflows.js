@@ -899,6 +899,9 @@ export function defaultToolContinuation(approval, decision) {
   if (decision === "failed") {
     return `The approved **${approval.tool_title || approval.tool_name}** action was attempted but did not complete. No successful external change is being claimed, and the conversation remains available so you can retry or choose another approach.`;
   }
+  if (decision === "uncertain") {
+    return `The approved **${approval.tool_title || approval.tool_name}** action was interrupted while the provider was processing it, so its outcome cannot be confirmed. Virenis did not replay the action. Check the provider before trying it again; this conversation can continue normally.`;
+  }
   return `The approved **${approval.tool_title || approval.tool_name}** action completed. Its result is now part of this conversation, and I can continue from it without asking you to repeat the request.`;
 }
 

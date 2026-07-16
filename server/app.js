@@ -107,22 +107,28 @@ import {
   resumeMcpApprovalConversation
 } from "./workflows.js";
 import {
+  acknowledgeUncertainMcpApproval,
   applyAgentMcpBindings,
+  attestMcpOAuthRevocationResolved,
   beginManagedMcpOAuth,
   clearMcpOAuthCookie,
   completeManagedMcpOAuth,
   createMcpConnection,
   decideMcpApproval,
+  disconnectMcpConnectionDurably,
   ensureMcpCredentialKey,
   executeMcpGatewayCall,
   isMcpToolAlias,
   marketplaceMcpRequirements,
   publicMcpApproval,
   publicMcpConnection,
+  publicMcpRevocationStatus,
   publicMcpTemplates,
+  queueStaleMcpOAuthRevocations,
+  recoverMcpOAuthRevocations,
+  recoverStaleMcpApprovalExecutions,
   refreshMcpConnection,
   revokePendingMcpOAuthState,
-  revokeMcpConnection,
   resolveAgentMcpBindings
 } from "./mcp.js";
 import {
@@ -237,6 +243,10 @@ export async function createApp({
   await store.init();
   await store.mutate((data) => pruneExpiredWorldGraphData(data));
   await store.mutate((data) => activePricingVersion(data));
+  const workflowRegistrationStartupRecovery = workflowRegistrationAnchorInventory(store, {
+    scheduled: autoRun
+  });
+  let workflowRegistrationStartupRecoveryPromise = Promise.resolve(workflowRegistrationStartupRecovery);
   const workflowStartupRecovery = autoRun
     ? await recoverInterruptedWorkflowActivations({ store })
     : { recovered: 0, workflow_ids: [] };
@@ -250,6 +260,43 @@ export async function createApp({
     enabled: resolvedClerkAdapter.enabled
   });
   const mcpCredentialKey = await ensureMcpCredentialKey({ dbPath });
+  const configuredMcpRecoveryGraceMs = Number(process.env.APP_MCP_OAUTH_RECOVERY_GRACE_MS || 20 * 60 * 1000);
+  const mcpRecoveryGraceMs = Number.isFinite(configuredMcpRecoveryGraceMs)
+    ? Math.max(20 * 60 * 1000, Math.min(configuredMcpRecoveryGraceMs, 60 * 60 * 1000))
+    : 20 * 60 * 1000;
+  const mcpRecoveryLimit = Math.max(1, Math.min(100, Number(process.env.APP_MCP_OAUTH_RECOVERY_BATCH || 25) || 25));
+  let mcpRevocationRecoveryInflight = null;
+  const recoverPendingMcpRevocations = () => {
+    if (mcpRevocationRecoveryInflight) return mcpRevocationRecoveryInflight;
+    const staleBefore = new Date(Date.now() - mcpRecoveryGraceMs).toISOString();
+    const task = Promise.all([
+      recoverMcpOAuthRevocations({
+        store,
+        key: mcpCredentialKey,
+        includeStrandedExchanges: true,
+        staleBefore,
+        limit: mcpRecoveryLimit
+      }),
+      recoverStaleMcpApprovalExecutions({ store, staleBefore })
+    ]).then(([revocations, approvals]) => ({ revocations, approvals }));
+    mcpRevocationRecoveryInflight = task;
+    return task.finally(() => {
+      if (mcpRevocationRecoveryInflight === task) mcpRevocationRecoveryInflight = null;
+    });
+  };
+  const mcpOAuthStartupRecovery = autoRun
+    ? await queueStaleMcpOAuthRevocations({
+      store,
+      includeStrandedExchanges: true,
+      staleBefore: new Date(Date.now() - mcpRecoveryGraceMs).toISOString()
+    })
+    : [];
+  const mcpApprovalStartupRecovery = autoRun
+    ? await recoverStaleMcpApprovalExecutions({
+      store,
+      staleBefore: new Date(Date.now() - mcpRecoveryGraceMs).toISOString()
+    })
+    : [];
   const performAccountDeletion = async ({ actor, providerInitiated = false }) => (
     identityManager.runAccountDeletion(actor.clerk_user_id, async () => {
       const started = await identityManager.beginAccountDeletion(actor, { providerInitiated });
@@ -373,12 +420,21 @@ export async function createApp({
   const activateWorkflow = ({ workflowId, actor }) => {
     const existing = workflowActivationInflight.get(workflowId);
     if (existing) return existing;
+    // OAuth callbacks and recovered work can activate a workflow after the
+    // initiating HTTP request has finished. Give that owner-scoped background
+    // mutation the same account-deletion drain semantics as an HTTP request.
+    // Registration is synchronous with the durable deletion marker in the
+    // enforced single web process, so it cannot slip between marker and drain.
+    const ownerMutation = identityManager.beginOwnerMutation(actor, {
+      kind: "workflow_activation"
+    });
     const task = activateWorkflowDraft({
       store,
       workflowId,
       actor,
-      mcpCredentialKey
-    });
+      mcpCredentialKey,
+      ownerMutation
+    }).finally(() => ownerMutation.release());
     workflowActivationInflight.set(workflowId, task);
     return task.finally(() => {
       if (workflowActivationInflight.get(workflowId) === task) {
@@ -405,6 +461,16 @@ export async function createApp({
     });
     return taskPromise;
   };
+  if (autoRun && workflowRegistrationStartupRecovery.pending > 0) {
+    workflowRegistrationStartupRecoveryPromise = scheduleBackgroundTask(async () => {
+      const result = await reconcileWorkflowRegistrationAnchors({ store, limit: 25 });
+      Object.assign(workflowRegistrationStartupRecovery, result, {
+        scheduled: false,
+        completed_at: nowIso()
+      });
+      return workflowRegistrationStartupRecovery;
+    });
+  }
   const scheduleChatRun = (runId, options = null, { recovered = false } = {}) => {
     if (scheduledChatRuns.has(runId)) {
       return false;
@@ -510,11 +576,31 @@ export async function createApp({
     : null;
   deletionRecoveryTimer?.unref?.();
   if (autoRun) setImmediate(scheduleAccountDeletionRecovery);
+  const configuredMcpRecoveryMs = Number(process.env.APP_MCP_OAUTH_RECOVERY_INTERVAL_MS || 60_000);
+  const mcpRecoveryMs = Number.isFinite(configuredMcpRecoveryMs)
+    ? Math.max(5_000, Math.min(configuredMcpRecoveryMs, 60 * 60 * 1000))
+    : 60_000;
+  const scheduleMcpRevocationRecovery = () => {
+    void recoverPendingMcpRevocations().catch((error) => {
+      console.error("MCP OAuth revocation recovery cycle failed.", {
+        code: String(error?.code || "mcp_oauth_revocation_recovery_failed").slice(0, 120)
+      });
+    });
+  };
+  const mcpRecoveryTimer = autoRun
+    ? setInterval(scheduleMcpRevocationRecovery, mcpRecoveryMs)
+    : null;
+  mcpRecoveryTimer?.unref?.();
+  if (autoRun && (mcpOAuthStartupRecovery.length > 0 || mcpApprovalStartupRecovery.length > 0)) {
+    setImmediate(scheduleMcpRevocationRecovery);
+  }
   const closeStore = store.close.bind(store);
   store.close = async (...args) => {
     clearInterval(retentionTimer);
     if (deletionRecoveryTimer) clearInterval(deletionRecoveryTimer);
+    if (mcpRecoveryTimer) clearInterval(mcpRecoveryTimer);
     await accountDeletionRecoveryInflight?.catch(() => undefined);
+    await mcpRevocationRecoveryInflight?.catch(() => undefined);
     return closeStore(...args);
   };
 
@@ -523,6 +609,7 @@ export async function createApp({
   app.locals.rateBuckets = rateLimiter.buckets;
   app.locals.clerkAdapter = resolvedClerkAdapter;
   app.locals.identityManager = identityManager;
+  app.locals.activateWorkflow = activateWorkflow;
   app.locals.eventStreams = eventStreams;
   app.locals.closeEventStreams = (options) => closeEventStreams(eventStreams, options);
   app.locals.backgroundTasks = backgroundTasks;
@@ -531,6 +618,10 @@ export async function createApp({
   app.locals.scheduleValidationRun = scheduleValidationRun;
   app.locals.workerInstanceId = workerInstanceId;
   app.locals.mcpCredentialKey = mcpCredentialKey;
+  app.locals.mcpOAuthStartupRecovery = mcpOAuthStartupRecovery;
+  app.locals.mcpApprovalStartupRecovery = mcpApprovalStartupRecovery;
+  app.locals.mcpOAuthRecoveryIntervalMs = mcpRecoveryMs;
+  app.locals.recoverPendingMcpRevocations = recoverPendingMcpRevocations;
   app.locals.worldGraphRetentionSweepMs = retentionSweepMs;
   app.locals.accountDeletionRecoveryIntervalMs = deletionRecoveryMs;
   app.locals.recoverPendingAccountDeletions = recoverPendingAccountDeletions;
@@ -1067,6 +1158,73 @@ export async function createApp({
     res.json({ connections });
   });
 
+  app.get("/api/mcp/revocations", (req, res) => {
+    res.setHeader("Cache-Control", "private, no-store");
+    const revocations = store.read((data) => (data.mcpOauthStates || [])
+      .filter((item) => (
+        item.workspace_id === req.auth.workspace_id
+        && (req.auth.role === "admin" || item.created_by === req.auth.user_id)
+        && (
+          (item.status === "revocation_pending" && Boolean(item.revocation_envelope))
+          || (
+            req.auth.role === "admin"
+            && !item.revocation_envelope
+            && ["account_deleting", "disconnect_cancelled", "superseded", "exchange_outcome_uncertain", "refresh_outcome_uncertain"].includes(item.status)
+            && Date.parse(item.uncertain_started_at || item.exchange_started_at || item.refresh_started_at || "") <= Date.now() - mcpRecoveryGraceMs
+          )
+        )
+      ))
+      .sort((left, right) => String(right.revocation_queued_at || "").localeCompare(String(left.revocation_queued_at || "")))
+      .map(publicMcpRevocationStatus));
+    res.json({ revocations });
+  });
+
+  app.post("/api/mcp/revocations/:revocation_id/retry", async (req, res, next) => {
+    res.setHeader("Cache-Control", "private, no-store");
+    try {
+      const matches = store.read((data) => (data.mcpOauthStates || []).filter((item) => (
+        item.oauth_state_id === req.params.revocation_id
+        && item.workspace_id === req.auth.workspace_id
+        && (req.auth.role === "admin" || item.created_by === req.auth.user_id)
+      )));
+      if (matches.length > 1) {
+        throwStatus(409, "MCP revocation identity is ambiguous and must be repaired.");
+      }
+      const [current] = matches;
+      if (!current) {
+        throwStatus(404, "Pending MCP revocation not found.");
+      }
+      await revokePendingMcpOAuthState(current, { key: mcpCredentialKey, store });
+      const updated = store.read((data) => (data.mcpOauthStates || [])
+        .find((item) => (
+          item.oauth_state_id === current.oauth_state_id
+          && item.workspace_id === current.workspace_id
+          && item.created_by === current.created_by
+          && item.provider_id === current.provider_id
+        )));
+      res.json({ ok: true, revocation: publicMcpRevocationStatus(updated) });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/admin/mcp/revocations/:revocation_id/resolve", async (req, res, next) => {
+    res.setHeader("Cache-Control", "private, no-store");
+    try {
+      const revocation = await attestMcpOAuthRevocationResolved({
+        store,
+        actor: req.auth,
+        revocationId: req.params.revocation_id,
+        confirmation: req.body?.confirmation,
+        evidenceReference: req.body?.evidence_reference,
+        reason: req.body?.reason
+      });
+      res.json({ ok: true, revocation });
+    } catch (error) {
+      next(error);
+    }
+  });
+
   app.post("/api/mcp/connections", async (req, res, next) => {
     try {
       const connection = await createMcpConnection({ body: req.body, actor: req.auth, key: mcpCredentialKey });
@@ -1083,16 +1241,13 @@ export async function createApp({
 
   app.post("/api/mcp/connections/:connection_id/refresh", async (req, res, next) => {
     try {
-      const current = store.read((data) => (data.mcpConnections || [])
-        .find((item) => item.connection_id === req.params.connection_id));
+      const current = store.read((data) => mcpConnectionForMutation(
+        data,
+        req,
+        req.params.connection_id
+      ));
       assertMcpConnectionMutation(current, req);
       const refreshed = await refreshMcpConnection(current, { key: mcpCredentialKey, store });
-      await store.mutate((data) => {
-        const index = data.mcpConnections.findIndex((item) => item.connection_id === current.connection_id);
-        if (index < 0) throwStatus(404, "MCP connection not found.");
-        data.mcpConnections[index] = refreshed;
-        return refreshed;
-      });
       res.json(publicMcpConnection(refreshed));
     } catch (error) {
       next(error);
@@ -1101,34 +1256,25 @@ export async function createApp({
 
   app.delete("/api/mcp/connections/:connection_id", async (req, res, next) => {
     try {
-      const current = store.read((data) => (data.mcpConnections || [])
-        .find((item) => item.connection_id === req.params.connection_id));
-      assertMcpConnectionMutation(current, req);
-      const boundAgents = store.read((data) => data.agents.filter((agent) =>
-        String(agent.workspace_id || "") === String(current.workspace_id || "")
-        && (agent.mcp_bindings || []).some((binding) => binding.connection_id === current.connection_id)
+      const current = store.read((data) => mcpConnectionForMutation(
+        data,
+        req,
+        req.params.connection_id
       ));
-      if (boundAgents.length) throwStatus(409, `Remove this connection from ${boundAgents.length} agent${boundAgents.length === 1 ? "" : "s"} first.`);
-      let revoked = false;
-      let revocationWarning = false;
-      if (current.auth_type === "oauth2") {
-        try {
-          revoked = await revokeMcpConnection(current, { key: mcpCredentialKey });
-        } catch {
-          revocationWarning = true;
-        }
-      }
-      await store.mutate((data) => {
-        data.mcpConnections = (data.mcpConnections || []).filter((item) => item.connection_id !== current.connection_id);
-        data.mcpOauthStates = (data.mcpOauthStates || []).filter((item) => item.connection_id !== current.connection_id);
-        return true;
+      assertMcpConnectionMutation(current, req);
+      const disconnected = await disconnectMcpConnectionDurably(current, {
+        key: mcpCredentialKey,
+        store
       });
-      res.json({
+      const revocationPending = disconnected.revocation?.status === "revocation_pending";
+      res.status(revocationPending ? 202 : 200).json({
         ok: true,
         connection_id: current.connection_id,
-        provider_revoked: revoked,
-        revocation_warning: revocationWarning
-          ? "The local credential was deleted, but the provider could not confirm revocation. Revoke the app from your provider security settings."
+        provider_revoked: disconnected.provider_revoked,
+        revocation_pending: revocationPending,
+        revocation: disconnected.revocation,
+        revocation_warning: revocationPending
+          ? "The connection is unavailable to agents while provider revocation is retried securely."
           : null
       });
     } catch (error) {
@@ -1151,10 +1297,7 @@ export async function createApp({
     try {
       const decision = req.body?.decision;
       const snapshot = store.read();
-      const current = (snapshot.mcpApprovals || []).find((item) => item.approval_id === req.params.approval_id);
-      if (!current || current.workspace_id !== req.auth.workspace_id || current.created_by !== req.auth.user_id) {
-        throwStatus(404, "MCP approval not found.");
-      }
+      const current = mcpApprovalForMutation(snapshot, req, req.params.approval_id);
       let approval;
       if (current.status === "pending") {
         try {
@@ -1167,7 +1310,11 @@ export async function createApp({
           });
         } catch (error) {
           const failed = store.read((data) => (data.mcpApprovals || [])
-            .find((item) => item.approval_id === req.params.approval_id));
+            .find((item) => (
+              item.approval_id === current.approval_id
+              && item.workspace_id === current.workspace_id
+              && item.created_by === current.created_by
+            )));
           if (failed?.status !== "failed") throw error;
           approval = publicMcpApproval(failed, mcpCredentialKey);
         }
@@ -1178,7 +1325,9 @@ export async function createApp({
         approval = publicMcpApproval(current, mcpCredentialKey);
       }
       let continuation;
-      const continuationDecision = approval.status === "failed" ? "failed" : decision;
+      const continuationDecision = approval.outcome_uncertain
+        ? "uncertain"
+        : approval.status === "failed" ? "failed" : decision;
       try {
         continuation = await resumeMcpApprovalConversation({
           store,
@@ -1194,6 +1343,44 @@ export async function createApp({
       } catch {
         continuation = store.read((data) => (data.conversationCheckpoints || [])
           .find((item) => item.approval_id === approval.approval_id));
+      }
+      res.json({
+        ...approval,
+        continuation: publicConversationCheckpoint(continuation)
+      });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/mcp/approvals/:approval_id/acknowledge-uncertain", async (req, res, next) => {
+    try {
+      const snapshot = store.read();
+      const current = mcpApprovalForMutation(snapshot, req, req.params.approval_id);
+      const approval = await acknowledgeUncertainMcpApproval({
+        store,
+        approvalId: current.approval_id,
+        actor: req.auth,
+        key: mcpCredentialKey
+      });
+      let continuation;
+      try {
+        continuation = await resumeMcpApprovalConversation({
+          store,
+          approval: {
+            ...approval,
+            workspace_id: current.workspace_id,
+            created_by: current.created_by
+          },
+          decision: "uncertain",
+          actor: req.auth,
+          continueConversation
+        });
+      } catch {
+        continuation = store.read((data) => (data.conversationCheckpoints || [])
+          .find((item) => item.approval_id === approval.approval_id
+            && item.workspace_id === current.workspace_id
+            && item.created_by === current.created_by));
       }
       res.json({
         ...approval,
@@ -1528,10 +1715,18 @@ export async function createApp({
       ) {
         throwStatus(404, "Conversation checkpoint not found.");
       }
-      const storedApproval = (snapshot.mcpApprovals || []).find((item) => item.approval_id === checkpoint.approval_id);
+      const matchingApprovals = (snapshot.mcpApprovals || []).filter((item) => (
+        item.approval_id === checkpoint.approval_id
+        && item.workspace_id === checkpoint.workspace_id
+        && item.created_by === checkpoint.created_by
+      ));
+      if (matchingApprovals.length > 1) throwStatus(409, "MCP approval identity is ambiguous and must be repaired.");
+      const [storedApproval] = matchingApprovals;
       if (!storedApproval) throwStatus(404, "MCP approval not found.");
       const decision = storedApproval.status === "denied" ? "deny" : "approve";
-      const continuationDecision = storedApproval.status === "failed" ? "failed" : decision;
+      const continuationDecision = storedApproval.failure_code === "mcp_execution_outcome_uncertain"
+        ? "uncertain"
+        : storedApproval.status === "failed" ? "failed" : decision;
       if (!["denied", "executed", "failed"].includes(storedApproval.status)) {
         throwStatus(409, "This tool decision is not ready to resume.");
       }
@@ -3812,6 +4007,8 @@ export async function createApp({
     };
   app.locals.startupRecovery = startupRecovery;
   app.locals.workflowStartupRecovery = workflowStartupRecovery;
+  app.locals.workflowRegistrationStartupRecovery = workflowRegistrationStartupRecovery;
+  app.locals.workflowRegistrationStartupRecoveryPromise = workflowRegistrationStartupRecoveryPromise;
   app.locals.continuationBillingStartupRecovery = continuationBillingStartupRecovery;
 
   return app;
@@ -4572,7 +4769,21 @@ async function purgeExternalAccountResources({
   for (const connection of resources.mcp_connections || []) {
     const receiptKey = purgeKey(`mcp:${connection.connection_id}`);
     if (completedPurgeKeys.has(receiptKey)) continue;
-    await revokeMcpConnection(connection, { key: mcpCredentialKey });
+    const disconnected = await disconnectMcpConnectionDurably(connection, {
+      key: mcpCredentialKey,
+      store: accountStore,
+      deletingOwnerId: actor.user_id
+    });
+    if (disconnected.revocation?.status === "revocation_pending") {
+      const pending = accountStore.read((data) => (data.mcpOauthStates || [])
+        .find((item) => (
+          item.oauth_state_id === disconnected.revocation.revocation_id
+          && item.workspace_id === connection.workspace_id
+          && item.created_by === connection.created_by
+          && item.provider_id === connection.provider_id
+        )));
+      await revokePendingMcpOAuthState(pending, { key: mcpCredentialKey, store: accountStore });
+    }
     await onPurgeComplete(receiptKey);
     completedPurgeKeys.add(receiptKey);
   }
@@ -5373,6 +5584,7 @@ function redactAgentForRequest(agent = {}, req) {
     source_text_internal: _sourceTextInternal,
     runtime_registration_audit_binding: _runtimeRegistrationAuditBinding,
     runtime_registration_agent_spec: _runtimeRegistrationAgentSpec,
+    workflow_registration_anchor: _workflowRegistrationAnchor,
     ...publicAgent
   } = agent;
   if (publicAgent.runtime) {
@@ -6601,9 +6813,203 @@ function normalizeSourceText(value) {
   return text;
 }
 
-async function activateWorkflowDraft({ store, workflowId, actor }) {
+const WORKFLOW_REGISTRATION_ANCHOR_SCHEMA = "workflow-runtime-registration-anchor-v1";
+
+function makeWorkflowRegistrationAnchor({
+  registrationId,
+  agent,
+  actor,
+  kind,
+  workflow = null,
+  node = null,
+  listingId = null
+}) {
+  return {
+    schema_version: WORKFLOW_REGISTRATION_ANCHOR_SCHEMA,
+    anchor_id: makeId("workflow_registration"),
+    registration_id: registrationId,
+    agent_id: agent.id,
+    kind,
+    workflow_id: workflow?.workflow_id || null,
+    workflow_node_id: node?.id || null,
+    listing_id: listingId || null,
+    workspace_id: actor.workspace_id,
+    created_by: actor.user_id,
+    requested_role: actor.role || "user",
+    created_at: nowIso()
+  };
+}
+
+function workflowRegistrationAnchorForAgent(agent) {
+  const anchor = agent?.workflow_registration_anchor;
+  if (
+    agent?.runtime_sync_pending !== true
+    || agent?.ready !== false
+    || !anchor
+    || anchor.schema_version !== WORKFLOW_REGISTRATION_ANCHOR_SCHEMA
+    || !/^workflow_registration_[0-9a-f]{32}$/.test(String(anchor.anchor_id || ""))
+    || !/^registration_[a-f0-9]{48}$/.test(String(anchor.registration_id || ""))
+    || anchor.agent_id !== agent.id
+    || anchor.workspace_id !== agent.workspace_id
+    || anchor.created_by !== agent.created_by
+    || !["generated", "marketplace"].includes(anchor.kind)
+  ) return null;
+  return anchor;
+}
+
+function workflowRegistrationAnchorInventory(store, { scheduled = false } = {}) {
+  const pending = store.read((data) => (data.agents || []).filter((agent) => (
+    agent.runtime_sync_pending === true
+    && agent.ready === false
+    && Boolean(agent.workflow_registration_anchor)
+  )).length);
+  return {
+    attempted: 0,
+    reconciled: 0,
+    pending,
+    deferred: 0,
+    results: [],
+    scheduled: Boolean(scheduled && pending > 0)
+  };
+}
+
+async function reconcileWorkflowRegistrationAnchors({
+  store,
+  workflowId = null,
+  agentId = null,
+  actor = null,
+  ownerMutation = null,
+  limit = Number.POSITIVE_INFINITY
+}) {
+  const allCandidates = store.read((data) => (data.agents || [])
+    .filter((agent) => agent.runtime_sync_pending === true && agent.ready === false)
+    .filter((agent) => !agentId || agent.id === agentId)
+    .filter((agent) => !actor || (
+      agent.workspace_id === actor.workspace_id
+      && agent.created_by === actor.user_id
+    ))
+    .filter((agent) => {
+      const anchor = agent.workflow_registration_anchor;
+      return !workflowId || anchor?.workflow_id === workflowId;
+    }));
+  const boundedLimit = Number.isSafeInteger(limit) && limit >= 0 ? limit : allCandidates.length;
+  const candidates = allCandidates.slice(0, boundedLimit);
+  const deferred = Math.max(0, allCandidates.length - candidates.length);
+  const results = [];
+  for (const candidate of candidates) {
+    const anchor = workflowRegistrationAnchorForAgent(candidate);
+    if (!anchor) {
+      results.push({
+        agent_id: candidate.id,
+        status: "pending",
+        error: "workflow_registration_anchor_invalid"
+      });
+      continue;
+    }
+    if (!realRuntimeEnabled()) {
+      results.push({
+        agent_id: candidate.id,
+        anchor_id: anchor.anchor_id,
+        status: "pending",
+        error: "runtime_disabled"
+      });
+      continue;
+    }
+    let remoteState = "purged";
+    try {
+      const cleanup = await purgeRuntimeAgentRegistration(
+        candidate.id,
+        anchor.registration_id,
+        {
+          user_id: anchor.created_by,
+          workspace_id: anchor.workspace_id,
+          role: anchor.requested_role || "user"
+        }
+      );
+      if (!runtimeAgentRegistrationWasPurged(cleanup)) {
+        results.push({
+          agent_id: candidate.id,
+          anchor_id: anchor.anchor_id,
+          status: "pending",
+          error: "runtime_registration_cleanup_unconfirmed"
+        });
+        continue;
+      }
+    } catch (error) {
+      if (Number(error?.status) === 404) {
+        remoteState = "absent";
+      } else {
+        results.push({
+          agent_id: candidate.id,
+          anchor_id: anchor.anchor_id,
+          status: "pending",
+          error: String(error?.code || `runtime_cleanup_${Number(error?.status) || "failed"}`).slice(0, 120)
+        });
+        continue;
+      }
+    }
+    try {
+      const removed = await store.mutate((data) => {
+        ownerMutation?.assertActiveInData(data);
+        const matches = (data.agents || []).filter((agent) => (
+          agent.id === candidate.id
+          && agent.workspace_id === anchor.workspace_id
+          && agent.created_by === anchor.created_by
+          && agent.runtime_sync_pending === true
+          && agent.ready === false
+          && agent.workflow_registration_anchor?.anchor_id === anchor.anchor_id
+          && agent.workflow_registration_anchor?.registration_id === anchor.registration_id
+        ));
+        if (matches.length !== 1) return false;
+        data.agents = data.agents.filter((agent) => agent !== matches[0]);
+        return true;
+      });
+      if (!removed) {
+        results.push({
+          agent_id: candidate.id,
+          anchor_id: anchor.anchor_id,
+          status: "pending",
+          error: "workflow_registration_anchor_changed"
+        });
+        continue;
+      }
+      results.push({
+        agent_id: candidate.id,
+        anchor_id: anchor.anchor_id,
+        status: "reconciled",
+        remote_state: remoteState
+      });
+    } catch (error) {
+      results.push({
+        agent_id: candidate.id,
+        anchor_id: anchor.anchor_id,
+        status: "pending",
+        error: String(error?.code || "workflow_registration_anchor_persistence_failed").slice(0, 120)
+      });
+    }
+  }
+  return {
+    attempted: results.length,
+    reconciled: results.filter((result) => result.status === "reconciled").length,
+    pending: results.filter((result) => result.status === "pending").length + deferred,
+    deferred,
+    results
+  };
+}
+
+async function activateWorkflowDraft({ store, workflowId, actor, ownerMutation = null }) {
+  const registrationRecovery = await reconcileWorkflowRegistrationAnchors({
+    store,
+    workflowId,
+    actor,
+    ownerMutation
+  });
+  if (registrationRecovery.pending > 0) {
+    throwStatus(503, "Workflow agent registration cleanup is still pending. Retry after Runtime is available.");
+  }
   const activationClaimId = makeId("activation");
   const claim = await store.mutate((data) => {
+    ownerMutation?.assertActiveInData(data);
     const current = assertWorkflowAccess(data, workflowId, actor, { mutable: true });
     if (!current.agent_workspace_id) {
       const suffix = String(current.workflow_id || "workflow").replace(/^workflow_/, "").slice(-6);
@@ -6666,13 +7072,21 @@ async function activateWorkflowDraft({ store, workflowId, actor }) {
     preflightWorkflowActivation({ workflow, snapshot: initialSnapshot, actor });
     const additionalSlots = workflowWorkspaceAdditionalSlots({ workflow, snapshot: initialSnapshot, actor });
     if (additionalSlots > 0) {
-      await store.mutate((data) => reserveAgentWorkspaceCapacity(
-        data,
-        workflow.agent_workspace_id,
-        actor,
-        additionalSlots,
-        capacityReservationId
-      ));
+      await store.mutate((data) => {
+        assertWorkflowActivationOwnerCommit(data, {
+          workflow,
+          actor,
+          ownerMutation,
+          expectedActivationClaimId: activationClaimId
+        });
+        return reserveAgentWorkspaceCapacity(
+          data,
+          workflow.agent_workspace_id,
+          actor,
+          additionalSlots,
+          capacityReservationId
+        );
+      });
       capacityReserved = true;
     }
     for (const node of workflow.nodes.filter((item) => item.type === "agent")) {
@@ -6719,7 +7133,9 @@ async function activateWorkflowDraft({ store, workflowId, actor }) {
               generated_agent: workflowGeneratedSpec(workflow, node, source)
             },
             actor,
-            derivedFrom: source.id
+            derivedFrom: source.id,
+            ownerMutation,
+            expectedActivationClaimId: activationClaimId
           }));
         }
         assignedAgentIds.add(nodeAgents.get(node.id).id);
@@ -6744,10 +7160,25 @@ async function activateWorkflowDraft({ store, workflowId, actor }) {
           store,
           req: { auth: actor },
           sourceAgent,
-          requestedId
+          requestedId,
+          ownerMutation,
+          workflowCommit: {
+            workflow,
+            node,
+            expectedActivationClaimId: activationClaimId
+          }
         });
         await store.mutate((data) => {
+          assertWorkflowActivationOwnerCommit(data, {
+            workflow,
+            actor,
+            ownerMutation,
+            expectedActivationClaimId: activationClaimId
+          });
           const stored = data.agents.find((item) => item.id === copied.id);
+          if (!stored || !workflowAgentMutable(stored, actor)) {
+            throwStatus(409, `Workflow agent ownership changed during activation: ${node.title}.`);
+          }
           stored.workflow_origin = {
             workflow_id: workflow.workflow_id,
             node_id: node.id,
@@ -6766,7 +7197,9 @@ async function activateWorkflowDraft({ store, workflowId, actor }) {
         store,
         workflow,
         node,
-        actor
+        actor,
+        ownerMutation,
+        expectedActivationClaimId: activationClaimId
       }));
       assignedAgentIds.add(nodeAgents.get(node.id).id);
     }
@@ -6824,6 +7257,12 @@ async function activateWorkflowDraft({ store, workflowId, actor }) {
       }
       if (!contractChanged && !(agent.connector_requirements_pending || []).length) continue;
       await store.mutate((data) => {
+        assertWorkflowActivationOwnerCommit(data, {
+          workflow,
+          actor,
+          ownerMutation,
+          expectedActivationClaimId: activationClaimId
+        });
         const stored = data.agents.find((item) => item.id === agent.id);
         if (!stored || !workflowAgentMutable(stored, actor)) {
           throwStatus(409, `Workflow agent ownership changed during activation: ${node.title}.`);
@@ -6855,13 +7294,21 @@ async function activateWorkflowDraft({ store, workflowId, actor }) {
       edges: workflowActivationEdges(workflow, nodeAgents)
     };
     if (capacityReserved) {
-      await store.mutate((data) => commitAgentWorkspaceReservation(
-        data,
-        workflow.agent_workspace_id,
-        actor,
-        capacityReservationId,
-        activation.node_agents.map((item) => item.agent_id)
-      ));
+      await store.mutate((data) => {
+        assertWorkflowActivationOwnerCommit(data, {
+          workflow,
+          actor,
+          ownerMutation,
+          expectedActivationClaimId: activationClaimId
+        });
+        return commitAgentWorkspaceReservation(
+          data,
+          workflow.agent_workspace_id,
+          actor,
+          capacityReservationId,
+          activation.node_agents.map((item) => item.agent_id)
+        );
+      });
       capacityReserved = false;
     }
     workflow = await markWorkflowActivation({
@@ -7101,7 +7548,35 @@ function workflowActivationEdges(workflow, nodeAgents) {
   return edges;
 }
 
-async function createWorkflowGeneratedAgent({ store, workflow, node, actor, derivedFrom = null }) {
+function assertWorkflowActivationOwnerCommit(data, {
+  workflow,
+  actor,
+  ownerMutation = null,
+  expectedActivationClaimId = null
+}) {
+  ownerMutation?.assertActiveInData(data);
+  const current = assertWorkflowAccess(data, workflow.workflow_id, actor, { mutable: true });
+  if (
+    expectedActivationClaimId
+    && (
+      current.status !== "activating"
+      || current.activation_claim_id !== expectedActivationClaimId
+    )
+  ) {
+    throwStatus(409, "Workflow activation ownership changed before the agent could be saved.");
+  }
+  return current;
+}
+
+async function createWorkflowGeneratedAgent({
+  store,
+  workflow,
+  node,
+  actor,
+  derivedFrom = null,
+  ownerMutation = null,
+  expectedActivationClaimId = null
+}) {
   const agentId = workflowAgentId(workflow, node);
   const existing = store.read((data) => data.agents.find((item) => item.id === agentId));
   if (existing) {
@@ -7109,7 +7584,18 @@ async function createWorkflowGeneratedAgent({ store, workflow, node, actor, deri
       existing.workflow_origin?.workflow_id === workflow.workflow_id
       && existing.workflow_origin?.node_id === node.id
       && workflowAgentMutable(existing, actor)
-    ) return existing;
+    ) {
+      if (
+        existing.runtime_sync_pending === true
+        && (
+          existing.ready === false
+          || Boolean(existing.workflow_registration_anchor)
+        )
+      ) {
+        throwStatus(503, `Generated agent cleanup is still pending: ${agentId}.`);
+      }
+      return existing;
+    }
     throwStatus(409, `Generated agent id is already in use: ${agentId}.`);
   }
   const spec = node.generated_agent || workflowGeneratedSpec(workflow, node);
@@ -7139,6 +7625,8 @@ async function createWorkflowGeneratedAgent({ store, workflow, node, actor, deri
     }
   });
   let runtimeCleanup = null;
+  let provisionalStored = false;
+  let registrationAnchor = null;
   try {
     if (realRuntimeEnabled()) {
       const auditContext = {
@@ -7153,6 +7641,37 @@ async function createWorkflowGeneratedAgent({ store, workflow, node, actor, deri
         auditContext,
         phase: "pending"
       };
+      registrationAnchor = makeWorkflowRegistrationAnchor({
+        registrationId,
+        agent,
+        actor,
+        kind: "generated",
+        workflow,
+        node
+      });
+      // Persist a tenant-owned, non-routable cleanup anchor before making the
+      // external registration. If compensation later fails, account deletion
+      // can still discover and purge the Runtime id instead of orphaning it.
+      await store.mutate((data) => {
+        assertWorkflowActivationOwnerCommit(data, {
+          workflow,
+          actor,
+          ownerMutation,
+          expectedActivationClaimId
+        });
+        if (data.agents.some((item) => item.id === agent.id)) {
+          throwStatus(409, `Generated agent id is already in use: ${agent.id}.`);
+        }
+        data.agents.push({
+          ...agent,
+          workflow_origin: { ...agent.workflow_origin },
+          ready: false,
+          runtime_sync_pending: true,
+          workflow_registration_anchor: registrationAnchor
+        });
+        return agent.id;
+      });
+      provisionalStored = true;
       const runtimeResult = await registerRuntimeAgent({
         ...agent,
         registration_id: registrationId,
@@ -7181,20 +7700,43 @@ async function createWorkflowGeneratedAgent({ store, workflow, node, actor, deri
       });
     }
     const created = await store.mutate((data) => {
-      if (data.agents.some((item) => item.id === agent.id)) {
+      assertWorkflowActivationOwnerCommit(data, {
+        workflow,
+        actor,
+        ownerMutation,
+        expectedActivationClaimId
+      });
+      const provisional = data.agents.find((item) => item.id === agent.id);
+      if (provisionalStored) {
+        if (
+          !provisional
+          || provisional.workflow_origin?.workflow_id !== workflow.workflow_id
+          || provisional.workflow_origin?.node_id !== node.id
+          || !workflowAgentMutable(provisional, actor)
+          || provisional.runtime_sync_pending !== true
+        ) {
+          throwStatus(409, `Generated agent ownership changed before it could be saved: ${agent.id}.`);
+        }
+        Object.assign(provisional, agent);
+        delete provisional.workflow_registration_anchor;
+      } else if (provisional) {
         throwStatus(409, `Generated agent id is already in use: ${agent.id}.`);
+      } else {
+        data.agents.push(agent);
       }
       agent.ready = true;
-      data.agents.push(agent);
+      const stored = provisionalStored ? provisional : agent;
+      stored.ready = true;
       appendAgentEvent(data, {
         eventType: "agent.workflow_created",
-        agent,
+        agent: stored,
         actor,
         details: { workflow_id: workflow.workflow_id, workflow_node_id: node.id }
       });
-      return agent;
+      return stored;
     });
     runtimeCleanup = null;
+    provisionalStored = false;
     return created;
   } catch (error) {
     if (runtimeCleanup) {
@@ -7219,6 +7761,27 @@ async function createWorkflowGeneratedAgent({ store, workflow, node, actor, deri
           else error.runtime_agent_compensation_failed = true;
         }
       }
+    }
+    if (provisionalStored && error.runtime_agent_compensated === true) {
+      await store.mutate((data) => {
+        const provisional = data.agents.find((item) => (
+          item.id === agent.id
+          && item.workflow_origin?.workflow_id === workflow.workflow_id
+          && item.workflow_origin?.node_id === node.id
+          && item.runtime_sync_pending === true
+          && item.workflow_registration_anchor?.anchor_id === registrationAnchor?.anchor_id
+          && workflowAgentMutable(item, actor)
+        ));
+        if (provisional) {
+          data.agents = data.agents.filter((item) => item !== provisional);
+          removeAgentFromAllWorkspaces(data, provisional.id);
+        }
+        return Boolean(provisional);
+      }).catch(() => {
+        // Retaining the cleanup anchor is safer than losing the only durable
+        // record of a registration whose local rollback could not be saved.
+        error.runtime_agent_cleanup_anchor_retained = true;
+      });
     }
     throw error;
   }
@@ -8041,8 +8604,22 @@ async function copyMarketplaceAgentToWorkspace({
   req,
   sourceAgent,
   requestedId,
-  targetAgentWorkspaceId = null
+  targetAgentWorkspaceId = null,
+  ownerMutation = null,
+  workflowCommit = null
 }) {
+  const exactRequestedId = String(requestedId || "").trim();
+  if (exactRequestedId) {
+    const registrationRecovery = await reconcileWorkflowRegistrationAnchors({
+      store,
+      agentId: exactRequestedId,
+      actor: req.auth,
+      ownerMutation
+    });
+    if (registrationRecovery.pending > 0) {
+      throwStatus(503, "Copied-agent registration cleanup is still pending. Retry after Runtime is available.");
+    }
+  }
   const snapshot = publishedMarketplaceSnapshot(sourceAgent);
   const listingId = marketplaceListingId(sourceAgent);
   const agentId = marketplaceCopyAgentId(store.read(), sourceAgent, requestedId);
@@ -8079,11 +8656,36 @@ async function copyMarketplaceAgentToWorkspace({
 
   let runtimeCleanup = null;
   let workspaceReservation = null;
+  let provisionalStored = false;
+  let registrationAnchor = null;
+  const assertCopyCommit = (data) => {
+    ownerMutation?.assertActiveInData(data);
+    if (workflowCommit?.workflow) {
+      const currentWorkflow = assertWorkflowActivationOwnerCommit(data, {
+        workflow: workflowCommit.workflow,
+        actor: req.auth,
+        ownerMutation,
+        expectedActivationClaimId: workflowCommit.expectedActivationClaimId
+      });
+      const currentNode = (currentWorkflow.nodes || []).find((item) => (
+        item.id === workflowCommit.node?.id
+      ));
+      if (
+        !currentNode
+        || currentNode.type !== "agent"
+        || currentNode.source !== "marketplace"
+        || currentNode.listing_id !== listingId
+      ) {
+        throwStatus(409, "Marketplace workflow-node ownership changed before the copied agent could be saved.");
+      }
+    }
+  };
   try {
     const selectedWorkspaceId = String(targetAgentWorkspaceId || "").trim();
     if (selectedWorkspaceId) {
       const reservationId = `marketplace-copy:${listingId}:${agentId}:${makeId("reservation")}`;
       await store.mutate((data) => {
+        assertCopyCommit(data);
         findAgentWorkspace(data, selectedWorkspaceId, req.auth, { mutable: true });
         reserveAgentWorkspaceCapacity(data, selectedWorkspaceId, req.auth, 1, reservationId);
       });
@@ -8093,13 +8695,37 @@ async function copyMarketplaceAgentToWorkspace({
       const auditContext = runtimeAuditContext(req);
       const registrationId = `registration_${crypto.randomBytes(24).toString("hex")}`;
       runtimeCleanup = { agentId, registrationId, auditContext, phase: "pending" };
+      registrationAnchor = makeWorkflowRegistrationAnchor({
+        registrationId,
+        agent: copied,
+        actor: req.auth,
+        kind: "marketplace",
+        workflow: workflowCommit?.workflow || null,
+        node: workflowCommit?.node || null,
+        listingId
+      });
+      await store.mutate((data) => {
+        assertCopyCommit(data);
+        if (data.agents.some((agent) => agent.id === agentId)) {
+          throwStatus(409, "Agent id already exists.");
+        }
+        data.agents.push({
+          ...copied,
+          marketplace_origin: { ...copied.marketplace_origin },
+          ready: false,
+          runtime_sync_pending: true,
+          workflow_registration_anchor: registrationAnchor
+        });
+        return agentId;
+      });
+      provisionalStored = true;
       const runtimeResult = await registerRuntimeAgent({
         ...copied,
         registration_id: registrationId,
         audit_context: auditContext
       });
       if (runtimeResult.status === "unchanged" || runtimeResult.result?.status === "unchanged") {
-        runtimeCleanup = null;
+        runtimeCleanup.phase = "absent";
         throwStatus(409, "Agent id already exists.");
       }
       if (!runtimeAgentRegistrationWasCreated(runtimeResult)) {
@@ -8116,8 +8742,16 @@ async function copyMarketplaceAgentToWorkspace({
         auditContext
       });
       const created = await store.mutate((data) => {
-        if (data.agents.some((agent) => agent.id === agentId)) {
-          throwStatus(409, "Agent id already exists.");
+        assertCopyCommit(data);
+        const provisional = data.agents.find((agent) => agent.id === agentId);
+        if (
+          !provisional
+          || provisional.runtime_sync_pending !== true
+          || provisional.workspace_id !== copied.workspace_id
+          || provisional.created_by !== copied.created_by
+          || provisional.marketplace_origin?.listing_id !== listingId
+        ) {
+          throwStatus(409, "Copied agent ownership changed before it could be saved.");
         }
         const stored = {
           ...copied,
@@ -8126,13 +8760,23 @@ async function copyMarketplaceAgentToWorkspace({
           visibility: "private",
           created_by: copied.created_by,
           marketplace_origin: copied.marketplace_origin,
+          ...(workflowCommit?.workflow && workflowCommit?.node ? {
+            workflow_origin: {
+              workflow_id: workflowCommit.workflow.workflow_id,
+              node_id: workflowCommit.node.id,
+              source: "marketplace",
+              listing_id: listingId
+            }
+          } : {}),
           ready: runtimeResult.ready ?? runtimeResult.result?.ready ?? true,
           ...(runtimeRegistrationAudit ? {
             runtime_registration_audit_binding: runtimeRegistrationAudit.binding,
             runtime_registration_agent_spec: runtimeRegistrationAudit.agentSpec
           } : {})
         };
-        data.agents.push(stored);
+        Object.assign(provisional, stored);
+        delete provisional.workflow_registration_anchor;
+        if (!workflowCommit?.workflow) delete provisional.runtime_sync_pending;
         if (workspaceReservation) {
           commitAgentWorkspaceReservation(
             data,
@@ -8144,18 +8788,20 @@ async function copyMarketplaceAgentToWorkspace({
         }
         appendAgentEvent(data, {
           eventType: "agent.marketplace_copied",
-          agent: stored,
+          agent: provisional,
           actor: req.auth,
           details: { listing_id: listingId, source_agent_id: sourceAgent.id }
         });
-        return stored;
+        return provisional;
       });
       runtimeCleanup = null;
+      provisionalStored = false;
       workspaceReservation = null;
       return created;
     }
 
     return await store.mutate((data) => {
+      assertCopyCommit(data);
       if (data.agents.some((agent) => agent.id === agentId)) {
         throwStatus(409, "Agent id already exists.");
       }
@@ -8180,6 +8826,7 @@ async function copyMarketplaceAgentToWorkspace({
     });
   } catch (error) {
     if (runtimeCleanup) {
+      if (runtimeCleanup.phase === "absent") error.runtime_agent_compensated = true;
       const shouldCompensate = runtimeCleanup.phase === "committed"
         || Number(error?.status || 0) >= 500
         || !Number(error?.status || 0);
@@ -8205,6 +8852,25 @@ async function copyMarketplaceAgentToWorkspace({
           }
         }
       }
+    }
+    if (provisionalStored && error.runtime_agent_compensated === true) {
+      await store.mutate((data) => {
+        const provisional = data.agents.find((agent) => (
+          agent.id === agentId
+          && agent.runtime_sync_pending === true
+          && agent.workspace_id === copied.workspace_id
+          && agent.created_by === copied.created_by
+          && agent.marketplace_origin?.listing_id === listingId
+          && agent.workflow_registration_anchor?.anchor_id === registrationAnchor?.anchor_id
+        ));
+        if (provisional) {
+          data.agents = data.agents.filter((agent) => agent !== provisional);
+          removeAgentFromAllWorkspaces(data, provisional.id);
+        }
+        return Boolean(provisional);
+      }).catch(() => {
+        error.runtime_agent_cleanup_anchor_retained = true;
+      });
     }
     if (workspaceReservation) {
       await store.mutate((data) => releaseAgentWorkspaceReservation(
@@ -8346,6 +9012,34 @@ function assertMcpConnectionMutation(connection, req) {
   if (!isAdmin(req) && connection.created_by !== req.auth?.user_id) {
     throwStatus(403, "Only the connection owner can change it.");
   }
+}
+
+function mcpConnectionForMutation(data, req, connectionId) {
+  const matches = (data.mcpConnections || []).filter((connection) => (
+    connection.connection_id === connectionId
+    && connection.workspace_id === req.auth?.workspace_id
+    && (isAdmin(req) || connection.created_by === req.auth?.user_id)
+  ));
+  if (matches.length > 1) {
+    throwStatus(409, "MCP connection identity is ambiguous and must be repaired before it can be changed.");
+  }
+  return matches[0] || null;
+}
+
+function mcpApprovalForMutation(data, req, approvalId) {
+  const matches = (data.mcpApprovals || []).filter((approval) => (
+    approval.approval_id === approvalId
+    && approval.workspace_id === req.auth?.workspace_id
+    && approval.created_by === req.auth?.user_id
+  ));
+  if (matches.length > 1) {
+    const error = new Error("MCP approval identity is ambiguous and must be repaired.");
+    error.status = 409;
+    error.code = "mcp_approval_ambiguous";
+    throw error;
+  }
+  if (!matches[0]) throwStatus(404, "MCP approval not found.");
+  return matches[0];
 }
 
 function throwStatus(status, message) {

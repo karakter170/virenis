@@ -190,7 +190,29 @@ marker with a bounded timeout, rebuilds a fresh tenant-qualified resource
 graph, and then performs idempotent external cleanup. Successful external
 cleanup steps have durable per-deletion receipts, so a transient provider or
 Runtime failure leaves the marker intact and a retry resumes instead of
-repeating completed steps. Each per-resource receipt is namespaced by a
+repeating completed steps. Owner-scoped background mutations, including an
+activation resumed by an OAuth callback, join the same drain before their first
+await. After a Runtime agent registration returns, the local commit rechecks
+the exact durable owner, captured deletion generation, and workflow activation
+claim. If deletion or another activation won, the registration is compensated
+and the local agent is not made routable. A non-routable tenant-owned cleanup
+anchor is written before the remote call; if immediate compensation itself is
+unavailable, deletion discovers that anchor and must purge the Runtime agent
+before the account can be removed. The anchor contains an internal exact
+registration cleanup identifier and is never returned by agent APIs or account
+exports. Startup inventories these anchors locally, marks interrupted workflows
+retryable, and schedules a bounded post-readiness recovery batch; Runtime
+availability therefore cannot block web readiness. The recovery handles both
+generated-agent and Marketplace-copy anchors, including a crash before the
+Runtime request and a crash after remote success but before local promotion. A
+missing exact registration is safe to remove locally; an exact matching
+registration is purged first. An ownership mismatch or Runtime outage leaves
+the anchor non-routable and pending, and the next workflow activation retry
+runs the same reconciliation before allocating a fresh registration. The
+scheduled recovery is exposed through the normal background-task drain so
+graceful shutdown can wait for or report its bounded batch.
+
+Each per-resource receipt is namespaced by a
 canonical digest of the exact external-resource snapshot. A credential or
 runtime registration changed under the same ID therefore receives a new purge,
 while only the exact already-purged version may be skipped. Clerk deletion
@@ -213,6 +235,16 @@ requires retry or operator remediation rather than being treated as clean. If
 the connection committed just before the marker, it is part of the fresh
 deletion graph and is revoked by the deletion saga.
 
+Refreshes use the same rule: an exact credential-revision intent is committed
+before the provider request. A crash cannot erase that evidence. Stale
+`exchanging` and `refreshing` records are promoted after the recovery grace to
+explicit exchange/refresh uncertainty and block deletion. An administrator must
+first remove the application grant at the provider, then record the evidence
+reference, reason, and strong confirmation in the Connections UI. The audited
+terminal receipt is scoped to the exact workspace, owner, connection, provider,
+and encrypted credential revision, so it cannot authorize cleanup for a
+colliding tenant record.
+
 Some providers do not expose a generic RFC-style revocation endpoint. Virenis
 does not silently claim success for those providers: deletion stays marked and
 fail-closed until a supported provider-specific deauthorization is available.
@@ -224,6 +256,11 @@ success resumable without treating an ambiguous authentication failure as
 proof of revocation. Other providers continue to use their advertised RFC-style
 endpoint; an unsupported provider remains fail-closed rather than reporting a
 local-only deletion as complete.
+
+An approved write action interrupted after provider dispatch is never retried
+automatically. Recovery exposes `execution_outcome_uncertain` in the original
+conversation, preserves the encrypted exact arguments, and requires the user to
+check the provider before continuing without replay.
 
 Startup and a bounded periodic worker scan durable deletion markers and
 document-cleanup outboxes. It retries the complete saga or filesystem cleanup

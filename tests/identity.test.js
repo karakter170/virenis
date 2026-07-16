@@ -10,6 +10,8 @@ import {
   requireAuthorizedClerkBrowserOrigin,
   validateClerkEnvironment
 } from "../server/clerkIdentity.js";
+import { attestMcpOAuthRevocationResolved } from "../server/mcp.js";
+import { setRuntimeFetchForTests } from "../server/runtimeClient.js";
 import { makeId } from "../server/store.js";
 
 const ENV_KEYS = [
@@ -25,7 +27,9 @@ const ENV_KEYS = [
   "APP_ACCOUNT_DELETION_DRAIN_TIMEOUT_MS",
   "PORT",
   "WEB_STORE_DRIVER",
-  "TCAR_ENGINE_MODE"
+  "TCAR_ENGINE_MODE",
+  "TCAR_RUNTIME_API_URL",
+  "TCAR_RUNTIME_API_KEY"
 ];
 
 let previousEnv;
@@ -48,7 +52,9 @@ beforeEach(async () => {
     "APP_PUBLIC_ORIGIN",
     "CLERK_AUTHORIZED_PARTIES",
     "APP_ACCOUNT_DELETION_DRAIN_TIMEOUT_MS",
-    "PORT"
+    "PORT",
+    "TCAR_RUNTIME_API_URL",
+    "TCAR_RUNTIME_API_KEY"
   ]) delete process.env[key];
   tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "virenis-clerk-"));
   fake = createFakeClerk();
@@ -489,9 +495,16 @@ describe("Clerk identity integration", () => {
         if (!rotated) {
           rotated = true;
           await app.locals.store.mutate((data) => {
-            const connection = data.mcpConnections.find((item) => item.connection_id === "mcpconn_same_id_rotates");
-            connection.credential = { revision: "second" };
-            connection.updated_at = "2026-07-16T00:00:01.000Z";
+            data.mcpConnections.push({
+              connection_id: "mcpconn_same_id_rotates",
+              provider_id: "custom",
+              auth_type: "none",
+              credential: { revision: "second" },
+              status: "ready",
+              workspace_id: identity.body.workspace_id,
+              created_by: identity.body.user_id,
+              updated_at: "2026-07-16T00:00:01.000Z"
+            });
             return true;
           });
         }
@@ -607,6 +620,168 @@ describe("Clerk identity integration", () => {
     expect(fake.deleteUserCalls).toBe(1);
   });
 
+  it("drains background workflow activation, rejects its post-Runtime commit, and leaves no orphan during deletion", async () => {
+    process.env.TCAR_ENGINE_MODE = "real";
+    process.env.TCAR_RUNTIME_API_URL = "http://runtime.identity-race.test";
+    process.env.TCAR_RUNTIME_API_KEY = "identity-workflow-race-test-key";
+    fake.addUser({
+      id: "user_delete_workflow_race",
+      email: "delete-workflow-race@example.com",
+      name: "Delete Workflow Race"
+    });
+    await startApp(fake.adapter, {
+      autoRun: true,
+      workflowComposer: async () => ({
+        title: "Background ceramic review",
+        nodes: [{
+          id: "ceramic_reviewer",
+          type: "agent",
+          title: "Ceramic Reviewer",
+          task: "Review the supplied ceramic description.",
+          produces: ["ceramic_review"]
+        }],
+        edges: []
+      })
+    });
+    const headers = asUser("user_delete_workflow_race");
+    const identity = (await request(app).get("/api/auth/me").set(headers).expect(200)).body;
+    const session = (await request(app)
+      .post("/api/chat/sessions")
+      .set(headers)
+      .send({ title: "Deletion race proof" })
+      .expect(201)).body;
+    const queued = (await request(app)
+      .post(`/api/chat/sessions/${session.session_id}/messages`)
+      .set(headers)
+      .send({ content: "/agent review this ceramic description" })
+      .expect(202)).body;
+    await waitForStoredRun(app, queued.run_id);
+    const workflow = await app.locals.store.mutate((data) => {
+      const current = data.workflows.find((item) => (
+        item.session_id === session.session_id
+        && item.workspace_id === identity.workspace_id
+        && item.created_by === identity.user_id
+      ));
+      expect(current).toBeTruthy();
+      current.approved_at = new Date().toISOString();
+      current.status = "ready_to_activate";
+      current.revision += 1;
+      return current;
+    });
+
+    let registrationObserved;
+    const registered = new Promise((resolve) => { registrationObserved = resolve; });
+    let allowRegistrationResponse;
+    const registrationResponseGate = new Promise((resolve) => { allowRegistrationResponse = resolve; });
+    const remoteAgents = new Set();
+    const runtimeCalls = [];
+    let compensationFailureReturned = false;
+    const restoreFetch = setRuntimeFetchForTests(async (url, options = {}) => {
+      const pathName = new URL(url).pathname;
+      const method = options.method || "GET";
+      const body = options.body ? JSON.parse(options.body) : {};
+      runtimeCalls.push({ method, pathName, body });
+      if (pathName === "/agents" && method === "POST") {
+        remoteAgents.add(body.id);
+        registrationObserved({ agentId: body.id, registrationId: body.registration_id });
+        // The Runtime has committed, but the application has not received the
+        // response and therefore cannot have committed the local agent yet.
+        await registrationResponseGate;
+        return Response.json({
+          ok: true,
+          status: "added",
+          id: body.id,
+          registration_id: body.registration_id,
+          result: { status: "added", id: body.id },
+          agent: {
+            ...body,
+            enabled: true,
+            mounted: true,
+            registration_kind: "agent",
+            registration_cleanup_allowed: true
+          },
+          mounted: true,
+          requires_vllm_reload: false
+        });
+      }
+      if (method === "DELETE" && pathName.startsWith("/agents/")) {
+        const agentId = decodeURIComponent(pathName.slice("/agents/".length));
+        if (body.purge_registration === true && !compensationFailureReturned) {
+          compensationFailureReturned = true;
+          return Response.json({ detail: "synthetic compensation outage" }, { status: 503 });
+        }
+        if (body.delete_archived === true) remoteAgents.delete(agentId);
+        return Response.json({
+          ok: true,
+          status: body.delete_archived === true ? "purged" : "archived",
+          id: agentId,
+          agent: { id: agentId, enabled: false, mounted: false },
+          enabled: false,
+          mounted: false,
+          purged: body.delete_archived === true,
+          requires_vllm_reload: false
+        });
+      }
+      return Response.json({ detail: "not found" }, { status: 404 });
+    });
+    try {
+      const backgroundActor = {
+        user_id: identity.user_id,
+        workspace_id: identity.workspace_id,
+        role: identity.role || "user"
+      };
+      const activationOutcome = app.locals.activateWorkflow({
+        workflowId: workflow.workflow_id,
+        actor: backgroundActor
+      }).then(
+        (value) => ({ value, error: null }),
+        (error) => ({ value: null, error })
+      );
+      const registration = await registered;
+      expect(remoteAgents.has(registration.agentId)).toBe(true);
+      expect(app.locals.store.read((data) => data.agents.find((agent) => agent.id === registration.agentId)))
+        .toMatchObject({ ready: false, runtime_sync_pending: true });
+
+      const deletionResponse = request(app)
+        .delete("/api/account")
+        .set(headers)
+        .send({ confirmation: "DELETE" })
+        .then((response) => response);
+      await waitForStoredUserStatus(app, "user_delete_workflow_race", "deleting");
+      expect(fake.deleteUserCalls).toBe(0);
+
+      allowRegistrationResponse();
+      const activation = await activationOutcome;
+      expect(activation.error).toMatchObject({
+        status: 409,
+        code: "account_deletion_in_progress",
+        runtime_agent_compensation_failed: true
+      });
+      const deleted = await deletionResponse;
+      expect(deleted.status).toBe(200);
+      expect(runtimeCalls.map((call) => `${call.method} ${call.pathName}`)).toEqual([
+        "POST /agents",
+        `DELETE /agents/${registration.agentId}`,
+        `DELETE /agents/${registration.agentId}`,
+        `DELETE /agents/${registration.agentId}`
+      ]);
+      expect(runtimeCalls[1].body).toMatchObject({
+        registration_id: registration.registrationId,
+        purge_registration: true
+      });
+      expect(runtimeCalls[2].body).not.toHaveProperty("delete_archived");
+      expect(runtimeCalls[3].body).toMatchObject({ delete_archived: true });
+      expect(remoteAgents).toEqual(new Set());
+      const persisted = app.locals.store.read();
+      expect(persisted.users.some((user) => user.clerk_user_id === "user_delete_workflow_race")).toBe(false);
+      expect(persisted.workflows.some((item) => item.workflow_id === workflow.workflow_id)).toBe(false);
+      expect(persisted.agents.some((agent) => agent.id === registration.agentId)).toBe(false);
+    } finally {
+      allowRegistrationResponse();
+      restoreFetch();
+    }
+  });
+
   it("fails closed while an OAuth exchange lacks a durable revocation outbox", async () => {
     fake.addUser({ id: "user_delete_oauth_gap", email: "delete-oauth-gap@example.com", name: "Delete OAuth Gap" });
     await startApp();
@@ -634,6 +809,134 @@ describe("Clerk identity integration", () => {
     expect(snapshot.users[0].status).toBe("deleting");
     expect(snapshot.mcpOauthStates[0].status).toBe("account_deleting");
     expect(fake.deleteUserCalls).toBe(0);
+
+    const operator = {
+      user_id: "security_operator",
+      workspace_id: identity.body.workspace_id,
+      role: "admin"
+    };
+    const attestation = {
+      store: app.locals.store,
+      actor: operator,
+      revocationId: "mcpoauth_unresolved_exchange",
+      confirmation: "PROVIDER_APP_ACCESS_REVOKED_AND_VERIFIED",
+      evidenceReference: "provider-console-deauthorization-case-1001",
+      reason: "The provider console confirms that the full application grant was removed."
+    };
+    await expect(attestMcpOAuthRevocationResolved(attestation)).rejects.toMatchObject({
+      status: 409,
+      code: "mcp_revocation_not_pending"
+    });
+    await app.locals.store.mutate((data) => {
+      data.mcpOauthStates[0].exchange_started_at = new Date(Date.now() - 21 * 60 * 1000).toISOString();
+      return data.mcpOauthStates[0];
+    });
+    await expect(attestMcpOAuthRevocationResolved({
+      ...attestation,
+      confirmation: "PROVIDER_ACCESS_REVOKED"
+    })).rejects.toMatchObject({
+      status: 400,
+      code: "mcp_revocation_resolution_confirmation_required"
+    });
+    await expect(attestMcpOAuthRevocationResolved({
+      ...attestation,
+      evidenceReference: ""
+    })).rejects.toMatchObject({ status: 400 });
+
+    const resolved = await attestMcpOAuthRevocationResolved(attestation);
+    expect(resolved).toMatchObject({
+      revocation_id: "mcpoauth_unresolved_exchange",
+      status: "revocation_manually_resolved"
+    });
+    expect(JSON.stringify(app.locals.store.read().identityAuditEvents.at(-1)))
+      .not.toContain(attestation.evidenceReference);
+
+    await request(app)
+      .delete("/api/account")
+      .set(headers)
+      .send({ confirmation: "DELETE" })
+      .expect(200);
+    expect(fake.deleteUserCalls).toBe(1);
+    expect(app.locals.store.read().users).toEqual([]);
+  });
+
+  it("recovers stale exchange and refresh intents, blocks deletion, and unblocks only after provider-wide attestation", async () => {
+    fake.addUser({ id: "user_delete_oauth_restart", email: "delete-oauth-restart@example.com", name: "Delete OAuth Restart" });
+    await startApp();
+    const headers = asUser("user_delete_oauth_restart");
+    const identity = await request(app).get("/api/auth/me").set(headers).expect(200);
+    const staleAt = new Date(Date.now() - 21 * 60 * 1000).toISOString();
+    await app.locals.store.mutate((data) => {
+      data.mcpOauthStates.push(
+        {
+          oauth_state_id: "mcpoauth_delete_restart_exchange",
+          provider_id: "gmail",
+          status: "exchanging",
+          workspace_id: identity.body.workspace_id,
+          created_by: identity.body.user_id,
+          created_at: staleAt,
+          exchange_started_at: staleAt
+        },
+        {
+          oauth_state_id: "mcprefresh_delete_restart_intent",
+          provider_id: "gmail",
+          status: "refreshing",
+          workspace_id: identity.body.workspace_id,
+          created_by: identity.body.user_id,
+          source_connection_id: "mcpconn_deleted_restart_proof",
+          source_credential_revision_digest: "a".repeat(64),
+          created_at: staleAt,
+          refresh_started_at: staleAt
+        }
+      );
+      return true;
+    });
+
+    await app.locals.recoverPendingMcpRevocations();
+    const recovered = app.locals.store.read().mcpOauthStates;
+    expect(recovered.find((item) => item.oauth_state_id === "mcpoauth_delete_restart_exchange")).toMatchObject({
+      status: "exchange_outcome_uncertain",
+      uncertain_started_at: staleAt
+    });
+    expect(recovered.find((item) => item.oauth_state_id === "mcprefresh_delete_restart_intent")).toMatchObject({
+      status: "refresh_outcome_uncertain",
+      uncertain_started_at: staleAt
+    });
+
+    const blocked = await request(app)
+      .delete("/api/account")
+      .set(headers)
+      .send({ confirmation: "DELETE" })
+      .expect(409);
+    expect(blocked.body.error).toBe("account_oauth_revocation_unresolved");
+    expect(fake.deleteUserCalls).toBe(0);
+
+    const operator = {
+      user_id: "security_restart_operator",
+      workspace_id: identity.body.workspace_id,
+      role: "admin"
+    };
+    for (const revocationId of [
+      "mcpoauth_delete_restart_exchange",
+      "mcprefresh_delete_restart_intent"
+    ]) {
+      await attestMcpOAuthRevocationResolved({
+        store: app.locals.store,
+        actor: operator,
+        revocationId,
+        confirmation: "PROVIDER_APP_ACCESS_REVOKED_AND_VERIFIED",
+        evidenceReference: `provider-wide-restart-attestation:${revocationId}`,
+        reason: "Provider-wide deauthorization resolves the process-crash token outcome before deletion resumes."
+      });
+    }
+
+    await request(app)
+      .delete("/api/account")
+      .set(headers)
+      .send({ confirmation: "DELETE" })
+      .expect(200);
+    expect(fake.deleteUserCalls).toBe(1);
+    expect(app.locals.store.read().users).toEqual([]);
   });
 
   it("isolates export and deletion when every tenant-local resource id collides", async () => {
@@ -1239,6 +1542,26 @@ describe("Clerk identity integration", () => {
     })).toThrow(/same Clerk application/);
   });
 });
+
+async function waitForStoredRun(targetApp, runId) {
+  for (let attempt = 0; attempt < 400; attempt += 1) {
+    const run = targetApp.locals.store.read((data) => data.runs.find((item) => item.run_id === runId));
+    if (["completed", "failed"].includes(run?.status)) return run;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Run ${runId} did not finish.`);
+}
+
+async function waitForStoredUserStatus(targetApp, clerkUserId, status) {
+  for (let attempt = 0; attempt < 400; attempt += 1) {
+    const user = targetApp.locals.store.read((data) => data.users.find((item) => (
+      item.clerk_user_id === clerkUserId
+    )));
+    if (user?.status === status) return user;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Clerk user ${clerkUserId} did not reach ${status}.`);
+}
 
 function createFakeClerk() {
   const state = {
