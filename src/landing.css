@@ -19,6 +19,16 @@
   -webkit-tap-highlight-color: transparent;
 }
 
+.landing-page button {
+  cursor: pointer;
+}
+
+.landing-page button:focus-visible,
+.landing-page a:focus-visible {
+  outline: 2px solid var(--landing-green);
+  outline-offset: 3px;
+}
+
 .landing-header {
   position: sticky;
   z-index: 20;
@@ -54,7 +64,7 @@
 .landing-login,
 .landing-signin {
   color: #4e5550;
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 570;
   text-decoration: none;
 }
@@ -82,7 +92,7 @@
 
 .landing-login {
   justify-self: end;
-  min-height: 38px;
+  min-height: 44px;
   display: inline-flex;
   align-items: center;
   gap: 7px;
@@ -107,9 +117,9 @@
 }
 
 .landing-signin {
-  min-height: 36px;
+  min-height: 44px;
   border: 0;
-  padding: 0 7px;
+  padding: 0 10px;
   color: var(--landing-ink);
   background: transparent;
 }
@@ -141,7 +151,7 @@
   margin: 0;
   color: var(--landing-green);
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 650;
   letter-spacing: 0.13em;
 }
@@ -190,7 +200,7 @@
 }
 
 .landing-primary {
-  min-height: 46px;
+  min-height: 48px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -200,7 +210,7 @@
   padding: 0 18px;
   color: #ffffff;
   background: var(--landing-green);
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 650;
   transition: background 150ms ease, transform 150ms ease;
 }
@@ -212,6 +222,7 @@
 
 .landing-secondary,
 .landing-text-link {
+  min-height: 44px;
   display: inline-flex;
   align-items: center;
   gap: 8px;
@@ -219,7 +230,7 @@
   padding: 0;
   color: var(--landing-ink);
   background: transparent;
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 620;
   text-decoration: underline;
   text-decoration-color: #aab4ad;
@@ -232,7 +243,7 @@
   gap: 24px;
   color: #7a817c;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 9px;
+  font-size: 10px;
   letter-spacing: 0.08em;
   text-transform: uppercase;
 }
@@ -251,7 +262,7 @@
 }
 
 .visual-label {
-  min-height: 42px;
+  min-height: 44px;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -259,7 +270,7 @@
   padding: 0 14px;
   color: #7d847f;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 8px;
+  font-size: 10px;
   font-style: normal;
   letter-spacing: 0.1em;
 }
@@ -352,14 +363,14 @@
 .demo-expert small {
   color: #758079;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 8px;
+  font-size: 9px;
   letter-spacing: 0.08em;
 }
 
 .demo-prompt p {
   margin: 9px 18px 0 0;
   color: #303632;
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1.45;
 }
 
@@ -423,7 +434,7 @@
 .demo-expert strong {
   margin-top: 21px;
   color: #272c29;
-  font-size: 11px;
+  font-size: 12px;
 }
 
 .demo-expert small {
@@ -460,7 +471,7 @@
 .demo-answer strong {
   grid-column: 1;
   color: #272c29;
-  font-size: 11px;
+  font-size: 12px;
 }
 
 .answer-lines {
@@ -490,7 +501,7 @@
   border-bottom: 1px solid var(--landing-line);
   color: #59605b;
   background: #ffffff;
-  font-size: 11px;
+  font-size: 13px;
   letter-spacing: 0.02em;
 }
 
@@ -548,7 +559,7 @@
 .process-list article > span {
   color: var(--landing-green);
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 9px;
+  font-size: 10px;
 }
 
 .process-list article > svg {
@@ -558,7 +569,7 @@
 .process-list h3,
 .feature-card h3 {
   margin: 1px 0 0;
-  font-size: 17px;
+  font-size: 18px;
   font-weight: 620;
   letter-spacing: -0.02em;
 }
@@ -567,7 +578,7 @@
 .feature-card p {
   margin: 0;
   color: var(--landing-muted);
-  font-size: 12px;
+  font-size: 14px;
   line-height: 1.65;
 }
 
@@ -630,7 +641,7 @@
 .feature-card > span {
   color: var(--landing-green);
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 8px;
+  font-size: 10px;
   font-weight: 650;
   letter-spacing: 0.12em;
 }
@@ -643,7 +654,7 @@
 .feature-card p {
   margin-top: 13px;
   max-width: 540px;
-  font-size: 13px;
+  font-size: 14px;
 }
 
 .feature-card-large > span,
@@ -671,7 +682,7 @@
   gap: 9px;
   margin-top: 11px;
   color: #e4efe9;
-  font-size: 12px;
+  font-size: 13px;
 }
 
 .knowledge-section {
@@ -736,7 +747,7 @@
 
 .knowledge-file strong,
 .knowledge-agent strong {
-  font-size: 11px;
+  font-size: 12px;
 }
 
 .knowledge-file small,
@@ -744,7 +755,7 @@
   margin-top: 4px;
   color: #7a827d;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 7px;
+  font-size: 10px;
   letter-spacing: 0.06em;
 }
 
@@ -758,7 +769,7 @@
   align-items: center;
   color: var(--landing-green);
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 7px;
+  font-size: 9px;
   letter-spacing: 0.1em;
 }
 
@@ -792,7 +803,7 @@
   padding: 4px 7px;
   color: var(--landing-green);
   background: #e9f3ee;
-  font-size: 8px;
+  font-size: 10px;
   font-style: normal;
   font-weight: 650;
 }
@@ -849,19 +860,19 @@
 }
 
 .tracking-preview strong {
-  font-size: 12px;
+  font-size: 13px;
 }
 
 .tracking-preview small {
   margin-top: 6px;
   color: var(--landing-muted);
-  font-size: 11px;
+  font-size: 12px;
 }
 
 .tracking-preview em {
   color: var(--landing-green);
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 8px;
+  font-size: 10px;
   font-style: normal;
   letter-spacing: 0.08em;
 }
@@ -882,7 +893,7 @@
   margin: 0 0 26px;
   color: #9fc2b1;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 9px;
+  font-size: 10px;
   letter-spacing: 0.13em;
 }
 
@@ -910,7 +921,7 @@
   padding: 0 clamp(24px, 4.4vw, 72px);
   color: #777f79;
   background: #ffffff;
-  font-size: 10px;
+  font-size: 12px;
 }
 
 .landing-footer > span {
@@ -925,14 +936,15 @@
 
 .landing-footer button {
   justify-self: end;
+  min-height: 44px;
   display: inline-flex;
   align-items: center;
   gap: 6px;
   border: 0;
-  padding: 8px 0;
+  padding: 8px 2px;
   color: var(--landing-ink);
   background: transparent;
-  font-size: 10px;
+  font-size: 12px;
 }
 
 @media (max-width: 1100px) {
@@ -981,8 +993,8 @@
   }
 
   .landing-login {
-    min-height: 34px;
-    font-size: 11px;
+    min-height: 44px;
+    font-size: 12px;
   }
 
   .landing-auth-actions {
@@ -990,7 +1002,7 @@
   }
 
   .landing-signin {
-    font-size: 11px;
+    font-size: 12px;
   }
 
   .landing-hero {

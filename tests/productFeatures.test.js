@@ -487,10 +487,15 @@ describe("Agent Studio product surfaces", () => {
     expect(markup).toContain("Resume now");
   });
 
-  it("presents an API-first homepage without adapter product language", () => {
-    const markup = renderToStaticMarkup(createElement(LandingPage, { onEnter: () => undefined }));
-    expect(markup).toContain("MODEL APIS");
-    expect(markup).toContain("Switch providers, not the workflow.");
+  it("presents the product as an understandable, user-controlled team", () => {
+    const markup = renderToStaticMarkup(createElement(LandingPage, { onSignUp: () => undefined }));
+    expect(markup).toContain("Build the team");
+    expect(markup).toContain("See a team in action");
+    expect(markup).toContain("Your team handles the handoffs");
+    expect(markup).toContain("WORKSPACE FIRST");
+    expect(markup).not.toContain("MODEL APIS");
+    expect(markup).not.toMatch(/Switch providers/i);
+    expect(markup).not.toMatch(/3 minute read/i);
     expect(markup).not.toMatch(/LoRA/i);
   });
 
