@@ -182,7 +182,7 @@ export default function LandingPage({ isSignedIn = false, onSignIn, onSignUp, on
             </article>
             <article className="feature-card">
               <div className="feature-icon"><UserPlus size={21} strokeWidth={1.6} /></div>
-              <span>WORKSPACE FIRST</span>
+              <span>YOUR TEAM FIRST</span>
               <h3>Start with the teammates you already trust.</h3>
               <p>Virenis looks at your own team first. When a role is missing, you can review the suggested specialist before it joins the work.</p>
             </article>

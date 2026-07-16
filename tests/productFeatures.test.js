@@ -6,8 +6,10 @@ import { renderToStaticMarkup } from "react-dom/server";
 import {
   AgentCatalog,
   AgentGraph,
+  ApprovalArguments,
   ConnectionsPanel,
   ChatMessage,
+  EmptyTeamWelcome,
   FormattedText,
   ProgressiveFormattedText,
   MarketplaceAgentDialog,
@@ -27,13 +29,22 @@ import {
   graphConnectionInputs,
   graphConnectionWouldCycle,
   graphConnections,
+  graphEdgeEndpoints,
   graphEdgePath,
   graphPositionForCanvas,
   graphPositionFromPointer,
   initialGraphPositions,
   progressiveRevealPlan,
+  responseStyleFromBoundary,
   storedGraphPositions,
+  unavailableCollaboratorHandoffs,
+  workflowProposedNewSpecialists,
+  workflowWorkspaceHasCapacity,
+  worldGraphChangeCounts,
   worldGraphAgentStatuses,
+  worldGraphPlainReason,
+  worldGraphUniqueWakeSpecialists,
+  workflowRunRequest,
   workflowRequirementConnections
 } from "../src/App.jsx";
 import LandingPage from "../src/LandingPage.jsx";
@@ -45,6 +56,61 @@ afterEach(() => {
 
 
 describe("Agent Studio product surfaces", () => {
+  it("requires enough open team places for a proposed workflow", () => {
+    expect(workflowWorkspaceHasCapacity({ agent_count: 13, max_agents: 16 }, 3)).toBe(true);
+    expect(workflowWorkspaceHasCapacity({ agent_count: 14, max_agents: 16 }, 3)).toBe(false);
+    expect(workflowWorkspaceHasCapacity({ agent_count: 16, max_agents: 16 }, 1)).toBe(false);
+    expect(workflowWorkspaceHasCapacity({ agent_count: 15, max_agents: 16 }, 1)).toBe(true);
+  });
+
+  it("checks workflow capacity from the specialists the draft will really add", () => {
+    const workflow = {
+      agent_workspace_id: "team_a",
+      nodes: [
+        { id: "reuse", type: "agent", source: "workspace", agent_id: "writer", new_specialist_required: false },
+        { id: "scoped", type: "agent", source: "workspace", agent_id: "researcher", new_specialist_required: true },
+        { id: "generated", type: "agent", source: "generated" }
+      ]
+    };
+    expect(workflowProposedNewSpecialists(workflow, {
+      agent_workspace_id: "team_a",
+      agent_ids: ["writer", "researcher"]
+    })).toBe(2);
+    expect(workflowProposedNewSpecialists(workflow, {
+      agent_workspace_id: "team_b",
+      agent_ids: []
+    })).toBe(3);
+  });
+
+  it("keeps every saved teammate handoff visible unless its teammate is truly unavailable", () => {
+    const collaborators = Array.from({ length: 30 }, (_, index) => ({ id: `specialist_${index}` }));
+    expect(unavailableCollaboratorHandoffs([
+      "user_request",
+      "agent:specialist_29:output",
+      "agent:removed_specialist:output"
+    ], collaborators)).toEqual(["agent:removed_specialist:output"]);
+  });
+
+  it("runs an approved workflow through routing metadata without leaking internal IDs into chat", () => {
+    const request = workflowRunRequest({
+      intent: "Prepare a customer-support handoff.",
+      activation: {
+        node_agents: [
+          { node_id: "n1", agent_id: "custom_support_4f91" },
+          { node_id: "n2", agent_id: "inventory_82bd" },
+          { node_id: "n3", agent_id: "custom_support_4f91" }
+        ]
+      }
+    });
+
+    expect(request).toEqual({
+      content: "Prepare a customer-support handoff.",
+      requestedAgentIds: ["custom_support_4f91", "inventory_82bd"]
+    });
+    expect(request.content).not.toContain("@custom_support_4f91");
+    expect(request.content).not.toContain("inventory_82bd");
+  });
+
   it("compiles every agent-builder ability into the persisted execution contract", () => {
     const payload = agentPayloadFromForm({
       item_type: "agent",
@@ -83,6 +149,36 @@ describe("Agent Studio product surfaces", () => {
     });
     expect(payload.boundary).toContain("Prioritize verified evidence");
     expect(payload).not.toHaveProperty("sources");
+  });
+
+  it("layers response preference onto custom guardrails without destroying either", () => {
+    const payload = agentPayloadFromForm({
+      item_type: "agent",
+      title: "Policy writer",
+      capability: "Write from approved policy.",
+      boundary: "Never invent an exception to the supplied policy.",
+      response_style: "direct",
+      consumes: ["user_request"],
+      produces: ["final_answer"],
+      tools: [],
+      resources: [],
+      mcp_bindings: []
+    });
+    expect(payload.boundary).toContain("Lead with the useful answer");
+    expect(payload.boundary).toContain("Additional role-specific guardrails:");
+    expect(payload.boundary).toContain("Never invent an exception");
+    expect(responseStyleFromBoundary(payload.boundary)).toEqual({
+      response_style: "direct",
+      boundary: "Never invent an exception to the supplied policy."
+    });
+    expect(responseStyleFromBoundary("Lead with the useful answer, keep it concise, stay within this agent's purpose, and state uncertainty when it matters.")).toEqual({
+      response_style: "direct",
+      boundary: ""
+    });
+    expect(responseStyleFromBoundary("A completely custom boundary.")).toEqual({
+      response_style: "custom",
+      boundary: "A completely custom boundary."
+    });
   });
 
   it("renders safe GitHub Markdown and KaTeX without executing raw HTML or loading images", () => {
@@ -158,8 +254,8 @@ describe("Agent Studio product surfaces", () => {
       },
       onClick: () => undefined
     }));
-    expect(markup).toContain("2 agents · 2.4s · 2,500 tokens");
-    expect(markup).toContain("Open Answer details, token usage, and complete agent outputs");
+    expect(markup).toContain("2 specialists · 2.4s · 2,500 tokens");
+    expect(markup).toContain("Open Answer details, token usage, and complete specialist results");
     expect(markup).not.toContain("usage-receipt");
   });
 
@@ -183,7 +279,7 @@ describe("Agent Studio product surfaces", () => {
       onFeedback: () => undefined,
       onDetails: () => undefined
     }));
-    expect(markup).toContain("1 agent · 1.8s · 840 tokens");
+    expect(markup).toContain("1 specialist · 1.8s · 840 tokens");
     expect(markup).not.toContain("class=\"usage-receipt\"");
     expect(markup).not.toContain("input ·");
   });
@@ -226,10 +322,10 @@ describe("Agent Studio product surfaces", () => {
       onDisputeOutcome: () => undefined,
       onCorrectOutcome: () => undefined
     }));
-    expect(markup).toContain("Agents and model usage");
+    expect(markup).toContain("How your team contributed");
     expect(markup).toContain("Router");
     expect(markup).toContain("Final answer");
-    expect(markup).toContain("Agent result");
+    expect(markup).toContain("Specialist result");
     expect(markup).toContain("Opening evidence");
     expect(markup).toContain("Closing evidence");
   });
@@ -256,9 +352,44 @@ describe("Agent Studio product surfaces", () => {
       agents: [{ id: "research_agent", title: "Research Agent" }],
       canWrite: true
     }));
-    expect(markup).toContain("Change record ready");
+    expect(markup).toContain("WorldGraph record ready");
+    expect(markup).toContain("WorldGraph · change-aware reuse");
     expect(markup).toContain("Check what changed");
     expect(markup).not.toContain("This answer is current");
+  });
+
+  it("shows the safe WorldGraph exclusion reason when earlier work could not be reused", () => {
+    const markup = renderToStaticMarkup(createElement(WorldGraphChanges, {
+      run: {
+        run_id: "run_reuse_unavailable",
+        status: "completed",
+        plan: { steps: [{ id: "s1", adapter: "research_agent", task: "Research", depends_on: [] }] },
+        world_graph: {
+          validity: "unchecked",
+          total: 1,
+          kept: 0,
+          refreshed: 1,
+          preparation: {
+            status: "disabled",
+            capsule_created: false,
+            primary_reason: "replay_signing_unavailable",
+            plain_reason: "Verified reuse was unavailable, so the work was checked again."
+          },
+          decisions: [{
+            step_id: "s1",
+            adapter: "research_agent",
+            action: "refreshed",
+            plain_reason: "Verified reuse was unavailable, so the work was checked again."
+          }]
+        }
+      },
+      agents: [{ id: "research_agent", title: "Research Agent" }],
+      canWrite: true
+    }));
+
+    expect(markup).toContain("Why earlier work was not available");
+    expect(markup).toContain("Verified reuse was unavailable, so the work was checked again.");
+    expect(markup).not.toContain("artifact_id");
   });
 
   it("describes WorldGraph decisions as work items when one agent owns multiple steps", () => {
@@ -289,11 +420,44 @@ describe("Agent Studio product surfaces", () => {
     }));
     const statuses = worldGraphAgentStatuses(run.world_graph.decisions);
 
-    expect(statuses.get("writer_agent")).toEqual({ kept: 1, refreshed: 1, total: 2, action: "mixed" });
-    expect(markup).toContain("1 validated work item was kept and 1 work item was refreshed");
-    expect(markup).toContain("Work item: Draft the answer");
-    expect(markup).toContain("Work item: Revise the answer");
+    expect(statuses.get("writer_agent")).toEqual({ kept: 1, fresh: 0, refreshed: 1, total: 2, action: "mixed" });
+    expect(markup).toContain("reused 1 previous result, checked 1 part again");
+    expect(markup).toContain("Assignment: Draft the answer");
+    expect(markup).toContain("Assignment: Revise the answer");
     expect(markup).not.toContain("99 agents");
+  });
+
+  it("distinguishes a fresh baseline from work that was checked again", () => {
+    const decisions = [
+      { step_id: "first", adapter: "researcher", action: "refreshed", reason: "no_matching_result" },
+      { step_id: "second", adapter: "reviewer", action: "refreshed", reason: "request_changed" }
+    ];
+    const markup = renderToStaticMarkup(createElement(WorldGraphChanges, {
+      run: {
+        run_id: "run_fresh_baseline",
+        status: "completed",
+        plan: { steps: [] },
+        world_graph: { validity: "unchecked", total: 2, decisions }
+      },
+      agents: [],
+      canWrite: true
+    }));
+    expect(worldGraphChangeCounts(decisions)).toEqual({ fresh: 1, rechecked: 1, reused: 0 });
+    expect(markup).toContain("Completed fresh now");
+    expect(markup).toContain("Checked again now");
+    expect(markup).toContain("There was no earlier validated result for this work.");
+  });
+
+  it("counts affected specialists uniquely and keeps runtime wording plain", () => {
+    expect(worldGraphUniqueWakeSpecialists({ decisions: [
+      { step_id: "draft", adapter: "writer", projected_action: "wake" },
+      { step_id: "revise", adapter: "writer", projected_action: "wake" },
+      { step_id: "facts", adapter: "researcher", projected_action: "keep" }
+    ] })).toBe(1);
+    expect(worldGraphPlainReason({
+      reason: "runtime_revision_changed_or_unverified",
+      plain_reason: "The Router runtime revision changed."
+    })).toBe("The underlying AI setup changed or could not be verified.");
   });
 
   it("progressively reveals new answers while server rendering and reduced motion retain the full text", () => {
@@ -359,7 +523,7 @@ describe("Agent Studio product surfaces", () => {
         }]
       }
     }));
-    expect(markup).toContain("Kept from earlier · no agent model call");
+    expect(markup).toContain("Reused from earlier · no specialist model call");
     expect(markup).toContain("0 calls");
     expect(markup).not.toContain("Provider token usage was not reported for this output");
   });
@@ -409,18 +573,18 @@ describe("Agent Studio product surfaces", () => {
       }]
     }));
 
-    expect(markup).toContain("AUTO-COMPOSER");
+    expect(markup).toContain("PROPOSED WORKFLOW");
     expect(markup).toContain("Proposed workflow handoff graph");
-    expect(markup).toContain("Your workspace");
+    expect(markup).toContain("Already on your team");
     expect(markup).toContain("Marketplace · maker");
-    expect(markup).toContain("New private agent");
+    expect(markup).toContain("Created for you");
     expect(markup).toContain("Tools: Web search");
-    expect(markup).toContain("Approve plan first");
+    expect(markup).toContain("Create the team first");
     expect(markup).not.toContain("Use Personal Gmail");
     expect(markup).not.toContain("Reconnect Old Gmail");
     expect(markup).not.toContain("Connect another");
     expect(markup).toContain("Review permissions and safety");
-    expect(markup).toContain("Approve plan");
+    expect(markup).toContain("Create this workflow");
     expect(markup).not.toContain("Send automatically");
 
     const approvedMarkup = renderToStaticMarkup(createElement(WorkflowDraftCard, {
@@ -492,7 +656,7 @@ describe("Agent Studio product surfaces", () => {
     expect(markup).toContain("Build the team");
     expect(markup).toContain("See a team in action");
     expect(markup).toContain("Your team handles the handoffs");
-    expect(markup).toContain("WORKSPACE FIRST");
+    expect(markup).toContain("YOUR TEAM FIRST");
     expect(markup).not.toContain("MODEL APIS");
     expect(markup).not.toMatch(/Switch providers/i);
     expect(markup).not.toMatch(/3 minute read/i);
@@ -561,7 +725,7 @@ describe("Agent Studio product surfaces", () => {
     expect(markup).toContain("Admin setup");
     expect(markup).toContain("Posting remains approval-gated");
     expect(markup).toContain("No endpoints or tokens to copy");
-    expect(markup).toContain("Custom MCP");
+    expect(markup).toContain("Advanced connection");
     expect(markup).not.toContain("HTTPS endpoint");
     expect(markup).not.toContain("Bearer token");
   });
@@ -579,7 +743,7 @@ describe("Agent Studio product surfaces", () => {
     expect(graphButtons).toHaveLength(2);
     expect(new Set(graphButtons.map((match) => match[0].match(/tone-\d/)?.[0])).size).toBe(2);
     expect(graphButtons.every((match) => !match[1].includes("<svg"))).toBe(true);
-    expect(markup).toContain("Connect agents");
+    expect(markup).toContain("Connect teammates");
     expect(markup).toContain('preserveAspectRatio="none"');
     expect(markup).not.toMatch(/LoRA|adapter model/i);
   });
@@ -602,9 +766,9 @@ describe("Agent Studio product surfaces", () => {
     }));
 
     expect(markup).toContain("world-mixed");
-    expect(markup).toContain("Latest answer: 1 kept, 1 refreshed");
-    expect(markup).toContain("1 work item kept from earlier · 1 refreshed now");
-    expect(markup).toContain("Lines show the current configured team links, not that answer&#x27;s execution path.");
+    expect(markup).toContain("Latest answer: 1 reused, 1 checked again");
+    expect(markup).toContain("1 previous result reused · 1 checked again");
+    expect(markup).toContain("The lines below show your saved handoffs.");
   });
 
   it("keeps the complete active API-agent catalog available to the session picker", () => {
@@ -669,6 +833,16 @@ describe("Agent Studio product surfaces", () => {
     }
   });
 
+  it("keeps configured handoffs visible for valid hyphenated agent ids", () => {
+    expect(graphConnections([
+      { id: "source-agent", resources: [], consumes: [] },
+      { id: "reply-writer", resources: ["agent:source-agent"], consumes: ["agent:source-agent:output"] }
+    ])).toEqual([
+      { from: "source-agent", to: "reply-writer", kind: "knowledge" },
+      { from: "source-agent", to: "reply-writer", kind: "handoff" }
+    ]);
+  });
+
   it("uses a collision-free visible grid and discloses agents outside the map limit", () => {
     const visibleAgents = Array.from({ length: 25 }, (_, index) => ({ id: `node_${index}`, title: `Agent ${index}`, enabled: true }));
     const positions = initialGraphPositions(visibleAgents);
@@ -684,8 +858,8 @@ describe("Agent Studio product surfaces", () => {
       agents: [...visibleAgents, ...Array.from({ length: 5 }, (_, index) => ({ id: `hidden_${index}`, title: `Hidden ${index}`, enabled: true }))],
       storageKey: ""
     }));
-    expect(markup).toContain("25 of 30 agents");
-    expect(markup).toContain("Lines involving hidden agents are omitted");
+    expect(markup).toContain("25 of 30 specialists");
+    expect(markup).toContain("Handoffs involving hidden specialists are omitted");
     expect(markup.match(/class="graph-node tone-/g)).toHaveLength(25);
   });
 
@@ -737,7 +911,17 @@ describe("Agent Studio product surfaces", () => {
     expect(originalSource).toEqual({ x: 100, y: 100 });
     expect(movedSource).toEqual({ x: 400, y: 300 });
     expect(movedPath).not.toEqual(originalPath);
-    expect(movedPath).toMatch(/^M 400 300 C /);
+    const endpoints = graphEdgeEndpoints(movedSource, destination);
+    expect(movedPath).toMatch(new RegExp(`^M ${endpoints.from.x} ${endpoints.from.y} C `));
+    expect(endpoints.from).not.toEqual(movedSource);
+    expect(endpoints.to).not.toEqual(destination);
+  });
+
+  it("keeps arrow endpoints ordered when graph bubbles overlap", () => {
+    const endpoints = graphEdgeEndpoints({ x: 100, y: 100 }, { x: 130, y: 100 }, { halfWidth: 80, halfHeight: 36 });
+    expect(endpoints.from.x).toBeLessThan(endpoints.to.x);
+    expect(endpoints.from.x).toBeGreaterThanOrEqual(100);
+    expect(endpoints.to.x).toBeLessThanOrEqual(130);
   });
 
   it("keeps a rendered bubble fully inside a narrow graph canvas", () => {
@@ -820,7 +1004,7 @@ describe("Agent Studio product surfaces", () => {
       onClose: () => undefined,
       onSaved: () => undefined
     }));
-    expect(publishMarkup).toContain("Agent description");
+    expect(publishMarkup).toContain("Specialist description");
     expect(publishMarkup).not.toMatch(/Achievements|Proof links|Version|License/);
 
     const detailMarkup = renderToStaticMarkup(createElement(MarketplaceAgentDialog, {
@@ -831,7 +1015,7 @@ describe("Agent Studio product surfaces", () => {
       onCopied: () => undefined
     }));
     expect(detailMarkup).toContain("Purpose and instructions");
-    expect(detailMarkup).toContain("Copy to my workspace");
+    expect(detailMarkup).toContain("Add to my team");
     expect(detailMarkup).toContain("Published by alice");
 
     const ratingMarkup = renderToStaticMarkup(createElement(RatingDialog, {
@@ -904,9 +1088,81 @@ describe("Agent Studio product surfaces", () => {
       onPublish: () => undefined,
       onUnpublish: () => undefined
     }));
-    expect(catalogMarkup).toContain("Edit description");
-    expect(catalogMarkup).toContain("Unpublish");
-    expect(catalogMarkup).toContain("Permanently delete Archived agent");
+    expect(catalogMarkup).toContain("Edit public description");
+    expect(catalogMarkup).toContain("Remove public listing");
+    expect(catalogMarkup).toContain("Delete permanently");
+  });
+
+  it("welcomes first-time users as the owner of a visible team", () => {
+    const markup = renderToStaticMarkup(createElement(EmptyTeamWelcome, {
+      workspace: { name: "Customer Care" },
+      agents: [
+        { id: "policy_reader", title: "Policy Reader", enabled: true, session_active: true },
+        { id: "reply_writer", title: "Reply Writer", enabled: true, session_active: true }
+      ]
+    }));
+    expect(markup).toContain("Customer Care is ready");
+    expect(markup).toContain("What should your team accomplish?");
+    expect(markup).toContain("2 available specialists");
+    expect(markup).toContain("Start with a request");
+    expect(markup).toContain("Build a repeatable workflow");
+    expect(markup).toContain("Manage your team");
+    expect(markup).not.toMatch(/\/workflow|\/agent/);
+  });
+
+  it("explains repeated WorldGraph work in plain language at answer level", () => {
+    const markup = renderToStaticMarkup(createElement(RunReceipt, {
+      run: {
+        status: "completed",
+        expert_outputs: [{ adapter: "brand" }, { adapter: "language" }],
+        sources: [],
+        outcome_contracts: [],
+        world_graph: {
+          total: 2,
+          kept: 0,
+          refreshed: 2,
+          decisions: [
+            { adapter: "brand", action: "refreshed", reason: "live_or_mutable_tool_available" },
+            { adapter: "language", action: "refreshed", reason: "live_or_mutable_tool_available" }
+          ]
+        }
+      }
+    }));
+    expect(markup).toContain("WorldGraph · 2 parts checked again · live information was enabled");
+  });
+
+  it("shows readable approval fields before exact technical arguments", () => {
+    const markup = renderToStaticMarkup(createElement(ApprovalArguments, {
+      argumentsValue: {
+        recipient_email: "customer@example.com",
+        subject: "Your replacement",
+        create_draft_only: true,
+        metadata: { source: "workflow" }
+      }
+    }));
+    expect(markup).toContain("Recipient Email");
+    expect(markup).toContain("customer@example.com");
+    expect(markup).toContain("Create Draft Only");
+    expect(markup).toContain("Yes");
+    expect(markup).toContain("Structured details included");
+    expect(markup).toContain("Technical details");
+    expect(markup).toContain("recipient_email");
+  });
+
+  it("keeps team creation primary and administrative actions secondary", () => {
+    const markup = renderToStaticMarkup(createElement(AgentCatalog, {
+      agents: [{ id: "planner", title: "Launch Planner", capability: "Plans launches.", enabled: true }],
+      workspaces: [{ agent_workspace_id: "team_1", name: "Launch Team", agent_count: 1, max_agents: 16 }],
+      activeWorkspace: { agent_workspace_id: "team_1", name: "Launch Team", agent_count: 1, max_agents: 16 },
+      auth: {},
+      sessionId: "session_1"
+    }));
+    expect(markup).toContain("Active team");
+    expect(markup).toContain("Add specialist");
+    expect(markup).toContain("Choose members");
+    expect(markup).toContain("More team actions");
+    expect(markup).toContain("Available for this chat");
+    expect(markup).not.toContain("No verified results yet");
   });
 
   it("opens published workspace agents with the same contract details as Marketplace agents", () => {
@@ -948,10 +1204,10 @@ describe("Agent Studio product surfaces", () => {
     }));
     expect(detailMarkup).toContain("Purpose and instructions");
     expect(detailMarkup).toContain("Use the supplied brief and identify missing context.");
-    expect(detailMarkup).toContain("web search");
+    expect(detailMarkup).toContain("Web search");
     expect(detailMarkup).toContain("Google Drive · Read files");
     expect(detailMarkup).toContain("first draft");
-    expect(detailMarkup).toContain("Back to workspace");
+    expect(detailMarkup).toContain("Back to team");
     expect(detailMarkup).toContain("Published by Alice");
   });
 
@@ -966,6 +1222,7 @@ describe("Agent Studio product surfaces", () => {
 
   it("keeps graph status labels readable and the mobile graph vertically reachable", () => {
     const styles = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
+    const appSource = readFileSync(new URL("../src/App.jsx", import.meta.url), "utf8");
     const nodeStatus = styles.match(/\.graph-node small\s*\{([\s\S]*?)\}/)?.[1] || "";
     const narrowGraph = styles.match(/@media \(max-width: 760px\)\s*\{([\s\S]*?)\.app-shell/)?.[1] || "";
     expect(nodeStatus).toContain("font-size: 11px");
@@ -974,5 +1231,11 @@ describe("Agent Studio product surfaces", () => {
     expect(styles).toMatch(/\.graph-canvas-scroll\s*\{[\s\S]*?overflow-x: auto;/);
     expect(styles).toMatch(/\.agent-graph\s*\{[\s\S]*?min-width: 800px;/);
     expect(styles).toContain(".graph-node.world-mixed");
+    expect(styles).toContain(".graph-node.world-fresh");
+    expect(styles).toMatch(/\.details-sheet-body > \.view-switch button\s*\{[\s\S]*?min-height: 44px;/);
+    expect(styles).toMatch(/\.quick-agent-menu\s*\{[\s\S]*?max-height: min\(420px, calc\(100dvh - 180px\)\);/);
+    expect(appSource).toContain('aria-haspopup="dialog"');
+    expect(appSource).toContain('role="dialog" aria-modal="false"');
+    expect(appSource).toContain('event.key !== "Escape"');
   });
 });

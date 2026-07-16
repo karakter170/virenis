@@ -91,7 +91,7 @@ beforeEach(async () => {
       artifact_validation: { valid: true },
       consumption_validation: { valid: true },
       source_validation: { valid: true, violations: [] },
-      allowed_tools: [],
+      allowed_tools: Array.isArray(runtimeAgent.tools) ? runtimeAgent.tools : [],
       tool_executions: [],
       execution_mode: reused ? "reused" : "executed",
       reused_from_artifact_id: candidate?.artifact_id || null,
@@ -240,11 +240,11 @@ afterEach(async () => {
   await fs.rm(tmpDir, { recursive: true, force: true });
 });
 
-async function send(sessionId) {
+async function send(sessionId, body = {}) {
   const queued = await request(app)
     .post(`/api/chat/sessions/${sessionId}/messages`)
     .set("Authorization", AUTH)
-    .send({ content: QUERY })
+    .send({ content: QUERY, ...body })
     .expect(202);
   expect((await app.locals.drainBackgroundTasks({ timeoutMs: 5000 })).ok).toBe(true);
   return request(app).get(`/api/chat/runs/${queued.body.run_id}`).set("Authorization", AUTH).expect(200);
@@ -261,7 +261,16 @@ describe.sequential("WorldGraph real-runtime bridge", () => {
     const cold = (await send(session.body.session_id)).body;
     expect(cold).toMatchObject({
       status: "completed",
-      world_graph: { kept: 0, refreshed: 1, total: 1 },
+      world_graph: {
+        kept: 0,
+        refreshed: 1,
+        total: 1,
+        preparation: {
+          capsule_created: false,
+          eligible_candidates: 0,
+          primary_reason: "no_matching_result"
+        }
+      },
       usage_receipt: { call_count: 2 }
     });
     expect(requests[0].world_graph).toBeUndefined();
@@ -271,7 +280,7 @@ describe.sequential("WorldGraph real-runtime bridge", () => {
     const repeatedCapsule = signedWorldGraphPayload(requests[1].world_graph);
     expect(repeatedCapsule).toMatchObject({
       schema_version: "virenis-world-graph-v1",
-      engine_revision: "world-graph-engine-v2",
+      engine_revision: "world-graph-engine-v3",
       scope: {
         target_run_id: repeated.run_id,
         workspace_id: "remote_workspace",
@@ -289,9 +298,28 @@ describe.sequential("WorldGraph real-runtime bridge", () => {
     });
     expect(repeated).toMatchObject({
       status: "completed",
-      world_graph: { kept: 1, refreshed: 0, total: 1 },
+      world_graph: {
+        kept: 1,
+        refreshed: 0,
+        total: 1,
+        preparation: {
+          status: "ready",
+          capsule_created: true,
+          eligible_candidates: 1,
+          primary_reason: "inputs_and_evidence_unchanged"
+        }
+      },
       usage_receipt: { call_count: 1 }
     });
+    expect(repeated.events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: "world_graph.prepared",
+        capsule_created: true,
+        eligible_candidates: 1
+      })
+    ]));
+    expect(JSON.stringify(repeated.world_graph.preparation)).not.toContain("replay_output");
+    expect(JSON.stringify(repeated.world_graph.preparation)).not.toContain("artifact_id");
     expect(repeated.events.filter((event) => event.type === "route.started")).toHaveLength(0);
     expect(repeated.events.filter((event) => event.type === "route.reused")).toHaveLength(1);
     expect(repeated.expert_outputs[0]).toMatchObject({
@@ -299,6 +327,88 @@ describe.sequential("WorldGraph real-runtime bridge", () => {
       execution_mode: "reused"
     });
     expect(repeated.usage_receipt.components.some((item) => item.kind === "agent")).toBe(false);
+  });
+
+  it("reuses a stable exact request when web search is authorized but was not used", async () => {
+    await app.locals.store.mutate((data) => {
+      const agent = data.agents.find((item) => item.id === "writing_synthesis_lora");
+      agent.tools = ["web_search"];
+      return agent;
+    });
+    runtimeAgent = app.locals.store.read().agents.find((item) => item.id === "writing_synthesis_lora");
+    const session = await request(app)
+      .post("/api/chat/sessions")
+      .set("Authorization", AUTH)
+      .send({ title: "Stable web-capable WorldGraph" })
+      .expect(201);
+
+    const cold = (await send(session.body.session_id)).body;
+    const repeated = (await send(session.body.session_id)).body;
+
+    expect(cold.world_graph).toMatchObject({ kept: 0, refreshed: 1 });
+    expect(signedWorldGraphPayload(requests[1].world_graph)?.candidates).toHaveLength(1);
+    expect(repeated.world_graph).toMatchObject({ kept: 1, refreshed: 0 });
+    expect(repeated.events.filter((event) => event.type === "route.reused")).toHaveLength(1);
+    expect(repeated.usage_receipt.components.some((item) => item.kind === "agent")).toBe(false);
+  });
+
+  it("reports why an exact repeat cannot reuse work when its approved workflow changes", async () => {
+    const session = await request(app)
+      .post("/api/chat/sessions")
+      .set("Authorization", AUTH)
+      .send({ title: "Workflow-bound WorldGraph" })
+      .expect(201);
+
+    const cold = (await send(session.body.session_id)).body;
+    const changedWorkflow = (await send(session.body.session_id, {
+      requested_agent_ids: ["writing_synthesis_lora"]
+    })).body;
+
+    expect(cold.world_graph).toMatchObject({ kept: 0, refreshed: 1 });
+    expect(requests[1].options.required_adapters).toEqual(["writing_synthesis_lora"]);
+    expect(requests[1].world_graph).toBeUndefined();
+    expect(changedWorkflow).toMatchObject({
+      status: "completed",
+      requested_agent_ids: ["writing_synthesis_lora"],
+      world_graph: {
+        kept: 0,
+        refreshed: 1,
+        preparation: {
+          status: "no_match",
+          capsule_created: false,
+          exact_request_artifacts: 1,
+          eligible_candidates: 0,
+          primary_reason: "execution_settings_changed",
+          exclusions: [expect.objectContaining({ reason: "execution_settings_changed", count: 1 })]
+        },
+        decisions: [expect.objectContaining({
+          adapter: "writing_synthesis_lora",
+          action: "refreshed",
+          reason: "execution_settings_changed"
+        })]
+      },
+      usage_receipt: { call_count: 2 }
+    });
+    expect(changedWorkflow.events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: "world_graph.prepared",
+        capsule_created: false,
+        eligible_candidates: 0,
+        primary_reason: "execution_settings_changed"
+      })
+    ]));
+    expect(JSON.stringify(changedWorkflow.world_graph.preparation)).not.toContain("replay_output");
+    expect(JSON.stringify(changedWorkflow.world_graph.preparation)).not.toContain("artifact_id");
+
+    // Once the same approved workflow repeats, the newer workflow-bound
+    // artifact is eligible and the specialist worker is skipped.
+    const sameWorkflow = (await send(session.body.session_id, {
+      requested_agent_ids: ["writing_synthesis_lora"]
+    })).body;
+    expect(signedWorldGraphPayload(requests[2].world_graph)?.candidates).toHaveLength(1);
+    expect(sameWorkflow.world_graph).toMatchObject({ kept: 1, refreshed: 0 });
+    expect(sameWorkflow.events.filter((event) => event.type === "route.started")).toHaveLength(0);
+    expect(sameWorkflow.usage_receipt.components.some((item) => item.kind === "agent")).toBe(false);
   });
 
   it("wakes the worker when the runtime model bytes change", async () => {

@@ -5,10 +5,10 @@ import { assertStoredDocumentIntegrity, scoreChunks, slugify } from "./documents
 import { executeRuntimeChat, realRuntimeEnabled, runtimeApiKey } from "./runtimeClient.js";
 import { agentRevision, digestValue, normalizeSha256Digest, realityRankMap, recordExecution } from "./outcomes.js";
 import {
+  prepareWorldGraphReplay,
   recordWorldGraphRun,
   selectWorldGraphSeedForStep,
-  worldGraphReplayCandidateIds,
-  worldGraphReplayCapsule
+  worldGraphReplayCandidateIds
 } from "./worldGraph.js";
 
 const MAX_MESSAGE_CHARS = 12000;
@@ -95,7 +95,7 @@ function producedContractSupportsInferredEdge(sourceAgent = {}, destinationAgent
   return producedContractSupportsContext(produces, consumes);
 }
 
-export function planRoutes({ query, agents, documents = [], agentRankings = {}, maxRoutingAdapters = 12 }) {
+export function planRoutes({ query, agents, documents = [], agentRankings = {}, maxRoutingAdapters = 12, requiredAgentIds = [] }) {
   const enabled = agents.filter((agent) => agent.enabled !== false && agent.runtime_sync_pending !== true);
   const hasAgent = (id) => enabled.some((agent) => agent.id === id);
   const lower = query.toLowerCase();
@@ -187,6 +187,59 @@ export function planRoutes({ query, agents, documents = [], agentRankings = {}, 
     activeAdds.delete(adapter);
     return result;
   };
+
+  const approvedWorkflowAgents = [...new Set(
+    (Array.isArray(requiredAgentIds) ? requiredAgentIds : [])
+      .map((agentId) => String(agentId || "").trim())
+      .filter((agentId) => agentId && hasAgent(agentId))
+  )];
+  if (approvedWorkflowAgents.length) {
+    if (approvedWorkflowAgents.length > specialistLimit) {
+      const error = new Error(`The approved workflow exceeds the ${specialistLimit}-specialist route limit.`);
+      error.code = "workflow_route_limit_exceeded";
+      throw error;
+    }
+    for (const agentId of approvedWorkflowAgents) {
+      const agent = enabled.find((candidate) => candidate.id === agentId);
+      addStep(agentId, `Complete the approved workflow assignment for ${agent?.title || "this specialist"}.`, [], {
+        adapter: agentId,
+        source: "approved_workflow",
+        confidence: 1,
+        reality_rank: rankingScore(agentRankings[agentId]),
+        reason: "Selected by the workflow the user approved."
+      });
+    }
+    const approvedSet = new Set(approvedWorkflowAgents);
+    for (const step of steps) {
+      const agent = enabled.find((candidate) => candidate.id === step.adapter);
+      const configuredDependencies = [
+        ...(agent?.consumes || []).map((value) => String(value || "").match(/^agent:([a-z0-9_]+):output$/)?.[1]),
+        ...(agent?.resources || []).map((value) => String(value || "").match(/^agent:([a-z0-9_]+)$/)?.[1])
+      ].filter((adapter) => adapter && adapter !== step.adapter && approvedSet.has(adapter));
+      step.depends_on = safeDependencyIds(step.id, [...new Set(configuredDependencies)]);
+    }
+    const plannedAdapters = new Set(steps.map((step) => step.adapter));
+    if (approvedWorkflowAgents.some((adapter) => !plannedAdapters.has(adapter))) {
+      const error = new Error("The approved workflow could not be compiled without dropping a requested specialist.");
+      error.code = "workflow_plan_incomplete";
+      throw error;
+    }
+    return {
+      steps,
+      routing: {
+        mode: "approved_workflow",
+        candidate_trace: [],
+        explicit_adapters: [],
+        selected: steps.map((step) => selections.get(step.adapter) || {
+          adapter: step.adapter,
+          source: "configured_handoff",
+          confidence: 1,
+          reality_rank: rankingScore(agentRankings[step.adapter]),
+          reason: "Included by the approved workflow's saved handoff."
+        })
+      }
+    };
+  }
 
   for (const agent of resolveExplicitAgentMentions(query, enabled)) {
     if (agent.id === "writing_synthesis_lora") continue;
@@ -714,6 +767,21 @@ async function processLocalChatRun({ store, bus, run_id, options = {} }) {
       documents: snapshot.documents,
       agentWorkspace
     });
+    const requiredAdapters = [...new Set(
+      (Array.isArray(snapshot.run.requested_agent_ids)
+        ? snapshot.run.requested_agent_ids
+        : Array.isArray(options.required_adapters)
+          ? options.required_adapters
+          : [])
+        .map((adapter) => String(adapter || "").trim())
+        .filter(Boolean)
+    )];
+    const allowedAdapterSet = new Set(scoped.allowedAdapters);
+    if (requiredAdapters.some((adapter) => !allowedAdapterSet.has(adapter))) {
+      const error = new Error("A workflow specialist is no longer available in the active team.");
+      error.code = "workflow_agent_unavailable";
+      throw error;
+    }
     const agentRankings = realityRankMap(snapshot, {
       agents: scoped.agents,
       workspaceId: snapshot.session?.workspace_id,
@@ -724,7 +792,8 @@ async function processLocalChatRun({ store, bus, run_id, options = {} }) {
       agents: scoped.agents,
       documents: scoped.documents,
       agentRankings,
-      maxRoutingAdapters: Number(options.max_routing_adapters) || 12
+      maxRoutingAdapters: Number(options.max_routing_adapters) || 12,
+      requiredAgentIds: requiredAdapters
     });
     const parallel = buildParallelBatches(plan.steps, Number(options.parallel_workers) || 2);
     await persistRunTransition({
@@ -990,23 +1059,28 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
       documents: snapshot.documents,
       agentWorkspace
     });
+    const requiredAdapters = [...new Set(
+      (Array.isArray(snapshot.run.requested_agent_ids)
+        ? snapshot.run.requested_agent_ids
+        : Array.isArray(options.required_adapters)
+          ? options.required_adapters
+          : [])
+        .map((adapter) => String(adapter || "").trim())
+        .filter(Boolean)
+    )];
+    const allowedAdapterSet = new Set(scoped.allowedAdapters);
+    if (requiredAdapters.some((adapter) => !allowedAdapterSet.has(adapter))) {
+      const error = new Error("A workflow specialist is no longer available in the active team.");
+      error.code = "workflow_agent_unavailable";
+      throw error;
+    }
     const agentRankings = realityRankMap(snapshot, {
       agents: scoped.agents,
       workspaceId: snapshot.session?.workspace_id,
       query
     });
-    await persistRunTransition({
-      store,
-      bus,
-      runId: run_id,
-      patch: { status: "planning", started_at: nowIso() },
-      events: [
-        { type: "run.started", run_id },
-        { type: "runtime.requested" }
-      ]
-    });
     const sharedMemory = normalizeSharedMemory(snapshot.session?.shared_memory || []);
-    const replayCapsule = worldGraphReplayCapsule({
+    const replayPreparation = prepareWorldGraphReplay({
       data: snapshot,
       run: snapshot.run,
       session: snapshot.session,
@@ -1016,6 +1090,27 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
       options,
       runFresh: options.run_fresh === true,
       signingKey: runtimeApiKey()
+    });
+    const replayCapsule = replayPreparation.capsule;
+    await persistRunTransition({
+      store,
+      bus,
+      runId: run_id,
+      patch: {
+        status: "planning",
+        started_at: nowIso(),
+        world_graph_preparation: replayPreparation.diagnostics
+      },
+      events: [
+        { type: "run.started", run_id },
+        {
+          type: "world_graph.prepared",
+          capsule_created: replayPreparation.diagnostics.capsule_created,
+          eligible_candidates: replayPreparation.diagnostics.eligible_candidates,
+          primary_reason: replayPreparation.diagnostics.primary_reason
+        },
+        { type: "runtime.requested" }
+      ]
     });
     const result = await executeRuntimeChat({
       query,
@@ -1037,6 +1132,7 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
         refiner_max_tokens: Number(options.refiner_max_tokens) || Number(process.env.TCAR_REFINER_MAX_TOKENS || 2048),
         temperature: Number(options.temperature ?? process.env.TCAR_TEMPERATURE ?? 0),
         allowed_adapters: scoped.allowedAdapters,
+        ...(requiredAdapters.length ? { required_adapters: requiredAdapters } : {}),
         agent_rankings: Object.fromEntries(
           Object.entries(agentRankings)
             .filter(([, ranking]) => ranking.routing_eligible === true)
@@ -1098,6 +1194,7 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
         sharedMemory,
         options,
         decisions: Array.isArray(result.worldGraph?.decisions) ? result.worldGraph.decisions : [],
+        preparation: replayPreparation.diagnostics,
         runtimeProvenance: result.componentProvenance || null,
         replayCandidateIds: worldGraphReplayCandidateIds(replayCapsule),
         createdAt: nowIso()
@@ -1158,6 +1255,7 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
         sharedMemory,
         options,
         decisions: Array.isArray(result.worldGraph?.decisions) ? result.worldGraph.decisions : [],
+        preparation: replayPreparation.diagnostics,
         // Component provenance binds model and executor bytes. The execution
         // receipt is audit metadata and intentionally cannot substitute for it.
         runtimeProvenance: result.componentProvenance || null,

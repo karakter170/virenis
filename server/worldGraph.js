@@ -5,12 +5,13 @@ import { runtimeApiKey } from "./runtimeClient.js";
 import { makeId, nowIso } from "./store.js";
 
 export const WORLD_GRAPH_SCHEMA_VERSION = "virenis-world-graph-v1";
-export const WORLD_GRAPH_ENGINE_REVISION = "world-graph-engine-v2";
+export const WORLD_GRAPH_ENGINE_REVISION = "world-graph-engine-v3";
 
 const WORLD_GRAPH_DIGEST_DOMAIN = "worldgraph-digest-v2\n";
 const WORLD_GRAPH_CAPSULE_ENCODING = "json-utf8-exact-v1";
 const WORLD_GRAPH_CAPSULE_SIGNATURE_DOMAIN = "worldgraph-reuse-envelope-v2\n";
 const WORLD_GRAPH_ARTIFACT_MAC_DOMAIN = "worldgraph-artifact-record-v1\n";
+const WORLD_GRAPH_EVENT_MAC_DOMAIN = "worldgraph-contest-event-v1\n";
 const replayCapsulePayloads = new WeakMap();
 
 const MAX_ARTIFACTS_PER_OWNER = 240;
@@ -189,12 +190,7 @@ function routeOptionState(options = {}) {
     max_tokens: Number(options.max_tokens) || null,
     refiner_max_tokens: Number(options.refiner_max_tokens) || null,
     temperature: Number(options.temperature) || 0,
-    runtime_mode: String(process.env.TCAR_ENGINE_MODE || "simulator"),
-    worker_model: String(process.env.VLLM_BASE_MODEL || ""),
-    worker_model_revision: String(process.env.VLLM_MODEL_REVISION || process.env.TCAR_MODEL_REVISION || ""),
-    provider: String(process.env.TCAR_SESSION_PROVIDER || ""),
-    provider_model: String(process.env.TCAR_SESSION_MODEL || ""),
-    provider_model_revision: String(process.env.TCAR_SESSION_MODEL_REVISION || "")
+    required_adapters: normalizedStrings(options.required_adapters)
   };
 }
 
@@ -248,11 +244,15 @@ function effectPolicy({ query, agent, output = null }) {
   const reasons = [];
   const agentIdentity = [agent?.id, agent?.title, ...(agent?.routing_cues || [])].join(" ").toLowerCase();
   const volatileSubject = String(query || "").toLowerCase().match(/\b(weather|price|stock|score|news|current|latest|live|recent)\b/)?.[1];
+  const mutableToolAvailable = allowedTools.some((tool) => !REPLAY_SAFE_TOOL_AVAILABILITY.has(tool));
   if (
     VOLATILE_QUERY.test(query)
-    && (allowedTools.some((tool) => VOLATILE_TOOLS.has(tool)) || (volatileSubject && agentIdentity.includes(volatileSubject)))
+    && (
+      mutableToolAvailable
+      || allowedTools.some((tool) => VOLATILE_TOOLS.has(tool))
+      || (volatileSubject && agentIdentity.includes(volatileSubject))
+    )
   ) reasons.push("time_sensitive_request");
-  if (allowedTools.some((tool) => !REPLAY_SAFE_TOOL_AVAILABILITY.has(tool))) reasons.push("live_or_mutable_tool_available");
   if (executedNames.some((tool) => VOLATILE_TOOLS.has(tool))) reasons.push("live_or_mutable_tool_used");
   if (executedNames.some((tool) => EFFECTFUL_TOOL.test(tool))) reasons.push("external_or_effectful_tool_used");
   if (executions.some((execution) => execution?.result?.approval_required === true)) reasons.push("approval_bound_action");
@@ -446,9 +446,35 @@ export function verifyWorldGraphArtifact(artifact) {
   );
 }
 
+function eventRecordHash(event) {
+  const { record_hash: _recordHash, ...body } = event || {};
+  const canonicalBody = worldGraphCanonicalJson(body);
+  const signingKey = runtimeApiKey();
+  if (String(signingKey).length >= 16) {
+    return `hmac-sha256:${crypto.createHmac("sha256", String(signingKey))
+      .update(WORLD_GRAPH_EVENT_MAC_DOMAIN, "utf8")
+      .update(canonicalBody, "utf8")
+      .digest("hex")}`;
+  }
+  return worldGraphDigest(body);
+}
+
+function verifyWorldGraphEvent(event) {
+  return Boolean(
+    event
+    && event.schema_version === WORLD_GRAPH_SCHEMA_VERSION
+    && event.event_type === "result.contested"
+    && event.record_hash === eventRecordHash(event)
+  );
+}
+
 function contestedArtifactIds(data) {
+  // Never promote an unsigned legacy/database-injected event into trusted
+  // audit truth during a read. Engine revision changes already invalidate old
+  // replay artifacts; any deliberate legacy migration belongs in an explicit,
+  // offline, scope-validating operation.
   return new Set((data.worldGraphEvents || [])
-    .filter((event) => event?.event_type === "result.contested")
+    .filter((event) => verifyWorldGraphEvent(event))
     .flatMap((event) => Array.isArray(event.artifact_ids) ? event.artifact_ids : []));
 }
 
@@ -667,6 +693,7 @@ export function recordWorldGraphRun({
   sharedMemory,
   options,
   decisions = [],
+  preparation = null,
   runtimeProvenance = null,
   replayCandidateIds = null,
   createdAt = nowIso()
@@ -782,7 +809,11 @@ export function recordWorldGraphRun({
     );
     if (conflicts.length && Number(options?.temperature || 0) === 0) {
       artifact.contested = true;
-      data.worldGraphEvents.push({
+      for (const conflict of conflicts) {
+        conflict.contested = true;
+        conflict.record_hash = artifactRecordHash(conflict);
+      }
+      const contestEvent = {
         event_id: makeId("wg_event"),
         schema_version: WORLD_GRAPH_SCHEMA_VERSION,
         event_type: "result.contested",
@@ -792,7 +823,9 @@ export function recordWorldGraphRun({
         adapter: step.adapter,
         artifact_ids: [...conflicts.map((item) => item.artifact_id), artifact.artifact_id],
         occurred_at: createdAt
-      });
+      };
+      contestEvent.record_hash = eventRecordHash(contestEvent);
+      data.worldGraphEvents.push(contestEvent);
     }
     artifact.record_hash = artifactRecordHash(artifact);
     data.worldGraphArtifacts.push(artifact);
@@ -804,6 +837,7 @@ export function recordWorldGraphRun({
     .filter(Boolean);
   const refreshed = completedOutputs.filter((item) => item.execution_mode !== "reused").length;
   const kept = completedOutputs.filter((item) => item.execution_mode === "reused").length;
+  const safePreparation = replayPreparationSummary(preparation || run.world_graph_preparation || {});
   run.world_graph = {
     schema_version: WORLD_GRAPH_SCHEMA_VERSION,
     kept,
@@ -818,10 +852,19 @@ export function recordWorldGraphRun({
         action: output?.execution_mode === "reused" ? "kept" : "refreshed",
         reason: output?.execution_mode === "reused"
           ? "inputs_and_evidence_unchanged"
-          : decision?.reason || "result_was_recomputed",
+          : (() => {
+            const runtimeReason = decision?.reason || "result_was_recomputed";
+            if (runtimeReason !== "no_matching_result") return runtimeReason;
+            const agentPreparation = safePreparation.agents.find((item) => item.adapter === step.adapter);
+            if (agentPreparation?.status === "excluded") return agentPreparation.reason;
+            return safePreparation.primary_reason !== "inputs_and_evidence_unchanged"
+              ? safePreparation.primary_reason
+              : runtimeReason;
+          })(),
         reused_from_run_id: output?.reused_from_run_id || decision?.origin_run_id || null
       };
     }),
+    preparation: safePreparation,
     created_at: createdAt
   };
   pruneWorldGraph(data, scope, Date.parse(createdAt));
@@ -876,6 +919,7 @@ export function pruneExpiredWorldGraphData(data, { now = Date.now() } = {}) {
 
 export function publicWorldGraphRun(run = {}) {
   const graph = run.world_graph || {};
+  const preparation = replayPreparationSummary(graph.preparation || run.world_graph_preparation || {});
   return {
     schema_version: graph.schema_version || WORLD_GRAPH_SCHEMA_VERSION,
     kept: Number(graph.kept) || 0,
@@ -892,6 +936,7 @@ export function publicWorldGraphRun(run = {}) {
       plain_reason: worldGraphReasonText(item.reason, item.action),
       reused_from_run_id: item.reused_from_run_id || null
     })) : [],
+    preparation,
     created_at: graph.created_at || null
   };
 }
@@ -1063,17 +1108,17 @@ export function previewWorldGraphRun({
 
 export function worldGraphReasonText(code, action = "") {
   const reasons = {
-    inputs_and_evidence_unchanged: "Its inputs, evidence, and agent instructions are unchanged.",
-    fresh_run_requested: "You asked every agent to check again.",
+    inputs_and_evidence_unchanged: "Its inputs, evidence, and specialist instructions are unchanged.",
+    fresh_run_requested: "You asked every specialist to check again.",
     no_matching_result: "No earlier validated result matched this work.",
-    agent_changed: "The agent's instructions or knowledge changed.",
-    agent_team_changed: "The active agent team changed since this answer ran.",
-    task_changed: "This agent received a different task.",
-    upstream_result_changed: "Work this agent relies on changed.",
-    dependencies_changed: "The handoff into this agent changed.",
+    agent_changed: "The specialist's instructions or knowledge changed.",
+    agent_team_changed: "The active team changed since this answer ran.",
+    task_changed: "This specialist received a different task.",
+    upstream_result_changed: "Work this specialist relies on changed.",
+    dependencies_changed: "The handoff into this specialist changed.",
     source_changed_or_unverifiable: "A source changed or could no longer be verified.",
     request_changed: "The request changed, so this work was checked again.",
-    conversation_context_changed: "Conversation context this agent uses changed.",
+    conversation_context_changed: "Conversation context this specialist uses changed.",
     execution_settings_changed: "The model or execution settings changed.",
     runtime_revision_changed_or_unverified: "The model or Router runtime revision changed or could not be verified.",
     stored_result_expired: "The earlier result was too old to keep.",
@@ -1087,15 +1132,81 @@ export function worldGraphReasonText(code, action = "") {
     external_or_effectful_tool_used: "External actions are never replayed.",
     approval_bound_action: "This work requires a new approval.",
     tool_result_requires_fresh_execution: "A tool result needed to be checked again.",
+    replay_signing_unavailable: "Verified reuse was unavailable, so the work was checked again.",
+    agent_unavailable: "The specialist was unavailable or still syncing.",
+    replay_payload_too_large: "The earlier result was too large to verify safely.",
+    duplicate_stored_result: "A newer matching result was considered instead.",
     reuse_provenance_unverified: "The earlier result could not be traced to a verified stored record.",
-    result_was_recomputed: "This agent checked its part of the answer now."
+    result_was_recomputed: "This specialist checked its part of the answer now."
   };
   return reasons[code] || (action === "kept"
     ? "The prior validated work is still current."
-    : "This agent checked its part of the answer now.");
+    : "This specialist checked its part of the answer now.");
 }
 
-export function worldGraphReplayCapsule({
+function replayPreparationSummary(value = {}) {
+  const exclusions = Array.isArray(value.exclusions) ? value.exclusions : [];
+  const agents = Array.isArray(value.agents) ? value.agents : [];
+  return {
+    status: ["ready", "no_match", "disabled"].includes(value.status) ? value.status : "no_match",
+    capsule_created: value.capsule_created === true,
+    artifacts_in_scope: Math.max(0, Number(value.artifacts_in_scope) || 0),
+    exact_request_artifacts: Math.max(0, Number(value.exact_request_artifacts) || 0),
+    eligible_candidates: Math.max(0, Number(value.eligible_candidates) || 0),
+    primary_reason: boundedText(value.primary_reason || "no_matching_result", 120),
+    plain_reason: worldGraphReasonText(value.primary_reason || "no_matching_result", "refresh"),
+    exclusions: exclusions.slice(0, 16).map((item) => ({
+      reason: boundedText(item?.reason || "no_matching_result", 120),
+      count: Math.max(0, Number(item?.count) || 0),
+      plain_reason: worldGraphReasonText(item?.reason || "no_matching_result", "refresh")
+    })),
+    agents: agents.slice(0, 24).map((item) => ({
+      adapter: boundedText(item?.adapter, 300),
+      status: item?.status === "eligible" ? "eligible" : "excluded",
+      reason: boundedText(item?.reason || "no_matching_result", 120),
+      plain_reason: item?.status === "eligible"
+        ? "A verified earlier result was available for comparison."
+        : worldGraphReasonText(item?.reason || "no_matching_result", "refresh")
+    }))
+  };
+}
+
+function newReplayPreparation() {
+  return {
+    status: "no_match",
+    capsule_created: false,
+    artifacts_in_scope: 0,
+    exact_request_artifacts: 0,
+    eligible_candidates: 0,
+    primary_reason: "no_matching_result",
+    exclusions: [],
+    agents: []
+  };
+}
+
+function addReplayExclusion(counts, agentReasons, reason, adapter = "") {
+  counts.set(reason, (counts.get(reason) || 0) + 1);
+  if (adapter && !agentReasons.has(adapter)) agentReasons.set(adapter, reason);
+}
+
+function finalizeReplayPreparation(preparation, counts, agentReasons, eligibleAdapters) {
+  preparation.exclusions = [...counts.entries()].map(([reason, count]) => ({ reason, count }));
+  preparation.agents = [...new Set([...agentReasons.keys(), ...eligibleAdapters])].map((adapter) => ({
+    adapter,
+    status: eligibleAdapters.has(adapter) ? "eligible" : "excluded",
+    reason: eligibleAdapters.has(adapter) ? "inputs_and_evidence_unchanged" : agentReasons.get(adapter) || "no_matching_result"
+  }));
+  if (preparation.eligible_candidates > 0) {
+    preparation.status = "ready";
+    preparation.capsule_created = true;
+    preparation.primary_reason = "inputs_and_evidence_unchanged";
+  } else if (preparation.primary_reason === "no_matching_result" && preparation.exclusions.length) {
+    preparation.primary_reason = preparation.exclusions[0].reason;
+  }
+  return replayPreparationSummary(preparation);
+}
+
+export function prepareWorldGraphReplay({
   data,
   run,
   session,
@@ -1107,7 +1218,28 @@ export function worldGraphReplayCapsule({
   signingKey = "",
   now = Date.now()
 }) {
-  if (runFresh || Number(options?.temperature || 0) !== 0 || String(signingKey).length < 16) return null;
+  const preparation = newReplayPreparation();
+  const exclusionCounts = new Map();
+  const agentReasons = new Map();
+  const eligibleAdapters = new Set();
+  if (runFresh) {
+    preparation.status = "disabled";
+    preparation.primary_reason = "fresh_run_requested";
+    addReplayExclusion(exclusionCounts, agentReasons, "fresh_run_requested");
+    return { capsule: null, diagnostics: finalizeReplayPreparation(preparation, exclusionCounts, agentReasons, eligibleAdapters) };
+  }
+  if (Number(options?.temperature || 0) !== 0) {
+    preparation.status = "disabled";
+    preparation.primary_reason = "creative_variation_requested";
+    addReplayExclusion(exclusionCounts, agentReasons, "creative_variation_requested");
+    return { capsule: null, diagnostics: finalizeReplayPreparation(preparation, exclusionCounts, agentReasons, eligibleAdapters) };
+  }
+  if (String(signingKey).length < 16) {
+    preparation.status = "disabled";
+    preparation.primary_reason = "replay_signing_unavailable";
+    addReplayExclusion(exclusionCounts, agentReasons, "replay_signing_unavailable");
+    return { capsule: null, diagnostics: finalizeReplayPreparation(preparation, exclusionCounts, agentReasons, eligibleAdapters) };
+  }
   const scope = scopeFor({ run, session });
   const queryDigest = worldGraphDigest(normalizedQuery(run?.query));
   const agentsById = new Map((agents || []).map((agent) => [agent.id, agent]));
@@ -1115,27 +1247,76 @@ export function worldGraphReplayCapsule({
   const seenCandidates = new Set();
   let totalBytes = 0;
   const contested = contestedArtifactIds(data);
-  for (const artifact of [...(data.worldGraphArtifacts || [])]
-    .filter((item) => sameScope(item, scope) && item.input_envelope?.query_digest === queryDigest)
-    .sort((left, right) => String(right.created_at).localeCompare(String(left.created_at)))) {
+  const scopedArtifacts = [...(data.worldGraphArtifacts || [])]
+    .filter((item) => sameScope(item, scope))
+    .sort((left, right) => String(right.created_at).localeCompare(String(left.created_at)));
+  preparation.artifacts_in_scope = scopedArtifacts.length;
+  const exactRequestArtifacts = scopedArtifacts.filter((item) => item.input_envelope?.query_digest === queryDigest);
+  preparation.exact_request_artifacts = exactRequestArtifacts.length;
+  if (!exactRequestArtifacts.length) {
+    preparation.primary_reason = scopedArtifacts.length ? "request_changed" : "no_matching_result";
+    addReplayExclusion(exclusionCounts, agentReasons, preparation.primary_reason);
+    return { capsule: null, diagnostics: finalizeReplayPreparation(preparation, exclusionCounts, agentReasons, eligibleAdapters) };
+  }
+  for (const artifact of exactRequestArtifacts) {
     if (candidates.length >= 24) break;
-    if (!verifyWorldGraphArtifact(artifact) || artifact.contested || contested.has(artifact.artifact_id) || !artifactAgeValid(artifact, now, options)) continue;
-    if (artifact.effect_policy?.replayable !== true) continue;
+    const adapter = String(artifact.adapter || artifact.input_envelope?.adapter || "");
+    if (!verifyWorldGraphArtifact(artifact)) {
+      addReplayExclusion(exclusionCounts, agentReasons, "stored_result_failed_integrity_check", adapter);
+      continue;
+    }
+    if (artifact.contested || contested.has(artifact.artifact_id)) {
+      addReplayExclusion(exclusionCounts, agentReasons, "stored_results_disagree", adapter);
+      continue;
+    }
+    if (!artifactAgeValid(artifact, now, options)) {
+      addReplayExclusion(exclusionCounts, agentReasons, "stored_result_expired", adapter);
+      continue;
+    }
+    if (artifact.effect_policy?.replayable !== true) {
+      addReplayExclusion(
+        exclusionCounts,
+        agentReasons,
+        artifact.effect_policy?.reasons?.[0] || "result_requires_fresh_execution",
+        adapter
+      );
+      continue;
+    }
     if (
       String(process.env.TCAR_ENGINE_MODE || "simulator").toLowerCase() === "real"
       && !normalizedRuntimeComponentState(artifact.runtime_component_state)
-    ) continue;
+    ) {
+      addReplayExclusion(exclusionCounts, agentReasons, "runtime_revision_changed_or_unverified", adapter);
+      continue;
+    }
     const agent = agentsById.get(artifact.adapter);
-    if (!agent || agent.enabled === false || agent.runtime_sync_pending === true) continue;
-    if (artifact.input_envelope.agent_revision !== agentRevision(agent)) continue;
-    if (artifact.input_envelope.source_state_digest !== worldGraphDigest(sourceStateForAgent(agent, documents))) continue;
-    if (!sourceStateReplayable(agent, documents)) continue;
+    if (!agent || agent.enabled === false || agent.runtime_sync_pending === true) {
+      addReplayExclusion(exclusionCounts, agentReasons, "agent_unavailable", adapter);
+      continue;
+    }
+    if (artifact.input_envelope.agent_revision !== agentRevision(agent)) {
+      addReplayExclusion(exclusionCounts, agentReasons, "agent_changed", adapter);
+      continue;
+    }
+    if (artifact.input_envelope.source_state_digest !== worldGraphDigest(sourceStateForAgent(agent, documents)) || !sourceStateReplayable(agent, documents)) {
+      addReplayExclusion(exclusionCounts, agentReasons, "source_changed_or_unverifiable", adapter);
+      continue;
+    }
     const memory = memoryState(agent, sharedMemory);
     const currentMemoryDigest = memory === null ? null : worldGraphDigest(memory);
-    if (artifact.input_envelope.memory_digest !== currentMemoryDigest) continue;
-    if (artifact.input_envelope.route_options_digest !== worldGraphDigest(routeOptionState(options))) continue;
+    if (artifact.input_envelope.memory_digest !== currentMemoryDigest) {
+      addReplayExclusion(exclusionCounts, agentReasons, "conversation_context_changed", adapter);
+      continue;
+    }
+    if (artifact.input_envelope.route_options_digest !== worldGraphDigest(routeOptionState(options))) {
+      addReplayExclusion(exclusionCounts, agentReasons, "execution_settings_changed", adapter);
+      continue;
+    }
     const candidateKey = `${artifact.adapter}\0${artifact.envelope_digest}`;
-    if (seenCandidates.has(candidateKey)) continue;
+    if (seenCandidates.has(candidateKey)) {
+      addReplayExclusion(exclusionCounts, agentReasons, "duplicate_stored_result", adapter);
+      continue;
+    }
     const candidate = {
       artifact_id: artifact.artifact_id,
       origin_run_id: artifact.origin_run_id,
@@ -1148,12 +1329,19 @@ export function worldGraphReplayCapsule({
       record_hash: artifact.record_hash
     };
     const bytes = Buffer.byteLength(JSON.stringify(candidate), "utf8");
-    if (bytes > MAX_REPLAY_BYTES || totalBytes + bytes > MAX_CAPSULE_BYTES) continue;
+    if (bytes > MAX_REPLAY_BYTES || totalBytes + bytes > MAX_CAPSULE_BYTES) {
+      addReplayExclusion(exclusionCounts, agentReasons, "replay_payload_too_large", adapter);
+      continue;
+    }
     totalBytes += bytes;
     seenCandidates.add(candidateKey);
     candidates.push(candidate);
+    eligibleAdapters.add(adapter);
   }
-  if (!candidates.length) return null;
+  preparation.eligible_candidates = candidates.length;
+  if (!candidates.length) {
+    return { capsule: null, diagnostics: finalizeReplayPreparation(preparation, exclusionCounts, agentReasons, eligibleAdapters) };
+  }
   const issuedAt = new Date(now).toISOString();
   const capsule = {
     schema_version: WORLD_GRAPH_SCHEMA_VERSION,
@@ -1191,7 +1379,14 @@ export function worldGraphReplayCapsule({
   // exact wrapper bytes cross the network, while the caller can still bind a
   // runtime reuse claim to candidates from this specific in-process capsule.
   replayCapsulePayloads.set(wrapper, capsule);
-  return wrapper;
+  return {
+    capsule: wrapper,
+    diagnostics: finalizeReplayPreparation(preparation, exclusionCounts, agentReasons, eligibleAdapters)
+  };
+}
+
+export function worldGraphReplayCapsule(options) {
+  return prepareWorldGraphReplay(options).capsule;
 }
 
 export function worldGraphReplayCandidateIds(wrapper) {

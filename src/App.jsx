@@ -55,7 +55,7 @@ import {
   X
 } from "lucide-react";
 import { UserButton, useAuth, useClerk } from "@clerk/react";
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { forwardRef, useEffect, useId, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
@@ -145,10 +145,10 @@ function friendlyError(error) {
     .replace(/TCAR/gi, "the service")
     .replace(/vLLM/gi, "the model service")
     .replace(/adapter models?/gi, "models")
-    .replace(/adapter id/gi, "agent id")
+    .replace(/adapter id/gi, "specialist id")
     .replace(/adapter source/gi, "model source")
-    .replace(/adapters/gi, "agents")
-    .replace(/adapter/gi, "agent");
+    .replace(/adapters/gi, "specialists")
+    .replace(/adapter/gi, "specialist");
 }
 
 export function availableSessionAgents(agents = []) {
@@ -163,6 +163,18 @@ export function agentsForWorkspace(agents = [], workspace = null) {
   if (!workspace || !Array.isArray(workspace.agent_ids)) return [];
   const memberIds = new Set(workspace.agent_ids.map((agentId) => String(agentId || "")).filter(Boolean));
   return agents.filter((agent) => memberIds.has(String(agent?.id || "")));
+}
+
+export function workflowRunRequest(workflow = {}) {
+  const requestedAgentIds = [...new Set(
+    (Array.isArray(workflow.activation?.node_agents) ? workflow.activation.node_agents : [])
+      .map((item) => String(item?.agent_id || "").trim())
+      .filter(Boolean)
+  )];
+  return {
+    content: String(workflow.intent || "").trim(),
+    requestedAgentIds
+  };
 }
 
 function workflowRequirementConnectionCandidates(requirement, connections = []) {
@@ -217,8 +229,8 @@ function emptyMetrics() {
 
 function runStatusLabel(status) {
   if (status === "queued") return "Getting ready";
-  if (status === "planning") return "Choosing agents";
-  if (status === "running") return "Agents are working";
+  if (status === "planning") return "Choosing teammates";
+  if (status === "running") return "Your team is working";
   if (status === "synthesizing") return "Composing the answer";
   if (status === "completed") return "Complete";
   if (status === "failed") return "Could not complete";
@@ -227,8 +239,8 @@ function runStatusLabel(status) {
 
 function agentFacingText(value, fallback = "") {
   const cleaned = String(value || "")
-    .replace(/\bLoRAs\b/gi, "agents")
-    .replace(/\bLoRA\b/gi, "agent")
+    .replace(/\bLoRAs\b/gi, "specialists")
+    .replace(/\bLoRA\b/gi, "specialist")
     .replace(/\badapter models?\b/gi, "models")
     .replace(/\badapters?\b/gi, "models")
     .replace(/\s+/g, " ")
@@ -240,7 +252,7 @@ function formatAgentName(agentId, agents) {
   const agent = agents.find((item) => item.id === agentId);
   const title = agentFacingText(agent?.title);
   if (title && title.length <= 58) return title;
-  return String(agentId || "Agent")
+  return String(agentId || "Specialist")
     .replace(/_lora$/i, "")
     .replace(/^custom_[a-z0-9]+_/i, "")
     .replace(/_/g, " ")
@@ -400,7 +412,7 @@ export default function App() {
   }
   if (route.surface === "identity") {
     if (isSignedIn && recoveryPage) return recoveryPage;
-    if (isSignedIn) return <div className="center-state app-auth-loading" role="status"><LoaderCircle className="spin" size={20} /><span>Opening your workspace</span></div>;
+    if (isSignedIn) return <div className="center-state app-auth-loading" role="status"><LoaderCircle className="spin" size={20} /><span>Opening your account</span></div>;
     return (
       <IdentityPage
         mode={route.mode}
@@ -493,13 +505,15 @@ function Workspace({ onHome, onSignedOut }) {
   const [workspaceDeleteTarget, setWorkspaceDeleteTarget] = useState(null);
   const [workflowWorkspacePrompt, setWorkflowWorkspacePrompt] = useState(null);
   const [teamNotice, setTeamNotice] = useState("");
+  const [teamSwitcherOpen, setTeamSwitcherOpen] = useState(false);
   const threadRef = useRef(null);
   const nearBottomRef = useRef(true);
   const eventSourceRef = useRef(null);
+  const teamSwitcherRef = useRef(null);
+  const teamMenuRef = useRef(null);
   const sendInFlightRef = useRef(false);
   const sendRetryRef = useRef(null);
   const progressivelyRenderedRunIdsRef = useRef(new Set());
-  const workflowWorkspaceConfirmedRef = useRef(false);
   const oauthReturnRef = useRef((() => {
     const parameters = new URLSearchParams(window.location.search);
     return {
@@ -527,6 +541,47 @@ function Workspace({ onHome, onSignedOut }) {
     const timer = window.setTimeout(() => setTeamNotice(""), 5200);
     return () => window.clearTimeout(timer);
   }, [teamNotice]);
+
+  useEffect(() => {
+    if (!teamSwitcherOpen) return undefined;
+    const focusTimer = window.requestAnimationFrame(() => {
+      const selected = teamMenuRef.current?.querySelector('[role="menuitemradio"][aria-checked="true"]');
+      const first = teamMenuRef.current?.querySelector('[role="menuitemradio"]');
+      (selected || first)?.focus();
+    });
+    const closeOutside = (event) => {
+      if (event.type === "keydown" && event.key === "Escape") {
+        setTeamSwitcherOpen(false);
+        teamSwitcherRef.current?.querySelector(".active-team-control")?.focus();
+        return;
+      }
+      if (event.type === "pointerdown" && !teamSwitcherRef.current?.contains(event.target)) setTeamSwitcherOpen(false);
+    };
+    document.addEventListener("pointerdown", closeOutside);
+    document.addEventListener("keydown", closeOutside);
+    return () => {
+      window.cancelAnimationFrame(focusTimer);
+      document.removeEventListener("pointerdown", closeOutside);
+      document.removeEventListener("keydown", closeOutside);
+    };
+  }, [teamSwitcherOpen]);
+
+  function handleTeamMenuKeyDown(event) {
+    if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+    const items = [...(teamMenuRef.current?.querySelectorAll('[role="menuitemradio"], [role="menuitem"]') || [])]
+      .filter((item) => !item.disabled);
+    if (!items.length) return;
+    event.preventDefault();
+    const currentIndex = items.indexOf(document.activeElement);
+    const nextIndex = event.key === "Home"
+      ? 0
+      : event.key === "End"
+        ? items.length - 1
+        : event.key === "ArrowDown"
+          ? (currentIndex + 1 + items.length) % items.length
+          : (currentIndex - 1 + items.length) % items.length;
+    items[nextIndex].focus();
+  }
 
   useEffect(() => {
     const parameters = new URLSearchParams(window.location.search);
@@ -891,23 +946,26 @@ function Workspace({ onHome, onSignedOut }) {
     return result;
   }
 
-  async function sendMessage(event, contentOverride = null) {
+  async function sendMessage(event, contentOverride = null, requestMetadata = {}) {
     event?.preventDefault();
     const content = String(contentOverride ?? draft).trim();
+    const requestedAgentIds = [...new Set(
+      (Array.isArray(requestMetadata.requestedAgentIds) ? requestMetadata.requestedAgentIds : [])
+        .map((agentId) => String(agentId || "").trim())
+        .filter(Boolean)
+    )];
     if (!content || !session || !canWrite || sendInFlightRef.current) return;
-    const workflowCommand = /^\/(workflow|agent)\s+\S/i.test(content);
-    if (workflowCommand && !workflowWorkspaceConfirmedRef.current) {
-      setWorkflowWorkspacePrompt({ content });
-      return;
-    }
-    workflowWorkspaceConfirmedRef.current = false;
     const previousSubmission = sendRetryRef.current;
+    const routingKey = requestedAgentIds.join("|");
     const submission = previousSubmission?.content === content
       && previousSubmission?.sessionId === session.session_id
+      && previousSubmission?.routingKey === routingKey
       ? previousSubmission
       : {
           content,
           sessionId: session.session_id,
+          routingKey,
+          requestedAgentIds,
           idempotencyKey: mutationIdempotencyKey("message")
         };
     sendInFlightRef.current = true;
@@ -926,6 +984,7 @@ function Workspace({ onHome, onSignedOut }) {
       const queued = await api.post(`/api/chat/sessions/${encodeURIComponent(session.session_id)}/messages`, {
         content,
         attachments: [],
+        ...(submission.requestedAgentIds.length ? { requested_agent_ids: submission.requestedAgentIds } : {}),
         options: { show_route_details: true }
       }, { idempotencyKey: submission.idempotencyKey });
       sendRetryRef.current = null;
@@ -1031,6 +1090,9 @@ function Workspace({ onHome, onSignedOut }) {
       const queued = await api.post(`/api/chat/sessions/${encodeURIComponent(session.session_id)}/messages`, {
         content,
         attachments: [],
+        ...(Array.isArray(run?.requested_agent_ids) && run.requested_agent_ids.length
+          ? { requested_agent_ids: run.requested_agent_ids }
+          : {}),
         options: {
           ...(run?.execution_options || {}),
           show_route_details: true,
@@ -1092,7 +1154,7 @@ function Workspace({ onHome, onSignedOut }) {
     return current;
   }
 
-  async function decideWorkflowDraft(workflow, decision) {
+  async function submitWorkflowDecision(workflow, decision) {
     if (!workflow || workflowBusy) return;
     setWorkflowBusy(workflow.workflow_id);
     setError("");
@@ -1109,6 +1171,21 @@ function Workspace({ onHome, onSignedOut }) {
     } finally {
       setWorkflowBusy("");
     }
+  }
+
+  async function decideWorkflowDraft(workflow, decision) {
+    if (!workflow || workflowBusy) return;
+    if (decision === "approve") {
+      const requiredCapacity = workflowProposedNewSpecialists(workflow, activeAgentWorkspace);
+      if (
+        requiredCapacity > 0
+        && (!activeAgentWorkspace || !workflowWorkspaceHasCapacity(activeAgentWorkspace, requiredCapacity))
+      ) {
+        setWorkflowWorkspacePrompt(workflow);
+        return;
+      }
+    }
+    await submitWorkflowDecision(workflow, decision);
   }
 
   async function resumeWorkflow(workflow) {
@@ -1186,17 +1263,24 @@ function Workspace({ onHome, onSignedOut }) {
   }
 
   async function runWorkflow(workflow) {
+    if (!workflow || workflowBusy) return;
+    setWorkflowBusy(workflow.workflow_id);
+    setError("");
     try {
       if (workflow.agent_workspace_id && workflow.agent_workspace_id !== session?.agent_workspace_id) {
         await switchAgentWorkspace(workflow.agent_workspace_id, { refresh: false });
       }
     } catch (workspaceError) {
       setError(friendlyError(workspaceError));
+      setWorkflowBusy("");
       return;
     }
-    const agentIds = (workflow.activation?.node_agents || []).map((item) => item.agent_id).filter(Boolean);
-    const mentions = agentIds.map((agentId) => `@${agentId}`).join(" ");
-    await sendMessage(null, `${mentions}${mentions ? " " : ""}${workflow.intent}`.trim());
+    try {
+      const request = workflowRunRequest(workflow);
+      await sendMessage(null, request.content, { requestedAgentIds: request.requestedAgentIds });
+    } finally {
+      setWorkflowBusy("");
+    }
   }
 
   async function decideToolCheckpoint(checkpoint, approval, decision) {
@@ -1297,7 +1381,7 @@ function Workspace({ onHome, onSignedOut }) {
   async function setGraphConnection(fromId, toId, connected) {
     if (!canWrite || !fromId || !toId || fromId === toId) return;
     const target = agents.find((agent) => agent.id === toId);
-    if (!target) throw new Error("The destination agent is no longer available.");
+    if (!target) throw new Error("The receiving specialist is no longer available.");
     setError("");
     try {
       const updated = await api.patch(`/api/agents/${encodeURIComponent(toId)}`, {
@@ -1537,22 +1621,42 @@ function Workspace({ onHome, onSignedOut }) {
 
         <div className="composer-zone">
           {!auth?.is_viewer && activeAgentWorkspace && (
-            <button
-              type="button"
-              className="active-team-control"
-              aria-label={`Manage ${activeAgentWorkspace.name || "active team"}`}
-              onClick={() => {
-                setResourceView("agents");
-                setResourcesOpen(true);
-              }}
-            >
-              <span className="active-team-icon"><Layers3 size={14} /></span>
-              <span>
-                <strong>{activeAgentWorkspace.name || "General team"}</strong>
-                <small>{activeAgentWorkspaceAgents.filter((agent) => agent.enabled !== false && agent.session_active !== false).length} available for this chat</small>
-              </span>
-              <ChevronDown size={14} />
-            </button>
+            <div className="active-team-switcher" ref={teamSwitcherRef}>
+              <button
+                type="button"
+                className="active-team-control"
+                aria-label={`Switch or manage ${activeAgentWorkspace.name || "active team"}`}
+                aria-expanded={teamSwitcherOpen}
+                onClick={() => setTeamSwitcherOpen((open) => !open)}
+              >
+                <span className="active-team-icon"><Layers3 size={14} /></span>
+                <span>
+                  <strong>{activeAgentWorkspace.name || "General team"}</strong>
+                  <small>{activeAgentWorkspaceAgents.filter((agent) => agent.enabled !== false && agent.session_active !== false).length} available for this chat</small>
+                </span>
+                <ChevronDown size={14} />
+              </button>
+              {teamSwitcherOpen && (
+                <div className="active-team-menu" ref={teamMenuRef} role="menu" aria-label="Choose the active team" onKeyDown={handleTeamMenuKeyDown}>
+                  <header><strong>Choose your team</strong><small>The chat and available specialists switch together.</small></header>
+                  <div>
+                    {agentWorkspaces.map((workspace) => {
+                      const memberCount = agentsForWorkspace(agents, workspace).filter((agent) => agent.enabled !== false).length;
+                      const selected = workspace.agent_workspace_id === activeAgentWorkspace.agent_workspace_id;
+                      return <button type="button" role="menuitemradio" aria-checked={selected} className={selected ? "selected" : ""} key={workspace.agent_workspace_id} onClick={() => {
+                        setTeamSwitcherOpen(false);
+                        if (!selected) switchAgentWorkspace(workspace.agent_workspace_id).catch((switchError) => setError(friendlyError(switchError)));
+                      }}><span><strong>{workspace.name}</strong><small>{memberCount} specialist{memberCount === 1 ? "" : "s"}</small></span>{selected && <Check size={14} />}</button>;
+                    })}
+                  </div>
+                  <button type="button" role="menuitem" className="manage-teams-link" onClick={() => {
+                    setTeamSwitcherOpen(false);
+                    setResourceView("agents");
+                    setResourcesOpen(true);
+                  }}><Settings2 size={14} />Manage teams and specialists</button>
+                </div>
+              )}
+            </div>
           )}
           {teamNotice && (
             <div className="team-notice" role="status">
@@ -1801,20 +1905,19 @@ function Workspace({ onHome, onSignedOut }) {
       {workflowWorkspacePrompt && (
         <WorkflowWorkspaceDialog
           workspaces={agentWorkspaces}
+          workflow={workflowWorkspacePrompt}
           activeWorkspaceId={activeAgentWorkspace?.agent_workspace_id || ""}
           onClose={() => setWorkflowWorkspacePrompt(null)}
           onConfirm={async (workspaceId) => {
             await switchAgentWorkspace(workspaceId, { refresh: false });
-            workflowWorkspaceConfirmedRef.current = true;
             setWorkflowWorkspacePrompt(null);
-            await sendMessage();
+            await submitWorkflowDecision(workflowWorkspacePrompt, "approve");
           }}
           onCreated={async (workspace) => {
             setAgentWorkspaces((items) => [...items, workspace]);
             await switchAgentWorkspace(workspace.agent_workspace_id, { refresh: false });
-            workflowWorkspaceConfirmedRef.current = true;
             setWorkflowWorkspacePrompt(null);
-            await sendMessage();
+            await submitWorkflowDecision(workflowWorkspacePrompt, "approve");
           }}
         />
       )}
@@ -1855,7 +1958,7 @@ function Workspace({ onHome, onSignedOut }) {
               const sourceWorkspace = agentWorkspaces.find((workspace) => workspace.agent_workspace_id === item.id);
               if (!sourceWorkspace) {
                 setMarketplaceTarget(null);
-                setError("The source workspace is no longer available.");
+                setError("That shared team is no longer available.");
                 setResourcesOpen(true);
                 setResourceView("marketplace");
                 return;
@@ -1877,7 +1980,7 @@ function Workspace({ onHome, onSignedOut }) {
             const sourceAgent = agents.find((agent) => agent.id === item.id);
             if (!sourceAgent) {
               setMarketplaceTarget(null);
-              setError("The source agent is no longer available in this workspace.");
+              setError("That specialist is no longer available on this team.");
               setResourcesOpen(true);
               setResourceView("marketplace");
               return;
@@ -1947,9 +2050,9 @@ function Workspace({ onHome, onSignedOut }) {
 
       {archiveTarget && (
         <ConfirmDialog
-          title="Archive agent?"
-          message={`${archiveTarget.title || "This agent"} will no longer be available for new answers.`}
-          confirmLabel="Archive"
+          title="Archive this specialist?"
+          message={`${archiveTarget.title || "This specialist"} will no longer be available for new assignments. Existing answers stay unchanged.`}
+          confirmLabel="Archive specialist"
           destructive
           onClose={() => {
             setArchiveTarget(null);
@@ -1962,8 +2065,8 @@ function Workspace({ onHome, onSignedOut }) {
 
       {deleteAgentTarget && (
         <ConfirmDialog
-          title="Delete archived agent permanently?"
-          message={`${deleteAgentTarget.title || "This archived agent"} and its Marketplace listing will be permanently removed. This cannot be undone.`}
+          title="Delete this archived specialist permanently?"
+          message={`${deleteAgentTarget.title || "This archived specialist"} and its public listing will be permanently removed. This cannot be undone.`}
           confirmLabel="Delete permanently"
           destructive
           icon={Trash2}
@@ -1978,9 +2081,9 @@ function Workspace({ onHome, onSignedOut }) {
 
       {unpublishTarget && (
         <ConfirmDialog
-          title="Remove from Marketplace?"
-          message={`${unpublishTarget.item?.title || "This agent"} will no longer be visible in the Marketplace. The agent will stay in your workspace.`}
-          confirmLabel="Unpublish"
+          title="Remove public listing?"
+          message={`${unpublishTarget.item?.title || "This specialist"} will no longer be visible in Discover. Your private copy stays on its team.`}
+          confirmLabel="Remove listing"
           destructive
           icon={Globe2}
           onClose={() => {
@@ -1995,9 +2098,9 @@ function Workspace({ onHome, onSignedOut }) {
 
       {workspaceDeleteTarget && (
         <ConfirmDialog
-          title="Delete workspace?"
-          message={`${workspaceDeleteTarget.name} will be removed. Its agents remain available and chats using it will switch to General.`}
-          confirmLabel="Delete workspace"
+          title="Delete this team?"
+          message={`${workspaceDeleteTarget.name} will be removed. Its specialists remain yours, and chats using it will switch to General.`}
+          confirmLabel="Delete team"
           destructive
           icon={Trash2}
           onClose={() => {
@@ -2096,9 +2199,10 @@ function findPreviousUser(messages, index) {
   return null;
 }
 
-function IconButton({ label, children, compact = false, className = "", ...props }) {
+const IconButton = forwardRef(function IconButton({ label, children, compact = false, className = "", ...props }, ref) {
   return (
     <button
+      ref={ref}
       className={`icon-button tooltip-control ${compact ? "compact" : ""} ${className}`.trim()}
       type="button"
       aria-label={label}
@@ -2109,7 +2213,7 @@ function IconButton({ label, children, compact = false, className = "", ...props
       {children}
     </button>
   );
-}
+});
 
 function ModalSurface({ title, description, side, onClose, children, className = "", closeDisabled = false }) {
   const titleId = useId();
@@ -2331,7 +2435,7 @@ export function WorkflowDraftCard({
 
       <WorkflowMiniGraph nodes={workflow.nodes || []} edges={workflow.edges || []} />
 
-      <div className="workflow-agent-sources" aria-label="Selected agents">
+      <div className="workflow-agent-sources" aria-label="Selected specialists">
         {agentNodes.map((node) => (
           <div key={node.id}>
             <span className={`workflow-source-dot ${node.source}`} />
@@ -2384,7 +2488,7 @@ export function WorkflowDraftCard({
                       <button type="button" disabled={!canWrite || busy} onClick={() => onConnect(workflow, requirement)}>
                         {requirement.connection_mode === "managed"
                           ? `Connect ${requirement.name}`
-                          : readyConnections.length ? "Add another MCP" : `Add ${requirement.name} MCP`}
+                          : readyConnections.length ? "Use another connection" : `Add ${requirement.name} connection`}
                       </button>
                     )}
                   </span>}
@@ -2431,8 +2535,12 @@ export function WorkflowDraftCard({
 export function WorkflowMiniGraph({ nodes, edges }) {
   const layout = workflowGraphLayout(nodes, edges);
   const height = Math.max(190, layout.height);
+  const nodeNames = Object.fromEntries(nodes.map((node) => [node.id, node.title || node.id]));
+  const handoffDescription = edges.length
+    ? edges.map((edge) => `${nodeNames[edge.source] || edge.source} passes work to ${nodeNames[edge.target] || edge.target}`).join("; ")
+    : `No handoffs. ${nodes.map((node) => nodeNames[node.id]).join(", ")}`;
   return (
-    <div className="workflow-mini-graph" style={{ height }} role="img" aria-label="Proposed workflow handoff graph">
+    <div className="workflow-mini-graph" style={{ height }} role="img" aria-label={`Proposed workflow handoff graph. ${handoffDescription}.`}>
       <svg viewBox={`0 0 640 ${height}`} preserveAspectRatio="none" aria-hidden="true">
         <defs><marker id="workflow-card-arrow" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 Z" /></marker></defs>
         {edges.map((edge) => {
@@ -2674,6 +2782,43 @@ function safeMarkdownUrl(url, key) {
   return "";
 }
 
+export function worldGraphDecisionKind(decision) {
+  if (decision?.action === "kept") return "reused";
+  if (decision?.action !== "refreshed") return "";
+  const reason = String(decision.reason || decision.reason_code || "");
+  return reason === "no_matching_result" ? "fresh" : "rechecked";
+}
+
+export function worldGraphChangeCounts(decisions = []) {
+  return (Array.isArray(decisions) ? decisions : []).reduce((counts, decision) => {
+    const kind = worldGraphDecisionKind(decision);
+    if (kind) counts[kind] += 1;
+    return counts;
+  }, { fresh: 0, rechecked: 0, reused: 0 });
+}
+
+export function worldGraphUniqueWakeSpecialists(currentCheck) {
+  return new Set((currentCheck?.decisions || [])
+    .filter((decision) => decision.projected_action === "wake")
+    .map((decision) => String(decision.adapter || "").trim())
+    .filter(Boolean)).size;
+}
+
+export function worldGraphPlainReason(decision) {
+  const reason = String(decision?.reason || decision?.reason_code || "");
+  const plainReasons = {
+    execution_settings_changed: "The answer settings changed.",
+    runtime_revision_changed_or_unverified: "The underlying AI setup changed or could not be verified.",
+    replay_signing_unavailable: "The saved evidence could not be verified safely."
+  };
+  if (plainReasons[reason]) return plainReasons[reason];
+  if (decision?.plain_reason) return decision.plain_reason;
+  const kind = worldGraphDecisionKind(decision);
+  if (kind === "fresh") return "There was no earlier validated result for this work.";
+  if (kind === "reused") return "The inputs for this result are unchanged.";
+  return "This part was checked again for the current answer.";
+}
+
 export function RunReceipt({ run, onClick }) {
   if (!run) {
     return (
@@ -2689,12 +2834,15 @@ export function RunReceipt({ run, onClick }) {
   const parts = [];
   if (!["completed", "failed"].includes(run.status)) parts.push(runStatusLabel(run.status));
   if (run.world_graph?.total > 0) {
-    const kept = Number(run.world_graph.kept || 0);
-    const refreshed = Number(run.world_graph.refreshed || 0);
+    parts.push("WorldGraph");
+    const counts = worldGraphChangeCounts(run.world_graph.decisions || []);
+    const kept = counts.reused;
+    const refreshed = counts.fresh + counts.rechecked;
     if (kept > 0) parts.push(`${kept} previous ${kept === 1 ? "result" : "results"} reused`);
-    if (refreshed > 0) parts.push(`${refreshed} ${refreshed === 1 ? "specialist checked" : "specialists checked"} again`);
+    if (counts.fresh > 0) parts.push(`${counts.fresh} ${counts.fresh === 1 ? "part" : "parts"} completed fresh`);
+    if (counts.rechecked > 0) parts.push(`${counts.rechecked} ${counts.rechecked === 1 ? "part" : "parts"} checked again`);
     const reasonCodes = (run.world_graph.decisions || []).map((decision) => String(decision.reason || decision.reason_code || ""));
-    if (refreshed > 0 && reasonCodes.some((reason) => reason.includes("live_or_mutable") || reason.includes("tool_result_requires_fresh"))) {
+    if (refreshed > 0 && reasonCodes.some((reason) => reason === "time_sensitive_request" || reason.includes("live_or_mutable") || reason.includes("tool_result_requires_fresh"))) {
       parts.push("live information was enabled");
     } else if (refreshed > 0 && reasonCodes.some((reason) => reason === "request_changed")) {
       parts.push("your request changed");
@@ -2779,14 +2927,14 @@ export function UsageReceipt({ receipt, agents = [], expertOutputs = [], include
         </span>
       </div>
       {components.length > 0 && (
-        <div className="usage-components" role="list" aria-label="Usage by router, agent, and final output">
+        <div className="usage-components" role="list" aria-label="Usage by Router, specialist, and final answer">
           {components.map((component, index) => (
             <div className={`usage-component ${component.kind || "other"}`} role="listitem" key={component.component_key || `${component.component}-${index}`}>
               <span className="usage-kind-dot" aria-hidden="true" />
               <span>
                 <strong>{usageComponentLabel(component, agents)}</strong>
                 <small>{component.reused_zero_cost
-                  ? "Kept from earlier · no agent model call"
+                  ? "Reused from earlier · no specialist model call"
                   : component.reported === false
                   ? "Provider token usage was not reported for this output"
                   : `${formatTokenCount(component.prompt_tokens)} input · ${formatTokenCount(component.completion_tokens)} output · ${formatCreditDisplay(component.charged_credits)}`}</small>
@@ -2848,7 +2996,7 @@ export function EmptyTeamWelcome({
 
   return (
     <div className="empty-chat team-welcome">
-      <span className="team-welcome-kicker"><Sparkles size={13} /> {hasTeam ? `${teamName} IS READY` : "YOUR TEAM SPACE IS READY"}</span>
+      <span className="team-welcome-kicker"><Sparkles size={13} /> {hasTeam ? `${teamName} is ready` : "Your team space is ready"}</span>
       <h1>{hasTeam ? "What should your team accomplish?" : "What do you want to accomplish?"}</h1>
       <p>{hasTeam
         ? `Describe the outcome. Virenis will assign the right work across your ${readyAgents.length} available ${readyAgents.length === 1 ? "specialist" : "specialists"}.`
@@ -2904,17 +3052,22 @@ function Composer({
   togglingAgentId
 }) {
   const inputRef = useRef(null);
+  const agentMenuTriggerRef = useRef(null);
+  const agentMenuRef = useRef(null);
   const listId = useId();
+  const teamPopupId = `${listId}-team`;
   const [mention, setMention] = useState(null);
   const [activeIndex, setActiveIndex] = useState(0);
   const [agentMenuOpen, setAgentMenuOpen] = useState(false);
+  const [dismissedCommandValue, setDismissedCommandValue] = useState("");
   const quickAgents = availableSessionAgents(agents);
   const activeAgentCount = quickAgents.filter((agent) => agent.session_active !== false).length;
   const commandMatch = value.match(/^\/([a-z]*)$/i);
-  const commandSuggestions = commandMatch ? [
+  const commandQuery = commandMatch?.[1]?.toLowerCase() || "";
+  const commandSuggestions = commandMatch && dismissedCommandValue !== value ? [
     { command: "workflow", title: "Build a repeatable workflow", detail: "Describe the process; review the team before anything is created" },
     { command: "agent", title: "Assemble a specialist team", detail: "Create a team you can call whenever you need it" }
-  ].filter((item) => item.command.startsWith(commandMatch[1].toLowerCase())) : [];
+  ].filter((item) => item.command.startsWith(commandQuery)) : [];
 
   const suggestions = useMemo(() => {
     if (!mention) return [];
@@ -2938,13 +3091,37 @@ function Composer({
   }, [focusRequest]);
 
   useEffect(() => {
+    if (!agentMenuOpen) return undefined;
+    const frame = window.requestAnimationFrame(() => {
+      agentMenuRef.current?.querySelector("button, input:not(:disabled), [tabindex='0']")?.focus();
+    });
+    const closeOutside = (event) => {
+      if (agentMenuRef.current?.contains(event.target) || agentMenuTriggerRef.current?.contains(event.target)) return;
+      setAgentMenuOpen(false);
+    };
+    const closeOnEscape = (event) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      setAgentMenuOpen(false);
+      agentMenuTriggerRef.current?.focus();
+    };
+    document.addEventListener("pointerdown", closeOutside);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      document.removeEventListener("pointerdown", closeOutside);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [agentMenuOpen]);
+
+  useEffect(() => {
     const input = inputRef.current;
     if (!input) return;
     input.style.height = "auto";
     input.style.height = `${Math.min(input.scrollHeight, 176)}px`;
   }, [value]);
 
-  useEffect(() => setActiveIndex(0), [mention?.query]);
+  useEffect(() => setActiveIndex(0), [mention?.query, commandQuery]);
 
   function updateMention(nextValue, caret) {
     const beforeCaret = nextValue.slice(0, caret);
@@ -2975,6 +3152,11 @@ function Composer({
     });
   }
 
+  function chooseCommand(command) {
+    onChange(`/${command} `);
+    requestAnimationFrame(() => inputRef.current?.focus());
+  }
+
   function onKeyDown(event) {
     if (mention && suggestions.length) {
       if (event.key === "ArrowDown") {
@@ -2998,6 +3180,28 @@ function Composer({
         return;
       }
     }
+    if (!mention && commandSuggestions.length) {
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        setActiveIndex((index) => (index + 1) % commandSuggestions.length);
+        return;
+      }
+      if (event.key === "ArrowUp") {
+        event.preventDefault();
+        setActiveIndex((index) => (index - 1 + commandSuggestions.length) % commandSuggestions.length);
+        return;
+      }
+      if ((event.key === "Enter" || event.key === "Tab") && !event.shiftKey) {
+        event.preventDefault();
+        chooseCommand(commandSuggestions[activeIndex]?.command || commandSuggestions[0].command);
+        return;
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setDismissedCommandValue(value);
+        return;
+      }
+    }
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
       onSubmit(event);
@@ -3007,12 +3211,18 @@ function Composer({
   return (
     <form className="composer" onSubmit={onSubmit}>
       {commandSuggestions.length > 0 && !mention && (
-        <div className="command-menu" role="listbox" aria-label="Composer commands">
-          {commandSuggestions.map((item) => (
-            <button type="button" role="option" aria-selected="false" key={item.command} onClick={() => {
-              onChange(`/${item.command} `);
-              requestAnimationFrame(() => inputRef.current?.focus());
-            }}>
+        <div className="command-menu" id={`${listId}-commands`} role="listbox" aria-label="Workflow commands">
+          {commandSuggestions.map((item, index) => (
+            <button
+              type="button"
+              role="option"
+              id={`${listId}-command-${index}`}
+              aria-selected={index === activeIndex}
+              className={index === activeIndex ? "active" : ""}
+              key={item.command}
+              onMouseDown={(event) => event.preventDefault()}
+              onClick={() => chooseCommand(item.command)}
+            >
               <WandSparkles size={15} />
               <span><strong>/{item.command} · {item.title}</strong><small>{item.detail}</small></span>
             </button>
@@ -3020,7 +3230,7 @@ function Composer({
         </div>
       )}
       {mention && suggestions.length > 0 && (
-        <div className="mention-menu" id={listId} role="listbox" aria-label="Agent suggestions">
+        <div className="mention-menu" id={listId} role="listbox" aria-label="Specialist suggestions">
           {suggestions.map((agent, index) => (
             <button
               type="button"
@@ -3079,17 +3289,20 @@ function Composer({
         <WandSparkles size={18} />
       </IconButton>
       <IconButton
+        ref={agentMenuTriggerRef}
         label="Choose your team for this chat"
         className={`composer-control agent-trigger ${agentMenuOpen ? "active" : ""}`}
         onClick={() => setAgentMenuOpen((open) => !open)}
         disabled={!sessionId}
         aria-expanded={agentMenuOpen}
+        aria-haspopup="dialog"
+        aria-controls={teamPopupId}
       >
         <Network size={18} />
         {activeAgentCount > 0 && <span className="composer-count" aria-hidden="true">{activeAgentCount}</span>}
       </IconButton>
       {agentMenuOpen && (
-        <div className="quick-agent-menu" aria-label="Your team for this chat">
+        <div ref={agentMenuRef} id={teamPopupId} className="quick-agent-menu" role="dialog" aria-modal="false" aria-label="Your team for this chat" tabIndex="-1">
           <div className="quick-menu-heading">
             <span><strong>Your team for this chat</strong><small>Available teammates are called only when their role fits.</small></span>
             <button type="button" onClick={() => { setAgentMenuOpen(false); onOpenAgents(); }}>Manage team</button>
@@ -3097,16 +3310,19 @@ function Composer({
           <div className="quick-agent-list">
             {quickAgents.map((agent) => (
               <label key={agent.id}>
-                <span><strong>{formatAgentName(agent.id, agents)}</strong><small>{agentFacingText(agent.capability, "Specialist agent")}</small></span>
-                <input
-                  type="checkbox"
-                  checked={agent.session_active !== false}
-                  disabled={!canWrite || togglingAgentId === agent.id}
-                  onChange={(event) => onToggleAgent(agent, event.target.checked)}
-                />
+                <span><strong>{formatAgentName(agent.id, agents)}</strong><small>{agentFacingText(agent.capability, "Specialist")}</small></span>
+                <span className="quick-agent-toggle">
+                  <small>{agent.session_active === false ? "Paused" : "Available"}</small>
+                  <input
+                    type="checkbox"
+                    checked={agent.session_active !== false}
+                    disabled={!canWrite || togglingAgentId === agent.id}
+                    onChange={(event) => onToggleAgent(agent, event.target.checked)}
+                  />
+                </span>
               </label>
             ))}
-            {quickAgents.length === 0 && <p>No specialists are on this team yet.</p>}
+            {quickAgents.length === 0 && <div className="quick-team-empty"><p>No specialists are on this team yet.</p><button type="button" onClick={() => { setAgentMenuOpen(false); onOpenAgents(); }}><Plus size={14} />Add your first specialist</button><small>Or use the wand beside the composer to build a workflow.</small></div>}
           </div>
         </div>
       )}
@@ -3116,6 +3332,7 @@ function Composer({
           ref={inputRef}
           value={value}
           onChange={(event) => {
+            setDismissedCommandValue("");
             onChange(event.target.value);
             updateMention(event.target.value, event.target.selectionStart);
           }}
@@ -3127,9 +3344,11 @@ function Composer({
           disabled={!canWrite}
           role="combobox"
           aria-autocomplete="list"
-          aria-expanded={Boolean(mention && suggestions.length)}
-          aria-controls={mention && suggestions.length ? listId : undefined}
-          aria-activedescendant={mention && suggestions.length ? `${listId}-${activeIndex}` : undefined}
+          aria-expanded={Boolean((mention && suggestions.length) || (!mention && commandSuggestions.length))}
+          aria-controls={mention && suggestions.length ? listId : !mention && commandSuggestions.length ? `${listId}-commands` : undefined}
+          aria-activedescendant={mention && suggestions.length
+            ? `${listId}-${activeIndex}`
+            : !mention && commandSuggestions.length ? `${listId}-command-${activeIndex}` : undefined}
         />
       </label>
       <IconButton
@@ -3514,10 +3733,10 @@ export function ConnectionsPanel({
 
       {revocations.length > 0 && (
         <div className="connection-revocation-stack" role="status" aria-label="Provider disconnects still being verified">
-          <div className="connections-subheading"><span><ShieldCheck size={15} /></span><div><strong>Finishing secure disconnect</strong><small>The connection is already unavailable to agents. Virenis keeps retrying until the provider confirms that access is revoked.</small></div></div>
+          <div className="connections-subheading"><span><ShieldCheck size={15} /></span><div><strong>Finishing secure disconnect</strong><small>The connection is already unavailable to specialists. Virenis keeps retrying until the provider confirms that access is revoked.</small></div></div>
           {revocations.map((revocation) => (
             <article className="connection-revocation-card" key={revocation.revocation_id}>
-              <div><strong>{templates.find((template) => template.id === revocation.provider_id)?.name || revocation.provider_id || "Connected provider"}</strong><small>{revocation.attempts ? `${revocation.attempts} ${revocation.attempts === 1 ? "attempt" : "attempts"} · ` : ""}{revocation.manual_resolution_required ? "Administrator verification is required" : "No agent can use this connection"}</small></div>
+              <div><strong>{templates.find((template) => template.id === revocation.provider_id)?.name || revocation.provider_id || "Connected provider"}</strong><small>{revocation.attempts ? `${revocation.attempts} ${revocation.attempts === 1 ? "attempt" : "attempts"} · ` : ""}{revocation.manual_resolution_required ? "Administrator verification is required" : "No specialist can use this connection"}</small></div>
               {canWrite && !revocation.manual_resolution_required && <button type="button" className="text-button ghost compact" disabled={busy === revocation.revocation_id} onClick={() => retryRevocation(revocation)}>{busy === revocation.revocation_id ? <LoaderCircle className="spin" size={13} /> : <RefreshCw size={13} />}Retry now</button>}
               {isAdmin && <button type="button" className="text-button ghost compact" disabled={busy === revocation.revocation_id} onClick={() => setResolutionDraft((current) => current?.revocation_id === revocation.revocation_id ? null : { revocation_id: revocation.revocation_id, evidence_reference: "", reason: "", confirmed: false })}><ShieldCheck size={13} />Record provider removal</button>}
               {isAdmin && resolutionDraft?.revocation_id === revocation.revocation_id && (
@@ -3621,7 +3840,7 @@ export function ConnectionsPanel({
             <div className="builder-field"><label htmlFor="mcp-endpoint">HTTPS endpoint</label><input id="mcp-endpoint" value={form.endpoint_url} onChange={(event) => setForm((current) => ({ ...current, endpoint_url: event.target.value }))} required type="url" placeholder={customTemplates.find((template) => template.id === form.template_id)?.endpoint_placeholder || "https://mcp.example.com/mcp"} /></div>
           </div>
           <fieldset className="connection-auth"><legend>Authentication</legend><label><input type="radio" name="mcp-auth" checked={form.auth_type === "none"} onChange={() => setForm((current) => ({ ...current, auth_type: "none", token: "" }))} />No authentication</label><label><input type="radio" name="mcp-auth" checked={form.auth_type === "bearer"} onChange={() => setForm((current) => ({ ...current, auth_type: "bearer" }))} />Bearer token</label></fieldset>
-          {form.auth_type === "bearer" && <div className="builder-field"><label htmlFor="mcp-token">Bearer token</label><input id="mcp-token" type="password" autoComplete="new-password" value={form.token} onChange={(event) => setForm((current) => ({ ...current, token: event.target.value }))} required /><small>Encrypted before it is written; never sent to an agent or published.</small></div>}
+          {form.auth_type === "bearer" && <div className="builder-field"><label htmlFor="mcp-token">Bearer token</label><input id="mcp-token" type="password" autoComplete="new-password" value={form.token} onChange={(event) => setForm((current) => ({ ...current, token: event.target.value }))} required /><small>Encrypted before it is written; never sent to a specialist or published.</small></div>}
           <label className="connection-trust-read"><input type="checkbox" checked={form.trust_read_annotations} onChange={(event) => setForm((current) => ({ ...current, trust_read_annotations: event.target.checked }))} /><span><strong>Allow declared read-only tools without approval</strong><small>Enable this only when you trust this MCP server's tool labels. Otherwise every call asks first.</small></span></label>
           <div className="connection-form-actions"><button type="button" className="text-button ghost" onClick={() => setShowForm(false)} disabled={busy === "create"}>Cancel</button><button type="submit" className="text-button primary" disabled={busy === "create"}>{busy === "create" ? <LoaderCircle className="spin" size={14} /> : <Plug size={14} />}Connect and discover tools</button></div>
         </form>
@@ -3648,7 +3867,7 @@ export function ConnectionsPanel({
             <footer><small>{connection.tools?.length || 0} available abilities · {connection.read_policy === "allow_declared_reads" ? "approved read actions run automatically" : "every action asks first"}</small>{canWrite && <div>{connection.reauthorization_required && <button type="button" className="text-button primary compact" disabled={busy === connection.connection_id} onClick={() => connectManaged(templates.find((template) => template.id === connection.provider_id) || { id: connection.provider_id, availability: "available" }, connection.connection_id)}>{busy === connection.connection_id ? <LoaderCircle className="spin" size={13} /> : <RefreshCw size={13} />}Reconnect</button>}<IconButton compact label={`Refresh available abilities for ${connection.name}`} disabled={busy === connection.connection_id || connection.reauthorization_required} onClick={() => refreshConnection(connection)}><RefreshCw className={busy === connection.connection_id ? "spin" : ""} size={15} /></IconButton><IconButton compact label={`Disconnect ${connection.name}`} disabled={busy === connection.connection_id} onClick={() => setDisconnectTarget(connection)}><Trash2 size={15} /></IconButton></div>}</footer>
           </article>
         ))}
-        {!connections.length && !showForm && <div className="empty-resource-state"><span><Plug size={22} /></span><h3>No accounts connected yet</h3><p>Connect a provider above, review its tools, and assign only the ones an agent needs.</p></div>}
+        {!connections.length && !showForm && <div className="empty-resource-state"><span><Plug size={22} /></span><h3>No accounts connected yet</h3><p>Connect an app above, review its abilities, and give each specialist only what the role needs.</p></div>}
       </div>
     </section>
   );
@@ -3676,7 +3895,7 @@ function RealityRank({ rank }) {
   const hasResults = summary.samples > 0;
   return (
     <div className="rank-summary">
-      <div className="rank-overview" title="Past verified results are used only when equally relevant agents tie">
+      <div className="rank-overview" title="Past verified results are used only when equally relevant specialists tie">
         <b>{hasResults ? `Result score ${summary.score_label}` : "No verified results yet"}</b>
         <i>{hasResults ? summary.sample_label : "Starts from a neutral baseline"}</i>
       </div>
@@ -3796,7 +4015,7 @@ export function AgentCatalog({
       </div>
       <label className="search-field full-width">
         <Search size={17} aria-hidden="true" />
-        <span className="sr-only">Search agents</span>
+        <span className="sr-only">Search specialists</span>
         <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search this team" />
       </label>
       <div className="flat-list agent-list">
@@ -3810,7 +4029,7 @@ export function AgentCatalog({
               <span className={`status-dot ${archived ? "muted" : runtimeOnly ? "pending" : "ready"}`} aria-hidden="true" />
               <div className="row-copy">
                 <strong>{formatAgentName(agent.id, agents)}</strong>
-                <span>{agentFacingText(agent.capability, "Custom agent")}</span>
+                <span>{agentFacingText(agent.capability, "Custom specialist")}</span>
                 <small>{archived ? "Archived" : runtimeOnly ? "Needs an owner" : agent.session_active === false ? "Paused for this chat" : "Available for this chat"}</small>
                 {realityRankSummary(agent.reality_rank).samples > 0 && <RealityRank rank={agent.reality_rank} />}
               </div>
@@ -3874,11 +4093,11 @@ export function graphConnections(agents) {
   }
   for (const agent of agents) {
     for (const resource of agent.resources || []) {
-      const id = String(resource).match(/^agent:([a-z0-9_]+)$/)?.[1];
+      const id = String(resource).match(/^agent:([a-z0-9_-]+)$/i)?.[1];
       if (id) connect(id, agent.id, "knowledge");
     }
     for (const input of agent.consumes || []) {
-      const id = String(input).match(/^agent:([a-z0-9_]+):output$/)?.[1];
+      const id = String(input).match(/^agent:([a-z0-9_-]+):output$/i)?.[1];
       if (id) connect(id, agent.id, "handoff");
     }
   }
@@ -3951,7 +4170,7 @@ export function graphEdgeEndpoints(from, to, nodeBounds = {}) {
   if (!Number.isFinite(deltaX) || !Number.isFinite(deltaY) || (!deltaX && !deltaY)) return null;
   const halfWidth = Math.max(1, Number(nodeBounds.halfWidth) || 80);
   const halfHeight = Math.max(1, Number(nodeBounds.halfHeight) || 36);
-  const boundaryScale = 1 / Math.max(Math.abs(deltaX) / halfWidth, Math.abs(deltaY) / halfHeight);
+  const boundaryScale = Math.min(0.45, 1 / Math.max(Math.abs(deltaX) / halfWidth, Math.abs(deltaY) / halfHeight));
   return {
     from: { x: Number(from.x) + deltaX * boundaryScale, y: Number(from.y) + deltaY * boundaryScale },
     to: { x: Number(to.x) - deltaX * boundaryScale, y: Number(to.y) - deltaY * boundaryScale }
@@ -3976,6 +4195,20 @@ export function graphTone(agentId) {
     hash = ((hash << 5) - hash + character.charCodeAt(0)) | 0;
   }
   return Math.abs(hash) % 5 + 1;
+}
+
+export function graphToneAssignments(agentIds = []) {
+  const assignments = new Map();
+  const used = new Set();
+  for (const id of [...agentIds].map(String).sort()) {
+    let tone = graphTone(id);
+    if (used.size < 5) {
+      while (used.has(tone)) tone = tone % 5 + 1;
+      used.add(tone);
+    }
+    assignments.set(id, tone);
+  }
+  return assignments;
 }
 
 export function initialGraphPositions(agents) {
@@ -4064,13 +4297,17 @@ export function worldGraphAgentStatuses(decisions = []) {
   const statuses = new Map();
   for (const decision of Array.isArray(decisions) ? decisions : []) {
     const adapter = String(decision?.adapter || "");
-    if (!adapter || !["kept", "refreshed"].includes(decision?.action)) continue;
-    const current = statuses.get(adapter) || { kept: 0, refreshed: 0, total: 0, action: "" };
-    current[decision.action] += 1;
+    const kind = worldGraphDecisionKind(decision);
+    if (!adapter || !kind) continue;
+    const current = statuses.get(adapter) || { kept: 0, fresh: 0, refreshed: 0, total: 0, action: "" };
+    if (kind === "reused") current.kept += 1;
+    else if (kind === "fresh") current.fresh += 1;
+    else current.refreshed += 1;
     current.total += 1;
-    current.action = current.kept > 0 && current.refreshed > 0
+    const states = [current.kept > 0, current.fresh > 0, current.refreshed > 0].filter(Boolean).length;
+    current.action = states > 1
       ? "mixed"
-      : current.refreshed > 0 ? "refreshed" : "kept";
+      : current.fresh > 0 ? "fresh" : current.refreshed > 0 ? "refreshed" : "kept";
     statuses.set(adapter, current);
   }
   return statuses;
@@ -4097,6 +4334,7 @@ export function AgentGraph({ agents, auth, workspace = null, storageKey, onConne
   const eligibleGraphAgents = agents
     .filter((agent) => !agent.document && !agent.resource_for_agent_id && agent.enabled !== false);
   const graphAgents = eligibleGraphAgents.slice(0, 25);
+  const graphTones = graphToneAssignments(graphAgents.map((agent) => agent.id));
   const graphAgentIds = graphAgents.map((agent) => agent.id).join("|");
   const [positions, setPositions] = useState(() => ({
     ...initialGraphPositions(graphAgents),
@@ -4123,12 +4361,13 @@ export function AgentGraph({ agents, auth, workspace = null, storageKey, onConne
   const latestStatuses = worldGraphAgentStatuses(run?.world_graph?.decisions || []);
   const latestWorkCounts = [...latestStatuses.values()].reduce((counts, status) => ({
     kept: counts.kept + status.kept,
+    fresh: counts.fresh + status.fresh,
     refreshed: counts.refreshed + status.refreshed
-  }), { kept: 0, refreshed: 0 });
+  }), { kept: 0, fresh: 0, refreshed: 0 });
   const latestGraphAvailable = run?.status === "completed"
     && ["unchecked", "current"].includes(run?.world_graph?.validity)
     && Number(run?.world_graph?.total || 0) > 0
-    && latestWorkCounts.kept + latestWorkCounts.refreshed > 0;
+    && latestWorkCounts.kept + latestWorkCounts.fresh + latestWorkCounts.refreshed > 0;
 
   useEffect(() => {
     setPositions({
@@ -4239,7 +4478,7 @@ export function AgentGraph({ agents, auth, workspace = null, storageKey, onConne
     setConnectFromId(null);
     setGraphError("");
     setGraphNotice("");
-    setMoveAnnouncement("Agent layout reset.");
+    setMoveAnnouncement("Team map auto-arranged.");
   }
 
   function moveFocused(deltaX, deltaY, direction) {
@@ -4293,15 +4532,15 @@ export function AgentGraph({ agents, auth, workspace = null, storageKey, onConne
     }
     if (connectFromId === agent.id) {
       setConnectFromId(null);
-      setGraphError("Choose a different destination agent.");
+      setGraphError("Choose a different receiving teammate.");
       return;
     }
     if (!canManageAgent(agent, auth)) {
-      setGraphError("Choose an agent you can edit as the destination.");
+      setGraphError("Choose a teammate you can edit as the receiver.");
       return;
     }
     if (allEdges.some((edge) => edge.from === connectFromId && edge.to === agent.id && edge.kind === "handoff")) {
-      setGraphError("Those agents already have a handoff connection.");
+      setGraphError("Those teammates already have this handoff.");
       return;
     }
     if (graphConnectionWouldCycle(allEdges, connectFromId, agent.id)) {
@@ -4327,7 +4566,7 @@ export function AgentGraph({ agents, auth, workspace = null, storageKey, onConne
     if (edge.kind !== "handoff" || connectionBusy) return;
     const target = eligibleGraphAgents.find((agent) => agent.id === edge.to);
     if (!canManageAgent(target, auth)) {
-      setGraphError("You can remove connections only from agents you can edit.");
+      setGraphError("You can remove handoffs only from specialists you can edit.");
       return;
     }
     setConnectionBusy(true);
@@ -4366,7 +4605,7 @@ export function AgentGraph({ agents, auth, workspace = null, storageKey, onConne
       {eligibleGraphAgents.length > graphAgents.length && (
         <div className="graph-limit-note" role="note">
           <AlertCircle size={15} aria-hidden="true" />
-          <span>Showing 25 of {eligibleGraphAgents.length} agents to keep the map readable. Lines involving hidden agents are omitted; select a visible agent to inspect all of its configured connections, or manage the full team in Agents.</span>
+          <span>Showing 25 of {eligibleGraphAgents.length} specialists to keep the map readable. Handoffs involving hidden specialists are omitted; use My team to manage every role.</span>
         </div>
       )}
       {latestGraphAvailable && (
@@ -4374,14 +4613,18 @@ export function AgentGraph({ agents, auth, workspace = null, storageKey, onConne
           <Check size={15} aria-hidden="true" />
           <div>
             <strong>What your team did on the latest answer</strong>
-            <span>{latestWorkCounts.kept} previous {latestWorkCounts.kept === 1 ? "result" : "results"} reused · {latestWorkCounts.refreshed} checked again</span>
+            <span>{[
+              latestWorkCounts.kept ? `${latestWorkCounts.kept} previous ${latestWorkCounts.kept === 1 ? "result" : "results"} reused` : "",
+              latestWorkCounts.fresh ? `${latestWorkCounts.fresh} completed fresh` : "",
+              latestWorkCounts.refreshed ? `${latestWorkCounts.refreshed} checked again` : ""
+            ].filter(Boolean).join(" · ")}</span>
             <small>The lines below show your saved handoffs. Open Answer details to see that run's exact assignment.</small>
           </div>
         </div>
       )}
       <div className={`graph-workspace ${focusedAgent && !connectMode ? "has-inspector" : ""}`}>
-        <div className="graph-canvas-scroll" role="region" aria-label="Scrollable agent map" tabIndex="0">
-        <div className={`agent-graph ${connectMode ? "is-connecting" : ""}`} ref={canvasRef} role="group" aria-label="Current agent team map. Select an agent to inspect its configured connections.">
+        <div className="graph-canvas-scroll" role="region" aria-label="Scrollable team map" tabIndex="0">
+        <div className={`agent-graph ${connectMode ? "is-connecting" : ""}`} ref={canvasRef} role="group" aria-label="Current specialist team map. Select a specialist to inspect its configured connections.">
         <svg viewBox="0 0 900 560" preserveAspectRatio="none" role="group" aria-label="Current configured handoff and knowledge links">
           <defs>
             <marker id="graph-arrow-handoff" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
@@ -4409,17 +4652,16 @@ export function AgentGraph({ agents, auth, workspace = null, storageKey, onConne
           const position = positions[agent.id] || { x: 450, y: 278 };
           const connectionCount = allEdges.filter((edge) => edge.from === agent.id || edge.to === agent.id).length;
           const latestStatus = latestStatuses.get(agent.id);
-          const latestStatusText = latestStatus?.action === "mixed"
-            ? `Latest answer: ${latestStatus.kept} kept, ${latestStatus.refreshed} refreshed`
-            : latestStatus?.action === "kept"
-              ? `Latest answer: ${latestStatus.total} ${latestStatus.total === 1 ? "work item" : "work items"} kept`
-              : latestStatus?.action === "refreshed"
-                ? `Latest answer: ${latestStatus.total} ${latestStatus.total === 1 ? "work item" : "work items"} refreshed`
-                : "";
+          const latestStatusParts = latestStatus ? [
+            latestStatus.kept > 0 ? `${latestStatus.kept} reused` : "",
+            latestStatus.fresh > 0 ? `${latestStatus.fresh} completed fresh` : "",
+            latestStatus.refreshed > 0 ? `${latestStatus.refreshed} checked again` : ""
+          ].filter(Boolean) : [];
+          const latestStatusText = latestStatusParts.length ? `Latest answer: ${latestStatusParts.join(", ")}` : "";
           return (
             <button
               type="button"
-              className={`graph-node tone-${graphTone(agent.id)} ${focusedId === agent.id ? "focused" : ""} ${connectFromId === agent.id ? "connection-source" : ""} ${agent.session_active === false ? "inactive" : ""} ${latestStatus?.action ? `world-${latestStatus.action}` : ""}`}
+              className={`graph-node tone-${graphTones.get(String(agent.id)) || graphTone(agent.id)} ${focusedId === agent.id ? "focused" : ""} ${connectFromId === agent.id ? "connection-source" : ""} ${agent.session_active === false ? "inactive" : ""} ${latestStatus?.action ? `world-${latestStatus.action}` : ""}`}
               style={{ left: `${(position.x / 900) * 100}%`, top: `${(position.y / 560) * 100}%` }}
               key={agent.id}
               onPointerDown={(event) => beginNodeDrag(event, agent.id)}
@@ -4445,11 +4687,11 @@ export function AgentGraph({ agents, auth, workspace = null, storageKey, onConne
             <strong>{formatAgentName(focusedId, agents)}</strong>
             <p>{agentFacingText(focusedAgent.capability, "No capability description yet.")}</p>
             {onEdit && canManageAgent(focusedAgent, auth) && <button type="button" className="graph-edit-agent" onClick={() => onEdit(focusedAgent)}><Pencil size={14} />Open specialist profile</button>}
-            <div className="graph-move-controls" role="group" aria-label="Move selected agent without dragging">
-              <button type="button" onClick={() => moveFocused(-36, 0, "left")} aria-label="Move selected agent left"><ArrowLeft size={14} /></button>
-              <button type="button" onClick={() => moveFocused(0, -30, "up")} aria-label="Move selected agent up"><ArrowUp size={14} /></button>
-              <button type="button" onClick={() => moveFocused(0, 30, "down")} aria-label="Move selected agent down"><ArrowDown size={14} /></button>
-              <button type="button" onClick={() => moveFocused(36, 0, "right")} aria-label="Move selected agent right"><ArrowRight size={14} /></button>
+            <div className="graph-move-controls" role="group" aria-label="Move selected specialist without dragging">
+              <button type="button" onClick={() => moveFocused(-36, 0, "left")} aria-label="Move selected specialist left"><ArrowLeft size={14} /></button>
+              <button type="button" onClick={() => moveFocused(0, -30, "up")} aria-label="Move selected specialist up"><ArrowUp size={14} /></button>
+              <button type="button" onClick={() => moveFocused(0, 30, "down")} aria-label="Move selected specialist down"><ArrowDown size={14} /></button>
+              <button type="button" onClick={() => moveFocused(36, 0, "right")} aria-label="Move selected specialist right"><ArrowRight size={14} /></button>
             </div>
             <span className="sr-only" role="status" aria-live="polite">{moveAnnouncement}</span>
             <div className="graph-relations">
@@ -4473,8 +4715,14 @@ export function AgentGraph({ agents, auth, workspace = null, storageKey, onConne
         )}
       </div>
       <div className="graph-legend">
-        <span className="palette"><i /><i /><i /></span><span>Names identify agents; color helps scan the map</span>
+        <span className="palette"><i /><i /><i /></span><span>Names identify specialists; color helps scan the map</span>
         <span><i className="handoff" />Work moves in the arrow direction</span><span><i className="knowledge" />Knowledge link</span>
+        {latestGraphAvailable && <>
+          <span><i className="result-state reused" />Solid border · previous work reused</span>
+          <span><i className="result-state fresh" />Dotted border · completed fresh</span>
+          <span><i className="result-state rechecked" />Dashed border · work checked again</span>
+          <span><i className="result-state mixed" />Double border · both happened</span>
+        </>}
       </div>
     </section>
   );
@@ -4489,21 +4737,21 @@ export function MarketplacePanel({ items, auth, onOpen = () => undefined, onRate
     <section className="resource-section marketplace-section" aria-labelledby="marketplace-heading">
       <div className="marketplace-hero">
         <span><Sparkles size={15} /> COMMUNITY LIBRARY</span>
-        <h3 id="marketplace-heading">Shared agents and teams, ready to make your own.</h3>
-        <p>Inspect how an agent or workspace works, see who published it, rate it, or copy an independent version.</p>
+        <h3 id="marketplace-heading">Shared specialists and teams, ready to make your own.</h3>
+        <p>See each role, its abilities, and its publisher. Add an independent copy to your own team when it fits.</p>
       </div>
       <div className="marketplace-toolbar">
-        <label className="search-field full-width"><Search size={16} /><span className="sr-only">Search marketplace</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search agents or publishers" /></label>
+        <label className="search-field full-width"><Search size={16} /><span className="sr-only">Search shared specialists and teams</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search roles, teams, or publishers" /></label>
       </div>
       <div className="marketplace-grid">
         {filtered.map((item) => (
           <article className="market-card" key={item.listing_id || item.id}>
-            <button type="button" className="market-card-open" onClick={() => onOpen(item)} aria-label={`View ${agentFacingText(item.title, "community agent")}`}>
+            <button type="button" className="market-card-open" onClick={() => onOpen(item)} aria-label={`View ${agentFacingText(item.title, "community specialist")}`}>
               <header><span className={`market-type ${item.item_type}`}>
                 {item.item_type === "workspace" ? <Network size={13} /> : <Bot size={13} />}
-                {item.item_type === "workspace" ? "workspace" : "agent"}
+                {item.item_type === "workspace" ? "team" : "specialist"}
               </span><ChevronRight size={15} /></header>
-              <h4>{agentFacingText(item.title, "Community agent")}</h4>
+              <h4>{agentFacingText(item.title, "Community specialist")}</h4>
               <p>{agentFacingText(item.description || item.capability)}</p>
               <small className="market-author">Published by {item.publisher_display_name || item.publisher?.user_id || item.published_by || "Virenis"}</small>
               {item.workspace_copy && <span className="market-copy-state"><Check size={12} />Copied as {item.workspace_copy.title || item.workspace_copy.name}</span>}
@@ -4516,7 +4764,7 @@ export function MarketplacePanel({ items, auth, onOpen = () => undefined, onRate
             </footer>
           </article>
         ))}
-        {filtered.length === 0 && <div className="market-empty"><Sparkles size={22} /><strong>No matches yet</strong><span>Try a broader search or publish an agent or workspace from the Agents tab.</span></div>}
+        {filtered.length === 0 && <div className="market-empty"><Sparkles size={22} /><strong>No matches yet</strong><span>Try a broader search, or publish a specialist or team from My team.</span></div>}
       </div>
     </section>
   );
@@ -4545,12 +4793,12 @@ export function PublishDialog({ agent, onClose, onSaved }) {
     }
   }
   return (
-    <ModalSurface title={existing.published ? "Edit Marketplace description" : "Publish to Marketplace"} description={`Share a clear description. People can inspect the ${workspaceListing ? "workspace" : "agent"} before copying it.`} onClose={onClose} className="form-dialog">
+    <ModalSurface title={existing.published ? "Edit public description" : "Publish publicly"} description={`Share a clear description. People can inspect the ${workspaceListing ? "team" : "specialist"} before adding their own copy.`} onClose={onClose} closeDisabled={busy} className="form-dialog">
       <form className="dialog-form publish-form" onSubmit={submit}>
         {error && <div className="form-error" role="alert">{error}</div>}
-        <div className="publish-subject"><span className={`market-type ${workspaceListing ? "workspace" : "agent"}`}>{workspaceListing ? <Network size={13} /> : <Bot size={13} />}{workspaceListing ? "workspace" : "agent"}</span><strong>{workspaceListing ? agent.name || agent.title : formatAgentName(agent.id, [agent])}</strong></div>
-        <label><span>{workspaceListing ? "Workspace" : "Agent"} description</span><textarea data-autofocus value={description} onChange={(event) => setDescription(event.target.value)} required maxLength={1200} placeholder={`Explain what this ${workspaceListing ? "team" : "agent"} helps with and when someone should use it.`} /></label>
-        <div className="publish-note">{workspaceListing ? <Network size={16} /> : <Bot size={16} />}<span><strong>Safe sharing</strong><small>Private notes, uploaded knowledge, credentials, and live MCP bindings are not included.</small></span></div>
+        <div className="publish-subject"><span className={`market-type ${workspaceListing ? "workspace" : "agent"}`}>{workspaceListing ? <Network size={13} /> : <Bot size={13} />}{workspaceListing ? "team" : "specialist"}</span><strong>{workspaceListing ? agent.name || agent.title : formatAgentName(agent.id, [agent])}</strong></div>
+        <label><span>{workspaceListing ? "Team" : "Specialist"} description</span><textarea data-autofocus value={description} onChange={(event) => setDescription(event.target.value)} required maxLength={1200} placeholder={`Explain what this ${workspaceListing ? "team" : "specialist"} helps with and when someone should use it.`} /></label>
+        <div className="publish-note">{workspaceListing ? <Network size={16} /> : <Bot size={16} />}<span><strong>Safe sharing</strong><small>Private notes, uploaded knowledge, credentials, and connected account access are not included.</small></span></div>
         <div className="dialog-actions"><button type="button" className="text-button ghost" onClick={onClose} disabled={busy}>Cancel</button><button type="submit" className="text-button primary" disabled={busy}>{busy ? <LoaderCircle className="spin" size={16} /> : existing.published ? <Pencil size={16} /> : <Upload size={16} />}{existing.published ? "Save description" : "Publish"}</button></div>
       </form>
     </ModalSurface>
@@ -4575,11 +4823,11 @@ export function RatingDialog({ item, onClose, onSaved }) {
     }
   }
   return (
-    <ModalSurface title={`Rate ${agentFacingText(item.title, item.item_type === "workspace" ? "workspace" : "agent")}`} description="Select a star rating from 1 to 5." onClose={onClose} className="small-dialog">
+    <ModalSurface title={`Rate ${agentFacingText(item.title, item.item_type === "workspace" ? "workspace" : "agent")}`} description="Select a star rating from 1 to 5." onClose={onClose} closeDisabled={busy} className="small-dialog">
       <form className="dialog-form" onSubmit={submit}>
         {error && <div className="form-error" role="alert">{error}</div>}
         <fieldset className="star-picker"><legend>Your rating</legend>{[1, 2, 3, 4, 5].map((value) => <button type="button" key={value} aria-label={`${value} star${value === 1 ? "" : "s"}`} aria-pressed={score === value} onClick={() => setScore(value)}><Star size={25} fill={value <= score ? "currentColor" : "none"} /></button>)}</fieldset>
-        <div className="dialog-actions"><button type="button" className="text-button ghost" onClick={onClose}>Cancel</button><button type="submit" className="text-button primary" disabled={busy}>{busy ? <LoaderCircle className="spin" size={16} /> : <Star size={16} />}Save rating</button></div>
+        <div className="dialog-actions"><button type="button" className="text-button ghost" onClick={onClose} disabled={busy}>Cancel</button><button type="submit" className="text-button primary" disabled={busy}>{busy ? <LoaderCircle className="spin" size={16} /> : <Star size={16} />}Save rating</button></div>
       </form>
     </ModalSurface>
   );
@@ -4592,7 +4840,7 @@ export function MarketplaceWorkspaceAgentDetails({
   onBack = () => undefined
 }) {
   const agent = entry?.agent || {};
-  const title = agentFacingText(agent.title, "Workspace agent");
+  const title = agentFacingText(agent.title, "Team specialist");
   const description = agentFacingText(agent.capability, "No purpose provided.");
   const tools = Array.isArray(agent.tools) ? agent.tools : [];
   const consumes = Array.isArray(agent.consumes) ? agent.consumes : [];
@@ -4610,17 +4858,17 @@ export function MarketplaceWorkspaceAgentDetails({
     <>
       <div className="marketplace-detail-layout workspace-agent-detail-layout">
         <main className="marketplace-detail-content">
-          <button type="button" className="workspace-agent-detail-back" onClick={onBack}><ArrowLeft size={14} />Back to workspace</button>
+          <button type="button" className="workspace-agent-detail-back" onClick={onBack}><ArrowLeft size={14} />Back to team</button>
           <section className="builder-panel marketplace-detail-intro">
             <div className="builder-heading">
-              <span>WORKSPACE AGENT</span>
+              <span>TEAM SPECIALIST</span>
               <h3>{description}</h3>
-              <p>Part of <strong>{agentFacingText(workspaceTitle, "Shared workspace")}</strong> · Published by <strong>{publisher}</strong>.</p>
+              <p>Part of <strong>{agentFacingText(workspaceTitle, "Shared team")}</strong> · Published by <strong>{publisher}</strong>.</p>
             </div>
           </section>
 
           <section className="builder-panel marketplace-detail-section" aria-labelledby="workspace-agent-purpose-heading">
-            <div className="builder-heading"><span>AGENT BASICS</span><h3 id="workspace-agent-purpose-heading">Purpose and instructions</h3></div>
+            <div className="builder-heading"><span>ROLE</span><h3 id="workspace-agent-purpose-heading">Purpose and instructions</h3></div>
             <dl className="marketplace-spec-list">
               <div><dt>What it does</dt><dd>{description}</dd></div>
               <div><dt>Instructions and limits</dt><dd>{agentFacingText(agent.boundary, "No additional limits provided.")}</dd></div>
@@ -4630,39 +4878,39 @@ export function MarketplaceWorkspaceAgentDetails({
           <section className="builder-panel marketplace-detail-section" aria-labelledby="workspace-agent-workflow-heading">
             <div className="builder-heading"><span>TOOLS &amp; TEAMWORK</span><h3 id="workspace-agent-workflow-heading">How it works</h3></div>
             <dl className="marketplace-spec-list compact">
-              <div><dt>Tools</dt><dd>{tools.length ? tools.map((value) => <span className="marketplace-spec-chip" key={value}>{String(value).replaceAll("_", " ")}</span>) : "No tools required"}</dd></div>
+              <div><dt>Abilities</dt><dd>{tools.length ? tools.map((value) => <span className="marketplace-spec-chip" key={value}>{workflowToolLabel(value)}</span>) : "No tools required"}</dd></div>
               <div><dt>Connections</dt><dd>{connectionTools.length ? connectionTools.map((tool) => <span className="marketplace-spec-chip" key={tool.key}>{tool.label}</span>) : "No external connection required"}</dd></div>
-              <div><dt>Receives</dt><dd>{consumes.length ? consumes.map((value) => <span className="marketplace-spec-chip" key={value}>{String(value).replaceAll("_", " ")}</span>) : "User request"}</dd></div>
-              <div><dt>Produces</dt><dd>{produces.length ? produces.map((value) => <span className="marketplace-spec-chip" key={value}>{String(value).replaceAll("_", " ")}</span>) : "Domain output"}</dd></div>
-              <div><dt>Router cues</dt><dd>{cues.length ? cues.join(", ") : "Uses its name and purpose"}</dd></div>
+              <div><dt>Receives</dt><dd>{consumes.length ? consumes.map((value) => <span className="marketplace-spec-chip" key={value}>{contractFieldLabel(value)}</span>) : "Your request"}</dd></div>
+              <div><dt>Hands back</dt><dd>{produces.length ? produces.map((value) => <span className="marketplace-spec-chip" key={value}>{contractFieldLabel(value)}</span>) : "Working answer"}</dd></div>
+              <div><dt>Best used for</dt><dd>{cues.length ? cues.join(", ") : "Requests matching its name and purpose"}</dd></div>
             </dl>
           </section>
 
           {(exclusions.private_knowledge || exclusions.agent_connections || exclusions.mcp_credentials_and_bindings) && (
             <div className="marketplace-sharing-boundary">
               <AlertCircle size={16} />
-              <span><strong>Workspace-safe agent</strong><small>{[exclusions.private_knowledge ? "Private knowledge" : null, exclusions.agent_connections ? "private workspace connections" : null, exclusions.mcp_credentials_and_bindings ? "live MCP credentials and bindings" : null].filter(Boolean).join(", ")} are not included in the published workspace.</small></span>
+              <span><strong>Safe independent copy</strong><small>A shared team never includes private knowledge, private handoffs, or connected-account access.</small></span>
             </div>
           )}
         </main>
 
-        <aside className="builder-preview marketplace-detail-preview" aria-label="Published workspace agent summary">
-          <div className="preview-badge"><Bot size={18} /><span>WORKSPACE AGENT</span></div>
+        <aside className="builder-preview marketplace-detail-preview" aria-label="Published team specialist summary">
+          <div className="preview-badge"><Bot size={18} /><span>TEAM SPECIALIST</span></div>
           <h4>{title}</h4>
           <p>{description}</p>
           <dl>
-            <div><dt>Workspace</dt><dd>{agentFacingText(workspaceTitle, "Shared workspace")}</dd></div>
+            <div><dt>Team</dt><dd>{agentFacingText(workspaceTitle, "Shared team")}</dd></div>
             <div><dt>Publisher</dt><dd>{publisher}</dd></div>
             <div><dt>Tools</dt><dd>{tools.length || "None"}</dd></div>
             <div><dt>Connections</dt><dd>{connectorRequirements.length || "None"}</dd></div>
             <div><dt>Outputs</dt><dd>{produces.length || "Default"}</dd></div>
           </dl>
-          <div className="preview-status"><Check size={14} /><div><strong>Included in this team</strong><small>Its sanitized contract is part of the workspace copy.</small></div></div>
+          <div className="preview-status"><Check size={14} /><div><strong>Included in this team</strong><small>Its share-safe role settings are part of the copy.</small></div></div>
         </aside>
       </div>
 
       <footer className="builder-actions marketplace-detail-actions">
-        <button type="button" className="text-button ghost" onClick={onBack}><ArrowLeft size={15} />Back to workspace</button>
+        <button type="button" className="text-button ghost" onClick={onBack}><ArrowLeft size={15} />Back to team</button>
         <span>Published by {publisher}</span>
       </footer>
     </>
@@ -4741,8 +4989,8 @@ export function MarketplaceAgentDialog({
     if (selectedWorkspaceAgent) {
       return (
         <ModalSurface
-          title={agentFacingText(selectedWorkspaceAgent.agent?.title, "Workspace agent")}
-          description={`Part of ${agentFacingText(detail.title, "Marketplace workspace")}`}
+          title={agentFacingText(selectedWorkspaceAgent.agent?.title, "Team specialist")}
+          description={`Part of ${agentFacingText(detail.title, "Shared team")}`}
           onClose={onClose}
           className="agent-builder-dialog marketplace-agent-dialog"
         >
@@ -4760,16 +5008,17 @@ export function MarketplaceAgentDialog({
     }
     return (
       <ModalSurface
-        title={agentFacingText(detail.title, "Marketplace workspace")}
+        title={agentFacingText(detail.title, "Shared team")}
         description={`Published by ${publisher}`}
         onClose={onClose}
+        closeDisabled={copying}
         className="agent-builder-dialog marketplace-agent-dialog"
       >
         <div className="marketplace-detail-body workspace-marketplace-detail">
           {error && <div className="form-error" role="alert">{error}</div>}
-          {loading && <div className="marketplace-detail-loading"><LoaderCircle className="spin" size={18} />Loading workspace details</div>}
+          {loading && <div className="marketplace-detail-loading"><LoaderCircle className="spin" size={18} />Loading team details</div>}
           <section className="builder-panel marketplace-detail-intro">
-            <div className="builder-heading"><span>SHARED AGENT WORKSPACE</span><h3>{detail.description || sharedWorkspace.description}</h3><p>{workspaceAgents.length} coordinated agent{workspaceAgents.length === 1 ? "" : "s"} · Published by <strong>{publisher}</strong>.</p></div>
+            <div className="builder-heading"><span>SHARED TEAM</span><h3>{detail.description || sharedWorkspace.description}</h3><p>{workspaceAgents.length} coordinated specialist{workspaceAgents.length === 1 ? "" : "s"} · Published by <strong>{publisher}</strong>.</p></div>
           </section>
           <div className="workspace-marketplace-agents">
             {workspaceAgents.map((entry, index) => (
@@ -4778,10 +5027,10 @@ export function MarketplaceAgentDialog({
                 className="workspace-marketplace-agent-card"
                 key={entry.source_agent_id || index}
                 onClick={() => setSelectedWorkspaceAgent(entry)}
-                aria-label={`View details for ${agentFacingText(entry.agent?.title, "workspace agent")}`}
+                aria-label={`View details for ${agentFacingText(entry.agent?.title, "team specialist")}`}
               >
                 <span>{index + 1}</span>
-                <div><strong>{entry.agent?.title || "Agent"}</strong><p>{entry.agent?.capability}</p><small>{(entry.agent?.produces || []).join(" · ") || "Domain output"}</small></div>
+                <div><strong>{entry.agent?.title || "Specialist"}</strong><p>{entry.agent?.capability}</p><small>{(entry.agent?.produces || []).map((value) => contractFieldLabel(value)).join(" · ") || "Working answer"}</small></div>
                 <ChevronRight size={15} aria-hidden="true" />
               </button>
             ))}
@@ -4796,15 +5045,15 @@ export function MarketplaceAgentDialog({
               })}
             </section>
           )}
-          <div className="marketplace-sharing-boundary"><AlertCircle size={16} /><span><strong>Independent, safe copy</strong><small>The team structure and sanitized agent instructions are copied. Private knowledge, credentials, and live connections are not.</small></span></div>
+          <div className="marketplace-sharing-boundary"><AlertCircle size={16} /><span><strong>Independent, safe copy</strong><small>The team structure and share-safe role instructions are copied. Private knowledge, credentials, and connected account access are not.</small></span></div>
           <footer className="builder-actions marketplace-detail-actions">
-            <button type="button" className="text-button ghost" onClick={onClose}>Close</button>
+            <button type="button" className="text-button ghost" onClick={onClose} disabled={copying}>Close</button>
             <span><Star size={14} fill="currentColor" /> {detail.rating_count ? `${detail.rating_average.toFixed(1)} (${detail.rating_count})` : "New"}</span>
             <div>
               {detail.can_manage && <button type="button" className="text-button ghost" onClick={() => onEditDescription(detail)}><Pencil size={15} />Edit description</button>}
               {detail.can_manage && <button type="button" className="text-button danger" onClick={() => onUnpublish(detail)}><Globe2 size={15} />Unpublish</button>}
               {!detail.is_self_published && <button type="button" className="text-button ghost" onClick={() => onRate(detail)} disabled={auth?.is_viewer}><Star size={15} />{detail.my_rating ? "Update rating" : "Rate"}</button>}
-              <button type="button" className="text-button primary" onClick={copyToWorkspace} disabled={auth?.is_viewer || loading || copying}>{copying ? <LoaderCircle className="spin" size={16} /> : <Copy size={16} />}{copying ? "Copying team" : "Copy workspace"}</button>
+              <button type="button" className="text-button primary" onClick={copyToWorkspace} disabled={auth?.is_viewer || loading || copying}>{copying ? <LoaderCircle className="spin" size={16} /> : <Copy size={16} />}{copying ? "Adding team" : "Add this team"}</button>
             </div>
           </footer>
         </div>
@@ -4813,14 +5062,15 @@ export function MarketplaceAgentDialog({
   }
   return (
     <ModalSurface
-      title={agentFacingText(detail.title, "Marketplace agent")}
+      title={agentFacingText(detail.title, "Shared specialist")}
       description={`Published by ${publisher}`}
       onClose={onClose}
+      closeDisabled={copying}
       className="agent-builder-dialog marketplace-agent-dialog"
     >
       <div className="marketplace-detail-body">
         {error && <div className="form-error" role="alert">{error}</div>}
-        {loading && <div className="marketplace-detail-loading"><LoaderCircle className="spin" size={18} />Loading agent details</div>}
+          {loading && <div className="marketplace-detail-loading"><LoaderCircle className="spin" size={18} />Loading specialist details</div>}
         <div className="marketplace-detail-layout">
           <main className="marketplace-detail-content">
             <section className="builder-panel marketplace-detail-intro">
@@ -4832,7 +5082,7 @@ export function MarketplaceAgentDialog({
             </section>
 
             <section className="builder-panel marketplace-detail-section" aria-labelledby="marketplace-purpose-heading">
-              <div className="builder-heading"><span>AGENT BASICS</span><h3 id="marketplace-purpose-heading">Purpose and instructions</h3></div>
+              <div className="builder-heading"><span>ROLE BASICS</span><h3 id="marketplace-purpose-heading">Purpose and instructions</h3></div>
               <dl className="marketplace-spec-list">
                 <div><dt>What it does</dt><dd>{agentFacingText(agent.capability, "No purpose provided.")}</dd></div>
                 <div><dt>Instructions and limits</dt><dd>{agentFacingText(agent.boundary, "No additional limits provided.")}</dd></div>
@@ -4842,25 +5092,25 @@ export function MarketplaceAgentDialog({
             <section className="builder-panel marketplace-detail-section" aria-labelledby="marketplace-workflow-heading">
               <div className="builder-heading"><span>TOOLS &amp; TEAMWORK</span><h3 id="marketplace-workflow-heading">How it works</h3></div>
               <dl className="marketplace-spec-list compact">
-                <div><dt>Tools</dt><dd>{tools.length ? tools.map((value) => <span className="marketplace-spec-chip" key={value}>{value.replaceAll("_", " ")}</span>) : "No tools required"}</dd></div>
+                <div><dt>Abilities</dt><dd>{tools.length ? tools.map((value) => <span className="marketplace-spec-chip" key={value}>{workflowToolLabel(value)}</span>) : "No external abilities required"}</dd></div>
                 <div><dt>Connections</dt><dd>{connectorRequirements.length ? connectorRequirements.flatMap((requirement) => requirement.tools.map((tool) => <span className="marketplace-spec-chip" key={`${requirement.connection_name}:${tool.name}`}>{requirement.connection_name} · {tool.title || tool.name}</span>)) : "No external connection required"}</dd></div>
-                <div><dt>Receives</dt><dd>{consumes.length ? consumes.map((value) => <span className="marketplace-spec-chip" key={value}>{value.replaceAll("_", " ")}</span>) : "User request"}</dd></div>
-                <div><dt>Produces</dt><dd>{produces.length ? produces.map((value) => <span className="marketplace-spec-chip" key={value}>{value.replaceAll("_", " ")}</span>) : "Domain output"}</dd></div>
-                <div><dt>Router cues</dt><dd>{cues.length ? cues.join(", ") : "Uses its name and purpose"}</dd></div>
+                <div><dt>Receives</dt><dd>{consumes.length ? consumes.map((value) => <span className="marketplace-spec-chip" key={value}>{contractFieldLabel(value)}</span>) : "Your request"}</dd></div>
+                <div><dt>Hands back</dt><dd>{produces.length ? produces.map((value) => <span className="marketplace-spec-chip" key={value}>{contractFieldLabel(value)}</span>) : "Working answer"}</dd></div>
+                <div><dt>Best used for</dt><dd>{cues.length ? cues.join(", ") : "Requests matching its name and purpose"}</dd></div>
               </dl>
             </section>
 
             {(exclusions.private_knowledge || exclusions.agent_connections || exclusions.mcp_credentials_and_bindings) && (
               <div className="marketplace-sharing-boundary">
                 <AlertCircle size={16} />
-                <span><strong>Workspace-safe copy</strong><small>{[exclusions.private_knowledge ? "Private knowledge" : null, exclusions.agent_connections ? "workspace agent connections" : null, exclusions.mcp_credentials_and_bindings ? "live MCP credentials and bindings" : null].filter(Boolean).join(", ")} will not be copied. Connection requirements remain visible so you can bind your own workspace tools.</small></span>
+                <span><strong>Safe independent copy</strong><small>{[exclusions.private_knowledge ? "Private knowledge" : null, exclusions.agent_connections ? "private team handoffs" : null, exclusions.mcp_credentials_and_bindings ? "connected account access" : null].filter(Boolean).join(", ")} will not be copied. Required apps stay visible so you can connect your own account.</small></span>
               </div>
             )}
           </main>
 
-          <aside className="builder-preview marketplace-detail-preview" aria-label="Marketplace agent summary">
-            <div className="preview-badge"><Bot size={18} /><span>SHARED AGENT</span></div>
-            <h4>{agentFacingText(detail.title, "Marketplace agent")}</h4>
+          <aside className="builder-preview marketplace-detail-preview" aria-label="Shared specialist summary">
+            <div className="preview-badge"><Bot size={18} /><span>SHARED SPECIALIST</span></div>
+            <h4>{agentFacingText(detail.title, "Shared specialist")}</h4>
             <p>{agentFacingText(detail.description || detail.capability)}</p>
             <dl>
               <div><dt>Publisher</dt><dd>{publisher}</dd></div>
@@ -4869,13 +5119,13 @@ export function MarketplaceAgentDialog({
               <div><dt>Outputs</dt><dd>{produces.length || "Default"}</dd></div>
               <div><dt>Rating</dt><dd>{detail.rating_count ? `${detail.rating_average.toFixed(1)} / 5` : "Not rated"}</dd></div>
             </dl>
-            <div className="marketplace-detail-rating"><Star size={17} fill="currentColor" /><strong>{detail.rating_count ? detail.rating_average.toFixed(1) : "New"}</strong><span>{detail.rating_count ? `${detail.rating_count} rating${detail.rating_count === 1 ? "" : "s"}` : detail.is_self_published ? "Your published agent" : "Be the first to rate"}</span></div>
+            <div className="marketplace-detail-rating"><Star size={17} fill="currentColor" /><strong>{detail.rating_count ? detail.rating_average.toFixed(1) : "New"}</strong><span>{detail.rating_count ? `${detail.rating_count} rating${detail.rating_count === 1 ? "" : "s"}` : detail.is_self_published ? "Your published specialist" : "Be the first to rate"}</span></div>
             {detail.workspace_copy && <div className="preview-status"><Check size={14} /><div><strong>Already on your team</strong><small>{detail.workspace_copy.title}</small></div></div>}
           </aside>
         </div>
 
         <footer className="builder-actions marketplace-detail-actions">
-          <button type="button" className="text-button ghost" onClick={onClose}>Close</button>
+          <button type="button" className="text-button ghost" onClick={onClose} disabled={copying}>Close</button>
           <span>Published by {publisher}</span>
           <div>
             {detail.can_manage && <button type="button" className="text-button ghost marketplace-edit-action" onClick={() => onEditDescription(detail)} disabled={loading}><Pencil size={15} />Edit description</button>}
@@ -4918,11 +5168,11 @@ export function AgentWorkspaceDialog({ workspace, onClose, onSaved }) {
     }
   }
   return (
-    <ModalSurface title={editing ? "Team details" : "Create a team"} description="A team groups the specialists who should work together in chat." onClose={onClose} className="form-dialog">
+    <ModalSurface title={editing ? "Team details" : "Create a team"} description="A team groups the specialists who should work together in chat." onClose={onClose} closeDisabled={busy} className="form-dialog">
       <form className="dialog-form" onSubmit={submit}>
         {error && <div className="form-error" role="alert">{error}</div>}
         <label><span>Team name</span><input data-autofocus value={name} onChange={(event) => setName(event.target.value)} disabled={workspace?.is_general} required maxLength={80} placeholder="Customer launch team" /></label>
-        <label><span>Description</span><textarea value={description} onChange={(event) => setDescription(event.target.value)} maxLength={1200} placeholder="Describe when this team should be active and what its agents accomplish together." /></label>
+        <label><span>Description</span><textarea value={description} onChange={(event) => setDescription(event.target.value)} maxLength={1200} placeholder="Describe when this team should be active and what its specialists accomplish together." /></label>
         <div className="dialog-actions"><button type="button" className="text-button ghost" onClick={onClose} disabled={busy}>Cancel</button><button type="submit" className="text-button primary" disabled={busy || !name.trim()}>{busy ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}{editing ? "Save details" : "Create team"}</button></div>
       </form>
     </ModalSurface>
@@ -4972,7 +5222,7 @@ export function AgentWorkspaceMembersDialog({ workspace, agents, onClose, onSave
     }
   }
   return (
-    <ModalSurface title={`Choose members for ${workspace.name}`} description={`Choose up to ${workspace.max_agents || 16} specialists. These are the roles the Router may assign when this team is active.`} onClose={onClose} className="form-dialog workspace-members-dialog">
+    <ModalSurface title={`Choose members for ${workspace.name}`} description={`Choose up to ${workspace.max_agents || 16} specialists. These are the roles the Router may assign when this team is active.`} onClose={onClose} closeDisabled={busy} className="form-dialog workspace-members-dialog">
       <form className="dialog-form" onSubmit={submit}>
         {error && <div className="form-error" role="alert">{error}</div>}
         <div className="workspace-member-count"><strong>{selected.size} / {workspace.max_agents || 16}</strong><span>specialists selected</span></div>
@@ -4981,7 +5231,7 @@ export function AgentWorkspaceMembersDialog({ workspace, agents, onClose, onSave
           {candidates.map((agent) => (
             <label className={selected.has(agent.id) ? "selected" : ""} key={agent.id}>
               <input type="checkbox" checked={selected.has(agent.id)} onChange={(event) => toggle(agent.id, event.target.checked)} />
-              <span><strong>{formatAgentName(agent.id, agents)}</strong><small>{agentFacingText(agent.capability, "Custom agent")}</small></span>
+              <span><strong>{formatAgentName(agent.id, agents)}</strong><small>{agentFacingText(agent.capability, "Custom specialist")}</small></span>
               <i>{agent.enabled === false ? "Archived" : agent.system_managed ? "Built-in" : "Your specialist"}</i>
             </label>
           ))}
@@ -4993,9 +5243,52 @@ export function AgentWorkspaceMembersDialog({ workspace, agents, onClose, onSave
   );
 }
 
-export function WorkflowWorkspaceDialog({ workspaces, activeWorkspaceId, onClose, onConfirm, onCreated }) {
-  const [selection, setSelection] = useState(activeWorkspaceId || workspaces[0]?.agent_workspace_id || "");
-  const [creating, setCreating] = useState(false);
+export function workflowProposedNewSpecialists(workflow, workspace) {
+  const nodes = (workflow?.nodes || []).filter((node) => node.type === "agent");
+  const existingIds = new Set(Array.isArray(workspace?.agent_ids) ? workspace.agent_ids : []);
+  const knowsMembership = Array.isArray(workspace?.agent_ids);
+  const sameOriginalTeam = Boolean(
+    workspace?.agent_workspace_id
+    && workspace.agent_workspace_id === workflow?.agent_workspace_id
+  );
+  const activatedByNode = new Map((workflow?.activation?.node_agents || []).map((item) => [item.node_id, item.agent_id]));
+  const assignedExisting = new Set();
+  const additions = new Set();
+  for (const node of nodes) {
+    const activatedId = String(activatedByNode.get(node.id) || "").trim();
+    if (activatedId) {
+      if (!existingIds.has(activatedId)) additions.add(`agent:${activatedId}`);
+      assignedExisting.add(activatedId);
+      continue;
+    }
+    const reusableId = node.source === "workspace" && node.new_specialist_required !== true
+      ? String(node.agent_id || "").trim()
+      : "";
+    if (reusableId && !assignedExisting.has(reusableId)) {
+      assignedExisting.add(reusableId);
+      const alreadyOnTeam = existingIds.has(reusableId) || (!knowsMembership && sameOriginalTeam);
+      if (!alreadyOnTeam) additions.add(`agent:${reusableId}`);
+      continue;
+    }
+    additions.add(`node:${node.id}`);
+  }
+  return additions.size;
+}
+
+export function workflowWorkspaceHasCapacity(workspace, requiredCapacity = 0) {
+  return (
+    Number(workspace?.max_agents || 16) - Number(workspace?.agent_count || 0)
+  ) >= Math.max(0, Number(requiredCapacity || 0));
+}
+
+export function WorkflowWorkspaceDialog({ workspaces, workflow, activeWorkspaceId, onClose, onConfirm, onCreated }) {
+  const requiredFor = (workspace) => workflowProposedNewSpecialists(workflow, workspace);
+  const hasRoom = (workspace) => workflowWorkspaceHasCapacity(workspace, requiredFor(workspace));
+  const preferredWorkspace = workspaces.find((workspace) => workspace.agent_workspace_id === activeWorkspaceId && hasRoom(workspace))
+    || workspaces.find(hasRoom);
+  const newTeamCapacity = workflowProposedNewSpecialists(workflow, { agent_workspace_id: "", agent_ids: [], agent_count: 0, max_agents: 16 });
+  const [selection, setSelection] = useState(preferredWorkspace?.agent_workspace_id || "");
+  const [creating, setCreating] = useState(!preferredWorkspace);
   const [name, setName] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -5012,6 +5305,9 @@ export function WorkflowWorkspaceDialog({ workspaces, activeWorkspaceId, onClose
         await onCreated(created);
       } else {
         if (!selection) throw new Error("Choose a team first.");
+        const selectedWorkspace = workspaces.find((workspace) => workspace.agent_workspace_id === selection);
+        const requiredCapacity = requiredFor(selectedWorkspace);
+        if (!hasRoom(selectedWorkspace)) throw new Error(`That team needs ${requiredCapacity} open ${requiredCapacity === 1 ? "place" : "places"} for the proposed specialists. Choose another team or create a new one.`);
         await onConfirm(selection);
       }
     } catch (submitError) {
@@ -5020,19 +5316,26 @@ export function WorkflowWorkspaceDialog({ workspaces, activeWorkspaceId, onClose
     }
   }
   return (
-    <ModalSurface title="Choose where this team should live" description="Your active team is selected by default. New or reused specialists will join it before the workflow is proposed." onClose={onClose} className="form-dialog workflow-workspace-dialog">
+    <ModalSurface title="Choose a team with room" description="Virenis checks the exact specialists in this draft and only asks for the open places it will actually use." onClose={onClose} closeDisabled={busy} className="form-dialog workflow-workspace-dialog">
       <form className="dialog-form" onSubmit={submit}>
         {error && <div className="form-error" role="alert">{error}</div>}
         <div className="workflow-workspace-options">
-          {workspaces.map((workspace) => (
-            <label className={!creating && selection === workspace.agent_workspace_id ? "selected" : ""} key={workspace.agent_workspace_id}>
-              <input type="radio" name="workflow-workspace" checked={!creating && selection === workspace.agent_workspace_id} onChange={() => { setCreating(false); setSelection(workspace.agent_workspace_id); }} />
-              <span><strong>{workspace.name}{workspace.agent_workspace_id === activeWorkspaceId ? " · Recommended" : ""}</strong><small>{workspace.agent_count} specialist{workspace.agent_count === 1 ? "" : "s"} · {workspace.description || "Your team"}</small></span>
-            </label>
-          ))}
+          {workspaces.map((workspace) => {
+            const requiredCapacity = requiredFor(workspace);
+            const insufficientRoom = !hasRoom(workspace);
+            const current = Number(workspace.agent_count || 0);
+            const maximum = Number(workspace.max_agents || 16);
+            const remaining = Math.max(0, maximum - current);
+            return (
+              <label className={[!creating && selection === workspace.agent_workspace_id ? "selected" : "", insufficientRoom ? "disabled" : ""].filter(Boolean).join(" ")} key={workspace.agent_workspace_id}>
+                <input type="radio" name="workflow-workspace" disabled={insufficientRoom || busy} checked={!creating && selection === workspace.agent_workspace_id} onChange={() => { setCreating(false); setSelection(workspace.agent_workspace_id); }} />
+                <span><strong>{workspace.name}{workspace.agent_workspace_id === activeWorkspaceId && !insufficientRoom ? " · Recommended" : ""}{insufficientRoom ? " · Not enough room" : ""}</strong><small>{current} / {maximum} specialists · {remaining} open · draft adds {requiredCapacity} · {workspace.description || "Your team"}</small></span>
+              </label>
+            );
+          })}
           <label className={creating ? "selected" : ""}>
-            <input type="radio" name="workflow-workspace" checked={creating} onChange={() => setCreating(true)} />
-            <span><strong>Create a new team</strong><small>Keep this workflow separate from your current team.</small></span>
+            <input type="radio" name="workflow-workspace" checked={creating} disabled={busy} onChange={() => setCreating(true)} />
+            <span><strong>Create a new team</strong><small>Keep all {newTeamCapacity} proposed {newTeamCapacity === 1 ? "specialist" : "specialists"} together in a separate team.</small></span>
           </label>
         </div>
         {creating && <label><span>New team name</span><input value={name} onChange={(event) => setName(event.target.value)} required maxLength={80} placeholder="Support automation" /></label>}
@@ -5048,7 +5351,7 @@ function KnowledgeList({ documents, agents, auth, canWrite, onAdd, onDelete }) {
       <div className="section-heading">
         <div>
           <h3 id="knowledge-heading">Knowledge</h3>
-          <p>Reusable files available to your agents in every chat.</p>
+          <p>Reusable private references your specialists can rely on across chats.</p>
         </div>
         <IconButton label="Add knowledge" onClick={onAdd} disabled={!canWrite}>
           <FilePlus2 size={18} />
@@ -5062,7 +5365,7 @@ function KnowledgeList({ documents, agents, auth, canWrite, onAdd, onDelete }) {
               <BookOpen size={18} aria-hidden="true" />
               <div className="row-copy">
                 <strong>{document.title}</strong>
-                <span>{document.chunks ? `${document.chunks} indexed sections` : "Ready to search"}</span>
+                <span>{document.chunks ? "Ready for grounded search" : "Ready to search"}</span>
                 <small>{parentAgent ? `Used by ${formatAgentName(parentAgent.id, agents)}` : document.visibility === "private" ? "Private · All chats" : `${document.visibility || "Available"} · All chats`}</small>
               </div>
               {canManageDocument(document, agents, auth) && (
@@ -5108,7 +5411,7 @@ function AdminPanel({ runtime, metrics, agents, documents, onRefresh }) {
       <div className="section-heading">
         <div>
           <h3 id="admin-heading">Admin</h3>
-          <p>Service health and workspace checks.</p>
+          <p>Service health and account checks.</p>
         </div>
         <IconButton label="Refresh status" onClick={onRefresh}>
           <RefreshCw size={18} />
@@ -5116,7 +5419,7 @@ function AdminPanel({ runtime, metrics, agents, documents, onRefresh }) {
       </div>
       <dl className="stat-list">
         <div><dt>Service</dt><dd>{runtime?.ok === false ? "Needs attention" : "Ready"}</dd></div>
-        <div><dt>Available agents</dt><dd>{readyAgents}</dd></div>
+        <div><dt>Available specialists</dt><dd>{readyAgents}</dd></div>
         <div><dt>Knowledge files</dt><dd>{documents.length}</dd></div>
         <div><dt>Completed runs</dt><dd>{metrics?.total_runs ?? 0}</dd></div>
         <div><dt>p95 response time</dt><dd>{metrics?.p95_end_to_end_latency ?? 0}s</dd></div>
@@ -5159,14 +5462,16 @@ function RankTieBreakNote({ tieBreak, adapter, agents }) {
 
 export function WorldGraphChanges({ run, agents, canWrite, onRefreshTracked, onRunFresh }) {
   const graph = run?.world_graph || {};
+  const preparation = graph.preparation || {};
   const [currentCheck, setCurrentCheck] = useState(null);
   const [checkBusy, setCheckBusy] = useState(false);
   const [checkError, setCheckError] = useState("");
   const [actionBusy, setActionBusy] = useState("");
   const [actionError, setActionError] = useState("");
   const decisions = Array.isArray(graph.decisions) ? graph.decisions : [];
-  const refreshed = decisions.filter((item) => item.action === "refreshed");
-  const kept = decisions.filter((item) => item.action === "kept");
+  const fresh = decisions.filter((item) => worldGraphDecisionKind(item) === "fresh");
+  const refreshed = decisions.filter((item) => worldGraphDecisionKind(item) === "rechecked");
+  const kept = decisions.filter((item) => worldGraphDecisionKind(item) === "reused");
   const hasCompletedChangeRecord = run?.status === "completed"
     && ["unchecked", "current"].includes(graph.validity)
     && Number(graph.total || 0) > 0
@@ -5227,15 +5532,17 @@ export function WorldGraphChanges({ run, agents, canWrite, onRefreshTracked, onR
   }
   const row = (decision) => {
     const step = planById.get(decision.step_id);
-    const isKept = decision.action === "kept";
+    const kind = worldGraphDecisionKind(decision);
+    const isKept = kind === "reused";
+    const isFresh = kind === "fresh";
     return (
-      <li className={isKept ? "kept" : "refreshed"} key={decision.step_id || decision.adapter}>
-        <span className="world-change-icon" aria-hidden="true">{isKept ? <Check size={15} /> : <RefreshCw size={15} />}</span>
+      <li className={isKept ? "kept" : isFresh ? "fresh" : "refreshed"} key={decision.step_id || decision.adapter}>
+        <span className="world-change-icon" aria-hidden="true">{isKept ? <Check size={15} /> : isFresh ? <Sparkles size={15} /> : <RefreshCw size={15} />}</span>
         <span>
           <strong>{formatAgentName(decision.adapter, agents)}</strong>
-          <small>{isKept ? "Work item kept from earlier" : "Work item refreshed now"}</small>
-          <p>{decision.plain_reason || (isKept ? "Its validated inputs are unchanged." : "This agent checked its part of the answer now.")}</p>
-          {step?.task && <em>Work item: {agentFacingText(step.task)}</em>}
+          <small>{isKept ? "Previous result reused" : isFresh ? "Completed fresh for this answer" : "Checked again for this answer"}</small>
+          <p>{worldGraphPlainReason(decision)}</p>
+          {step?.task && <em>Assignment: {agentFacingText(step.task)}</em>}
           {step?.depends_on?.length > 0 && (
             <em>Uses {step.depends_on.map((id) => formatAgentName(planById.get(id)?.adapter || id, agents)).join(", ")}</em>
           )}
@@ -5251,6 +5558,7 @@ export function WorldGraphChanges({ run, agents, canWrite, onRefreshTracked, onR
         : "This answer does not include a verified change record.";
     return (
       <section className="detail-section world-changes" aria-labelledby="world-changes-heading">
+        <span className="worldgraph-product-label">WorldGraph · change-aware reuse</span>
         <div className="world-unavailable-card">
           <span><AlertCircle size={18} aria-hidden="true" /></span>
           <div>
@@ -5260,10 +5568,13 @@ export function WorldGraphChanges({ run, agents, canWrite, onRefreshTracked, onR
         </div>
         {canWrite && run?.status === "completed" && (
           <>
-            <div className="world-run-disclosure">
-              <AlertCircle size={15} aria-hidden="true" />
-              <span>A fresh run still uses Router planning and final answer synthesis. Billing may reserve the full-run maximum first, then settle only the provider work actually used.</span>
-            </div>
+            <details className="world-advanced-disclosure">
+              <summary>Advanced run details</summary>
+              <div className="world-run-disclosure">
+                <AlertCircle size={15} aria-hidden="true" />
+                <span>A fresh run still uses Router planning and final answer synthesis. Billing may reserve the full-run maximum first, then settle only the provider work actually used.</span>
+              </div>
+            </details>
             <button type="button" className="text-button secondary world-run-fresh" onClick={() => startRefresh(true)} disabled={Boolean(actionBusy)}>
               {actionBusy === "fresh" ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}
               {actionBusy === "fresh" ? "Starting fresh run" : "Run all work fresh"}
@@ -5276,29 +5587,43 @@ export function WorldGraphChanges({ run, agents, canWrite, onRefreshTracked, onR
   }
   return (
     <section className="detail-section world-changes" aria-labelledby="world-changes-heading">
+      <span className="worldgraph-product-label">WorldGraph · change-aware reuse</span>
       <div className="world-current-card" role="status" aria-live="polite">
         <span><Check size={18} aria-hidden="true" /></span>
         <div>
-          <strong id="world-changes-heading">Change record ready</strong>
-          <p>When this answer ran, {kept.length} validated {kept.length === 1 ? "work item was" : "work items were"} kept and {refreshed.length} {refreshed.length === 1 ? "work item was" : "work items were"} refreshed.</p>
+          <strong id="world-changes-heading">WorldGraph record ready</strong>
+          <p>Your team {[
+            kept.length ? `reused ${kept.length} previous ${kept.length === 1 ? "result" : "results"}` : "",
+            fresh.length ? `completed ${fresh.length} ${fresh.length === 1 ? "part" : "parts"} fresh` : "",
+            refreshed.length ? `checked ${refreshed.length} ${refreshed.length === 1 ? "part" : "parts"} again` : ""
+          ].filter(Boolean).join(", ")} for this answer.</p>
         </div>
       </div>
+      {preparation.status && preparation.capsule_created === false && preparation.primary_reason !== "no_matching_result" && (
+        <div className="world-preparation-note" role="note">
+          <AlertCircle size={16} aria-hidden="true" />
+          <div>
+            <strong>Why earlier work was not available</strong>
+            <p>{preparation.plain_reason || "No earlier validated result could be safely reused for this answer."}</p>
+          </div>
+        </div>
+      )}
       <div
         className="world-change-map"
         role="img"
-        aria-label={`Router checked inputs and evidence. ${kept.length} work items were kept from earlier and ${refreshed.length} were refreshed now. The answer was combined.`}
+        aria-label={`Router recorded the work. ${kept.length} reused, ${fresh.length} completed fresh, and ${refreshed.length} checked again. The answer was combined.`}
       >
         <Network size={17} aria-hidden="true" />
-        <span>Router checked inputs and evidence</span>
+        <span>Router recorded the work</span>
         <ChevronRight size={14} aria-hidden="true" />
-        <span>{kept.length} work items kept · {refreshed.length} refreshed</span>
+        <span>{kept.length} reused · {fresh.length} fresh · {refreshed.length} checked again</span>
         <ChevronRight size={14} aria-hidden="true" />
         <span>Answer combined</span>
       </div>
       <div className="world-check-panel">
         <div>
           <strong>Has anything changed since then?</strong>
-          <p>Check agent instructions, source revisions, conversation inputs, and live-tool rules without calling a model.</p>
+          <p>Check teammate roles, sources, conversation inputs, and live-information rules without asking the model to redo the work.</p>
         </div>
         <button type="button" className="text-button secondary" onClick={checkWhatChanged} disabled={checkBusy || Boolean(actionBusy)} aria-busy={checkBusy}>
           {checkBusy ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}
@@ -5311,16 +5636,16 @@ export function WorldGraphChanges({ run, agents, canWrite, onRefreshTracked, onR
           <span aria-hidden="true">{currentCheck.validity === "current" ? <Check size={17} /> : <RefreshCw size={17} />}</span>
           <div>
             <strong>{currentCheck.validity === "current"
-              ? "Nothing needs to rerun"
-              : `${currentCheck.wake_count} ${currentCheck.wake_count === 1 ? "work item may need" : "work items may need"} to run again`}</strong>
+              ? "Everything is still current"
+              : `${worldGraphUniqueWakeSpecialists(currentCheck)} ${worldGraphUniqueWakeSpecialists(currentCheck) === 1 ? "specialist may need" : "specialists may need"} to work again`}</strong>
             <p>{currentCheck.validity === "current"
-              ? `${currentCheck.keep_count} validated ${currentCheck.keep_count === 1 ? "result is" : "results are"} still usable.`
-              : `${currentCheck.keep_count} ${currentCheck.keep_count === 1 ? "work item can stay" : "work items can stay"} asleep. This preview used no model calls.`}</p>
+              ? `${currentCheck.keep_count} previous ${currentCheck.keep_count === 1 ? "result is" : "results are"} still usable. This check only compared saved evidence and settings; it did not ask the AI team to redo the work.`
+              : `${currentCheck.wake_count} ${currentCheck.wake_count === 1 ? "part needs" : "parts need"} updating; ${currentCheck.keep_count} previous ${currentCheck.keep_count === 1 ? "result can" : "results can"} be reused. This check only compared saved evidence and settings; it did not ask the AI team to redo the work.`}</p>
             {currentCheck.validity !== "current" && (
               <ul>
                 {(currentCheck.decisions || []).filter((item) => item.projected_action === "wake").map((item) => (
                   <li key={item.step_id || item.adapter}>
-                    <b>{formatAgentName(item.adapter, agents)}</b><span>{item.plain_reason}</span>
+                    <b>{formatAgentName(item.adapter, agents)}</b><span>{worldGraphPlainReason(item)}</span>
                   </li>
                 ))}
               </ul>
@@ -5332,15 +5657,21 @@ export function WorldGraphChanges({ run, agents, canWrite, onRefreshTracked, onR
           </div>
         </div>
       )}
+      {fresh.length > 0 && (
+        <div className="world-change-group">
+          <h4>Completed fresh now</h4>
+          <ul>{fresh.map(row)}</ul>
+        </div>
+      )}
       {refreshed.length > 0 && (
         <div className="world-change-group">
-          <h4>Refreshed now</h4>
+          <h4>Checked again now</h4>
           <ul>{refreshed.map(row)}</ul>
         </div>
       )}
       {kept.length > 0 && (
         <div className="world-change-group">
-          <h4>Kept from earlier</h4>
+          <h4>Reused from earlier</h4>
           <ul>{kept.map(row)}</ul>
         </div>
       )}
@@ -5351,10 +5682,13 @@ export function WorldGraphChanges({ run, agents, canWrite, onRefreshTracked, onR
       </div>
       {canWrite && run?.status === "completed" && (
         <>
-          <div className="world-run-disclosure">
-            <AlertCircle size={15} aria-hidden="true" />
-            <span>A refresh still runs Router planning and final answer synthesis. Billing may reserve the full-run maximum first, then settle only the provider work actually used.</span>
-          </div>
+          <details className="world-advanced-disclosure">
+            <summary>Advanced run details</summary>
+            <div className="world-run-disclosure">
+              <AlertCircle size={15} aria-hidden="true" />
+              <span>A refresh still runs Router planning and final answer synthesis. Billing may reserve the full-run maximum first, then settle only the provider work actually used.</span>
+            </div>
+          </details>
           <div className="world-run-actions">
             {currentCheck?.validity === "needs_refresh" && (
               <button type="button" className="text-button primary" onClick={() => startRefresh(false)} disabled={Boolean(actionBusy) || checkBusy}>
@@ -5364,7 +5698,7 @@ export function WorldGraphChanges({ run, agents, canWrite, onRefreshTracked, onR
             )}
             <button type="button" className="text-button secondary world-run-fresh" onClick={() => startRefresh(true)} disabled={Boolean(actionBusy) || checkBusy}>
               {actionBusy === "fresh" ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}
-              {actionBusy === "fresh" ? "Starting fresh run" : "Run all agents anyway"}
+              {actionBusy === "fresh" ? "Starting fresh run" : "Run the whole team anyway"}
             </button>
           </div>
           {actionError && <p className="form-error world-action-error" role="alert">{actionError}</p>}
@@ -5419,8 +5753,8 @@ export function RunDetailsSheet({
         {run && (
           <>
             <div className="view-switch five-up" aria-label="Answer detail view">
-              <button type="button" aria-pressed={view === "changes"} onClick={() => selectView("changes")}>Changes</button>
-              <button type="button" aria-pressed={view === "agents"} onClick={() => selectView("agents")}>Agents</button>
+              <button type="button" aria-pressed={view === "changes"} onClick={() => selectView("changes")}>What changed</button>
+              <button type="button" aria-pressed={view === "agents"} onClick={() => selectView("agents")}>Team</button>
               <button type="button" aria-pressed={view === "sources"} onClick={() => selectView("sources")}>Sources</button>
               <button type="button" aria-pressed={view === "outcomes"} onClick={() => selectView("outcomes")}>Results</button>
               <button type="button" aria-pressed={view === "activity"} onClick={() => selectView("activity")}>Activity</button>
@@ -5439,7 +5773,7 @@ export function RunDetailsSheet({
             {view === "agents" && (
               <section className="detail-section" aria-labelledby="used-agents-heading">
                 <div className="section-heading compact-heading">
-                  <div><h3 id="used-agents-heading">Agents and model usage</h3><p>{run.expert_outputs?.length || 0} contributors. Expand any agent to read its complete result.</p></div>
+                  <div><h3 id="used-agents-heading">How your team contributed</h3><p>{run.expert_outputs?.length || 0} {(run.expert_outputs?.length || 0) === 1 ? "specialist" : "specialists"} contributed. Open any role to read the work it handed back.</p></div>
                 </div>
                 <UsageReceipt
                   receipt={run.usage_receipt}
@@ -5471,7 +5805,7 @@ export function RunDetailsSheet({
                           {route.task && <p><strong>Task</strong>{route.task}</p>}
                           {route.domain_answer && (
                             <div className="agent-full-output">
-                              <strong>Agent result</strong>
+                              <strong>Specialist result</strong>
                               <FormattedText text={route.domain_answer} />
                             </div>
                           )}
@@ -5502,7 +5836,7 @@ export function RunDetailsSheet({
                       </details>
                     );
                   })}
-                  {!run.expert_outputs?.length && <p className="muted-empty">No agent details are available.</p>}
+                  {!run.expert_outputs?.length && <p className="muted-empty">No specialist details are available.</p>}
                 </div>
               </section>
             )}
@@ -5658,11 +5992,11 @@ export function RunDetailsSheet({
 function eventLabel(type) {
   const labels = {
     "run.started": "Started",
-    "planner.started": "Choosing agents",
-    "planner.completed": "Agents selected",
+    "planner.started": "Choosing teammates",
+    "planner.completed": "Teammates selected",
     "runtime.requested": "Request accepted",
-    "route.started": "Agent started",
-    "route.completed": "Agent finished",
+    "route.started": "Specialist started",
+    "route.completed": "Specialist finished",
     "synthesis.started": "Composing answer",
     "final.completed": "Answer completed",
     "run.failed": "Answer failed"
@@ -5675,8 +6009,8 @@ function contractFieldLabel(value, agents = []) {
   const agentMatch = text.match(/^agent:([a-z0-9_-]+):output$/i);
   if (agentMatch) return `${formatAgentName(agentMatch[1], agents)} output`;
   const labels = {
-    domain_outputs: "All verified agent outputs",
-    upstream_route_outputs: "Other agents’ verified work",
+    domain_outputs: "Completed specialist work",
+    upstream_route_outputs: "Work passed from teammates",
     document_context: "Attached document context",
     table_context: "Structured data",
     shared_memory: "Conversation context",
@@ -5724,9 +6058,9 @@ const AGENT_TEMPLATES = [
   },
   {
     id: "coordinate",
-    label: "Coordinate agents",
+    label: "Coordinate specialists",
     icon: Network,
-    capability: "Coordinate work from other agents, resolve overlaps, preserve important constraints, and prepare a unified handoff.",
+    capability: "Coordinate work from other specialists, resolve overlaps, preserve important constraints, and prepare a unified handoff.",
     tools: [],
     consumes: ["user_request", "upstream_route_outputs"],
     produces: ["agent_handoff"]
@@ -5738,19 +6072,19 @@ const RESPONSE_STYLES = [
     id: "direct",
     title: "Direct",
     detail: "Lead with the answer and keep it concise.",
-    boundary: "Lead with the useful answer, keep it concise, stay within this agent's purpose, and state uncertainty when it matters."
+    boundary: "Lead with the useful answer, keep it concise, stay within this specialist's purpose, and state uncertainty when it matters."
   },
   {
     id: "thorough",
     title: "Thorough",
     detail: "Explain the reasoning and important tradeoffs.",
-    boundary: "Explain the reasoning, assumptions, and important tradeoffs. Use only approved tools and knowledge, and stay within this agent's purpose."
+    boundary: "Explain the reasoning, assumptions, and important tradeoffs. Use only approved tools and knowledge, and stay within this specialist's purpose."
   },
   {
     id: "careful",
     title: "Careful",
     detail: "Prioritize evidence, limits, and uncertainty.",
-    boundary: "Prioritize verified evidence, identify important limits, state uncertainty clearly, and do not go beyond this agent's purpose."
+    boundary: "Prioritize verified evidence, identify important limits, state uncertainty clearly, and do not go beyond this specialist's purpose."
   }
 ];
 
@@ -5786,13 +6120,24 @@ function collaboratorToken(agentId) {
   return `agent:${agentId}:output`;
 }
 
+export function unavailableCollaboratorHandoffs(consumes = [], collaborators = []) {
+  const available = new Set((collaborators || []).map((candidate) => collaboratorToken(candidate.id)));
+  return (consumes || []).filter((value) => /^agent:.+:output$/.test(value) && !available.has(value));
+}
+
 export function agentPayloadFromForm(form, { isAdmin = false, hasDocumentResources = false } = {}) {
   const responseStyle = RESPONSE_STYLES.find((style) => style.id === form.response_style);
+  const customBoundary = form.boundary.trim();
+  const combinedBoundary = responseStyle
+    ? customBoundary
+      ? `${responseStyle.boundary}\n\nAdditional role-specific guardrails:\n${customBoundary}`
+      : responseStyle.boundary
+    : customBoundary || RESPONSE_STYLES[0].boundary;
   return {
     item_type: form.item_type,
     title: form.title.trim(),
     capability: form.capability.trim(),
-    boundary: form.boundary.trim() || responseStyle?.boundary || RESPONSE_STYLES[0].boundary,
+    boundary: combinedBoundary,
     routing_cues: form.routing_cues || `${form.title}, ${form.capability}`,
     consumes: [...new Set([
       "user_request",
@@ -5811,15 +6156,31 @@ export function agentPayloadFromForm(form, { isAdmin = false, hasDocumentResourc
   };
 }
 
+export function responseStyleFromBoundary(boundary) {
+  const value = String(boundary || "").trim();
+  for (const style of RESPONSE_STYLES) {
+    const recognizedBoundaries = [...new Set([
+      style.boundary,
+      style.boundary.replaceAll("specialist's", "agent's")
+    ])];
+    for (const recognizedBoundary of recognizedBoundaries) {
+      if (value === recognizedBoundary) return { response_style: style.id, boundary: "" };
+      const prefix = `${recognizedBoundary}\n\nAdditional role-specific guardrails:\n`;
+      if (value.startsWith(prefix)) return { response_style: style.id, boundary: value.slice(prefix.length).trim() };
+    }
+  }
+  return { response_style: "custom", boundary: value };
+}
+
 function createAgentForm(agent) {
   if (agent) {
-    const matchingStyle = RESPONSE_STYLES.find((style) => style.boundary === String(agent.boundary || "").trim());
+    const responseConfiguration = responseStyleFromBoundary(agent.boundary);
     return {
       id: agent.id,
       title: agentFacingText(agent.title),
       capability: agentFacingText(agent.capability),
-      boundary: matchingStyle ? "" : agent.boundary || "",
-      response_style: matchingStyle?.id || "custom",
+      boundary: responseConfiguration.boundary,
+      response_style: responseConfiguration.response_style,
       routing_cues: (agent.routing_cues || []).join(", "),
       consumes: agent.consumes?.length ? [...agent.consumes] : ["user_request"],
       produces: agent.produces?.length ? [...agent.produces] : ["domain_outputs"],
@@ -5864,13 +6225,19 @@ function AgentDialog({ auth, runtime, agent, agents, documents, mcpConnections =
   const [busy, setBusy] = useState(false);
   const [uploadProgress, setUploadProgress] = useState("");
   const [error, setError] = useState("");
+  const [templateUndo, setTemplateUndo] = useState(null);
   const initialFormSignature = useRef("");
   if (!initialFormSignature.current) initialFormSignature.current = JSON.stringify(form);
   const fileInputId = useId();
   const knowledgeDocuments = (documents || []).filter((document) => document.scope !== "chat" && document.enabled !== false);
-  const collaboratorAgents = (agents || [])
-    .filter((candidate) => candidate.id !== agent?.id && candidate.enabled !== false && !candidate.document && !candidate.resource_for_agent_id)
+  const allCollaboratorAgents = (agents || [])
+    .filter((candidate) => candidate.id !== agent?.id && candidate.enabled !== false && !candidate.document && !candidate.resource_for_agent_id);
+  const selectedCollaboratorTokens = new Set((form.consumes || []).filter((value) => /^agent:.+:output$/.test(value)));
+  const collaboratorAgents = [...allCollaboratorAgents]
+    .sort((left, right) => Number(selectedCollaboratorTokens.has(collaboratorToken(right.id))) - Number(selectedCollaboratorTokens.has(collaboratorToken(left.id)))
+      || String(left.title || left.id).localeCompare(String(right.title || right.id)))
     .slice(0, 24);
+  const unavailableCollaboratorTokens = unavailableCollaboratorHandoffs(form.consumes, allCollaboratorAgents);
   const selectedDocumentCount = knowledgeDocuments.filter((document) => form.resources.includes(resourceToken(document.agent_id))).length;
   const dirty = JSON.stringify(form) !== initialFormSignature.current || newFiles.length > 0 || Boolean(createdAgentId);
 
@@ -5921,6 +6288,12 @@ function AgentDialog({ auth, runtime, agent, agents, documents, mcpConnections =
   }
 
   function applyTemplate(template) {
+    setTemplateUndo({
+      capability: form.capability,
+      tools: form.tools,
+      consumes: form.consumes,
+      produces: form.produces
+    });
     setForm((current) => ({
       ...current,
       capability: template.capability,
@@ -5928,6 +6301,12 @@ function AgentDialog({ auth, runtime, agent, agents, documents, mcpConnections =
       consumes: [...new Set(["user_request", ...template.consumes])],
       produces: [...template.produces]
     }));
+  }
+
+  function undoTemplate() {
+    if (!templateUndo) return;
+    setForm((current) => ({ ...current, ...templateUndo }));
+    setTemplateUndo(null);
   }
 
   function changeResponseStyle(style) {
@@ -5972,7 +6351,16 @@ function AgentDialog({ auth, runtime, agent, agents, documents, mcpConnections =
   async function submit(event) {
     event.preventDefault();
     if (step < 2) {
+      if (step === 1 && unavailableCollaboratorTokens.length) {
+        setError("Remove unavailable teammate handoffs before continuing.");
+        return;
+      }
       setStep((current) => current + 1);
+      return;
+    }
+    if (unavailableCollaboratorTokens.length) {
+      setStep(1);
+      setError("Remove unavailable teammate handoffs before saving this specialist.");
       return;
     }
     setBusy(true);
@@ -6032,7 +6420,9 @@ function AgentDialog({ auth, runtime, agent, agents, documents, mcpConnections =
     { label: "Abilities", detail: "Tools and teammates" },
     { label: "Knowledge", detail: "Sources and review" }
   ];
-  const canContinue = step === 0 ? form.title.trim() && form.capability.trim() : step === 1 ? form.produces.length > 0 : true;
+  const canContinue = step === 0
+    ? form.title.trim() && form.capability.trim()
+    : step === 1 ? form.produces.length > 0 && unavailableCollaboratorTokens.length === 0 : true;
 
   return (
     <ModalSurface
@@ -6043,7 +6433,7 @@ function AgentDialog({ auth, runtime, agent, agents, documents, mcpConnections =
       className="agent-builder-dialog"
     >
       <form className="agent-builder" onSubmit={submit}>
-        <nav className="builder-steps" aria-label="Agent setup progress">
+        <nav className="builder-steps" aria-label="Specialist setup progress">
           {steps.map((item, index) => (
             <button
               type="button"
@@ -6089,6 +6479,7 @@ function AgentDialog({ auth, runtime, agent, agents, documents, mcpConnections =
                     })}
                   </div>
                 </div>
+                {templateUndo && <div className="template-applied-note" role="status"><Check size={14} /><span>Starter role applied. You can edit every field.</span><button type="button" onClick={undoTemplate}>Undo</button></div>}
                 <fieldset className="choice-fieldset response-style-fieldset">
                   <legend>How should it respond?</legend>
                   <div className="response-style-grid">
@@ -6100,6 +6491,7 @@ function AgentDialog({ auth, runtime, agent, agents, documents, mcpConnections =
                       </label>
                     ))}
                   </div>
+                  {form.response_style === "custom" && <div className="custom-response-note"><ShieldCheck size={14} /><span><strong>Custom response instructions preserved</strong><small>Choose a preference only if you want to layer it on top of the existing guardrails.</small></span></div>}
                 </fieldset>
                 <details className="builder-details">
                   <summary><Settings2 size={15} /> Add specific guardrails <span>Optional</span></summary>
@@ -6191,11 +6583,20 @@ function AgentDialog({ auth, runtime, agent, agents, documents, mcpConnections =
                     })}
                   </div>
                 </fieldset>
-                {collaboratorAgents.length > 0 && (
+                {(collaboratorAgents.length > 0 || unavailableCollaboratorTokens.length > 0) && (
                   <details className="builder-details collaborator-details">
                     <summary><Network size={15} /> Choose specific teammates <span>{form.consumes.filter((value) => /^agent:.+:output$/.test(value)).length || "Optional"}</span></summary>
                     <p>Select teammates whose completed work can be passed to this specialist.</p>
                     <div className="collaborator-list">
+                      {unavailableCollaboratorTokens.map((token) => {
+                        const unavailableId = token.slice("agent:".length, -":output".length);
+                        return (
+                          <label className="unavailable" key={token}>
+                            <input type="checkbox" checked onChange={() => toggleValue("consumes", token, false)} />
+                            <AlertCircle size={15} /><span><strong>Unavailable teammate</strong><small>{unavailableId} is no longer on this team. Clear this handoff before saving.</small></span>
+                          </label>
+                        );
+                      })}
                       {collaboratorAgents.map((candidate) => {
                         const token = collaboratorToken(candidate.id);
                         return (
@@ -6269,7 +6670,7 @@ function AgentDialog({ auth, runtime, agent, agents, documents, mcpConnections =
                 )}
                 <details className="builder-details">
                   <summary><Sparkles size={15} /> Paste short notes <span>Optional</span></summary>
-                  <div className="builder-field"><label htmlFor="agent-notes">Private notes and rules</label><textarea id="agent-notes" value={form.source_text} onChange={(event) => update("source_text", event.target.value)} placeholder="Paste facts, terminology, or rules this agent should use..." /></div>
+                  <div className="builder-field"><label htmlFor="agent-notes">Private notes and rules</label><textarea id="agent-notes" value={form.source_text} onChange={(event) => update("source_text", event.target.value)} placeholder="Paste facts, terminology, or rules this specialist should use..." /></div>
                 </details>
                 <details className="builder-details">
                   <summary><Settings2 size={15} /> Advanced setup</summary>
@@ -6344,6 +6745,7 @@ function AdoptionDialog({ auth, agent, onClose, onSaved }) {
       title="Adopt agent"
       description="Assign ownership before this runtime agent can be edited or archived."
       onClose={onClose}
+      closeDisabled={busy}
       className="form-dialog"
     >
       <form className="dialog-form" onSubmit={submit}>
@@ -6411,8 +6813,9 @@ function DocumentUploadDialog({ scope = "knowledge", sessionId = null, onClose, 
       title={scope === "chat" ? "Attach file to this chat" : "Add to Knowledge"}
       description={scope === "chat"
         ? "This file will be available only in this chat."
-        : "This file will be available to your agents across all chats."}
+        : "This file will be available to your specialists across all chats."}
       onClose={onClose}
+      closeDisabled={busy}
       className="form-dialog"
     >
       <form className="dialog-form" onSubmit={submit}>
@@ -6461,12 +6864,12 @@ function FeedbackDialog({ runId, onClose, onSaved }) {
     }
   }
   return (
-    <ModalSurface title="Report a problem" description="Tell us what was wrong with this answer." onClose={onClose} className="small-dialog">
+    <ModalSurface title="Report a problem" description="Tell us what was wrong with this answer." onClose={onClose} closeDisabled={busy} className="small-dialog">
       <form className="dialog-form" onSubmit={submit}>
         {error && <div className="form-error" role="alert">{error}</div>}
         <label><span>What happened?</span><textarea data-autofocus value={reason} onChange={(event) => setReason(event.target.value)} required maxLength={1000} /></label>
         <div className="dialog-actions">
-          <button type="button" className="text-button ghost" onClick={onClose}>Cancel</button>
+          <button type="button" className="text-button ghost" onClick={onClose} disabled={busy}>Cancel</button>
           <button type="submit" className="text-button primary" disabled={busy || !reason.trim()}>{busy ? <LoaderCircle className="spin" size={16} /> : <Flag size={16} />}Send</button>
         </div>
       </form>
@@ -6479,7 +6882,7 @@ function ConfirmDialog({ title, message, confirmLabel, destructive, icon: Icon, 
   const [error, setError] = useState("");
   const ConfirmIcon = Icon || (destructive ? Archive : Check);
   return (
-    <ModalSurface title={title} description={message} onClose={onClose} className="small-dialog">
+    <ModalSurface title={title} description={message} onClose={onClose} closeDisabled={busy} className="small-dialog">
       <div className="confirmation-body">
         {error && <div className="form-error" role="alert">{error}</div>}
         <div className="dialog-actions confirmation-actions">
@@ -6618,7 +7021,7 @@ function OutcomeDialog({ run, agents, auth, onClose, onSaved }) {
     event.preventDefault();
     setError("");
     if (!predictionsAreValid) {
-      setError("Each active prediction needs an exact passage from that agent's recorded answer containing the prediction value.");
+      setError("Each active prediction needs an exact passage from that specialist's recorded answer containing the prediction value.");
       return;
     }
     setBusy(true);
@@ -6667,7 +7070,7 @@ function OutcomeDialog({ run, agents, auth, onClose, onSaved }) {
   }
 
   return (
-    <ModalSurface title="Track a claim" description="Set the question now. Record what actually happened when the date arrives." onClose={onClose} className="wide-dialog simple-tracking-dialog">
+    <ModalSurface title="Track a claim" description="Set the question now. Record what actually happened when the date arrives." onClose={onClose} closeDisabled={busy} className="wide-dialog simple-tracking-dialog">
       <form className="dialog-form simple-tracking-form" onSubmit={submit}>
         {error && <div className="form-error" role="alert">{error}</div>}
         <div className="tracking-form-intro">
@@ -6703,9 +7106,9 @@ function OutcomeDialog({ run, agents, auth, onClose, onSaved }) {
           {form.outcome_type === "categorical" && <label className="span-two"><span>Possible results <small>optional, comma separated</small></span><input value={form.allowed_values} onChange={(event) => update("allowed_values", event.target.value)} placeholder="Approved, delayed, cancelled" /></label>}
         </div>
         <details className="advanced-fields prediction-details">
-          <summary><Bot size={15} /> Agent estimates <span>{Object.values(form.predictions).filter((prediction) => !prediction.abstained).length} found in this answer</span></summary>
+          <summary><Bot size={15} /> Specialist estimates <span>{Object.values(form.predictions).filter((prediction) => !prediction.abstained).length} found in this answer</span></summary>
           <div>
-            <p className="advanced-explainer">Virenis keeps any clear estimate already stated in the answer. Agents without a recorded estimate are skipped.</p>
+            <p className="advanced-explainer">Virenis keeps any clear estimate already stated in the answer. Specialists without a recorded estimate are skipped.</p>
             <fieldset className="prediction-fieldset">
               {participants.map((participant) => {
                 const prediction = form.predictions[participant.step_id];
@@ -6853,7 +7256,7 @@ function SettlementDialog({ contract, onClose, onSaved }) {
   }
 
   return (
-    <ModalSurface title="Record the result" description={contract.title} onClose={onClose} className="form-dialog">
+    <ModalSurface title="Record the result" description={contract.title} onClose={onClose} closeDisabled={busy} className="form-dialog">
       <form className="dialog-form" onSubmit={submit}>
         {error && <div className="form-error" role="alert">{error}</div>}
         <div className={`due-notice ${isDue ? "ready" : ""}`}>
@@ -6915,7 +7318,7 @@ function DisputeDialog({ contract, onClose, onSaved }) {
   }
 
   return (
-    <ModalSurface title="Dispute result" description={contract.title} onClose={onClose} className="form-dialog">
+    <ModalSurface title="Dispute result" description={contract.title} onClose={onClose} closeDisabled={busy} className="form-dialog">
       <form className="dialog-form" onSubmit={submit}>
         {error && <div className="form-error" role="alert">{error}</div>}
         <dl className="outcome-result dispute-result">
@@ -6999,7 +7402,7 @@ function CorrectionDialog({ contract, onClose, onSaved }) {
   }
 
   return (
-    <ModalSurface title="Correct result" description={contract.title} onClose={onClose} className="form-dialog">
+    <ModalSurface title="Correct result" description={contract.title} onClose={onClose} closeDisabled={busy} className="form-dialog">
       <form className="dialog-form" onSubmit={submit}>
         {error && <div className="form-error" role="alert">{error}</div>}
         <div className={`due-notice ${isDue ? "ready" : ""}`}>

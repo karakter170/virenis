@@ -330,9 +330,7 @@ const REALISTIC_PIPELINE_PROMPTS = [
 const AGENTS_REQUIRING_LIVE_RECHECK = new Set([
   "finance_reasoning_lora",
   "refund_policy_lora",
-  "software_architect_lora",
-  "sql_analytics_lora",
-  "security_review_lora"
+  "sql_analytics_lora"
 ]);
 
 describe.sequential("30 realistic full chat-pipeline selective-wake scenarios", () => {

@@ -1758,6 +1758,27 @@ export async function createApp({
       const runOptions = normalizeChatOptions(req.body.options, {
         outputSettings: modelOutputSettingsForWorkspace(data, session.workspace_id)
       });
+      const requestedAgentIds = normalizeRequestedAgentIds(req.body.requested_agent_ids);
+      if (requestedAgentIds.length) {
+        const agentWorkspace = activeAgentWorkspaceForSession(data, session);
+        const routingScope = scopedRoutingContext({
+          session,
+          agents: data.agents,
+          documents: data.documents,
+          agentWorkspace
+        });
+        const allowed = new Set(routingScope.allowedAdapters);
+        const unavailable = requestedAgentIds.filter((agentId) => !allowed.has(agentId));
+        if (unavailable.length) {
+          throwStatus(409, "One or more workflow specialists are no longer available in the active team. Review the workflow before running it again.");
+        }
+        if (requestedAgentIds.length > runOptions.max_routing_adapters) {
+          throwStatus(400, `This workflow exceeds the ${runOptions.max_routing_adapters}-specialist run limit.`);
+        }
+      }
+      const executionOptions = requestedAgentIds.length
+        ? { ...runOptions, required_adapters: requestedAgentIds }
+        : runOptions;
       const workflowCommand = parseWorkflowCommand(req.body.content);
       const attachments = normalizeMessageAttachments(req.body.attachments);
       const idempotencyKey = normalizeIdempotencyKey(req.headers["idempotency-key"]);
@@ -1767,7 +1788,8 @@ export async function createApp({
       const submissionDigest = crypto.createHash("sha256").update(JSON.stringify({
         content: req.body.content.trim(),
         attachments,
-        options: runOptions,
+        options: executionOptions,
+        requested_agent_ids: requestedAgentIds,
         agent_workspace_id: session.agent_workspace_id || null
       }), "utf8").digest("hex");
       const now = nowIso();
@@ -1796,7 +1818,8 @@ export async function createApp({
         base_model: BASE_MODEL,
         parallel_workers: runOptions.parallel_workers,
         max_routing_adapters: runOptions.max_routing_adapters,
-        execution_options: runOptions,
+        execution_options: executionOptions,
+        requested_agent_ids: requestedAgentIds,
         query: message.content,
         plan: { steps: [] },
         parallel: { workers: runOptions.parallel_workers, batches: [], maxBatchWidth: 0, parallelizable: false },
@@ -5841,6 +5864,9 @@ function currentWorldGraphPreview(data, run, { runtimeComponentProvenance = null
   const refreshOptions = normalizeChatOptions(publicRunExecutionOptions(run.execution_options), {
     outputSettings: modelOutputSettingsForWorkspace(data, session.workspace_id)
   });
+  if (Array.isArray(run.requested_agent_ids) && run.requested_agent_ids.length) {
+    refreshOptions.required_adapters = [...run.requested_agent_ids];
+  }
   return previewWorldGraphRun({
     data,
     run,
@@ -5887,6 +5913,7 @@ function readRunResult(store, runId, req) {
     agent_workspace_id: run.agent_workspace_id || null,
     status: run.status,
     query: run.query,
+    requested_agent_ids: Array.isArray(run.requested_agent_ids) ? run.requested_agent_ids : [],
     final_answer: run.final_answer || "",
     plan: run.plan,
     parallel: run.parallel,
@@ -6510,6 +6537,17 @@ function normalizeChatOptions(options = {}, { outputSettings = null } = {}) {
     refiner_max_tokens: boundedInt(options.refiner_max_tokens, finalOutputTokens, 32, maximumFinalOutputTokens),
     temperature: boundedFloat(options.temperature, Number(process.env.TCAR_TEMPERATURE || 0), 0, Number(process.env.TCAR_CLIENT_MAX_TEMPERATURE || 1))
   };
+}
+
+function normalizeRequestedAgentIds(value) {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) throwStatus(400, "requested_agent_ids must be a list.");
+  if (value.length > 32) throwStatus(400, "requested_agent_ids contains too many specialists.");
+  const normalized = [...new Set(value.map((item) => String(item || "").trim()).filter(Boolean))];
+  if (normalized.some((agentId) => !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,239}$/.test(agentId))) {
+    throwStatus(400, "requested_agent_ids contains an invalid specialist identifier.");
+  }
+  return normalized;
 }
 
 function normalizeMessageAttachments(value) {

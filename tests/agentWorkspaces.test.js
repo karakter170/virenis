@@ -349,6 +349,48 @@ describe("agent workspaces", () => {
     expect(sessionDetail.body.messages.filter((message) => message.role === "user")).toHaveLength(2);
   });
 
+  it("executes approved workflow specialists from metadata without exposing their IDs in chat", async () => {
+    const workspace = await createWorkspace("Support workflow team");
+    await createAgent({ id: "workflow_mail_reader", workspaceId: workspace.agent_workspace_id });
+    await createAgent({ id: "workflow_reply_writer", workspaceId: workspace.agent_workspace_id });
+    await createAgent({ id: "workflow_unrelated_analyst", workspaceId: workspace.agent_workspace_id });
+    const session = await createSession(workspace.agent_workspace_id);
+    const content = "Prepare the approved customer-support handoff.";
+
+    const queued = await request(app)
+      .post(`/api/chat/sessions/${session.session_id}/messages`)
+      .set("Authorization", as("alice"))
+      .send({
+        content,
+        requested_agent_ids: ["workflow_mail_reader", "workflow_reply_writer"]
+      })
+      .expect(202);
+    const completed = await waitForRun(queued.body.run_id);
+
+    expect(completed.query).toBe(content);
+    expect(completed.requested_agent_ids).toEqual(["workflow_mail_reader", "workflow_reply_writer"]);
+    expect(completed.plan.steps.map((step) => step.adapter)).toEqual([
+      "workflow_mail_reader",
+      "workflow_reply_writer"
+    ]);
+    expect(completed.plan.steps.map((step) => step.adapter)).not.toContain("workflow_unrelated_analyst");
+    expect(completed.plan.routing.mode).toBe("approved_workflow");
+    const detail = await request(app)
+      .get(`/api/chat/sessions/${session.session_id}`)
+      .set("Authorization", as("alice"))
+      .expect(200);
+    const userMessage = detail.body.messages.find((message) => message.message_id === queued.body.message_id);
+    expect(userMessage.content).toBe(content);
+    expect(userMessage.content).not.toContain("@workflow_mail_reader");
+    expect(userMessage.content).not.toContain("workflow_reply_writer");
+
+    await request(app)
+      .post(`/api/chat/sessions/${session.session_id}/messages`)
+      .set("Authorization", as("alice"))
+      .send({ content: "Try an unavailable workflow.", requested_agent_ids: ["second_team_specialist"] })
+      .expect(409);
+  });
+
   it("binds /agent composition and activation to the chosen workspace", async () => {
     const workspace = await createWorkspace("Poetry workflow");
     const session = await createSession(workspace.agent_workspace_id);

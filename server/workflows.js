@@ -499,10 +499,12 @@ export async function decideWorkflow({ store, workflowId, actor, decision, expec
       }
       appendWorkflowStatusMessage(data, workflow, {
         kind: "workflow_declined",
-        content: `The **${workflow.title}** draft was closed. Any partially created workflow agents will be removed; workspace connections you already authorized remain available. This conversation can continue normally.`
+        content: `The **${workflow.title}** draft was closed. Any partially created specialists will be removed; connected apps you already authorized remain available. This conversation can continue normally.`
       });
       return workflow;
     }
+    const session = (data.sessions || []).find((item) => item.session_id === workflow.session_id);
+    if (session?.agent_workspace_id) workflow.agent_workspace_id = session.agent_workspace_id;
     workflow.approved_at ||= now;
     workflow.updated_at = now;
     workflow.revision += 1;
@@ -606,7 +608,7 @@ export async function markWorkflowActivation({
       }
       appendWorkflowStatusMessage(data, workflow, {
         kind: "workflow_activated",
-        content: `**${workflow.title}** is ready. Its agents and handoffs are now available to the Router. You can continue chatting or run the team from this workflow card.`
+        content: `**${workflow.title}** is ready. Its specialists and handoffs are now available to the Router. You can continue chatting or run the team from this workflow card.`
       });
     } else if (status === "activation_failed") {
       workflow.error = bounded(error || "Workflow setup could not be completed.", 500);
@@ -1065,6 +1067,11 @@ function normalizeWorkflowProposal(raw, context) {
   if (!edges.length && nodes.length > 1) edges.push(...chainEdges(nodes));
   connectWorkflowRoots(nodes, edges, primaryTrigger.id);
   enforceSideEffectApprovals(nodes, edges);
+  for (const node of nodes) {
+    if (node.type !== "agent") continue;
+    const candidate = candidateMap.get(String(node.candidate_id || ""));
+    node.new_specialist_required = workflowProposalNeedsNewSpecialist({ nodes, edges }, node, candidate);
+  }
   const detectedRequirements = detectProviderRequirements(context.input.intent, nodes);
   const connectionRequirements = detectedRequirements.map((requirement) => {
     const connection = findRequirementConnection(requirement, context.data.mcpConnections || [], context.actor);
@@ -1175,7 +1182,7 @@ function workflowCandidates(data, session, actor, intent, agentWorkspaceId = nul
       || selectedAgentIds.has(agent.id)
       || sessionDocument;
     if (accessibleWorkspaceAgent && selectedForWorkspace && agentIdCounts.get(agent.id) === 1) {
-      workspace.push(candidateFromWorkspaceAgent(agent, intent));
+      workspace.push(candidateFromWorkspaceAgent(agent, intent, actor));
     }
     if (!agent.document && agent.marketplace?.published === true && agent.marketplace?.snapshot) {
       marketplace.push(candidateFromMarketplaceAgent(agent, ratingsByListing, intent));
@@ -1240,7 +1247,7 @@ function workflowConnections(data, actor, intent) {
     .map((item) => item.value);
 }
 
-function candidateFromWorkspaceAgent(agent, intent) {
+function candidateFromWorkspaceAgent(agent, intent, actor) {
   const providerIds = (agent.mcp_bindings || [])
     .map((binding) => safeProviderId(binding.template_id))
     .filter((providerId) => providerId && providerId !== "custom");
@@ -1261,6 +1268,11 @@ function candidateFromWorkspaceAgent(agent, intent) {
         : (agent.system_managed ? "system" : "workspace"),
     workflow_generated: Boolean(agent.workflow_origin),
     system_managed: Boolean(agent.system_managed),
+    workflow_mutable: Boolean(
+      agent.visibility === "private"
+      && String(agent.workspace_id || "") === String(actor?.workspace_id || "")
+      && agent.created_by === actor?.user_id
+    ),
     match_score: lexicalScore(intent, [agent.title, agent.capability, ...(agent.routing_cues || [])])
   };
 }
@@ -1397,6 +1409,33 @@ function workflowRoleCapability(rawNode, candidate, candidates, task) {
 
 function canonicalCapabilityText(value) {
   return String(value || "").toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+function workflowProposalNeedsNewSpecialist(workflow, node, candidate) {
+  if (node.source !== "workspace") return true;
+  if (!candidate) return true;
+  // A chat document is already an isolated conversation resource. Activation
+  // keeps that retrieval-backed specialist intact instead of copying it.
+  if (candidate.origin === "chat_document") return false;
+  if (!candidate.workflow_mutable || candidate.workflow_generated || candidate.system_managed) return true;
+  if (nearestWorkflowUpstreamAgentNodes(workflow, node.id).length > 0) return true;
+  const inferredProviders = new Set(node.provider_ids || []);
+  for (const edge of workflow.edges || []) {
+    if (edge.source !== node.id && edge.target !== node.id) continue;
+    const adjacentId = edge.source === node.id ? edge.target : edge.source;
+    const adjacent = (workflow.nodes || []).find((item) => item.id === adjacentId);
+    if (["tool", "trigger", "action"].includes(adjacent?.type)) {
+      for (const providerId of adjacent.provider_ids || []) inferredProviders.add(providerId);
+    }
+  }
+  if (inferredProviders.size > 0) return true;
+  const candidateTools = new Set(candidate.tools || []);
+  if ((node.tools || []).some((tool) => !candidateTools.has(tool))) return true;
+  const candidateProduces = new Set(candidate.produces || []);
+  if ((node.produces || []).some((output) => !candidateProduces.has(output))) return true;
+  const nodeCapability = canonicalCapabilityText(node.capability);
+  const candidateCapability = canonicalCapabilityText(candidate.capability);
+  return Boolean(nodeCapability && candidateCapability && nodeCapability !== candidateCapability);
 }
 
 function semanticTokenSet(...values) {
@@ -1643,7 +1682,7 @@ function appendWorkflowStatusMessage(data, workflow, { kind, content }) {
 function workflowDraftMessage(workflow) {
   const agentCount = workflow.nodes.filter((node) => node.type === "agent").length;
   const missing = workflow.connection_requirements.filter((item) => item.status !== "connected");
-  return `I composed **${workflow.title}** with ${agentCount} ${agentCount === 1 ? "agent" : "agents"}. Review the proposed handoffs, permissions, and ${missing.length ? "required connections" : "safety boundaries"} before creating it.`;
+  return `I composed **${workflow.title}** with ${agentCount} ${agentCount === 1 ? "specialist" : "specialists"}. Review the proposed handoffs, permissions, and ${missing.length ? "required connections" : "safety boundaries"} before creating it.`;
 }
 
 function workflowRunPlan(workflow) {

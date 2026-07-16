@@ -234,4 +234,51 @@ describe("canonical Agent Studio execution contract", () => {
       maxBatchWidth: 2
     });
   });
+
+  it("never lets configured dependencies displace an approved workflow specialist", () => {
+    const agents = [
+      {
+        id: "first_upstream",
+        title: "First upstream",
+        capability: "Prepare the first input.",
+        consumes: ["user_request"],
+        produces: ["first_input"],
+        resources: [],
+        enabled: true
+      },
+      {
+        id: "second_upstream",
+        title: "Second upstream",
+        capability: "Prepare the second input.",
+        consumes: ["user_request"],
+        produces: ["second_input"],
+        resources: [],
+        enabled: true
+      },
+      {
+        id: "approved_destination",
+        title: "Approved destination",
+        capability: "Complete the approved work.",
+        consumes: [
+          "user_request",
+          "agent:first_upstream:output",
+          "agent:second_upstream:output"
+        ],
+        produces: ["final_answer"],
+        resources: [],
+        enabled: true
+      }
+    ];
+
+    const plan = planRoutes({
+      query: "Complete the approved workflow.",
+      agents,
+      requiredAgentIds: ["approved_destination"],
+      maxRoutingAdapters: 1
+    });
+
+    expect(plan.steps.map((step) => step.adapter)).toEqual(["approved_destination"]);
+    expect(plan.steps[0].depends_on).toEqual([]);
+    expect(plan.routing.mode).toBe("approved_workflow");
+  });
 });

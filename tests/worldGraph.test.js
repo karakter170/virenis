@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { chunkDocument, documentIndexDigest, documentRevision } from "../server/documents.js";
 import { digestValue } from "../server/outcomes.js";
 import {
+  prepareWorldGraphReplay,
   previewWorldGraphRun,
   pruneExpiredWorldGraphData,
   publicWorldGraphSnapshot,
@@ -75,7 +76,12 @@ function routeOutput(step, version = "v1", patch = {}) {
   };
 }
 
-function fixture({ query = "Prepare a clear launch recommendation.", agentPatches = {}, plan = null } = {}) {
+function fixture({
+  query = "Prepare a clear launch recommendation.",
+  agentPatches = {},
+  plan = null,
+  options = { max_tokens: 1024, temperature: 0 }
+} = {}) {
   const agents = [
     agent("research_agent", agentPatches.research_agent),
     agent("safety_agent", agentPatches.safety_agent),
@@ -121,10 +127,10 @@ function fixture({ query = "Prepare a clear launch recommendation.", agentPatche
     agents,
     documents: [],
     sharedMemory: [],
-    options: { max_tokens: 1024, temperature: 0 },
+    options,
     createdAt: "2026-07-15T10:00:01.000Z"
   });
-  return { data, run, session, plan: resolvedPlan, agents, documents: [], outputs };
+  return { data, run, session, plan: resolvedPlan, agents, documents: [], outputs, options };
 }
 
 function replayFixture(base, {
@@ -326,9 +332,31 @@ describe("WorldGraph validity and selective replay", () => {
     const live = fixture({ query: "Give me the latest live launch status today.", agentPatches: { research_agent: { tools: ["web_search"] } } });
     expect(replayFixture(live).actions).toEqual({ research_agent: "refreshed", safety_agent: "kept", writer_agent: "kept" });
     const earthquake = fixture({ agentPatches: { research_agent: { tools: ["earthquake_feed"] } } });
-    expect(replayFixture(earthquake).reasons.research_agent).toBe("live_or_mutable_tool_available");
+    expect(replayFixture(earthquake).actions.research_agent).toBe("kept");
     const futureDynamicTool = fixture({ agentPatches: { research_agent: { tools: ["future_external_connector"] } } });
-    expect(replayFixture(futureDynamicTool).actions.research_agent).toBe("refreshed");
+    expect(replayFixture(futureDynamicTool).actions.research_agent).toBe("kept");
+    const currentFutureTool = fixture({
+      query: "Give me the current status.",
+      agentPatches: { research_agent: { tools: ["future_external_connector"] } }
+    });
+    expect(replayFixture(currentFutureTool).actions.research_agent).toBe("refreshed");
+    expect(replayFixture(currentFutureTool).reasons.research_agent).toBe("time_sensitive_request");
+  });
+
+  it("reuses stable research work when a live tool was available but never called", () => {
+    const base = fixture({
+      query: "Explain the Renault brand and the Python language.",
+      agentPatches: {
+        research_agent: { tools: ["web_search"] },
+        safety_agent: { tools: ["web_search"] }
+      }
+    });
+    const repeated = replayFixture(base);
+    expect(repeated.actions).toEqual({
+      research_agent: "kept",
+      safety_agent: "kept",
+      writer_agent: "kept"
+    });
   });
 
   it("wakes routes when a request-level refiner budget changes", () => {
@@ -533,7 +561,42 @@ describe("WorldGraph validity and selective replay", () => {
       run,
       actor: { workspace_id: "workspace_one", user_id: "user_one" }
     }).contested_results).toBe(2);
+    const disputed = base.data.worldGraphArtifacts.filter((artifact) => artifact.adapter === "research_agent");
+    expect(disputed).toHaveLength(2);
+    expect(disputed.every((artifact) => artifact.contested && verifyWorldGraphArtifact(artifact))).toBe(true);
+    expect(base.data.worldGraphEvents.every((event) => /^hmac-sha256:|^sha256:/.test(event.record_hash))).toBe(true);
     expect(replayFixture(base).reasons.research_agent).toBe("stored_results_disagree");
+  });
+
+  it("never authenticates an unsigned cross-tenant contest event during reads", () => {
+    const base = fixture();
+    const target = base.data.worldGraphArtifacts[0];
+    const originalHash = target.record_hash;
+    base.data.worldGraphEvents.push({
+      event_id: "forged_legacy_event",
+      schema_version: "virenis-world-graph-v1",
+      event_type: "result.contested",
+      workspace_id: "workspace_attacker",
+      created_by: "user_attacker",
+      session_id: "session_attacker",
+      agent_workspace_id: "team_attacker",
+      run_id: "run_attacker",
+      step_id: "s1",
+      adapter: target.adapter,
+      artifact_ids: [target.artifact_id],
+      occurred_at: "2026-07-15T10:00:02.000Z"
+    });
+
+    const snapshot = publicWorldGraphSnapshot({
+      data: base.data,
+      run: base.run,
+      actor: { workspace_id: "workspace_one", user_id: "user_one" }
+    });
+
+    expect(target.contested).toBe(false);
+    expect(target.record_hash).toBe(originalHash);
+    expect(base.data.worldGraphEvents.at(-1)).not.toHaveProperty("record_hash");
+    expect(snapshot.contested_results).toBe(0);
   });
 
   it("redacts tool arguments and result data in stored replay material", () => {
@@ -781,10 +844,152 @@ describe("WorldGraph validity and selective replay", () => {
     const payload = signedCapsulePayload(capsule);
     expect(payload).toMatchObject({
       schema_version: "virenis-world-graph-v1",
-      engine_revision: "world-graph-engine-v2"
+      engine_revision: "world-graph-engine-v3"
     });
     expect(payload.scope).toMatchObject({ target_run_id: "run_target", workspace_id: "workspace_one", user_id: "user_one", session_id: "session_one", agent_workspace_id: "team_one" });
     expect(payload.candidates).toHaveLength(3);
+  });
+
+  it("explains replay readiness without exposing stored result payloads", () => {
+    const base = fixture();
+    const prepared = prepareWorldGraphReplay({
+      data: base.data,
+      run: { ...base.run, run_id: "run_diagnostics" },
+      session: base.session,
+      agents: base.agents,
+      documents: [],
+      // The session may grow between exact repeats. These agents do not
+      // consume shared memory, so unrelated history must not wake them.
+      sharedMemory: [{ tag: "older_result", source: "application", content: "Unrelated history." }],
+      options: { max_tokens: 1024, temperature: 0 },
+      signingKey: "a-runtime-key-long-enough-for-hmac",
+      now: Date.parse("2026-07-15T10:02:00.000Z")
+    });
+
+    expect(signedCapsulePayload(prepared.capsule).candidates).toHaveLength(3);
+    expect(prepared.diagnostics).toMatchObject({
+      status: "ready",
+      capsule_created: true,
+      artifacts_in_scope: 3,
+      exact_request_artifacts: 3,
+      eligible_candidates: 3,
+      primary_reason: "inputs_and_evidence_unchanged"
+    });
+    expect(prepared.diagnostics.agents).toHaveLength(3);
+    expect(prepared.diagnostics.agents.every((item) => item.status === "eligible")).toBe(true);
+    expect(JSON.stringify(prepared.diagnostics)).not.toContain("replay_output");
+    expect(JSON.stringify(prepared.diagnostics)).not.toContain("domain_answer");
+    expect(JSON.stringify(prepared.diagnostics)).not.toContain("artifact_id");
+  });
+
+  it("surfaces why verified reuse was unavailable instead of silently refreshing", () => {
+    const base = fixture();
+    const changedAgents = base.agents.map((item) => item.id === "research_agent"
+      ? { ...item, capability: "Use the revised research instructions." }
+      : item);
+    const prepared = prepareWorldGraphReplay({
+      data: base.data,
+      run: { ...base.run, run_id: "run_changed_agent" },
+      session: base.session,
+      agents: changedAgents,
+      documents: [],
+      sharedMemory: [],
+      options: { max_tokens: 1024, temperature: 0 },
+      signingKey: "a-runtime-key-long-enough-for-hmac",
+      now: Date.parse("2026-07-15T10:02:00.000Z")
+    });
+
+    expect(signedCapsulePayload(prepared.capsule).candidates).toHaveLength(2);
+    expect(prepared.diagnostics).toMatchObject({
+      capsule_created: true,
+      eligible_candidates: 2,
+      exclusions: expect.arrayContaining([expect.objectContaining({ reason: "agent_changed", count: 1 })]),
+      agents: expect.arrayContaining([
+        expect.objectContaining({ adapter: "research_agent", status: "excluded", reason: "agent_changed" })
+      ])
+    });
+
+    const unsigned = prepareWorldGraphReplay({
+      data: base.data,
+      run: { ...base.run, run_id: "run_unsigned" },
+      session: base.session,
+      agents: base.agents,
+      documents: [],
+      sharedMemory: [],
+      options: { max_tokens: 1024, temperature: 0 },
+      signingKey: "short",
+      now: Date.parse("2026-07-15T10:02:00.000Z")
+    });
+    expect(unsigned.capsule).toBeNull();
+    expect(unsigned.diagnostics).toMatchObject({
+      status: "disabled",
+      capsule_created: false,
+      primary_reason: "replay_signing_unavailable",
+      plain_reason: "Verified reuse was unavailable, so the work was checked again."
+    });
+  });
+
+  it("binds the approved workflow specialist set and explains an exact-repeat mismatch", () => {
+    const base = fixture({
+      options: {
+        max_tokens: 1024,
+        temperature: 0,
+        required_adapters: ["research_agent", "writer_agent"]
+      }
+    });
+    const common = {
+      data: base.data,
+      run: { ...base.run, run_id: "run_required_workflow" },
+      session: base.session,
+      agents: base.agents,
+      documents: [],
+      sharedMemory: [],
+      signingKey: "a-runtime-key-long-enough-for-hmac",
+      now: Date.parse("2026-07-15T10:02:00.000Z")
+    };
+
+    // A specialist set is a set for replay purposes: ordering and duplicate UI
+    // selections do not create a false settings change.
+    const sameWorkflow = prepareWorldGraphReplay({
+      ...common,
+      options: {
+        max_tokens: 1024,
+        temperature: 0,
+        required_adapters: ["writer_agent", "research_agent", "writer_agent"]
+      }
+    });
+    expect(signedCapsulePayload(sameWorkflow.capsule).candidates).toHaveLength(3);
+    expect(sameWorkflow.diagnostics).toMatchObject({
+      status: "ready",
+      capsule_created: true,
+      exact_request_artifacts: 3,
+      eligible_candidates: 3
+    });
+
+    // The text is still an exact repeat, but changing the approved workflow is
+    // an execution input and must fail closed with an observable reason.
+    const changedWorkflow = prepareWorldGraphReplay({
+      ...common,
+      run: { ...common.run, run_id: "run_changed_required_workflow" },
+      options: {
+        max_tokens: 1024,
+        temperature: 0,
+        required_adapters: ["research_agent"]
+      }
+    });
+    expect(changedWorkflow.capsule).toBeNull();
+    expect(changedWorkflow.diagnostics).toMatchObject({
+      status: "no_match",
+      capsule_created: false,
+      exact_request_artifacts: 3,
+      eligible_candidates: 0,
+      primary_reason: "execution_settings_changed",
+      exclusions: [expect.objectContaining({ reason: "execution_settings_changed", count: 3 })]
+    });
+    expect(changedWorkflow.diagnostics.agents).toHaveLength(3);
+    expect(changedWorkflow.diagnostics.agents.every((item) => (
+      item.status === "excluded" && item.reason === "execution_settings_changed"
+    ))).toBe(true);
   });
 });
 

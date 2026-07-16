@@ -162,6 +162,36 @@ describe("explicit workflow Auto-Composer", () => {
     }
   });
 
+  it("activates an approved draft in the team selected after composition", async () => {
+    const session = await createSession();
+    const queued = await sendMessage(session.session_id, "/agent coordinate a xylophone quality review");
+    await waitForRun(queued.body.run_id);
+    const workflow = (await getSession(session.session_id)).body.workflows[0];
+    expect(workflow.nodes.find((node) => node.type === "agent").new_specialist_required).toBe(true);
+
+    const targetTeam = (await request(app)
+      .post("/api/agent-workspaces")
+      .set(auth("workflow_alice"))
+      .send({ name: "Xylophone launch team" })
+      .expect(201)).body;
+    await request(app)
+      .patch(`/api/chat/sessions/${session.session_id}/agent-workspace`)
+      .set(auth("workflow_alice"))
+      .send({ agent_workspace_id: targetTeam.agent_workspace_id })
+      .expect(200);
+
+    const approved = (await request(app)
+      .post(`/api/workflows/${workflow.workflow_id}/decision`)
+      .set(auth("workflow_alice"))
+      .send({ decision: "approve", revision: workflow.revision })
+      .expect(200)).body;
+    expect(approved.agent_workspace_id).toBe(targetTeam.agent_workspace_id);
+    const storedTarget = app.locals.store.read((data) => data.agentWorkspaces.find((item) => (
+      item.agent_workspace_id === targetTeam.agent_workspace_id
+    )));
+    expect(storedTarget.agent_ids).toContain(approved.activation.node_agents[0].agent_id);
+  });
+
   it("deduplicates retried slash-command submissions and rejects key reuse for different content", async () => {
     const session = await createSession();
     const key = "workflow-submit-proof-0001";
@@ -1098,7 +1128,7 @@ describe("explicit workflow Auto-Composer", () => {
       message.workflow_id === workflow.workflow_id
       && message.kind === "workflow_declined"
     )));
-    expect(statusMessage.content).toContain("workspace connections you already authorized remain available");
+    expect(statusMessage.content).toContain("connected apps you already authorized remain available");
   });
 
   it("compensates a Runtime registration when durable workflow-agent persistence fails", async () => {

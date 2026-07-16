@@ -21,6 +21,8 @@ The unit of reuse is a validated route output, not a full answer. A route that w
 - If its instructions changed but its recomputed output has the same canonical digest under the validated output contract, unaffected consumers may remain asleep.
 - Final synthesis still combines the route outputs into a new answer.
 
+The session controller treats the current request as authoritative and uses older conversation content only to resolve references. A narrowing follow-up such as “continue specifically with Renault's Clio” therefore selects the Renault specialist without reactivating unrelated Python or business-idea branches merely because they appeared earlier in the chat. This routing scope guard is separate from reuse: the first changed Clio request runs the selected Renault route, while an exact repeat can reuse that verified route.
+
 ## Reuse invariant
 
 A stored route is reusable only when all of these bindings match:
@@ -35,7 +37,7 @@ A stored route is reusable only when all of these bindings match:
 | Memory | Digest of the admitted conversation/shared memory, but only for agents whose contract consumes it |
 | Sources | Source configuration, private-knowledge digest, retrieval settings, and document corpus/index revisions |
 | Documents | Enabled state, runtime-sync state, and committed-document integrity; metadata-only/external documents must bind valid corpus and index digests |
-| Execution | Base-model checkpoint bytes, transitive executor source bytes, worker dependency/configuration digest, tokenizer bytes, retrieval/embedding configuration, runtime mode, token limits, and temperature |
+| Execution | Base-model checkpoint bytes, transitive executor source bytes, worker dependency/configuration digest, tokenizer bytes, retrieval/embedding configuration, request token limits, temperature, and the normalized set of specialists in a user-approved workflow |
 | Effects | A pure, replayable effect policy with no executed tool receipt |
 
 The Router also requires an unexpired artifact whose record seal, input-envelope digest, output digest, and validation contracts all verify. In production real-runtime mode, the record seal is an HMAC under the web/runtime secret, so a database-only writer cannot forge a modified artifact by recomputing a public checksum. Simulator/development mode uses an unkeyed integrity checksum when no secret is configured. A mismatch wakes the route; it never silently falls back to an approximate match.
@@ -58,7 +60,7 @@ WorldGraph intentionally refuses reuse when safety cannot be proved. A route run
 
 - `run_fresh` is enabled or temperature is nonzero.
 - The request is time-sensitive and the route can provide mutable information.
-- The agent has an unbound live/mutable capability such as web, news, weather, browser, HTTP, repository, market, or an unknown future integration. Deterministic document/index availability can remain eligible only when immutable source revisions are bound; an actual tool receipt still forces fresh execution.
+- The request asks for current or changing information and the agent has a live/mutable capability such as web, news, weather, browser, HTTP, repository, market, or an unknown future integration. Merely having an unused tool available does not invalidate a stable exact repeat because the unchanged tool allowlist is already bound into the agent revision. Deterministic document/index availability can remain eligible only when immutable source revisions are bound; any actual tool receipt still forces fresh execution.
 - Any tool was executed, including a deterministic read. Tool implementation and argument digests are not yet part of the v1 replay contract.
 - The route executed an MCP/external action or requires approval.
 - A document is disabled, awaiting runtime synchronization, unverifiable, lacks bound corpus/index digests, or fails its committed-content integrity check.
@@ -66,7 +68,9 @@ WorldGraph intentionally refuses reuse when safety cannot be proved. A route run
 
 Raw tool arguments and raw returned data are not copied into replay receipts. Stored tool receipts contain bounded names/status fields and data digests only. External actions are never repeated by the change preview and are never automatically replayed.
 
-At deterministic settings, two different validated outputs for the same exact input envelope create an append-only `result.contested` event. Both results are then excluded from reuse.
+At deterministic settings, two different validated outputs for the same exact input envelope create an integrity-sealed `result.contested` event. Both artifacts are marked contested with new seals and are then excluded from reuse. Modifying either the event or either artifact without the application key fails verification.
+
+Capsule preparation is observable rather than silent. Each run records whether a signed capsule was created, the number of exact-request artifacts and eligible candidates, and bounded exclusion reason codes such as changed instructions, relevant memory, sources, settings, expiry, disagreement, or unavailable signing. Public run responses contain only counts and plain explanations—never replay payloads, artifact IDs, envelopes, record hashes, or signatures. The runtime audit receipt independently records capsule presence and candidate count.
 
 ## “Check what changed” and refresh UX
 
@@ -80,7 +84,7 @@ The check is conservative around dependencies: if an upstream route might change
 
 A completed run's change record describes what happened when that answer ran. It is not a continuous freshness claim. Users must select **Check what changed** to compare it with current state.
 
-Color is not the only signal: kept/refreshed states use different icons, labels, status text, and accessible live regions. Reused agents are labeled “Kept from earlier · no agent model call,” and their agent-call count is zero.
+Color is not the only signal: reused/checked-again states use different icons, labels, status text, and accessible live regions. Reused specialists are labeled “Reused from earlier · no specialist model call,” and their specialist-call count is zero.
 
 ## HTTP API
 
@@ -151,7 +155,8 @@ WorldGraph adds no browser-visible secret and no new model request. In real-runt
 - The web server and runtime must hold the same strong API secret (prefer the supported secret-file setting in production).
 - The web server creates an HMAC-SHA256 capsule bound to the target run, workspace, user, session, agent workspace, and exact query.
 - The runtime verifies the signature, exact scope, query digest, schema/revision, timestamps, size, and candidate count before executor work.
-- The executor independently verifies agent revision, task, dependency identities/digests, output digest, validation state, sources, and effect policy before skipping a worker model call.
+- The executor independently verifies agent revision, task, admitted-memory digest, current execution-setting digest, dependency identities/digests, output digest, validation state, sources, and effect policy before skipping a worker model call.
+- The cross-service execution-setting digest contains request-owned settings only. Process-local web/GPU environment values are bound through authenticated runtime component provenance instead, so a normal split deployment does not invalidate every candidate.
 
 Production checklist:
 
@@ -185,15 +190,16 @@ python /home/ubuntu/project/scripts/test_world_graph_executor.py
 python /home/ubuntu/project/scripts/test_phase219_executor_data_plane.py
 ```
 
-The executor proof asserts instrumented provider-call roles: a cold three-agent DAG calls all three agents plus final synthesis; an all-clean repeat calls final synthesis only; a changed branch wakes itself and its consumer; and an unchanged recomputed output preserves its consumer. It also rejects tampered output, tool-bound output, forged dependencies, invalid upstream validation, expired capsules, changed model/executor/configuration provenance, and cross-query candidates.
+The executor proof asserts instrumented provider-call roles: a cold three-agent DAG calls all three agents plus final synthesis; an all-clean repeat calls final synthesis only; a changed branch wakes itself and its consumer; and an unchanged recomputed output preserves its consumer. It also rejects tampered output, tool-bound output, forged dependencies, invalid upstream validation, expired capsules, changed admitted memory, changed execution settings, changed model/executor/configuration provenance, and cross-query candidates. The capsule proof checks that the production Node and Python implementations produce the same execution-setting digest.
 
 For an optional live Qwen/vLLM smoke test, first load a reachable, API-key-protected Router runtime whose catalog exposes the test agent to the test user's agent workspace, then run:
 
 ```bash
 node /home/ubuntu/project/scripts/test_world_graph_live_runtime.mjs
+node /home/ubuntu/project/scripts/test_world_graph_live_followup.mjs
 ```
 
-The script must finish with `ok: true`, at least one cold worker route, at least one reused repeat route, fewer repeat `route.started` events, and provider usage that excludes reused agents. Treat a catalog/scope failure as a deployment failure; do not weaken workspace isolation to make the smoke test pass.
+The generic script must finish with `ok: true`, at least one cold worker route, at least one reused repeat route, fewer repeat `route.started` events, and provider usage that excludes reused specialists. The follow-up script reproduces the Renault + Python + business example: three initial routes, Renault alone on the narrowed Clio turn, then one reused Renault result and zero worker-route starts on the exact repeat. Treat a catalog/scope failure as a deployment failure; do not weaken workspace isolation to make the smoke test pass.
 
 ## Deliberate v1 boundaries
 
