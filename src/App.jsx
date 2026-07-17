@@ -3021,8 +3021,7 @@ const WORKSPACE_SIDEBAR_VIEWS = [
   { id: "graph", label: "Team map", icon: Network },
   { id: "marketplace", label: "Discover", icon: Sparkles },
   { id: "connections", label: "Apps", icon: Plug },
-  { id: "knowledge", label: "Knowledge", icon: BookOpen },
-  { id: "account", label: "Account", icon: ContactRound, secondary: true }
+  { id: "knowledge", label: "Knowledge", icon: BookOpen }
 ];
 
 export function WorkspaceSidebar({
@@ -3124,7 +3123,7 @@ export function WorkspaceSidebar({
         disabled={newChatDisabled || !canWrite}
         onClick={onNewChat}
       >
-        <SquarePen size={18} />
+        <SquarePen size={16} />
         <span className="sidebar-label">New chat</span>
       </button>
 
@@ -3140,7 +3139,7 @@ export function WorkspaceSidebar({
             disabled={navigationDisabled}
             onClick={() => onOpenView(id)}
           >
-            <Icon size={17} />
+            <Icon size={16} />
             <span className="sidebar-label">{label}</span>
           </button>
         ))}
@@ -3200,7 +3199,7 @@ export function WorkspaceSidebar({
         </button>
         <div className="sidebar-profile">
           <span className="clerk-user-control">{accountControl}</span>
-          <button className="sidebar-profile-copy sidebar-label" type="button" disabled={navigationDisabled} onClick={() => onOpenView("account")}>
+          <button className="sidebar-profile-copy sidebar-label" type="button" aria-label="Open account" disabled={navigationDisabled} onClick={() => onOpenView("account")}>
             <strong>{auth?.display_name || auth?.user_id || "Your account"}</strong>
             <small>{auth?.email || (auth?.is_admin ? "Admin" : auth?.is_viewer ? "Viewer" : "Private workspace")}</small>
           </button>
@@ -5837,7 +5836,7 @@ export function AgentGraph({ agents, auth, workspace = null, storageKey, onConne
       <div className={`graph-workspace ${focusedAgent && !connectMode ? "has-inspector" : ""}`}>
         <div className="graph-canvas-scroll" role="region" aria-label="Scrollable team map" tabIndex="0">
         <div className={`agent-graph ${connectMode ? "is-connecting" : ""}`} ref={canvasRef} role="group" aria-label="Current specialist team map. Select a specialist to inspect its configured connections.">
-        <svg viewBox="0 0 900 560" preserveAspectRatio="none" role="group" aria-label="Current configured handoff and knowledge links">
+        <svg className="graph-connection-layer" viewBox="0 0 900 560" preserveAspectRatio="none" role="group" aria-label="Current configured handoff and knowledge links">
           <defs>
             <marker id="graph-arrow-handoff" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
               <path d="M0,0 L7,3.5 L0,7 Z" />

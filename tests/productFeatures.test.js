@@ -1047,8 +1047,28 @@ describe("Agent Studio product surfaces", () => {
     expect(new Set(graphButtons.map((match) => match[0].match(/tone-\d/)?.[0])).size).toBe(2);
     expect(graphButtons.every((match) => !match[1].includes("<svg"))).toBe(true);
     expect(markup).toContain("Connect teammates");
+    expect(markup).toContain('class="graph-connection-layer"');
     expect(markup).toContain('preserveAspectRatio="none"');
     expect(markup).not.toMatch(/LoRA|adapter model/i);
+  });
+
+  it("keeps empty-team actions at their intended size instead of stretching them across the map", () => {
+    const styles = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
+    const markup = renderToStaticMarkup(createElement(AgentGraph, {
+      agents: [],
+      auth: { is_viewer: false },
+      storageKey: "",
+      onCreate: () => undefined
+    }));
+
+    expect(markup).toContain('class="graph-connection-layer"');
+    expect(markup).toContain('class="graph-empty"');
+    expect(markup).toContain("Your team map is ready");
+    expect(markup).toContain("Add a specialist");
+    expect(markup).toMatch(/width="22" height="22"[^>]*class="lucide lucide-layers"/);
+    expect(markup).toMatch(/width="14" height="14"[^>]*class="lucide lucide-plus"/);
+    expect(styles).toMatch(/\.agent-graph > \.graph-connection-layer\s*\{[\s\S]*?width: 100%;[\s\S]*?height: 100%;/);
+    expect(styles).not.toMatch(/\.agent-graph\s+svg\s*\{/);
   });
 
   it("keeps legacy internal specialist ids out of visible catalog, chat, graph, and Marketplace wording", () => {
@@ -1410,7 +1430,7 @@ describe("Agent Studio product surfaces", () => {
       ],
       storageKey: ""
     }));
-    const svg = markup.match(/<svg viewBox="0 0 900 560"[\s\S]*?<\/svg>/)?.[0] || "";
+    const svg = markup.match(/<svg class="graph-connection-layer" viewBox="0 0 900 560"[\s\S]*?<\/svg>/)?.[0] || "";
     expect(svg).toContain("Source hands work to Consumer");
     expect(svg).toContain("Source provides knowledge to Knowledge");
     expect(svg).not.toContain('role="button"');
@@ -1892,7 +1912,9 @@ describe("Agent Studio product surfaces", () => {
     expect(markup).toContain("Discover");
     expect(markup).toContain("Apps");
     expect(markup).toContain("Knowledge");
-    expect(markup).toContain("Account");
+    expect(markup).toContain('aria-label="Open account"');
+    expect(markup).not.toContain('<span class="sidebar-label">Account</span>');
+    expect(markup.match(/class="sidebar-nav-item/g) || []).toHaveLength(5);
     expect(markup).toContain("Past Chats");
     expect(markup).toContain("Backend techniques");
     expect(markup).toContain("Launch checklist");
@@ -1906,6 +1928,7 @@ describe("Agent Studio product surfaces", () => {
       auth: { ...commonProps.auth, is_admin: true }
     }));
     expect(adminMarkup).toContain('title="Admin"');
+    expect(adminMarkup.match(/class="sidebar-nav-item/g) || []).toHaveLength(6);
 
     const viewerMarkup = renderToStaticMarkup(createElement(WorkspaceSidebar, {
       ...commonProps,
@@ -1920,6 +1943,28 @@ describe("Agent Studio product surfaces", () => {
     }));
     expect(mobileMarkup).toContain('role="dialog"');
     expect(mobileMarkup).toContain('aria-modal="true"');
+  });
+
+  it("reserves more sidebar height for Past Chats while preserving mobile touch targets", () => {
+    const styles = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
+    const sidebar = styles.match(/\.workspace-sidebar\s*\{([\s\S]*?)\}/)?.[1] || "";
+    const newChat = styles.match(/\.sidebar-new-chat\s*\{([\s\S]*?)\}/)?.[1] || "";
+    const resourceNav = styles.match(/\.sidebar-resource-nav\s*\{([\s\S]*?)\}/)?.[1] || "";
+    const navItem = styles.match(/\.sidebar-nav-item\s*\{([\s\S]*?)\}/)?.[1] || "";
+    const history = styles.match(/\.sidebar-history\s*\{([\s\S]*?)\}/)?.[1] || "";
+    const mobile = styles.slice(styles.indexOf("@media (max-width: 900px)"));
+
+    expect(sidebar).toContain("grid-template-rows: auto auto auto minmax(0, 1fr) auto");
+    expect(sidebar).toContain("gap: 8px");
+    expect(newChat).toContain("min-height: 40px");
+    expect(newChat).toContain("font-size: 12px");
+    expect(resourceNav).toContain("gap: 1px");
+    expect(navItem).toContain("min-height: 34px");
+    expect(navItem).toContain("font-size: 12px");
+    expect(history).toContain("min-height: 0");
+    expect(history).toContain("gap: 6px");
+    expect(history).toContain("padding-top: 8px");
+    expect(mobile).toMatch(/\.workspace-sidebar \.sidebar-new-chat,[\s\S]*?\.workspace-sidebar\.is-collapsed \.sidebar-balance\s*\{[\s\S]*?min-height: 44px;/);
   });
 
   it("keeps the new-chat composer anchored without an empty-state spacer", () => {
