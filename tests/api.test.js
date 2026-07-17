@@ -13,12 +13,21 @@ import { appendAgentEvent } from "../server/outcomes.js";
 let tmpDir;
 let app;
 let previousStoreDriver;
+let previousActiveRunLimits;
+const ACTIVE_RUN_LIMIT_ENV_KEYS = [
+  "APP_MAX_ACTIVE_RUNS_PER_USER",
+  "APP_MAX_ACTIVE_RUNS_PER_WORKSPACE",
+  "APP_MAX_ACTIVE_RUNS_GLOBAL"
+];
 const resetRuntimeFetchTransport = setRuntimeFetchForTests((...args) => globalThis.fetch(...args));
 
 afterAll(() => resetRuntimeFetchTransport());
 
 beforeEach(async () => {
   previousStoreDriver = process.env.WEB_STORE_DRIVER;
+  previousActiveRunLimits = Object.fromEntries(
+    ACTIVE_RUN_LIMIT_ENV_KEYS.map((key) => [key, process.env[key]])
+  );
   process.env.WEB_STORE_DRIVER = "json";
   tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "tcar-chat-"));
   app = await createApp({
@@ -34,6 +43,13 @@ afterEach(async () => {
     delete process.env.WEB_STORE_DRIVER;
   } else {
     process.env.WEB_STORE_DRIVER = previousStoreDriver;
+  }
+  for (const key of ACTIVE_RUN_LIMIT_ENV_KEYS) {
+    if (previousActiveRunLimits[key] === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = previousActiveRunLimits[key];
+    }
   }
   await fs.rm(tmpDir, { recursive: true, force: true });
 });
@@ -133,6 +149,40 @@ describe("runtime and catalog", () => {
     const destination = plan.steps.find((step) => step.adapter === "business_plan_agent");
     expect(source).toBeTruthy();
     expect(destination.depends_on).toContain(source.id);
+  });
+
+  it("compiles handoffs and knowledge dependencies for valid hyphenated agent ids", () => {
+    const plan = planRoutes({
+      query: "@reply-writer prepare the final reply",
+      agents: [
+        {
+          id: "source-agent",
+          title: "Source Agent",
+          enabled: true
+        },
+        {
+          id: "knowledge-source",
+          title: "Knowledge Source",
+          document: { title: "Approved source" },
+          enabled: true
+        },
+        {
+          id: "reply-writer",
+          title: "Reply Writer",
+          consumes: ["agent:source-agent:output"],
+          resources: ["agent:knowledge-source"],
+          enabled: true
+        }
+      ],
+      maxRoutingAdapters: 3
+    });
+
+    const source = plan.steps.find((step) => step.adapter === "source-agent");
+    const knowledge = plan.steps.find((step) => step.adapter === "knowledge-source");
+    const destination = plan.steps.find((step) => step.adapter === "reply-writer");
+    expect(source).toBeTruthy();
+    expect(knowledge).toMatchObject({ resource_support: true });
+    expect(destination.depends_on).toEqual(expect.arrayContaining([source.id, knowledge.id]));
   });
 
   it("excludes disabled and unmounted agents from the routing scope", () => {
@@ -291,6 +341,8 @@ describe("runtime and catalog", () => {
       TCAR_ALLOW_LOCAL_RUNTIME_URL: process.env.TCAR_ALLOW_LOCAL_RUNTIME_URL,
       TCAR_ALLOW_LOOPBACK_RUNTIME_TUNNEL: process.env.TCAR_ALLOW_LOOPBACK_RUNTIME_TUNNEL,
       TCAR_ALLOW_SAME_ORIGIN_RUNTIME_URL: process.env.TCAR_ALLOW_SAME_ORIGIN_RUNTIME_URL,
+      TCAR_ALLOW_INSECURE_PRIVATE_RUNTIME_HTTP: process.env.TCAR_ALLOW_INSECURE_PRIVATE_RUNTIME_HTTP,
+      WEB_ALLOW_INSECURE_PRIVATE_POSTGRES: process.env.WEB_ALLOW_INSECURE_PRIVATE_POSTGRES,
       HOST: process.env.HOST
     };
 
@@ -316,6 +368,8 @@ describe("runtime and catalog", () => {
       delete process.env.TCAR_ALLOW_LOCAL_RUNTIME_URL;
       delete process.env.TCAR_ALLOW_LOOPBACK_RUNTIME_TUNNEL;
       delete process.env.TCAR_ALLOW_SAME_ORIGIN_RUNTIME_URL;
+      delete process.env.TCAR_ALLOW_INSECURE_PRIVATE_RUNTIME_HTTP;
+      delete process.env.WEB_ALLOW_INSECURE_PRIVATE_POSTGRES;
       expect(() => requireRuntimeConfigured()).toThrow(/TCAR_RUNTIME_API_KEY/);
 
       process.env.TCAR_RUNTIME_API_KEY = "0123456789abcdef0123456789abcdef";
@@ -346,10 +400,39 @@ describe("runtime and catalog", () => {
       process.env.APP_PUBLIC_ORIGIN = "https://app.example.com";
       expect(() => requireRuntimeConfigured()).toThrow(/real public web origin/);
 
+      for (const invalidOrigin of [
+        "https://localhost.localdomain",
+        "https://0.0.0.0",
+        "https://[::1]",
+        "https://[::]"
+      ]) {
+        process.env.APP_PUBLIC_ORIGIN = invalidOrigin;
+        expect(() => requireRuntimeConfigured()).toThrow(/real public web origin/);
+      }
+
       process.env.APP_PUBLIC_ORIGIN = "http://app.prod.test";
       expect(() => requireRuntimeConfigured()).toThrow(/https/);
 
       process.env.APP_PUBLIC_ORIGIN = "https://app.prod.test";
+      process.env.DATABASE_URL = "postgres://user:pass@postgres.prod.test:5432/tcar";
+      expect(() => requireRuntimeConfigured()).toThrow(/sslmode=verify-full/);
+
+      process.env.DATABASE_URL = "postgres://user:pass@postgres.prod.test:5432/tcar?sslmode=verify-full";
+      expect(() => requireRuntimeConfigured()).not.toThrow();
+
+      process.env.DATABASE_URL = "postgres://user:pass@postgres.prod.test:5432/tcar";
+      process.env.WEB_ALLOW_INSECURE_PRIVATE_POSTGRES = "1";
+      expect(() => requireRuntimeConfigured()).not.toThrow();
+      delete process.env.WEB_ALLOW_INSECURE_PRIVATE_POSTGRES;
+      process.env.DATABASE_URL = "postgres://user:pass@localhost:5432/tcar";
+
+      process.env.TCAR_RUNTIME_API_URL = "http://gpu-runtime.prod.test:9000";
+      expect(() => requireRuntimeConfigured()).toThrow(/must use HTTPS/);
+
+      process.env.TCAR_ALLOW_INSECURE_PRIVATE_RUNTIME_HTTP = "1";
+      expect(() => requireRuntimeConfigured()).not.toThrow();
+      delete process.env.TCAR_ALLOW_INSECURE_PRIVATE_RUNTIME_HTTP;
+
       process.env.TCAR_RUNTIME_API_URL = "http://127.0.0.1:9000";
       expect(() => requireRuntimeConfigured()).toThrow(/private GPU runtime host/);
 
@@ -501,6 +584,7 @@ describe("runtime and catalog", () => {
       expect(health.body.ok).toBe(true);
       const readiness = await request(prodApp).get("/readyz").expect(200);
       expect(readiness.body.ok).toBe(true);
+      expect(readiness.body.ready).toBe(true);
       expect(readiness.body.store).toBeUndefined();
       await request(prodApp).get("/api/runtime/health").expect(401);
       const missingApi = await request(prodApp)
@@ -519,6 +603,86 @@ describe("runtime and catalog", () => {
         }
       }
       await fs.rm(prodTmp, { recursive: true, force: true });
+    }
+  });
+
+  it("marks every API response private and non-cacheable", async () => {
+    const session = await createSession("Cache privacy");
+    const responses = [
+      await request(app).get("/api/chat/sessions").expect(200),
+      await request(app).get(`/api/chat/sessions/${session.session_id}`).expect(200),
+      await request(app).get("/api/documents").expect(200),
+      await request(app).get("/api/marketplace").expect(200),
+      await request(app).get("/api/not-a-real-route").expect(404)
+    ];
+
+    for (const response of responses) {
+      expect(response.headers["cache-control"]).toBe("private, no-store");
+      expect(response.headers.pragma).toBe("no-cache");
+      expect(response.headers.expires).toBe("0");
+    }
+
+    const health = await request(app).get("/healthz").expect(200);
+    expect(health.headers["cache-control"]).toBeUndefined();
+  });
+
+  it("keeps liveness healthy while readiness fails when durable storage is unavailable", async () => {
+    const originalReadinessCheck = app.locals.store.readinessCheck.bind(app.locals.store);
+    app.locals.store.readinessCheck = async () => {
+      throw new Error("database connection lost");
+    };
+
+    try {
+      const health = await request(app).get("/healthz").expect(200);
+      expect(health.body.ok).toBe(true);
+      expect(health.body.ready).toBeUndefined();
+
+      const readiness = await request(app).get("/readyz").expect(503);
+      expect(readiness.body).toMatchObject({
+        ok: false,
+        ready: false,
+        service: "virenis",
+        message: "Application is not ready."
+      });
+    } finally {
+      app.locals.store.readinessCheck = originalReadinessCheck;
+    }
+  });
+
+  it("fails readiness when the required runtime is live but reports ready false", async () => {
+    const previous = {
+      TCAR_ENGINE_MODE: process.env.TCAR_ENGINE_MODE,
+      TCAR_RUNTIME_API_URL: process.env.TCAR_RUNTIME_API_URL,
+      TCAR_RUNTIME_API_KEY: process.env.TCAR_RUNTIME_API_KEY,
+      WEB_READY_REQUIRE_RUNTIME: process.env.WEB_READY_REQUIRE_RUNTIME
+    };
+    const previousFetch = globalThis.fetch;
+    let runtimeReady = false;
+
+    try {
+      process.env.TCAR_ENGINE_MODE = "real";
+      process.env.TCAR_RUNTIME_API_URL = "http://gpu-runtime.internal:9000";
+      process.env.TCAR_RUNTIME_API_KEY = "runtime0123456789abcdef0123456789abcdef";
+      process.env.WEB_READY_REQUIRE_RUNTIME = "1";
+      globalThis.fetch = async () => Response.json({
+        ok: true,
+        ready: runtimeReady,
+        service: "tcar-gpu-runtime-api"
+      });
+
+      await request(app).get("/healthz").expect(200);
+      const notReady = await request(app).get("/readyz").expect(503);
+      expect(notReady.body).toMatchObject({ ok: false, ready: false });
+
+      runtimeReady = true;
+      const ready = await request(app).get("/readyz").expect(200);
+      expect(ready.body).toMatchObject({ ok: true, ready: true, runtime_mode: "real" });
+    } finally {
+      globalThis.fetch = previousFetch;
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
     }
   });
 
@@ -546,6 +710,7 @@ describe("runtime and catalog", () => {
       });
 
       const readiness = await request(prodApp).get("/readyz").expect(200);
+      expect(readiness.body.ready).toBe(true);
       expect(readiness.body.store.agents).toBeGreaterThan(0);
       expect(readiness.body.store.sessions).toBe(0);
     } finally {
@@ -1208,6 +1373,21 @@ describe("runtime and catalog", () => {
     };
     await request(app).post("/api/agents").send(payload).expect(201);
     await request(app).post("/api/agents").send(payload).expect(409);
+
+    await request(app).post("/api/agents").send({
+      id: "bounded_array_contract",
+      title: "Bounded array contract",
+      capability: "Proves array-form contract fields are bounded.",
+      boundary: "Do not accept unbounded contract lists.",
+      consumes: Array.from({ length: 30 }, (_, index) => `input_${index}`),
+      produces: Array.from({ length: 30 }, (_, index) => `output_${index}`),
+      routing_cues: Array.from({ length: 30 }, (_, index) => `cue_${index}`),
+      tools: Array.from({ length: 30 }, (_, index) => `tool_${index}`)
+    }).expect(201);
+    const bounded = await request(app).get("/api/agents/bounded_array_contract").expect(200);
+    for (const field of ["consumes", "produces", "routing_cues", "tools"]) {
+      expect(bounded.body[field]).toHaveLength(20);
+    }
   });
 
   it("persists per-session agent activation without changing the global agent", async () => {
@@ -1329,7 +1509,8 @@ describe("runtime and catalog", () => {
 
     const previousTokens = process.env.APP_API_TOKENS_JSON;
     process.env.APP_API_TOKENS_JSON = JSON.stringify({
-      market_rater: { user_id: "independent_rater", workspace_id: "workspace_rater", role: "user" }
+      market_rater: { user_id: "independent_rater", workspace_id: "workspace_rater", role: "user" },
+      market_rater_other: { user_id: "independent_rater", workspace_id: "workspace_rater_other", role: "user" }
     });
     try {
       const firstRating = await request(app)
@@ -1338,6 +1519,31 @@ describe("runtime and catalog", () => {
         .send({ score: 4 })
         .expect(201);
       expect(firstRating.body).toMatchObject({ rating_average: 4, rating_count: 1 });
+
+      const crossWorkspaceRating = await request(app)
+        .post("/api/marketplace/items/market_clinical_agent/ratings")
+        .set("Authorization", "Bearer market_rater_other")
+        .send({ score: 2 })
+        .expect(200);
+      expect(crossWorkspaceRating.body).toMatchObject({
+        rating_average: 2,
+        rating_count: 1,
+        my_rating: { score: 2 }
+      });
+
+      const originalWorkspaceView = await request(app)
+        .get("/api/marketplace/items/market_clinical_agent")
+        .set("Authorization", "Bearer market_rater")
+        .expect(200);
+      expect(originalWorkspaceView.body).toMatchObject({
+        rating_average: 2,
+        rating_count: 1,
+        my_rating: { score: 2 }
+      });
+      expect(app.locals.store.read().marketplaceRatings.filter((rating) => (
+        rating.listing_id === item.listing_id
+        && rating.created_by === "independent_rater"
+      ))).toHaveLength(1);
 
       const updatedRating = await request(app)
         .post("/api/marketplace/items/market_clinical_agent/ratings")
@@ -1358,11 +1564,57 @@ describe("runtime and catalog", () => {
       else process.env.APP_API_TOKENS_JSON = previousTokens;
     }
 
+    await request(app)
+      .patch("/api/agents/market_clinical_agent")
+      .send({
+        capability: "Rewrites clinical language and now drafts follow-up questions.",
+        boundary: "Preserve clinical meaning, state uncertainty, and separate follow-up questions."
+      })
+      .expect(200);
+
     const edited = await request(app)
       .post("/api/marketplace/items/market_clinical_agent")
       .send({ description: "An edited description for patient-safe clinical rewriting." })
       .expect(200);
-    expect(edited.body.description).toBe("An edited description for patient-safe clinical rewriting.");
+    expect(edited.body).toMatchObject({
+      listing_id: item.listing_id,
+      description: "An edited description for patient-safe clinical rewriting.",
+      rating_average: 5,
+      rating_count: 1
+    });
+
+    const frozenDetail = await request(app)
+      .get("/api/marketplace/items/market_clinical_agent")
+      .expect(200);
+    expect(frozenDetail.body.agent).toMatchObject({
+      capability: "Rewrites technical clinical language for patients.",
+      boundary: "Preserve clinical meaning and state uncertainty."
+    });
+
+    await request(app)
+      .post("/api/marketplace/items/market_clinical_agent")
+      .send({ description: "Invalid revision flag.", new_revision: "yes" })
+      .expect(400);
+
+    const revised = await request(app)
+      .post("/api/marketplace/items/market_clinical_agent")
+      .send({
+        description: "Clinical rewriting with bounded follow-up questions.",
+        new_revision: true
+      })
+      .expect(200);
+    expect(revised.body.listing_id).not.toBe(item.listing_id);
+    expect(revised.body).toMatchObject({ rating_average: 0, rating_count: 0 });
+    expect(app.locals.store.read().marketplaceRatings
+      .some((rating) => rating.listing_id === item.listing_id)).toBe(false);
+
+    const revisedDetail = await request(app)
+      .get("/api/marketplace/items/market_clinical_agent")
+      .expect(200);
+    expect(revisedDetail.body.agent).toMatchObject({
+      capability: "Rewrites clinical language and now drafts follow-up questions.",
+      boundary: "Preserve clinical meaning, state uncertainty, and separate follow-up questions."
+    });
 
     await request(app)
       .delete("/api/marketplace/items/market_clinical_agent")
@@ -1372,9 +1624,22 @@ describe("runtime and catalog", () => {
       .expect(404);
     const afterUnpublish = await request(app).get("/api/marketplace").expect(200);
     expect(afterUnpublish.body.items.some((entry) => entry.id === "market_clinical_agent")).toBe(false);
+
+    const republished = await request(app)
+      .post("/api/marketplace/items/market_clinical_agent")
+      .send({ description: "Republished clinical rewriting agent." })
+      .expect(201);
+    expect(republished.body.listing_id).not.toBe(revised.body.listing_id);
+    expect(republished.body).toMatchObject({ rating_average: 0, rating_count: 0 });
+    await request(app)
+      .delete("/api/marketplace/items/market_clinical_agent")
+      .expect(200);
+
     const marketplaceEvents = app.locals.store.read().agentEvents
       .filter((event) => event.agent_id === "market_clinical_agent")
       .map((event) => event.event_type);
+    expect(marketplaceEvents).toContain("agent.marketplace_description_updated");
+    expect(marketplaceEvents).toContain("agent.marketplace_revision_published");
     expect(marketplaceEvents).toContain("agent.marketplace_unpublished");
   });
 
@@ -1383,6 +1648,7 @@ describe("runtime and catalog", () => {
     process.env.APP_API_TOKENS_JSON = JSON.stringify({
       market_alice: { user_id: "alice", workspace_id: "workspace_a", role: "user" },
       market_bob: { user_id: "bob", workspace_id: "workspace_b", role: "user" },
+      market_charlie: { user_id: "charlie", workspace_id: "workspace_b", role: "user" },
       market_other_alice: { user_id: "alice", workspace_id: "workspace_c", role: "user" }
     });
 
@@ -1426,13 +1692,27 @@ describe("runtime and catalog", () => {
         .get("/api/marketplace/items/alice_shared_research_agent")
         .set("Authorization", "Bearer market_other_alice")
         .expect(200);
-      expect(sameUserDifferentWorkspace.body.is_self_published).toBe(false);
-      const crossWorkspaceRating = await request(app)
+      expect(sameUserDifferentWorkspace.body.is_self_published).toBe(true);
+      await request(app)
         .post("/api/marketplace/items/alice_shared_research_agent/ratings")
         .set("Authorization", "Bearer market_other_alice")
         .send({ score: 3 })
-        .expect(201);
-      expect(crossWorkspaceRating.body).toMatchObject({ rating_average: 3, rating_count: 1 });
+        .expect(403);
+
+      // A legacy self-rating recorded before user identity was enforced must
+      // not influence the public score, even when it came from another workspace.
+      await app.locals.store.mutate((data) => {
+        data.marketplaceRatings.push({
+          rating_id: "rating_legacy_cross_workspace_self",
+          listing_id: publication.body.listing_id,
+          agent_id: "alice_shared_research_agent",
+          score: 3,
+          workspace_id: "workspace_c",
+          created_by: "alice",
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        });
+      });
 
       const bobListing = await request(app)
         .get("/api/marketplace/items/alice_shared_research_agent")
@@ -1445,6 +1725,7 @@ describe("runtime and catalog", () => {
         can_manage: false,
         is_self_published: false
       });
+      expect(bobListing.body).toMatchObject({ rating_average: 0, rating_count: 0 });
       expect(bobListing.body.agent.exclusions).toEqual({
         private_knowledge: true,
         agent_connections: true
@@ -1460,12 +1741,13 @@ describe("runtime and catalog", () => {
         .set("Authorization", "Bearer market_bob")
         .send({ score: 4 })
         .expect(201);
-      expect(bobRating.body).toMatchObject({ rating_average: 3.5, rating_count: 2 });
+      expect(bobRating.body).toMatchObject({ rating_average: 4, rating_count: 1 });
 
       const copied = await request(app)
         .post("/api/marketplace/items/alice_shared_research_agent/copy")
         .set("Authorization", "Bearer market_bob")
-        .send({})
+        .set("Idempotency-Key", "marketplace-agent-copy-0001")
+        .send({ listing_id: bobListing.body.listing_id })
         .expect(201);
       expect(copied.body).toMatchObject({
         ok: true,
@@ -1487,8 +1769,42 @@ describe("runtime and catalog", () => {
           }
         }
       });
+      expect(copied.body.duplicate).toBe(false);
+      expect(copied.body.agent).not.toHaveProperty("marketplace_copy_idempotency");
       const copiedAgentId = copied.body.agent.id;
       expect(copiedAgentId).not.toBe("alice_shared_research_agent");
+
+      const replayed = await request(app)
+        .post("/api/marketplace/items/alice_shared_research_agent/copy")
+        .set("Authorization", "Bearer market_bob")
+        .set("Idempotency-Key", "marketplace-agent-copy-0001")
+        .send({ listing_id: bobListing.body.listing_id })
+        .expect(200);
+      expect(replayed.body).toMatchObject({
+        duplicate: true,
+        agent: { id: copiedAgentId }
+      });
+      await request(app)
+        .post("/api/marketplace/items/alice_shared_research_agent/copy")
+        .set("Authorization", "Bearer market_bob")
+        .send({ listing_id: bobListing.body.listing_id })
+        .expect(400)
+        .expect((response) => expect(response.body.error).toBe("idempotency_key_required"));
+      await request(app)
+        .post("/api/marketplace/items/alice_shared_research_agent/copy")
+        .set("Authorization", "Bearer market_bob")
+        .set("Idempotency-Key", "marketplace-agent-stale-0001")
+        .send({ listing_id: "listing_stale_revision" })
+        .expect(409)
+        .expect((response) => expect(response.body.error).toBe("marketplace_listing_changed"));
+      const otherTenantUserCopy = await request(app)
+        .post("/api/marketplace/items/alice_shared_research_agent/copy")
+        .set("Authorization", "Bearer market_charlie")
+        .set("Idempotency-Key", "marketplace-agent-copy-0001")
+        .send({ listing_id: bobListing.body.listing_id })
+        .expect(201);
+      expect(otherTenantUserCopy.body.agent.created_by).toBe("charlie");
+      expect(otherTenantUserCopy.body.agent.id).not.toBe(copiedAgentId);
 
       const bobAgents = await request(app)
         .get("/api/agents")
@@ -1546,8 +1862,8 @@ describe("runtime and catalog", () => {
         .expect(200);
       expect(updatedForBob.body).toMatchObject({
         description: "Alice's updated description for clear research briefs.",
-        rating_average: 3.5,
-        rating_count: 2
+        rating_average: 4,
+        rating_count: 1
       });
 
       await request(app)
@@ -1693,10 +2009,31 @@ describe("runtime and catalog", () => {
       data.marketplaceRatings.push({
         rating_id: "legacy_rating",
         agent_id: "legacy_marketplace_agent",
-        score: 4,
+        score: 2,
         review: "This text must not survive migration.",
         workspace_id: "workspace_default",
-        created_by: "user_local"
+        created_by: "user_local",
+        created_at: "2026-01-01T00:00:00.000Z",
+        updated_at: "2026-01-01T00:00:00.000Z"
+      });
+      data.marketplaceRatings.push({
+        rating_id: "legacy_rating_latest_a",
+        agent_id: "legacy_marketplace_agent",
+        score: 3,
+        workspace_id: "workspace_other_a",
+        created_by: "user_local",
+        created_at: "2026-01-02T00:00:00.000Z",
+        updated_at: "2026-01-03T00:00:00.000Z"
+      });
+      data.marketplaceRatings.push({
+        rating_id: "legacy_rating_latest_z",
+        agent_id: "legacy_marketplace_agent",
+        score: 4,
+        comment: "This duplicate comment must also be removed.",
+        workspace_id: "workspace_other_z",
+        created_by: "user_local",
+        created_at: "2026-01-02T00:00:00.000Z",
+        updated_at: "2026-01-03T00:00:00.000Z"
       });
       data.marketplaceRatings.push({
         rating_id: "legacy_self_rating",
@@ -1714,7 +2051,7 @@ describe("runtime and catalog", () => {
 
     const stored = app.locals.store.read((data) => ({
       agent: data.agents.find((agent) => agent.id === "legacy_marketplace_agent"),
-      rating: data.marketplaceRatings.find((rating) => rating.rating_id === "legacy_rating"),
+      ratings: data.marketplaceRatings.filter((rating) => rating.agent_id === "legacy_marketplace_agent"),
       selfRating: data.marketplaceRatings.find((rating) => rating.rating_id === "legacy_self_rating")
     }));
     expect(stored.agent.marketplace).toMatchObject({
@@ -1725,7 +2062,14 @@ describe("runtime and catalog", () => {
     for (const retiredField of ["summary", "achievements", "proofs", "version", "license"]) {
       expect(stored.agent.marketplace).not.toHaveProperty(retiredField);
     }
-    expect(stored.rating).not.toHaveProperty("review");
+    expect(stored.ratings).toHaveLength(1);
+    expect(stored.ratings[0]).toMatchObject({
+      rating_id: "legacy_rating_latest_z",
+      score: 4,
+      created_by: "user_local",
+      listing_id: stored.agent.marketplace.listing_id
+    });
+    expect(stored.ratings[0]).not.toHaveProperty("comment");
     expect(stored.selfRating).toBeUndefined();
 
     const listing = await request(app)
@@ -2758,22 +3102,34 @@ describe("chat execution", () => {
   });
 
   it("closes open run event streams on shutdown", async () => {
+    const sessionId = "sess_sse_shutdown";
+    const runId = "run_sse_shutdown";
+    await app.locals.store.mutate((data) => {
+      const now = new Date().toISOString();
+      data.sessions.push({
+        session_id: sessionId,
+        title: "SSE close",
+        workspace_id: "workspace_default",
+        visibility: "private",
+        created_by: "user_local",
+        created_at: now,
+        updated_at: now,
+        last_message_at: now,
+        shared_memory: []
+      });
+      data.runs.push({
+        run_id: runId,
+        session_id: sessionId,
+        status: "running",
+        events: [{ type: "run.started", at: now }]
+      });
+    });
     const server = await new Promise((resolve) => {
       const instance = app.listen(0, "127.0.0.1", () => resolve(instance));
     });
     const baseUrl = `http://127.0.0.1:${server.address().port}`;
     try {
-      const session = await fetch(`${baseUrl}/api/chat/sessions`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title: "SSE close" })
-      }).then((response) => response.json());
-      const queued = await fetch(`${baseUrl}/api/chat/sessions/${session.session_id}/messages`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ content: "Plan a secure support workflow." })
-      }).then((response) => response.json());
-      const stream = await fetch(`${baseUrl}/api/chat/runs/${queued.run_id}/events`);
+      const stream = await fetch(`${baseUrl}/api/chat/runs/${runId}/events`);
       expect(stream.ok).toBe(true);
       expect(app.locals.eventStreams.size).toBe(1);
 
@@ -2848,10 +3204,9 @@ describe("chat execution", () => {
         headers: { Authorization: "Bearer event_user_token" }
       });
       expect(stream.ok).toBe(true);
-      const bodyPromise = stream.text();
-      expect(app.locals.eventStreams.size).toBe(1);
-      app.locals.closeEventStreams({ reason: "test" });
-      const body = await bodyPromise;
+      const body = await stream.text();
+      expect(app.locals.eventStreams.size).toBe(0);
+      expect(app.locals.bus.listenerCount(runId)).toBe(0);
       expect(body).toContain("run.failed");
       expect(body).toContain("The run failed before completion");
       expect(body).not.toContain("super-secret-value");
@@ -3145,7 +3500,15 @@ describe("chat execution", () => {
         .set("Authorization", `Bearer ${tokenAdmin}`)
         .expect(200);
       expect(adminRun.body.error.message).toBe(userRun.error.message);
-      expect(JSON.stringify(adminRun.body.error_admin_only)).toContain("super-secret-value");
+      expect(adminRun.body.error_admin_only).toMatchObject({
+        code: "model_service_unavailable",
+        status: 502,
+        error_type: "Error"
+      });
+      expect(adminRun.body.error_admin_only.fingerprint).toMatch(/^sha256:[a-f0-9]{64}$/);
+      expect(JSON.stringify(adminRun.body.error_admin_only)).not.toContain("super-secret-value");
+      expect(JSON.stringify(realApp.locals.store.read())).not.toContain("super-secret-value");
+      expect(await fs.readFile(path.join(realTmp, "db.json"), "utf8")).not.toContain("super-secret-value");
     } finally {
       await realApp?.locals?.drainBackgroundTasks?.({ timeoutMs: 5000 });
       await realApp?.locals?.store?.close?.();
@@ -3660,6 +4023,9 @@ describe("chat execution", () => {
   });
 
   it("handles concurrent chat stress without losing runs", async () => {
+    process.env.APP_MAX_ACTIVE_RUNS_PER_USER = "100";
+    process.env.APP_MAX_ACTIVE_RUNS_PER_WORKSPACE = "100";
+    process.env.APP_MAX_ACTIVE_RUNS_GLOBAL = "100";
     const sessions = await Promise.all(Array.from({ length: 25 }, (_, index) => createSession(`Stress ${index}`)));
     const queued = await Promise.all(
       sessions.map((session, index) =>
@@ -3786,6 +4152,9 @@ describe("documents and sources", () => {
   });
 
   it("separates reusable Knowledge uploads from chat-only uploads", async () => {
+    process.env.APP_MAX_ACTIVE_RUNS_PER_USER = "4";
+    process.env.APP_MAX_ACTIVE_RUNS_PER_WORKSPACE = "4";
+    process.env.APP_MAX_ACTIVE_RUNS_GLOBAL = "4";
     const sessionA = await createSession("Scoped files A");
     const sessionB = await createSession("Scoped files B");
     const knowledge = await request(app)

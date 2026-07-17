@@ -15,6 +15,7 @@ import {
   FormattedText,
   ProgressiveFormattedText,
   MarketplaceAgentDialog,
+  MarketplaceDetailFailure,
   MarketplaceWorkspaceAgentDetails,
   MarketplacePanel,
   KnowledgeDocumentDialog,
@@ -29,6 +30,7 @@ import {
   WorldGraphChanges,
   WorkflowDraftCard,
   agentPayloadFromForm,
+  approvalActivityPresentation,
   agentsForWorkspace,
   availableSessionAgents,
   graphConnectionInputs,
@@ -40,10 +42,12 @@ import {
   graphPositionFromPointer,
   initialGraphPositions,
   mergeLiveRunEvent,
+  marketplaceDetailActionsDisabled,
   progressiveRevealPlan,
   responseStyleFromBoundary,
   runProgressGraph,
   runProgressSpecialists,
+  settleConnectionApproval,
   storedGraphPositions,
   unavailableCollaboratorHandoffs,
   workflowProposedNewSpecialists,
@@ -64,6 +68,38 @@ afterEach(() => {
 
 
 describe("Agent Studio product surfaces", () => {
+  it("describes denied and uncertain app actions without calling them approved", () => {
+    expect(approvalActivityPresentation("denied")).toMatchObject({
+      label: "Declined · nothing ran",
+      icon: "deny"
+    });
+    expect(approvalActivityPresentation("execution_outcome_uncertain")).toMatchObject({
+      label: "Needs provider verification",
+      icon: "warning"
+    });
+  });
+
+  it("refreshes the saved conversation after an app approval continues it", async () => {
+    const order = [];
+    const client = {
+      post: vi.fn(async (path, body) => {
+        order.push("decision");
+        expect(path).toBe("/api/mcp/approvals/approval_1");
+        expect(body).toEqual({ decision: "approve" });
+      })
+    };
+
+    await settleConnectionApproval({
+      approvalId: "approval_1",
+      decision: "approve",
+      client,
+      onRefresh: async () => { order.push("resources"); },
+      onRefreshConversation: async () => { order.push("conversation"); }
+    });
+
+    expect(order).toEqual(["decision", "resources", "conversation"]);
+  });
+
   it("keeps live Router assignments safe, current, and deduplicated", () => {
     const planning = mergeLiveRunEvent({ run_id: "run_live", status: "queued", events: [] }, {
       type: "planner.completed",
@@ -401,6 +437,7 @@ describe("Agent Studio product surfaces", () => {
       onDetails: () => undefined
     }));
     expect(markup).toContain("1 specialist · 1.8s · 840 tokens");
+    expect(markup).toContain('aria-label="Run this prompt again"');
     expect(markup).not.toContain("class=\"usage-receipt\"");
     expect(markup).not.toContain("input ·");
   });
@@ -992,6 +1029,85 @@ describe("Agent Studio product surfaces", () => {
     expect(markup).not.toMatch(/LoRA|adapter model/i);
   });
 
+  it("keeps legacy internal specialist ids out of visible catalog, chat, graph, and Marketplace wording", () => {
+    const legacyAgent = {
+      id: "finance_reasoning_lora",
+      title: "Finance LoRA",
+      capability: "Uses an adapter model to prepare a bounded briefing.",
+      enabled: true,
+      session_active: true,
+      visibility: "private",
+      created_by: "alice",
+      workspace_id: "workspace_a"
+    };
+    const workspace = {
+      agent_workspace_id: "team_legacy",
+      name: "Briefing team",
+      agent_ids: [legacyAgent.id],
+      agent_count: 1,
+      max_agents: 16
+    };
+    const marketplaceItem = {
+      ...legacyAgent,
+      listing_id: "listing_legacy_agent",
+      item_type: "agent",
+      description: "A LoRA adapter model for briefings.",
+      published_by: "alice",
+      rating_average: 0,
+      rating_count: 0,
+      agent: {
+        ...legacyAgent,
+        consumes: ["user_request"],
+        produces: ["briefing"],
+        tools: []
+      }
+    };
+    const surfaces = [
+      createElement(AgentCatalog, {
+        agents: [legacyAgent],
+        workspaces: [workspace],
+        activeWorkspace: workspace,
+        auth: { user_id: "alice", workspace_id: "workspace_a" },
+        sessionId: "session_legacy",
+        onToggle: () => undefined
+      }),
+      createElement(Composer, {
+        value: "",
+        onChange: () => undefined,
+        onSubmit: () => undefined,
+        agents: [legacyAgent],
+        allAgents: [legacyAgent],
+        workspaces: [workspace],
+        activeWorkspace: workspace,
+        sessionId: "session_legacy",
+        canWrite: true,
+        chatDocuments: [],
+        onToggleAgent: () => undefined
+      }),
+      createElement(AgentGraph, { agents: [legacyAgent], workspace, storageKey: "" }),
+      createElement(MarketplacePanel, { items: [marketplaceItem], auth: { user_id: "bob" } }),
+      createElement(MarketplaceAgentDialog, {
+        item: marketplaceItem,
+        auth: { user_id: "bob" },
+        onClose: () => undefined,
+        onCopied: () => undefined
+      }),
+      createElement(RunProgress, {
+        agents: [legacyAgent],
+        run: {
+          status: "running",
+          plan: { steps: [{ id: "s1", adapter: legacyAgent.id, task: "Prepare a briefing.", depends_on: [] }] },
+          events: []
+        }
+      })
+    ];
+    const markup = surfaces.map((surface) => renderToStaticMarkup(surface)).join("\n")
+      .replaceAll(legacyAgent.id, "internal-specialist-id");
+
+    expect(markup).not.toMatch(/\bLoRA\b|adapter model/i);
+    expect(markup).toContain("Finance specialist");
+  });
+
   it("shows mixed per-work-item history without presenting current links as run edges", () => {
     const markup = renderToStaticMarkup(createElement(AgentGraph, {
       agents: [{ id: "writer_agent", title: "Writer", enabled: true }],
@@ -1013,6 +1129,37 @@ describe("Agent Studio product surfaces", () => {
     expect(markup).toContain("Latest answer: 1 reused, 1 checked again");
     expect(markup).toContain("1 previous result reused · 1 checked again");
     expect(markup).toContain("The lines below show your saved handoffs.");
+  });
+
+  it("locks execution-changing team controls while preserving map inspection and layout", () => {
+    const agents = [
+      { id: "writer", title: "Writer", capability: "Drafts answers.", enabled: true, visibility: "private", created_by: "alice", workspace_id: "workspace_a" },
+      { id: "reviewer", title: "Reviewer", capability: "Reviews drafts.", enabled: true, visibility: "private", created_by: "alice", workspace_id: "workspace_a" }
+    ];
+    const graphMarkup = renderToStaticMarkup(createElement(AgentGraph, {
+      agents,
+      auth: { user_id: "alice", workspace_id: "workspace_a" },
+      configurationBusy: true,
+      storageKey: ""
+    }));
+    expect(graphMarkup).toContain("This answer is using the current team.");
+    expect(graphMarkup).toMatch(/<button[^>]*disabled=""[^>]*title="Available when the current answer finishes"[^>]*>.*Connect teammates/s);
+    expect(graphMarkup).toMatch(/<button type="button">.*Auto-arrange/s);
+    expect(graphMarkup).toContain('class="graph-node');
+
+    const workspace = { agent_workspace_id: "team_active", name: "Active team", agent_ids: agents.map((agent) => agent.id), agent_count: 2, max_agents: 16 };
+    const catalogMarkup = renderToStaticMarkup(createElement(AgentCatalog, {
+      agents,
+      workspaces: [workspace],
+      activeWorkspace: workspace,
+      auth: { user_id: "alice", workspace_id: "workspace_a" },
+      configurationBusy: true,
+      sessionId: "session_active",
+      onToggle: () => undefined
+    }));
+    expect(catalogMarkup).toContain("Team membership and specialist settings unlock when it finishes.");
+    expect(catalogMarkup).toMatch(/Archive specialist<\/button>/);
+    expect(catalogMarkup).toMatch(/disabled=""[^>]*>.*Archive specialist/s);
   });
 
   it("keeps the complete active API-agent catalog available to the session picker", () => {
@@ -1381,6 +1528,41 @@ describe("Agent Studio product surfaces", () => {
     expect(catalogMarkup).toContain("Delete permanently");
   });
 
+  it("keeps Marketplace mutations locked until full details load and offers an explicit retry", () => {
+    expect(marketplaceDetailActionsDisabled({ loading: true, detailReady: false, detailError: "" })).toBe(true);
+    expect(marketplaceDetailActionsDisabled({ loading: false, detailReady: false, detailError: "Network unavailable" })).toBe(true);
+    expect(marketplaceDetailActionsDisabled({ loading: false, detailReady: true, detailError: "" })).toBe(false);
+
+    const failureMarkup = renderToStaticMarkup(createElement(MarketplaceDetailFailure, {
+      message: "Details could not be verified.",
+      onRetry: () => undefined
+    }));
+    expect(failureMarkup).toContain('role="alert"');
+    expect(failureMarkup).toContain("Details could not be verified.");
+    expect(failureMarkup).toContain("Retry details");
+
+    const loadingMarkup = renderToStaticMarkup(createElement(MarketplaceAgentDialog, {
+      item: {
+        id: "summary_only_agent",
+        listing_id: "listing_summary_only",
+        item_type: "agent",
+        title: "Summary-only specialist",
+        can_manage: true,
+        is_self_published: true,
+        rating_average: 0,
+        rating_count: 0
+      },
+      auth: { user_id: "alice" },
+      onClose: () => undefined,
+      onCopied: () => undefined,
+      onEditDescription: () => undefined,
+      onUnpublish: () => undefined
+    }));
+    expect(loadingMarkup).toMatch(/marketplace-edit-action[^>]*disabled/);
+    expect(loadingMarkup).toMatch(/marketplace-unpublish-action[^>]*disabled/);
+    expect(loadingMarkup).toMatch(/text-button primary[^>]*disabled/);
+  });
+
   it("welcomes first-time users as the owner of a visible team", () => {
     const markup = renderToStaticMarkup(createElement(EmptyTeamWelcome, {
       workspace: { name: "Customer Care" },
@@ -1396,6 +1578,20 @@ describe("Agent Studio product surfaces", () => {
     expect(markup).toContain("Build a repeatable workflow");
     expect(markup).toContain("Manage your team");
     expect(markup).not.toMatch(/\/workflow|\/agent/);
+  });
+
+  it("keeps normal chat understandable when every configured specialist is paused", () => {
+    const markup = renderToStaticMarkup(createElement(EmptyTeamWelcome, {
+      workspace: { name: "Customer Care" },
+      agents: [
+        { id: "policy_reader", title: "Policy Reader", enabled: true, session_active: false },
+        { id: "reply_writer", title: "Reply Writer", enabled: true, session_active: false }
+      ]
+    }));
+    expect(markup).toContain("Customer Care specialists are paused");
+    expect(markup).toContain("continue without a specialist");
+    expect(markup).toContain("Manage your team");
+    expect(markup).not.toContain("Add your first specialist");
   });
 
   it("explains repeated WorldGraph work in plain language at answer level", () => {
@@ -1496,6 +1692,7 @@ describe("Agent Studio product surfaces", () => {
     expect(detailMarkup).toContain("Google Drive · Read files");
     expect(detailMarkup).toContain("first draft");
     expect(detailMarkup).toContain("Back to team");
+    expect(detailMarkup).toContain("data-autofocus=\"true\"");
     expect(detailMarkup).toContain("Published by Alice");
   });
 
@@ -1530,5 +1727,19 @@ describe("Agent Studio product surfaces", () => {
     expect(appSource).toContain('aria-haspopup="dialog"');
     expect(appSource).toMatch(/role="dialog"\s+aria-modal="false"/);
     expect(appSource).toContain('event.key !== "Escape"');
+  });
+
+  it("compacts signed-in header controls for 320px phones", () => {
+    const styles = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
+    expect(styles).toContain("@media (max-width: 420px)");
+    expect(styles).toMatch(/\.app-header \.balance-pill-copy\s*\{\s*display:\s*none/);
+    expect(styles).toMatch(/\.app-header \.studio-button\s*\{[\s\S]*?width:\s*36px/);
+  });
+
+  it("prevents unavailable built-in tools from being newly selected", () => {
+    const appSource = readFileSync(new URL("../src/App.jsx", import.meta.url), "utf8");
+    expect(appSource).toContain("unavailable && !selected");
+    expect(appSource).toContain("templateTools = template.tools.filter");
+    expect(appSource).toContain("applied without an unavailable ability");
   });
 });

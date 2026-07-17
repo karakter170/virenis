@@ -25,6 +25,10 @@ const ENV_KEYS = [
   "APP_PUBLIC_ORIGIN",
   "CLERK_AUTHORIZED_PARTIES",
   "APP_ACCOUNT_DELETION_DRAIN_TIMEOUT_MS",
+  "APP_SSE_MAX_STREAMS_GLOBAL",
+  "APP_SSE_MAX_STREAMS_PER_IDENTITY",
+  "APP_SSE_HEARTBEAT_MS",
+  "APP_SSE_MAX_LIFETIME_MS",
   "PORT",
   "WEB_STORE_DRIVER",
   "TCAR_ENGINE_MODE",
@@ -52,6 +56,10 @@ beforeEach(async () => {
     "APP_PUBLIC_ORIGIN",
     "CLERK_AUTHORIZED_PARTIES",
     "APP_ACCOUNT_DELETION_DRAIN_TIMEOUT_MS",
+    "APP_SSE_MAX_STREAMS_GLOBAL",
+    "APP_SSE_MAX_STREAMS_PER_IDENTITY",
+    "APP_SSE_HEARTBEAT_MS",
+    "APP_SSE_MAX_LIFETIME_MS",
     "PORT",
     "TCAR_RUNTIME_API_URL",
     "TCAR_RUNTIME_API_KEY"
@@ -618,6 +626,100 @@ describe("Clerk identity integration", () => {
       .send({ confirmation: "DELETE" })
       .expect(200);
     expect(fake.deleteUserCalls).toBe(1);
+  });
+
+  it("closes only the deleting owner's event streams before draining authenticated requests", async () => {
+    process.env.APP_ACCOUNT_DELETION_DRAIN_TIMEOUT_MS = "250";
+    fake.addUser({ id: "user_delete_stream", email: "delete-stream@example.com", name: "Delete Stream" });
+    fake.addUser({ id: "user_other_stream", email: "other-stream@example.com", name: "Other Stream" });
+    await startApp();
+
+    const ownerHeaders = asUser("user_delete_stream");
+    const otherHeaders = asUser("user_other_stream");
+    await request(app).get("/api/auth/me").set(ownerHeaders).expect(200);
+    await request(app).get("/api/auth/me").set(otherHeaders).expect(200);
+    const ownerSession = await request(app)
+      .post("/api/chat/sessions")
+      .set(ownerHeaders)
+      .send({ title: "Deleting owner stream" })
+      .expect(201);
+    const otherSession = await request(app)
+      .post("/api/chat/sessions")
+      .set(otherHeaders)
+      .send({ title: "Other owner stream" })
+      .expect(201);
+    const ownerRunId = "run_delete_owner_stream";
+    const otherRunId = "run_delete_other_stream";
+    await app.locals.store.mutate((data) => {
+      const now = new Date().toISOString();
+      data.runs.push(
+        {
+          run_id: ownerRunId,
+          session_id: ownerSession.body.session_id,
+          status: "running",
+          events: [{ type: "run.started", at: now }]
+        },
+        {
+          run_id: otherRunId,
+          session_id: otherSession.body.session_id,
+          status: "running",
+          events: [{ type: "run.started", at: now }]
+        }
+      );
+      return true;
+    });
+
+    const server = await new Promise((resolve) => {
+      const instance = app.listen(0, "127.0.0.1", () => resolve(instance));
+    });
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    try {
+      const ownerStream = await fetch(`${baseUrl}/api/chat/runs/${ownerRunId}/events`, {
+        headers: ownerHeaders
+      });
+      const otherStream = await fetch(`${baseUrl}/api/chat/runs/${otherRunId}/events`, {
+        headers: otherHeaders
+      });
+      expect(ownerStream.status).toBe(200);
+      expect(otherStream.status).toBe(200);
+      expect(app.locals.eventStreams.size).toBe(2);
+
+      // Keep the HTTP event stream open while making the persisted run safe
+      // to purge. This isolates the deletion-drain behavior from the separate
+      // guard that rejects deletion while model work is still active.
+      await app.locals.store.mutate((data) => {
+        const run = data.runs.find((item) => item.run_id === ownerRunId);
+        run.status = "completed";
+        run.completed_at = new Date().toISOString();
+        return run.run_id;
+      });
+
+      const deleted = await request(app)
+        .delete("/api/account")
+        .set(ownerHeaders)
+        .send({ confirmation: "DELETE" });
+      expect(deleted.status, JSON.stringify(deleted.body)).toBe(200);
+      expect(deleted.body.ok).toBe(true);
+      expect(fake.deleteUserCalls).toBe(1);
+      expect(app.locals.eventStreams.size).toBe(1);
+      expect([...app.locals.eventStreams][0]).toMatchObject({
+        user_id: "user_other_stream"
+      });
+      expect(await ownerStream.text()).toContain("account_deletion");
+
+      const closed = app.locals.closeEventStreams({ reason: "identity_test_cleanup" });
+      expect(closed).toMatchObject({ closed: 1, pending: 0 });
+      expect(await otherStream.text()).toContain("identity_test_cleanup");
+    } finally {
+      app.locals.closeEventStreams({ reason: "identity_test_finally" });
+      server.closeAllConnections?.();
+      await new Promise((resolve, reject) => {
+        server.close((error) => {
+          if (error) reject(error);
+          else resolve();
+        });
+      });
+    }
   });
 
   it("drains background workflow activation, rejects its post-Runtime commit, and leaves no orphan during deletion", async () => {

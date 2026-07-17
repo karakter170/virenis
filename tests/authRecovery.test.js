@@ -6,7 +6,7 @@ import {
   resetAuthenticationNotification,
   shouldOpenWorkspaceFromIdentity
 } from "../src/authRecovery.js";
-import { loadAuthenticatedResourceBatch } from "../src/workspaceBootstrap.js";
+import { loadAuthenticatedResourceBatch, loadCompleteResource } from "../src/workspaceBootstrap.js";
 
 describe("authentication recovery", () => {
   it("holds a Clerk-signed-in user on recovery instead of redirecting back to the failing workspace", () => {
@@ -91,5 +91,29 @@ describe("authenticated workspace bootstrap", () => {
     expect(result.identity.user_id).toBe("user_test");
     expect(result.resources.map((item) => item.status)).toEqual(["fulfilled", "rejected"]);
     expect(calls).toEqual(["/api/auth/me", "/api/chat/sessions", "/api/optional"]);
+  });
+
+  it("loads every advertised page instead of silently dropping resources after the first page", async () => {
+    const calls = [];
+    const api = {
+      async get(path) {
+        calls.push(path);
+        const parsed = new URL(path, "http://virenis.local");
+        const offset = Number(parsed.searchParams.get("offset") || 0);
+        const rows = Array.from({ length: Math.min(2, 5 - offset) }, (_, index) => ({
+          session_id: `session_${offset + index}`
+        }));
+        return { sessions: rows, total: 5, limit: 2, offset };
+      }
+    };
+    const result = await loadCompleteResource(api, "/api/chat/sessions");
+    expect(result.sessions.map((session) => session.session_id)).toEqual([
+      "session_0", "session_1", "session_2", "session_3", "session_4"
+    ]);
+    expect(calls).toEqual([
+      "/api/chat/sessions",
+      "/api/chat/sessions?limit=2&offset=2",
+      "/api/chat/sessions?limit=1&offset=4"
+    ]);
   });
 });

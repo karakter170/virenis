@@ -122,6 +122,19 @@ cp .env.remote.example .env.remote.local
 npm run preflight:auth:remote -- https://app.your-domain.example
 npm run build:remote
 npm run preflight:remote
+```
+
+For the supplied production deployment, install the completed environment as
+`/etc/tcar/web-remote.env` and start `tcar-web-tunneled.service`; its
+`StateDirectory=` contract creates the private data, upload, and generated
+secret roots before Node starts. If you intentionally run a foreground smoke
+with `npm run start:remote`, first provision those same roots for the service
+user (the environment points at `/var/lib`, which an ordinary user cannot
+create):
+
+```bash
+sudo install -d -o ubuntu -g ubuntu -m 0700 \
+  /var/lib/tcar-web-data /var/lib/tcar-web-uploads /var/lib/tcar-web-secrets
 npm run start:remote
 ```
 
@@ -137,7 +150,7 @@ preserve the public host and HTTPS scheme. The equivalent Nginx settings are:
 proxy_set_header Host $host;
 proxy_set_header X-Forwarded-Host $host;
 proxy_set_header X-Forwarded-Proto https;
-proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+proxy_set_header X-Forwarded-For $remote_addr;
 ```
 
 Keep `APP_TRUST_PROXY=loopback` when the reverse proxy connects to Node over
@@ -326,11 +339,17 @@ npm test
 npm run build
 ```
 
-For a disposable PostgreSQL table, set `DATABASE_URL` and run:
+For a disposable PostgreSQL database, set `DATABASE_URL` to a migration/test
+role and run (never use the production serving-role DSN for this DDL smoke):
 
 ```bash
 npm run test:clerk:postgres
 ```
+
+For the already-migrated production database, use
+`node scripts/serving_database_attestation.mjs` with the least-privileged
+serving role. That attestation verifies permissions and RLS without DDL and
+rolls back its read/write contract probe.
 
 Before production traffic, create a production Clerk instance and keys, add the
 public origin and redirect URLs in Clerk, configure the signed webhook, sign up

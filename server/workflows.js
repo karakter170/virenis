@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 
 import { releaseRunReservation, reserveRunCredits, settleRunCredits } from "./billing.js";
+import { PUBLISHER_ID_RE, publicPublisher } from "./marketplacePublisherIdentity.js";
 import { isManagedMcpProviderId } from "./mcpOAuth.js";
 import { makeId, nowIso } from "./store.js";
 
@@ -413,7 +414,7 @@ export function publicWorkflow(workflow) {
     intent: workflow.intent,
     status: workflow.status,
     revision: workflow.revision,
-    nodes: workflow.nodes || [],
+    nodes: (workflow.nodes || []).map(publicWorkflowNode),
     edges: workflow.edges || [],
     connection_requirements: workflow.connection_requirements || [],
     permissions: workflow.permissions || [],
@@ -427,6 +428,28 @@ export function publicWorkflow(workflow) {
     declined_at: workflow.declined_at || null,
     error: workflow.error || null
   };
+}
+
+function publicWorkflowNode(node) {
+  if (!node || typeof node !== "object" || node.source !== "marketplace") return node;
+  const publisherId = PUBLISHER_ID_RE.test(String(node.publisher_id || node.publisher || ""))
+    ? String(node.publisher_id || node.publisher)
+    : null;
+  const publisherDisplayName = bounded(
+    node.publisher_display_name
+      || (node.publisher_status === "deleted" ? "Deleted publisher" : "Community publisher"),
+    80
+  );
+  const safe = {
+    ...node,
+    publisher: publisherId,
+    publisher_id: publisherId,
+    publisher_display_name: publisherDisplayName,
+    publisher_status: node.publisher_status === "deleted" ? "deleted" : "active"
+  };
+  delete safe.publisher_user_id;
+  delete safe.publisher_workspace_id;
+  return safe;
 }
 
 export function publicConversationCheckpoint(checkpoint) {
@@ -959,7 +982,10 @@ function normalizeWorkflowProposal(raw, context) {
         node.candidate_id = candidate.candidate_id;
         node.agent_id = candidate.source === "workspace" ? candidate.agent_id : null;
         node.listing_id = candidate.source === "marketplace" ? candidate.listing_id : null;
-        node.publisher = candidate.publisher || null;
+        node.publisher = candidate.publisher_id || candidate.publisher || null;
+        node.publisher_id = candidate.publisher_id || candidate.publisher || null;
+        node.publisher_display_name = candidate.publisher_display_name || "Community publisher";
+        node.publisher_status = candidate.publisher_status === "deleted" ? "deleted" : "active";
         node.rating = candidate.source === "marketplace" ? candidate.rating : null;
         // The proposed role is the source of truth. A catalog candidate can
         // fill a missing capability, but must never overwrite a more specific
@@ -1185,7 +1211,7 @@ function workflowCandidates(data, session, actor, intent, agentWorkspaceId = nul
       workspace.push(candidateFromWorkspaceAgent(agent, intent, actor));
     }
     if (!agent.document && agent.marketplace?.published === true && agent.marketplace?.snapshot) {
-      marketplace.push(candidateFromMarketplaceAgent(agent, ratingsByListing, intent));
+      marketplace.push(candidateFromMarketplaceAgent(data, agent, ratingsByListing, intent));
     }
   }
   workspace.sort(candidateSort);
@@ -1277,9 +1303,10 @@ function candidateFromWorkspaceAgent(agent, intent, actor) {
   };
 }
 
-function candidateFromMarketplaceAgent(agent, ratingsByListing, intent) {
+function candidateFromMarketplaceAgent(data, agent, ratingsByListing, intent) {
   const snapshot = agent.marketplace.snapshot || {};
   const listingId = safeListingId(agent.marketplace.listing_id) || `listing_${digest(agent.id).slice(0, 16)}`;
+  const publisher = publicPublisher(data, agent.marketplace);
   const ratingAggregate = ratingsByListing.get(listingId) || { total: 0, count: 0 };
   const average = ratingAggregate.count
     ? ratingAggregate.total / ratingAggregate.count
@@ -1296,7 +1323,13 @@ function candidateFromMarketplaceAgent(agent, ratingsByListing, intent) {
     produces: stringList(snapshot.produces, 20, 120),
     tools: stringList(snapshot.tools, 30, 128),
     provider_ids: [...new Set(providerIds)],
-    publisher: bounded(agent.marketplace.published_by || agent.created_by, 160),
+    // Public workflow state must never persist the authentication-provider
+    // subject used to authorize or rate a listing. The compatibility
+    // `publisher` field deliberately contains the opaque public identity.
+    publisher: publisher.id,
+    publisher_id: publisher.id,
+    publisher_display_name: publisher.display_name,
+    publisher_status: publisher.status,
     rating: { average: Number(average.toFixed(2)), count: ratingAggregate.count },
     match_score: lexicalScore(intent, [snapshot.title, snapshot.capability, agent.marketplace.description, ...(snapshot.routing_cues || [])])
   };

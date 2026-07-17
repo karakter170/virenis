@@ -45,6 +45,16 @@ import {
   writeDocumentFiles
 } from "./documents.js";
 import {
+  normalizeDiagnosticError,
+  projectValidationResult,
+  safeDiagnosticLog
+} from "./diagnostics.js";
+import {
+  assignMarketplacePublisher,
+  publicMarketplaceOrigin,
+  publicPublisher
+} from "./marketplacePublisherIdentity.js";
+import {
   buildParallelBatches,
   computeMetrics,
   normalizeSharedMemory,
@@ -146,6 +156,7 @@ import {
   ensureGeneralAgentWorkspace,
   findAgentWorkspace,
   listAgentWorkspaces,
+  pruneAgentWorkspaceReservations,
   publicAgentWorkspace,
   releaseAgentWorkspaceReservation,
   removeAgentFromAllWorkspaces,
@@ -161,6 +172,16 @@ const DEFAULT_UPLOAD_FIELD_BYTES = 64 * 1024;
 const DEFAULT_UPLOAD_FIELDS = 20;
 const DEFAULT_UPLOAD_PARTS = 24;
 const DEFAULT_JSON_BODY_BYTES = 1 * 1024 * 1024;
+const DEFAULT_SSE_MAX_STREAMS_GLOBAL = 500;
+const DEFAULT_SSE_MAX_STREAMS_PER_IDENTITY = 8;
+const DEFAULT_SSE_HEARTBEAT_MS = 15_000;
+const DEFAULT_SSE_MAX_LIFETIME_MS = 16 * 60 * 1000;
+const TERMINAL_RUN_EVENT_TYPES = new Set([
+  "final.completed",
+  "run.completed",
+  "run.failed",
+  "run.cancelled"
+]);
 
 function createUploadMiddleware() {
   const fileSize = maxUploadFileBytes();
@@ -206,10 +227,45 @@ function maxJsonBodyBytes() {
   return positiveEnvInt("APP_MAX_JSON_BODY_BYTES", DEFAULT_JSON_BODY_BYTES);
 }
 
+function resolveSseConfig() {
+  const testMode = process.env.NODE_ENV === "test";
+  const maxStreamsGlobal = boundedEnvInt(
+    "APP_SSE_MAX_STREAMS_GLOBAL",
+    DEFAULT_SSE_MAX_STREAMS_GLOBAL,
+    { min: 1, max: 10_000 }
+  );
+  return {
+    maxStreamsGlobal,
+    maxStreamsPerIdentity: Math.min(maxStreamsGlobal, boundedEnvInt(
+      "APP_SSE_MAX_STREAMS_PER_IDENTITY",
+      DEFAULT_SSE_MAX_STREAMS_PER_IDENTITY,
+      { min: 1, max: 100 }
+    )),
+    heartbeatMs: boundedEnvInt(
+      "APP_SSE_HEARTBEAT_MS",
+      DEFAULT_SSE_HEARTBEAT_MS,
+      { min: testMode ? 5 : 1_000, max: 60_000 }
+    ),
+    maxLifetimeMs: boundedEnvInt(
+      "APP_SSE_MAX_LIFETIME_MS",
+      DEFAULT_SSE_MAX_LIFETIME_MS,
+      { min: testMode ? 20 : 10_000, max: 60 * 60 * 1000 }
+    )
+  };
+}
+
+function boundedEnvInt(name, defaultValue, { min, max }) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === null || String(raw).trim() === "") return defaultValue;
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed)) return defaultValue;
+  return Math.max(min, Math.min(parsed, max));
+}
+
 class RunBus {
-  constructor() {
+  constructor({ maxListeners = DEFAULT_SSE_MAX_STREAMS_GLOBAL } = {}) {
     this.emitter = new EventEmitter();
-    this.emitter.setMaxListeners(500);
+    this.emitter.setMaxListeners(Math.max(10, maxListeners));
   }
 
   publish(runId, event) {
@@ -219,6 +275,10 @@ class RunBus {
   subscribe(runId, listener) {
     this.emitter.on(runId, listener);
     return () => this.emitter.off(runId, listener);
+  }
+
+  listenerCount(runId) {
+    return this.emitter.listenerCount(runId);
   }
 }
 
@@ -300,6 +360,14 @@ export async function createApp({
   const performAccountDeletion = async ({ actor, providerInitiated = false }) => (
     identityManager.runAccountDeletion(actor.clerk_user_id, async () => {
       const started = await identityManager.beginAccountDeletion(actor, { providerInitiated });
+      // The durable deletion marker now rejects new owner requests. Close any
+      // older long-lived SSE requests before draining so an abandoned browser
+      // connection cannot keep account deletion in a retry loop.
+      closeEventStreams(eventStreams, {
+        reason: "account_deletion",
+        eventName: "stream.closed",
+        predicate: (stream) => eventStreamBelongsToActor(stream, actor)
+      });
       await identityManager.drainAuthenticatedRequests(actor);
 
       let resources = null;
@@ -417,6 +485,8 @@ export async function createApp({
         content: defaultToolContinuation({ tool_title: tool_name, tool_name }, decision)
       }));
   const workflowActivationInflight = new Map();
+  const marketplaceCopyInflight = new Map();
+  const runtimeAdoptionInflight = new Map();
   const activateWorkflow = ({ workflowId, actor }) => {
     const existing = workflowActivationInflight.get(workflowId);
     if (existing) return existing;
@@ -442,7 +512,8 @@ export async function createApp({
       }
     });
   };
-  const bus = new RunBus();
+  const sseConfig = resolveSseConfig();
+  const bus = new RunBus({ maxListeners: sseConfig.maxStreamsGlobal });
   const rateLimiter = createRateLimiter();
   const documentUpload = createUploadMiddleware();
   const eventStreams = new Set();
@@ -453,7 +524,7 @@ export async function createApp({
     const taskPromise = new Promise((resolve) => setImmediate(resolve))
       .then(task)
       .catch((error) => {
-        console.error("virenis background task failed.", error);
+        safeDiagnosticLog("background.task_failed", { operation: "background_task" }, error);
       });
     backgroundTasks.add(taskPromise);
     taskPromise.finally(() => {
@@ -556,7 +627,7 @@ export async function createApp({
     : 3_600_000;
   const retentionTimer = setInterval(() => {
     void store.mutate((data) => pruneExpiredWorldGraphData(data)).catch((error) => {
-      console.error("WorldGraph retention sweep failed.", error);
+      safeDiagnosticLog("world_graph.retention_failed", { operation: "world_graph_retention" }, error);
     });
   }, retentionSweepMs);
   retentionTimer.unref?.();
@@ -596,6 +667,7 @@ export async function createApp({
   }
   const closeStore = store.close.bind(store);
   store.close = async (...args) => {
+    closeEventStreams(eventStreams, { reason: "store_close" });
     clearInterval(retentionTimer);
     if (deletionRecoveryTimer) clearInterval(deletionRecoveryTimer);
     if (mcpRecoveryTimer) clearInterval(mcpRecoveryTimer);
@@ -612,6 +684,7 @@ export async function createApp({
   app.locals.activateWorkflow = activateWorkflow;
   app.locals.eventStreams = eventStreams;
   app.locals.closeEventStreams = (options) => closeEventStreams(eventStreams, options);
+  app.locals.sseConfig = sseConfig;
   app.locals.backgroundTasks = backgroundTasks;
   app.locals.scheduleBackgroundTask = scheduleBackgroundTask;
   app.locals.scheduleChatRun = scheduleChatRun;
@@ -630,6 +703,7 @@ export async function createApp({
   app.disable("x-powered-by");
   app.use(requestId);
   app.use(securityHeaders);
+  app.use(apiPrivacyHeaders);
   app.use(optionalClerkMiddleware(resolvedClerkAdapter));
   app.get("/healthz", (_req, res) => {
     res.json({
@@ -640,16 +714,21 @@ export async function createApp({
   });
   app.get("/readyz", async (_req, res) => {
     try {
-      const data = store.read();
+      await store.readinessCheck();
       if (process.env.WEB_READY_REQUIRE_RUNTIME === "1" && realRuntimeEnabled()) {
-        await fetchRuntimeHealth();
+        const runtime = await fetchRuntimeHealth();
+        if (runtime?.ok !== true || runtime?.ready !== true) {
+          throw new Error("TCAR runtime is reachable but not ready.");
+        }
       }
       const readiness = {
         ok: true,
+        ready: true,
         service: "virenis",
         runtime_mode: realRuntimeEnabled() ? "real" : "simulator"
       };
       if (process.env.WEB_READY_INCLUDE_STORE_COUNTS === "1") {
+        const data = store.read();
         readiness.store = {
           sessions: data.sessions.length,
           runs: data.runs.length,
@@ -661,6 +740,7 @@ export async function createApp({
     } catch {
       res.status(503).json({
         ok: false,
+        ready: false,
         service: "virenis",
         message: "Application is not ready."
       });
@@ -860,6 +940,9 @@ export async function createApp({
   app.patch("/api/agent-workspaces/:agent_workspace_id", async (req, res, next) => {
     try {
       const workspace = await store.mutate((data) => {
+        if (Object.prototype.hasOwnProperty.call(req.body || {}, "agent_ids")) {
+          assertAgentWorkspaceExecutionInputsMutable(data, req.params.agent_workspace_id);
+        }
         const updated = updateAgentWorkspace(data, req.params.agent_workspace_id, req.auth, req.body || {});
         if ("agent_ids" in (req.body || {})) {
           setAgentWorkspaceMembers(data, updated.agent_workspace_id, req.auth, req.body.agent_ids);
@@ -874,11 +957,14 @@ export async function createApp({
 
   app.delete("/api/agent-workspaces/:agent_workspace_id", async (req, res, next) => {
     try {
-      const result = await store.mutate((data) => deleteAgentWorkspace(
-        data,
-        req.params.agent_workspace_id,
-        req.auth
-      ));
+      const result = await store.mutate((data) => {
+        assertAgentWorkspaceExecutionInputsMutable(data, req.params.agent_workspace_id);
+        return deleteAgentWorkspace(
+          data,
+          req.params.agent_workspace_id,
+          req.auth
+        );
+      });
       res.json({
         ok: true,
         deleted_agent_workspace_id: result.deleted.agent_workspace_id,
@@ -1468,6 +1554,7 @@ export async function createApp({
   app.post("/api/chat/sessions", async (req, res, next) => {
     try {
       const now = nowIso();
+      const workspaceId = tenantMutationWorkspaceId(req, req.body.workspace_id);
       const session = await store.mutate((data) => {
         ensureGeneralAgentWorkspace(data, req.auth);
         const requestedAgentWorkspaceId = String(req.body?.agent_workspace_id || "").trim();
@@ -1477,7 +1564,7 @@ export async function createApp({
         const created = {
           session_id: makeId("sess"),
           title: cleanTitle(req.body.title) || "New chat",
-          workspace_id: requestWorkspaceId(req, req.body.workspace_id),
+          workspace_id: workspaceId,
           agent_workspace_id: agentWorkspace?.agent_workspace_id || null,
           visibility: ["private", "team", "global"].includes(req.body.visibility) ? req.body.visibility : "private",
           created_by: req.auth.user_id,
@@ -1527,6 +1614,7 @@ export async function createApp({
       const updated = await store.mutate((data) => {
         const session = findAccessibleSession(data, req.params.session_id, req);
         assertSessionMutationAccess(session, req);
+        assertSessionExecutionInputsMutable(data, session.session_id);
         const workspace = findAgentWorkspace(data, workspaceId, req.auth);
         if (["copying", "cleanup_required"].includes(workspace.copy_status)) {
           throwStatus(409, workspace.copy_error || "This workspace is still being prepared.");
@@ -1563,6 +1651,7 @@ export async function createApp({
       }
       const updated = await store.mutate((data) => {
         const mutableSession = data.sessions.find((item) => item.session_id === session.session_id);
+        assertSessionExecutionInputsMutable(data, mutableSession?.session_id);
         const inactive = new Set(Array.isArray(mutableSession.inactive_agent_ids) ? mutableSession.inactive_agent_ids : []);
         if (req.body.active) inactive.delete(agent.id);
         else inactive.add(agent.id);
@@ -1740,8 +1829,7 @@ export async function createApp({
         approval,
         decision: continuationDecision,
         actor: req.auth,
-        continueConversation,
-        force: true
+        continueConversation
       });
       res.json(publicConversationCheckpoint(resumed));
     } catch (error) {
@@ -1755,6 +1843,7 @@ export async function createApp({
       await recoverStaleContinuationReservations({ store, actor: req.auth });
       const data = store.read();
       const session = findAccessibleSession(data, req.params.session_id, req);
+      assertSessionMutationAccess(session, req);
       const runOptions = normalizeChatOptions(req.body.options, {
         outputSettings: modelOutputSettingsForWorkspace(data, session.workspace_id)
       });
@@ -1855,6 +1944,9 @@ export async function createApp({
             return { message: existingMessage, run: existingRun, created: false };
           }
         }
+        const mutableSession = mutable.sessions.find((item) => item.session_id === session.session_id);
+        if (!mutableSession) throwStatus(404, "Chat session not found.");
+        assertSessionExecutionInputsSettled(mutable, mutableSession);
         mutable.messages.push(message);
         reserveRunCredits(mutable, {
           run,
@@ -1863,8 +1955,6 @@ export async function createApp({
           kind: workflowCommand ? "workflow_composition" : "chat"
         });
         mutable.runs.push(run);
-        const mutableSession = mutable.sessions.find((item) => item.session_id === session.session_id);
-        if (!mutableSession) throwStatus(404, "Chat session not found.");
         mutableSession.updated_at = now;
         mutableSession.last_message_at = now;
         if (mutableSession.title === "New chat") {
@@ -1890,27 +1980,63 @@ export async function createApp({
   });
 
   app.get("/api/chat/runs/:run_id/events", (req, res, next) => {
+    let stream = null;
     try {
       const data = store.read();
       const run = findAccessibleRun(data, req.params.run_id, req);
+      const terminal = TERMINAL_WORK_STATUSES.has(run.status);
+      if (!terminal) {
+        assertEventStreamCapacity(eventStreams, req, sseConfig);
+      }
       res.writeHead(200, {
         "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache, no-transform",
-        Connection: "keep-alive"
+        "Cache-Control": "private, no-cache, no-store, no-transform",
+        Connection: "keep-alive",
+        "X-Accel-Buffering": "no"
       });
-      for (const event of run.events || []) {
-        writeSseEvent(res, redactRunEventForRequest(event, req));
+      res.flushHeaders?.();
+
+      if (terminal) {
+        for (const event of run.events || []) {
+          if (!writeSseResponseEvent(res, redactRunEventForRequest(event, req))) break;
+        }
+        res.end();
+        return;
       }
-      const stream = { run_id: run.run_id, res };
+
+      stream = createRunEventStream({ eventStreams, run, req, res });
       eventStreams.add(stream);
-      const unsubscribe = bus.subscribe(run.run_id, (event) => {
-        writeSseEvent(res, redactRunEventForRequest(event, req));
+      stream.onClientClose = () => closeRunEventStream(stream, {
+        reason: "client_disconnected",
+        notify: false,
+        endResponse: false
       });
-      req.on("close", () => {
-        unsubscribe();
-        eventStreams.delete(stream);
+      req.once("close", stream.onClientClose);
+      res.once("close", stream.onClientClose);
+      stream.onResponseError = () => closeRunEventStream(stream, {
+        reason: "response_error",
+        notify: false,
+        endResponse: false
       });
+      res.once("error", stream.onResponseError);
+      subscribeAndReplayRunEventStream({
+        stream,
+        bus,
+        store,
+        req,
+        runId: run.run_id
+      });
+      if (stream.closed) return;
+      startRunEventStreamTimers(stream, sseConfig);
     } catch (error) {
+      if (stream) closeRunEventStream(stream, { reason: "stream_setup_failed", notify: false });
+      if (res.headersSent) {
+        if (!res.writableEnded) res.end();
+        return;
+      }
+      if (error?.code === "event_stream_limit") {
+        res.setHeader("Retry-After", "1");
+      }
       next(error);
     }
   });
@@ -2014,6 +2140,7 @@ export async function createApp({
       };
       await store.mutate((data) => {
         const run = findAccessibleRun(data, req.params.run_id, req);
+        assertRunMutationAccess(data, run, req);
         run.feedback = [...(run.feedback || []), feedback];
         return feedback;
       });
@@ -2472,22 +2599,44 @@ export async function createApp({
       assertAgentMutationAccess(current, req);
       if (!current || current.enabled === false) throwStatus(404, "Agent not found.");
       const wasPublished = current.marketplace?.published === true;
+      const previousListingId = wasPublished ? marketplaceListingId(current) : null;
       const marketplace = normalizeMarketplacePayload(req.body, current, req);
+      const publishedNewRevision = Boolean(
+        wasPublished
+        && previousListingId
+        && marketplace.listing_id !== previousListingId
+      );
       const updated = await store.mutate((data) => {
         const agent = data.agents.find((item) => item.id === current.id);
         assertAgentMutationAccess(agent, req);
         if (!agent || agent.enabled === false) throwStatus(404, "Agent not found.");
         agent.item_type = marketplace.item_type;
         agent.marketplace = marketplace;
+        assignMarketplacePublisher(data, agent.marketplace, {
+          ownerId: agent.marketplace.published_by,
+          displayName: req.auth.display_name
+        });
         data.marketplaceRatings = (data.marketplaceRatings || [])
+          .filter((rating) => (
+            !marketplace.previous_listing_id
+            || String(rating.listing_id || "") !== String(marketplace.previous_listing_id)
+          ))
           .filter((rating) => !marketplaceRatingIsSelf(rating, agent));
         agent.last_edited_by = req.auth.user_id;
         agent.last_edited_at = nowIso();
         appendAgentEvent(data, {
-          eventType: wasPublished ? "agent.marketplace_description_updated" : "agent.marketplace_published",
+          eventType: publishedNewRevision
+            ? "agent.marketplace_revision_published"
+            : wasPublished
+              ? "agent.marketplace_description_updated"
+              : "agent.marketplace_published",
           agent,
           actor: req.auth,
-          details: { item_type: marketplace.item_type, listing_id: marketplace.listing_id }
+          details: {
+            item_type: marketplace.item_type,
+            listing_id: marketplace.listing_id,
+            ...(publishedNewRevision ? { previous_listing_id: previousListingId } : {})
+          }
         });
         return agent;
       });
@@ -2583,7 +2732,6 @@ export async function createApp({
           let rating = data.agentWorkspaceRatings.find((candidate) => (
             candidate.listing_id === listingId
             && candidate.created_by === req.auth.user_id
-            && String(candidate.workspace_id || "") === String(req.auth.workspace_id || "")
           ));
           const now = nowIso();
           const created = !rating;
@@ -2625,7 +2773,6 @@ export async function createApp({
         const existing = data.marketplaceRatings.find((rating) =>
           marketplaceRatingMatches(rating, currentItem)
           && rating.created_by === req.auth.user_id
-          && String(rating.workspace_id || "") === String(req.auth.workspace_id || "")
         );
         const now = nowIso();
         if (existing) {
@@ -2661,46 +2808,67 @@ export async function createApp({
 
   app.post("/api/marketplace/items/:agent_id/copy", async (req, res, next) => {
     try {
-      const snapshot = store.read();
-      const workspaceItem = (snapshot.agentWorkspaces || []).find((workspace) => (
-        workspace.agent_workspace_id === req.params.agent_id
-        && workspace.marketplace?.published === true
-      ));
-      if (workspaceItem) {
-        const copiedWorkspace = await copyMarketplaceWorkspaceToUser({
-          store,
-          req,
-          sourceWorkspace: workspaceItem
-        });
-        res.status(201).json({
-          ok: true,
-          status: "copied",
-          listing_id: agentWorkspaceListingId(workspaceItem),
-          source_agent_workspace_id: workspaceItem.agent_workspace_id,
-          agent_workspace: publicAgentWorkspace(copiedWorkspace, store.read())
-        });
-        return;
-      }
-      const item = snapshot.agents.find((agent) =>
-        agent.id === req.params.agent_id
-        && agent.enabled !== false
-        && agent.marketplace?.published === true
+      const copyContext = marketplaceCopyIdempotencyContext(req, req.params.agent_id, req.body || {});
+      const result = await runIdempotentMutation(
+        marketplaceCopyInflight,
+        copyContext.single_flight_key,
+        copyContext.request_digest,
+        async () => {
+          const replay = marketplaceCopyReplay(store.read(), req, copyContext);
+          if (replay) {
+            return {
+              created: false,
+              payload: marketplaceCopyResponse(store.read(), req, replay)
+            };
+          }
+          const snapshot = store.read();
+          const workspaceItem = (snapshot.agentWorkspaces || []).find((workspace) => (
+            workspace.agent_workspace_id === req.params.agent_id
+            && workspace.marketplace?.published === true
+          ));
+          if (workspaceItem) {
+            assertMarketplaceListingRevision(copyContext.listing_id, agentWorkspaceListingId(workspaceItem));
+            const copiedWorkspace = await copyMarketplaceWorkspaceToUser({
+              store,
+              req,
+              sourceWorkspace: workspaceItem,
+              idempotency: copyContext
+            });
+            return {
+              created: true,
+              payload: marketplaceCopyResponse(store.read(), req, {
+                kind: "workspace",
+                workspace: copiedWorkspace
+              })
+            };
+          }
+          const item = snapshot.agents.find((agent) =>
+            agent.id === req.params.agent_id
+            && agent.enabled !== false
+            && agent.marketplace?.published === true
+          );
+          if (!item) throwStatus(404, "Marketplace item not found.");
+          assertMarketplaceListingRevision(copyContext.listing_id, marketplaceListingId(item));
+          const copied = await copyMarketplaceAgentToWorkspace({
+            store,
+            req,
+            sourceAgent: item,
+            requestedId: req.body?.id,
+            targetAgentWorkspaceId: req.body?.agent_workspace_id,
+            idempotency: copyContext
+          });
+          return {
+            created: true,
+            payload: marketplaceCopyResponse(store.read(), req, {
+              kind: "agent",
+              agent: copied
+            })
+          };
+        }
       );
-      if (!item) throwStatus(404, "Marketplace item not found.");
-      const copied = await copyMarketplaceAgentToWorkspace({
-        store,
-        req,
-        sourceAgent: item,
-        requestedId: req.body?.id,
-        targetAgentWorkspaceId: req.body?.agent_workspace_id
-      });
-      res.status(201).json({
-        ok: true,
-        status: "copied",
-        listing_id: marketplaceListingId(item),
-        source_agent_id: item.id,
-        agent_workspace_id: req.body?.agent_workspace_id || null,
-        agent: redactAgentForRequest(copied, req)
+      res.status(result.created ? 201 : 200).json({
+        ...result.payload,
+        duplicate: !result.created
       });
     } catch (error) {
       next(error);
@@ -2772,65 +2940,89 @@ export async function createApp({
       if (!realRuntimeEnabled()) {
         throwStatus(409, "Runtime-agent adoption requires the real runtime.");
       }
-      const runtimeResultBefore = await fetchRuntimeAgent(req.params.agent_id);
-      const runtimeAgentBefore = stripRuntimeRegistrationMetadata(runtimeResultBefore.agent);
-      if (!runtimeAgentBefore?.id || runtimeAgentBefore.id !== req.params.agent_id) {
-        throwStatus(404, "Runtime agent not found.");
-      }
-      const receiptResponse = await fetchRuntimeSubjectReceipts("agent", req.params.agent_id);
-      const subjectChain = await verifyRuntimeAuditSubject("agent", req.params.agent_id, {
-        throughSequence: receiptResponse.snapshot_sequence
-      });
-      const runtimeResult = await fetchRuntimeAgent(req.params.agent_id);
-      const runtimeAgent = stripRuntimeRegistrationMetadata(runtimeResult.agent);
-      if (!runtimeAgentSameAuditState(runtimeAgentBefore, runtimeAgent)) {
-        throwStatus(409, "Runtime agent changed while its audit history was being adopted. Retry the request.");
-      }
-      const runtimeAudit = validateRuntimeAgentAdoptionAudit({
-        agentId: req.params.agent_id,
-        runtimeAgent,
-        receiptResponse,
-        subjectChain
-      });
       const visibility = agentVisibilityForRequest(req, req.body.visibility, "private");
       const workspaceId = requestWorkspaceId(req, req.body.workspace_id);
       const createdBy = normalizeAdoptedAgentOwner(req.body.created_by, req.auth.user_id);
-      const adopted = await store.mutate((data) => {
-        if (data.agents.some((agent) => agent.id === runtimeAgent.id)) {
-          throwStatus(409, "Agent already has virenis ownership metadata.");
-        }
-        const now = nowIso();
-        const agent = {
-          ...runtimeAgent,
-          workspace_id: workspaceId,
-          visibility,
-          created_by: createdBy,
-          runtime_only: false,
-          runtime_registration_audit_binding: runtimeAudit.binding,
-          last_edited_by: req.auth.user_id,
-          last_edited_at: now
-        };
-        data.agents.push(agent);
-        appendAgentEvent(data, {
-          eventType: "agent.adopted",
-          agent,
-          actor: req.auth,
-          details: {
-            adopted_from: "runtime_only",
-            assigned_owner: createdBy,
-            assigned_visibility: visibility,
-            runtime_registration_receipt_id: runtimeAudit.binding.receipt_id,
-            runtime_chain_snapshot_sequence: runtimeAudit.binding.chain_snapshot_sequence,
-            runtime_chain_snapshot_head_hash: runtimeAudit.binding.chain_snapshot_head_hash
-          }
-        });
-        return agent;
+      const adoptionContext = runtimeAdoptionIdempotencyContext(req, req.params.agent_id, {
+        workspace_id: workspaceId,
+        created_by: createdBy,
+        visibility
       });
-      res.status(201).json({
+      const result = await runIdempotentMutation(
+        runtimeAdoptionInflight,
+        adoptionContext.single_flight_key,
+        adoptionContext.request_digest,
+        async () => {
+          const replay = runtimeAdoptionReplay(store.read(), adoptionContext);
+          if (replay) return { created: false, agent: replay };
+          const runtimeResultBefore = await fetchRuntimeAgent(req.params.agent_id);
+          const runtimeAgentBefore = stripRuntimeRegistrationMetadata(runtimeResultBefore.agent);
+          if (!runtimeAgentBefore?.id || runtimeAgentBefore.id !== req.params.agent_id) {
+            throwStatus(404, "Runtime agent not found.");
+          }
+          const receiptResponse = await fetchRuntimeSubjectReceipts("agent", req.params.agent_id);
+          const subjectChain = await verifyRuntimeAuditSubject("agent", req.params.agent_id, {
+            throughSequence: receiptResponse.snapshot_sequence
+          });
+          const runtimeResult = await fetchRuntimeAgent(req.params.agent_id);
+          const runtimeAgent = stripRuntimeRegistrationMetadata(runtimeResult.agent);
+          if (!runtimeAgentSameAuditState(runtimeAgentBefore, runtimeAgent)) {
+            throwStatus(409, "Runtime agent changed while its audit history was being adopted. Retry the request.");
+          }
+          const runtimeAudit = validateRuntimeAgentAdoptionAudit({
+            agentId: req.params.agent_id,
+            runtimeAgent,
+            receiptResponse,
+            subjectChain
+          });
+          const adopted = await store.mutate((data) => {
+            const replayAfterRuntime = runtimeAdoptionReplay(data, adoptionContext);
+            if (replayAfterRuntime) return replayAfterRuntime;
+            if (data.agents.some((agent) => agent.id === runtimeAgent.id)) {
+              throwStatus(409, "Agent already has virenis ownership metadata.");
+            }
+            const now = nowIso();
+            const agent = {
+              ...runtimeAgent,
+              workspace_id: workspaceId,
+              visibility,
+              created_by: createdBy,
+              runtime_only: false,
+              runtime_registration_audit_binding: runtimeAudit.binding,
+              runtime_adoption_idempotency: {
+                key_digest: adoptionContext.key_digest,
+                request_digest: adoptionContext.request_digest,
+                adopted_by: req.auth.user_id,
+                created_at: now
+              },
+              last_edited_by: req.auth.user_id,
+              last_edited_at: now
+            };
+            data.agents.push(agent);
+            appendAgentEvent(data, {
+              eventType: "agent.adopted",
+              agent,
+              actor: req.auth,
+              details: {
+                adopted_from: "runtime_only",
+                assigned_owner: createdBy,
+                assigned_visibility: visibility,
+                runtime_registration_receipt_id: runtimeAudit.binding.receipt_id,
+                runtime_chain_snapshot_sequence: runtimeAudit.binding.chain_snapshot_sequence,
+                runtime_chain_snapshot_head_hash: runtimeAudit.binding.chain_snapshot_head_hash
+              }
+            });
+            return agent;
+          });
+          return { created: true, agent: adopted };
+        }
+      );
+      res.status(result.created ? 201 : 200).json({
         status: "adopted",
+        duplicate: !result.created,
         agent: redactAgentForRequest({
-          ...adopted,
-          agent_revision: agentRevision(adopted)
+          ...result.agent,
+          agent_revision: agentRevision(result.agent)
         }, req)
       });
     } catch (error) {
@@ -2901,6 +3093,7 @@ export async function createApp({
       const targetAgentWorkspace = requestedAgentWorkspaceId
         ? await store.mutate((data) => {
             const workspace = findAgentWorkspace(data, requestedAgentWorkspaceId, req.auth, { mutable: true });
+            assertAgentWorkspaceExecutionInputsMutable(data, workspace.agent_workspace_id);
             reserveAgentWorkspaceCapacity(data, workspace.agent_workspace_id, req.auth, 1, reservationId);
             return publicAgentWorkspace(workspace, data);
           })
@@ -3082,10 +3275,11 @@ export async function createApp({
     let lifecycleIntent = null;
     try {
       const localAgent = uniqueStoredAgent(store.read(), req.params.agent_id, { allowMissing: true });
-      assertAgentMutationAccess(localAgent, req);
-      if (realRuntimeEnabled() && !localAgent) {
+      if (realRuntimeEnabled() && !localAgent && isAdmin(req)) {
         throwStatus(409, "Adopt the runtime-only agent before editing it through virenis.");
       }
+      assertAgentMutationAccess(localAgent, req);
+      assertAgentExecutionInputsMutable(store.read(), localAgent);
       const patch = normalizeAgentPatchPayload(req.body);
       const requestedMcpBindings = resolveAgentMcpBindings(req.body.mcp_bindings, store.read(), req.auth);
       if (requestedMcpBindings !== undefined || patch.tools) {
@@ -3180,6 +3374,7 @@ export async function createApp({
         if (!agent) {
           throwStatus(404, "Agent not found.");
         }
+        assertAgentExecutionInputsMutable(data, agent);
         for (const [key, value] of Object.entries(patch)) {
           if (key === "source_text") {
             agent.source_text_internal = value;
@@ -3279,10 +3474,11 @@ export async function createApp({
     let lifecycleIntent = null;
     try {
       const localAgent = uniqueStoredAgent(store.read(), req.params.agent_id, { allowMissing: true });
-      assertAgentMutationAccess(localAgent, req);
-      if (realRuntimeEnabled() && !localAgent) {
+      if (realRuntimeEnabled() && !localAgent && isAdmin(req)) {
         throwStatus(409, "Adopt the runtime-only agent before archiving it through virenis.");
       }
+      assertAgentMutationAccess(localAgent, req);
+      assertAgentExecutionInputsMutable(store.read(), localAgent);
       if (realRuntimeEnabled()) {
         lifecycleIntent = await store.mutate((data) => beginRuntimeLifecycleIntent(data, {
           agentId: req.params.agent_id,
@@ -3344,6 +3540,7 @@ export async function createApp({
         if (!agent) {
           throwStatus(404, "Agent not found.");
         }
+        assertAgentExecutionInputsMutable(data, agent);
         agent.enabled = false;
         agent.archived_at = nowIso();
         agent.mounted = false;
@@ -3987,13 +4184,13 @@ export async function createApp({
     const status = error.status || 500;
     const code = error.code || (status >= 500 ? "internal_error" : "bad_request");
     if (status >= 500) {
-      console.error("virenis request failed.", {
+      safeDiagnosticLog("http.request_failed", {
         request_id: req.id,
+        operation: "api_request",
         method: req.method,
-        path: req.path,
-        error: error.message,
-        stack: error.stack
-      });
+        status,
+        code
+      }, error);
     }
     const payload = {
       error: code,
@@ -4299,8 +4496,9 @@ async function processValidationRun({ store, validation_run_id: validationRunId,
       run.status = "completed";
       run.ok = Boolean(result.ok);
       run.completed_at = nowIso();
-      run.summary = result.summary?.summary || result.summary || null;
-      run.runtime = result;
+      const diagnosticResult = projectValidationResult(result);
+      run.summary = diagnosticResult.summary || null;
+      run.runtime = diagnosticResult;
       run.events.push({ type: "validation.completed", ok: run.ok, at: run.completed_at });
       return run;
     });
@@ -4359,11 +4557,9 @@ async function recordBackgroundValidationFailure({ store, validationRunId, attem
       code: String(error?.code || "validation_failed"),
       message: validation.message
     };
-    validation.error_admin_only = {
-      code: String(error?.code || "validation_failed"),
-      message: String(error?.message || "Background validation processor failed."),
-      stack: error?.stack || null
-    };
+    validation.error_admin_only = normalizeDiagnosticError(error, {
+      fallbackCode: "validation_failed"
+    });
     validation.events.push({
       type: "validation.failed",
       code: validation.error.code,
@@ -4529,23 +4725,291 @@ function sleep(ms) {
   });
 }
 
-function closeEventStreams(eventStreams, { reason = "shutdown" } = {}) {
-  const streams = [...eventStreams];
-  for (const stream of streams) {
+function assertEventStreamCapacity(eventStreams, req, config) {
+  if (eventStreams.size >= config.maxStreamsGlobal) {
+    throw eventStreamLimitError("The server has reached its open event-stream limit. Retry shortly.");
+  }
+  const { identityKey } = eventStreamIdentity(req);
+  const identityStreams = [...eventStreams]
+    .filter((stream) => !stream.closed && stream.identity_key === identityKey)
+    .length;
+  if (identityStreams >= config.maxStreamsPerIdentity) {
+    throw eventStreamLimitError("You have too many open event streams. Close an existing stream and retry.");
+  }
+}
+
+function eventStreamLimitError(message) {
+  const error = new Error(message);
+  error.status = 429;
+  error.code = "event_stream_limit";
+  return error;
+}
+
+function eventStreamIdentity(req) {
+  const clerkUserId = String(req.auth?.clerk_user_id || "").trim() || null;
+  const userId = String(req.auth?.user_id || "anonymous");
+  const workspaceId = String(req.auth?.workspace_id || "workspace_default");
+  return {
+    // Tenant coordinates are the application identity boundary. Keying Clerk
+    // and configured-token aliases identically prevents one owner from
+    // multiplying their cap by changing authentication mechanism.
+    identityKey: JSON.stringify([workspaceId, userId]),
+    clerkUserId,
+    userId,
+    workspaceId
+  };
+}
+
+function createRunEventStream({ eventStreams, run, req, res }) {
+  const identity = eventStreamIdentity(req);
+  return {
+    stream_id: makeId("stream"),
+    run_id: run.run_id,
+    identity_key: identity.identityKey,
+    clerk_user_id: identity.clerkUserId,
+    user_id: identity.userId,
+    workspace_id: identity.workspaceId,
+    opened_at: nowIso(),
+    req,
+    res,
+    eventStreams,
+    unsubscribe: null,
+    heartbeatTimer: null,
+    lifetimeTimer: null,
+    onClientClose: null,
+    onResponseError: null,
+    closed: false
+  };
+}
+
+function subscribeAndReplayRunEventStream({ stream, bus, store, req, runId }) {
+  const bufferedEvents = [];
+  let replaying = true;
+  const deliverLiveEvent = (event) => {
+    if (stream.closed) return;
+    if (replaying) {
+      bufferedEvents.push(event);
+      return;
+    }
     try {
-      stream.res.write(`event: shutdown\ndata: ${JSON.stringify({ reason, at: nowIso() })}\n\n`);
+      if (!writeRunEventStreamEvent(stream, redactRunEventForRequest(event, req))) return;
+      if (TERMINAL_RUN_EVENT_TYPES.has(event?.type)) {
+        closeRunEventStream(stream, { reason: String(event.type), notify: false });
+      }
+    } catch {
+      closeRunEventStream(stream, { reason: "event_write_failed", notify: false });
+    }
+  };
+
+  const unsubscribe = bus.subscribe(runId, deliverLiveEvent);
+  if (stream.closed) {
+    // A custom bus or response implementation can close synchronously while a
+    // listener is being attached. The regular close path cannot remove a
+    // subscription it has not received yet, so release it explicitly here.
+    unsubscribe();
+    return;
+  }
+  stream.unsubscribe = unsubscribe;
+
+  // Subscribe before taking the replay snapshot. Publications that race with
+  // this read are buffered, while a publication immediately before listener
+  // registration is recovered from the authoritative persisted run.
+  const data = store.read();
+  const currentRun = findAccessibleRun(data, runId, req);
+  const replayEvents = Array.isArray(currentRun.events) ? currentRun.events : [];
+  const replayFingerprints = runEventFingerprintCounts(replayEvents);
+  let terminalEventType = null;
+
+  for (const event of replayEvents) {
+    if (!writeRunEventStreamEvent(stream, redactRunEventForRequest(event, req))) return;
+    if (TERMINAL_RUN_EVENT_TYPES.has(event?.type)) {
+      terminalEventType = String(event.type);
+    }
+  }
+
+  if (TERMINAL_WORK_STATUSES.has(currentRun.status) || terminalEventType) {
+    replaying = false;
+    closeRunEventStream(stream, {
+      reason: terminalEventType || String(currentRun.status),
+      notify: false
+    });
+    return;
+  }
+
+  // A persisted transition normally publishes the same event after its store
+  // commit. Consume those matching buffered copies as a multiset so repeated,
+  // legitimate events retain their durable order without appearing twice.
+  let bufferedIndex = 0;
+  while (!stream.closed && bufferedIndex < bufferedEvents.length) {
+    const event = bufferedEvents[bufferedIndex];
+    bufferedIndex += 1;
+    const fingerprint = runEventFingerprint(event);
+    const replayedCount = replayFingerprints.get(fingerprint) || 0;
+    if (replayedCount > 0) {
+      replayFingerprints.set(fingerprint, replayedCount - 1);
+      if (TERMINAL_RUN_EVENT_TYPES.has(event?.type)) {
+        terminalEventType ||= String(event.type);
+      }
+      continue;
+    }
+    if (!writeRunEventStreamEvent(stream, redactRunEventForRequest(event, req))) return;
+    if (TERMINAL_RUN_EVENT_TYPES.has(event?.type)) {
+      terminalEventType = String(event.type);
+      break;
+    }
+  }
+
+  replaying = false;
+  if (terminalEventType) {
+    closeRunEventStream(stream, {
+      reason: terminalEventType,
+      notify: false
+    });
+  }
+}
+
+function runEventFingerprintCounts(events) {
+  const counts = new Map();
+  for (const event of events) {
+    const fingerprint = runEventFingerprint(event);
+    counts.set(fingerprint, (counts.get(fingerprint) || 0) + 1);
+  }
+  return counts;
+}
+
+function runEventFingerprint(event) {
+  const value = event && typeof event === "object" && !Array.isArray(event)
+    ? Object.fromEntries(Object.entries(event).filter(([key]) => key !== "at"))
+    : event;
+  return JSON.stringify(canonicalRunEventValue(value));
+}
+
+function canonicalRunEventValue(value) {
+  if (Array.isArray(value)) return value.map((item) => canonicalRunEventValue(item));
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(Object.keys(value)
+    .sort()
+    .map((key) => [key, canonicalRunEventValue(value[key])]));
+}
+
+function startRunEventStreamTimers(stream, config) {
+  if (stream.closed) return;
+  stream.heartbeatTimer = setInterval(() => {
+    writeRunEventStreamChunk(stream, `: heartbeat ${nowIso()}\n\n`);
+  }, config.heartbeatMs);
+  stream.heartbeatTimer.unref?.();
+  stream.lifetimeTimer = setTimeout(() => {
+    closeRunEventStream(stream, {
+      reason: "max_lifetime",
+      eventName: "stream.closed"
+    });
+  }, config.maxLifetimeMs);
+  stream.lifetimeTimer.unref?.();
+}
+
+function writeSseResponseEvent(res, event) {
+  if (res.destroyed || res.writableEnded) return false;
+  try {
+    return res.write(`data: ${JSON.stringify(event)}\n\n`);
+  } catch {
+    return false;
+  }
+}
+
+function writeRunEventStreamEvent(stream, event) {
+  try {
+    return writeRunEventStreamChunk(stream, `data: ${JSON.stringify(event)}\n\n`);
+  } catch {
+    closeRunEventStream(stream, { reason: "event_serialization_failed", notify: false });
+    return false;
+  }
+}
+
+function writeRunEventStreamChunk(stream, chunk) {
+  if (!stream || stream.closed || stream.res.destroyed || stream.res.writableEnded) {
+    if (stream && !stream.closed) {
+      closeRunEventStream(stream, {
+        reason: "response_unavailable",
+        notify: false,
+        endResponse: false
+      });
+    }
+    return false;
+  }
+  try {
+    if (stream.res.write(chunk)) return true;
+  } catch {
+    // Closing below removes the listener and both timers.
+  }
+  closeRunEventStream(stream, { reason: "backpressure", notify: false });
+  return false;
+}
+
+function closeRunEventStream(stream, {
+  reason = "closed",
+  eventName = "stream.closed",
+  notify = true,
+  endResponse = true
+} = {}) {
+  if (!stream || stream.closed) return false;
+  stream.closed = true;
+  if (stream.heartbeatTimer) clearInterval(stream.heartbeatTimer);
+  if (stream.lifetimeTimer) clearTimeout(stream.lifetimeTimer);
+  stream.heartbeatTimer = null;
+  stream.lifetimeTimer = null;
+  try {
+    stream.unsubscribe?.();
+  } catch {
+    // Cleanup must continue even if a custom bus implementation misbehaves.
+  }
+  stream.unsubscribe = null;
+  if (stream.onClientClose) {
+    stream.req?.off?.("close", stream.onClientClose);
+    stream.res?.off?.("close", stream.onClientClose);
+  }
+  if (stream.onResponseError) stream.res?.off?.("error", stream.onResponseError);
+  stream.eventStreams?.delete(stream);
+
+  if (endResponse && !stream.res.destroyed && !stream.res.writableEnded) {
+    if (notify) {
+      const safeEventName = /^[A-Za-z0-9_.-]+$/.test(eventName) ? eventName : "stream.closed";
+      try {
+        stream.res.write(
+          `event: ${safeEventName}\ndata: ${JSON.stringify({ reason, at: nowIso() })}\n\n`
+        );
+      } catch {
+        // The client may already have disconnected.
+      }
+    }
+    try {
       stream.res.end();
     } catch {
       // The client may already have disconnected.
-    } finally {
-      eventStreams.delete(stream);
     }
   }
-  return { closed: streams.length, pending: eventStreams.size };
+  return true;
 }
 
-function writeSseEvent(res, event) {
-  res.write(`data: ${JSON.stringify(event)}\n\n`);
+function eventStreamBelongsToActor(stream, actor) {
+  if (!stream || !actor) return false;
+  const clerkUserId = String(actor.clerk_user_id || "");
+  if (clerkUserId && stream.clerk_user_id === clerkUserId) return true;
+  return String(stream.user_id || "") === String(actor.user_id || "")
+    && String(stream.workspace_id || "") === String(actor.workspace_id || "");
+}
+
+function closeEventStreams(eventStreams, {
+  reason = "shutdown",
+  eventName = "shutdown",
+  predicate = null
+} = {}) {
+  const streams = [...eventStreams];
+  let closed = 0;
+  for (const stream of streams) {
+    if (predicate && !predicate(stream)) continue;
+    if (closeRunEventStream(stream, { reason, eventName })) closed += 1;
+  }
+  return { closed, pending: eventStreams.size };
 }
 
 function configureTrustProxy(app) {
@@ -4591,6 +5055,18 @@ function securityHeaders(_req, res, next) {
     if (process.env.APP_ENABLE_HSTS !== "0") {
       res.setHeader("Strict-Transport-Security", "max-age=15552000; includeSubDomains");
     }
+  }
+  next();
+}
+
+function apiPrivacyHeaders(req, res, next) {
+  if (req.path === "/api" || req.path.startsWith("/api/")) {
+    // API payloads are identity- and workspace-dependent. This also protects
+    // authentication failures and early webhook/OAuth responses that return
+    // before the application-auth middleware runs.
+    res.setHeader("Cache-Control", "private, no-store");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
   }
   next();
 }
@@ -5073,6 +5549,21 @@ function requestWorkspaceId(req, requested) {
   return req.auth?.workspace_id || "workspace_default";
 }
 
+function tenantMutationWorkspaceId(req, requested) {
+  const authenticatedWorkspaceId = String(req.auth?.workspace_id || "workspace_default");
+  const requestedWorkspaceId = String(requested || "").trim();
+  if (isAdmin(req) && requestedWorkspaceId && requestedWorkspaceId !== authenticatedWorkspaceId) {
+    // Ordinary data-plane routes are always tenant-bound. In particular,
+    // APP_ALLOW_WORKSPACE_OVERRIDE must not turn a support administrator into
+    // a cross-tenant creator. Cross-workspace operations require an explicit
+    // /api/admin control-plane route.
+    throwStatus(404, "Workspace not found.");
+  }
+  // Preserve the established anti-spoofing behavior for ordinary users: an
+  // untrusted workspace_id field is ignored and the authenticated tenant wins.
+  return authenticatedWorkspaceId;
+}
+
 function canAccessWorkspace(req, workspaceId) {
   if (isAdmin(req) && process.env.APP_ADMIN_SEES_ALL_WORKSPACES === "1") {
     return true;
@@ -5110,7 +5601,7 @@ function agentOwnershipForRequest(req, body = {}) {
     // Cross-tenant sharing is an explicit Marketplace operation. Even an
     // administrator-created global/team agent remains attached to a workspace;
     // only the signed-in product catalog is intentionally unscoped.
-    workspace_id: requestWorkspaceId(req, body.workspace_id),
+    workspace_id: tenantMutationWorkspaceId(req, body.workspace_id),
     visibility,
     created_by: req.auth.user_id
   };
@@ -5124,26 +5615,43 @@ function normalizeAdoptedAgentOwner(value, fallback) {
   return owner;
 }
 
+function isSameWorkspaceResource(resource, req) {
+  return Boolean(
+    resource
+    && resource.workspace_id
+    && req.auth?.workspace_id
+    && String(resource.workspace_id) === String(req.auth.workspace_id)
+  );
+}
+
+function canMutateAgent(agent, req) {
+  if (!isSameWorkspaceResource(agent, req)) {
+    // The signed-in product catalog is intentionally unscoped rather than
+    // owned by another tenant. Preserve its existing administrator lifecycle
+    // controls without granting access to any workspace-bound record.
+    return Boolean(
+      isAdmin(req)
+      && agent
+      && !agent.workspace_id
+      && agent.system_managed === true
+      && agent.visibility === "global"
+    );
+  }
+  if (isAdmin(req)) return true;
+  return agent.visibility === "private" && agent.created_by === req.auth?.user_id;
+}
+
 function assertAgentMutationAccess(agent, req) {
-  if (isAdmin(req)) {
-    return;
-  }
-  if (
-    !agent ||
-    agent.visibility !== "private" ||
-    String(agent.workspace_id || "") !== String(req.auth?.workspace_id || "") ||
-    agent.created_by !== req.auth?.user_id
-  ) {
-    throwStatus(404, "Agent not found.");
-  }
+  // APP_ADMIN_SEES_ALL_WORKSPACES expands read-only support visibility. It must
+  // never turn an ordinary tenant route into an unscoped control-plane route.
+  // Cross-tenant administration belongs under an explicit /api/admin endpoint.
+  if (!canMutateAgent(agent, req)) throwStatus(404, "Agent not found.");
 }
 
 function assertSessionMutationAccess(session, req) {
-  if (isAdmin(req)) return;
   if (
-    !session ||
-    String(session.workspace_id || "") !== String(req.auth?.workspace_id || "") ||
-    session.created_by !== req.auth?.user_id
+    !isSameWorkspaceResource(session, req)
+    || (!isAdmin(req) && session.created_by !== req.auth?.user_id)
   ) {
     throwStatus(404, "Chat session not found.");
   }
@@ -5232,6 +5740,8 @@ function beginRuntimeLifecycleIntent(data, {
   details = {}
 }) {
   data.runtimeLifecycleIntents ||= [];
+  const executionAgent = data.agents.find((item) => item.id === agentId);
+  if (executionAgent) assertAgentExecutionInputsMutable(data, executionAgent);
   if (data.runtimeLifecycleIntents.some((intent) => intent.agent_id === agentId)) {
     throwStatus(409, "This agent already has a pending Runtime lifecycle operation.");
   }
@@ -5608,8 +6118,27 @@ function redactAgentForRequest(agent = {}, req) {
     runtime_registration_audit_binding: _runtimeRegistrationAuditBinding,
     runtime_registration_agent_spec: _runtimeRegistrationAgentSpec,
     workflow_registration_anchor: _workflowRegistrationAnchor,
+    marketplace_copy_idempotency: _marketplaceCopyIdempotency,
+    runtime_adoption_idempotency: _runtimeAdoptionIdempotency,
     ...publicAgent
   } = agent;
+  if (publicAgent.marketplace_origin) {
+    publicAgent.marketplace_origin = publicMarketplaceOrigin(publicAgent.marketplace_origin);
+  }
+  if (publicAgent.marketplace && typeof publicAgent.marketplace === "object") {
+    const marketplace = { ...publicAgent.marketplace };
+    const publisherId = String(marketplace.publisher_id || "").trim() || null;
+    marketplace.publisher = {
+      id: publisherId,
+      user_id: publisherId,
+      display_name: marketplace.publisher_display_name || "Community publisher",
+      status: marketplace.publisher_status === "deleted" ? "deleted" : "active"
+    };
+    marketplace.published_by = publisherId;
+    delete marketplace.publisher_workspace_id;
+    delete marketplace.updated_by;
+    publicAgent.marketplace = marketplace;
+  }
   if (publicAgent.runtime) {
     publicAgent.runtime = stripRuntimeRegistrationResponse(publicAgent.runtime);
   }
@@ -5799,39 +6328,41 @@ function outcomeContractWithIntegrity(data, contract) {
 }
 
 function assertOutcomeMutationAccess(contract, req) {
-  if (isAdmin(req)) {
-    return;
-  }
   if (
-    String(contract.workspace_id || "") !== String(req.auth?.workspace_id || "")
-    || contract.created_by !== req.auth?.user_id
+    !isSameWorkspaceResource(contract, req)
+    || (!isAdmin(req) && contract.created_by !== req.auth?.user_id)
   ) {
     throwStatus(404, "Outcome Contract not found.");
   }
 }
 
 function assertOutcomeRunMutationAccess(session, req) {
-  if (isAdmin(req)) {
-    return;
+  if (
+    !isSameWorkspaceResource(session, req)
+    || (!isAdmin(req) && session.created_by !== req.auth?.user_id)
+  ) {
+    throwStatus(404, "Run not found.");
   }
+}
+
+function assertRunMutationAccess(data, run, req) {
+  const session = data.sessions.find((item) => item.session_id === run?.session_id);
   if (
     !session
-    || String(session.workspace_id || "") !== String(req.auth?.workspace_id || "")
-    || session.created_by !== req.auth?.user_id
+    || !isSameWorkspaceResource(session, req)
+    || (!isAdmin(req) && session.created_by !== req.auth?.user_id)
   ) {
     throwStatus(404, "Run not found.");
   }
 }
 
 function assertDocumentMutationAccess(document, req) {
-  if (isAdmin(req)) {
-    return;
-  }
   if (
-    !document
-    || document.visibility !== "private"
-    || String(document.workspace_id || "") !== String(req.auth?.workspace_id || "")
-    || document.created_by !== req.auth?.user_id
+    !isSameWorkspaceResource(document, req)
+    || (!isAdmin(req) && (
+      document.visibility !== "private"
+      || document.created_by !== req.auth?.user_id
+    ))
   ) {
     throwStatus(404, "Document not found.");
   }
@@ -6020,11 +6551,7 @@ async function recordBackgroundChatFailure({ store, bus, run_id, error, attemptI
       retryable: publicFailure.retryable,
       action: publicFailure.action
     };
-    run.error_admin_only = {
-      code,
-      message: error?.message || "Background chat processor failed.",
-      stack: error?.stack || null
-    };
+    run.error_admin_only = normalizeDiagnosticError(error, { fallbackCode: code });
     run.events = Array.isArray(run.events) ? run.events : [];
     run.events.push({ type: "run.failed", code, message: publicRunFailureMessage(code), at: completedAt });
     releaseRunReservation(data, run, { reason: code });
@@ -6806,13 +7333,14 @@ function resolveDocumentUploadScope(data, req, body = {}) {
     return {
       scope,
       session_id: null,
-      workspace_id: requestWorkspaceId(req, body?.workspace_id)
+      workspace_id: tenantMutationWorkspaceId(req, body?.workspace_id)
     };
   }
   if (!suppliedSessionId) {
     throwStatus(400, "Chat uploads require session_id.");
   }
   const session = findAccessibleSession(data, suppliedSessionId, req);
+  assertSessionMutationAccess(session, req);
   return {
     scope,
     session_id: session.session_id,
@@ -7933,7 +8461,7 @@ function selectWorkflowTools(tools, keywords, { allowWrite = false } = {}) {
 
 function splitList(value) {
   if (Array.isArray(value)) {
-    return value.map(String).map((item) => item.trim()).filter(Boolean);
+    return value.map(String).map((item) => item.trim()).filter(Boolean).slice(0, 20);
   }
   return String(value || "")
     .split(/[\n,]+/)
@@ -8055,7 +8583,7 @@ function agentItemType(_agent = {}) {
 function marketplaceAgentSnapshot(agent = {}) {
   const rawConsumes = splitList(agent.consumes);
   const rawTools = splitList(agent.tools);
-  const omittedAgentConnections = rawConsumes.some((value) => /^agent:[a-z0-9_]+:output$/.test(value));
+  const omittedAgentConnections = rawConsumes.some((value) => /^agent:[a-z0-9_-]+:output$/i.test(value));
   const omittedPrivateKnowledge = Boolean(
     agent.source_text_internal
     || agent.document
@@ -8065,7 +8593,7 @@ function marketplaceAgentSnapshot(agent = {}) {
     || rawConsumes.includes("document_context")
   );
   const consumes = rawConsumes
-    .filter((value) => !/^agent:[a-z0-9_]+:output$/.test(value))
+    .filter((value) => !/^agent:[a-z0-9_-]+:output$/i.test(value))
     .filter((value) => value !== "document_context");
   if (!consumes.includes("user_request")) consumes.unshift("user_request");
   const tools = rawTools
@@ -8136,12 +8664,8 @@ function marketplaceListingId(agent = {}) {
   return `listing_${digest}`;
 }
 
-function marketplacePublisherUserId(agent = {}) {
+function marketplacePublisherOwnerId(agent = {}) {
   return String(agent.marketplace?.published_by || agent.created_by || "Virenis").trim() || "Virenis";
-}
-
-function marketplacePublisherWorkspaceId(agent = {}) {
-  return agent.marketplace?.publisher_workspace_id ?? agent.workspace_id ?? null;
 }
 
 function marketplaceDescription(agent = {}) {
@@ -8158,7 +8682,7 @@ function marketplaceSearchText(agent = {}) {
   const connectorText = (snapshot.connector_requirements || [])
     .flatMap((requirement) => [requirement.connection_name, ...(requirement.tools || []).flatMap((tool) => [tool.name, tool.title])])
     .join(" ");
-  return `${snapshot.title} ${snapshot.capability} ${marketplaceDescription(agent)} ${marketplacePublisherUserId(agent)} ${agent.marketplace?.publisher_display_name || ""} ${snapshot.routing_cues.join(" ")} ${connectorText}`
+  return `${snapshot.title} ${snapshot.capability} ${marketplaceDescription(agent)} ${agent.marketplace?.publisher_id || ""} ${agent.marketplace?.publisher_display_name || ""} ${snapshot.routing_cues.join(" ")} ${connectorText}`
     .toLowerCase();
 }
 
@@ -8166,6 +8690,9 @@ function normalizeMarketplacePayload(body = {}, agent = {}, req) {
   const itemType = agentItemType(agent);
   if (body.item_type && body.item_type !== itemType) {
     throwStatus(400, "Marketplace item_type must match the stored creation type.");
+  }
+  if ("new_revision" in body && typeof body.new_revision !== "boolean") {
+    throwStatus(400, "new_revision must be a boolean.");
   }
   const retiredFields = ["achievements", "proofs", "version", "license"]
     .filter((field) => field in body);
@@ -8178,18 +8705,29 @@ function normalizeMarketplacePayload(body = {}, agent = {}, req) {
     .slice(0, 1200);
   if (!description) throwStatus(400, "Agent description is required.");
   const now = nowIso();
+  const existing = agent.marketplace && typeof agent.marketplace === "object"
+    ? agent.marketplace
+    : null;
+  const wasPublished = existing?.published === true;
+  const createsRevision = !wasPublished || body.new_revision === true;
+  const previousListingId = existing?.listing_id ? marketplaceListingId(agent) : null;
   return {
     published: true,
-    listing_id: agent.marketplace?.listing_id || makeId("listing"),
+    listing_id: createsRevision ? makeId("listing") : marketplaceListingId(agent),
     item_type: itemType,
     description,
-    snapshot: marketplaceAgentSnapshot(agent),
-    published_by: agent.marketplace?.published_by || req.auth.user_id,
-    publisher_display_name: agent.marketplace?.publisher_display_name || req.auth.display_name || req.auth.user_id,
-    publisher_workspace_id: agent.marketplace?.publisher_workspace_id ?? req.auth.workspace_id ?? null,
+    // Description edits do not silently replace the product that accumulated
+    // the listing's ratings. A current behavior snapshot is published only for
+    // a first publication, a republish after unpublishing, or an explicit new
+    // revision (which receives a fresh listing id and therefore fresh ratings).
+    snapshot: createsRevision ? marketplaceAgentSnapshot(agent) : publishedMarketplaceSnapshot(agent),
+    published_by: existing?.published_by || req.auth.user_id,
+    publisher_display_name: existing?.publisher_display_name || req.auth.display_name || "Community publisher",
+    publisher_workspace_id: existing?.publisher_workspace_id ?? req.auth.workspace_id ?? null,
     updated_by: req.auth.user_id,
-    published_at: agent.marketplace?.published_at || now,
-    updated_at: now
+    published_at: createsRevision ? now : existing?.published_at || now,
+    updated_at: now,
+    ...(createsRevision && previousListingId ? { previous_listing_id: previousListingId } : {})
   };
 }
 
@@ -8203,31 +8741,15 @@ function marketplaceRatingMatches(rating = {}, agent = {}) {
 function marketplaceRatingIsSelf(rating = {}, agent = {}) {
   const ratingUser = String(rating.created_by || "");
   if (!ratingUser) return false;
-  const publisherWorkspaceId = marketplacePublisherWorkspaceId(agent);
-  if (
-    ratingUser === marketplacePublisherUserId(agent)
-    && (
-      publisherWorkspaceId === null
-      || String(rating.workspace_id || "") === String(publisherWorkspaceId)
-    )
-  ) return true;
-  return ratingUser === String(agent.created_by || "")
-    && String(rating.workspace_id || "") === String(agent.workspace_id || "");
+  return ratingUser === marketplacePublisherOwnerId(agent)
+    || ratingUser === String(agent.created_by || "");
 }
 
 function marketplaceIsSelfPublished(agent = {}, req) {
   const userId = String(req.auth?.user_id || "");
   if (!userId) return false;
-  const publisherWorkspaceId = marketplacePublisherWorkspaceId(agent);
-  if (
-    userId === marketplacePublisherUserId(agent)
-    && (
-      publisherWorkspaceId === null
-      || String(req.auth?.workspace_id || "") === String(publisherWorkspaceId)
-    )
-  ) return true;
-  return userId === String(agent.created_by || "")
-    && String(req.auth?.workspace_id || "") === String(agent.workspace_id || "");
+  return userId === marketplacePublisherOwnerId(agent)
+    || userId === String(agent.created_by || "");
 }
 
 function marketplaceItemSummary(data, agent, req) {
@@ -8239,7 +8761,6 @@ function marketplaceItemSummary(data, agent, req) {
   const averageRating = ratings.length ? Number((score / ratings.length).toFixed(2)) : 0;
   const myRating = ratings.find((rating) =>
     rating.created_by === req.auth?.user_id
-    && String(rating.workspace_id || "") === String(req.auth?.workspace_id || "")
   ) || null;
   const listingId = marketplaceListingId(agent);
   const snapshot = publishedMarketplaceSnapshot(agent);
@@ -8250,13 +8771,8 @@ function marketplaceItemSummary(data, agent, req) {
     && String(candidate.workspace_id || "") === String(req.auth?.workspace_id || "")
   ) || null;
   const selfPublished = marketplaceIsSelfPublished(agent, req);
-  const publisherUser = (data.users || []).find((user) => user.user_id === marketplacePublisherUserId(agent));
-  const publisherDisplayName = publisherUser?.display_name || agent.marketplace?.publisher_display_name || marketplacePublisherUserId(agent);
-  const canManage = isAdmin(req) || (
-    agent.visibility === "private"
-    && agent.created_by === req.auth?.user_id
-    && String(agent.workspace_id || "") === String(req.auth?.workspace_id || "")
-  );
+  const publisher = publicPublisher(data, agent.marketplace);
+  const canManage = canMutateAgent(agent, req);
   return {
     id: agent.id,
     listing_id: listingId,
@@ -8265,9 +8781,11 @@ function marketplaceItemSummary(data, agent, req) {
     capability: snapshot.capability,
     item_type: agentItemType(agent),
     description: marketplaceDescription(agent),
-    publisher: { user_id: marketplacePublisherUserId(agent) },
-    published_by: marketplacePublisherUserId(agent),
-    publisher_display_name: publisherDisplayName,
+    publisher: { ...publisher, user_id: publisher.id },
+    publisher_id: publisher.id,
+    // Compatibility alias: this is an opaque public id, never the owner key.
+    published_by: publisher.id,
+    publisher_display_name: publisher.display_name,
     published_at: agent.marketplace?.published_at || null,
     updated_at: agent.marketplace?.updated_at || null,
     rating_average: averageRating,
@@ -8325,7 +8843,7 @@ function agentWorkspaceMarketplaceSnapshot(data, workspace) {
   const edges = [];
   for (const target of selectedAgents) {
     for (const input of target.consumes || []) {
-      const sourceId = String(input).match(/^agent:([a-z0-9_]+):output$/)?.[1];
+      const sourceId = String(input).match(/^agent:([a-z0-9_-]+):output$/i)?.[1];
       if (sourceId && members.has(sourceId) && sourceId !== target.id) {
         edges.push({ from: sourceId, to: target.id, label: "handoff" });
       }
@@ -8373,7 +8891,6 @@ function agentWorkspaceMarketplaceIsSelfPublished(workspace, req) {
   return Boolean(
     workspace
     && workspace.marketplace?.published_by === req.auth?.user_id
-    && String(workspace.marketplace?.publisher_workspace_id || "") === String(req.auth?.workspace_id || "")
   );
 }
 
@@ -8389,13 +8906,10 @@ function agentWorkspaceMarketplaceSummary(data, workspace, req) {
   const listingId = agentWorkspaceListingId(workspace);
   const ratings = (data.agentWorkspaceRatings || [])
     .filter((rating) => rating.listing_id === listingId)
-    .filter((rating) => !(
-      rating.created_by === workspace.marketplace?.published_by
-      && String(rating.workspace_id || "") === String(workspace.marketplace?.publisher_workspace_id || "")
-    ))
+    .filter((rating) => rating.created_by !== workspace.marketplace?.published_by)
     .filter((rating) => Number.isInteger(Number(rating.score)) && Number(rating.score) >= 1 && Number(rating.score) <= 5);
   const ratingTotal = ratings.reduce((total, rating) => total + Number(rating.score), 0);
-  const publisherUser = (data.users || []).find((user) => user.user_id === workspace.marketplace?.published_by);
+  const publisher = publicPublisher(data, workspace.marketplace);
   const copied = (data.agentWorkspaces || []).find((candidate) => (
     candidate.marketplace_origin?.listing_id === listingId
     && candidate.created_by === req.auth?.user_id
@@ -8404,7 +8918,6 @@ function agentWorkspaceMarketplaceSummary(data, workspace, req) {
   const snapshot = publishedAgentWorkspaceSnapshot(data, workspace);
   const myRating = ratings.find((rating) => (
     rating.created_by === req.auth?.user_id
-    && String(rating.workspace_id || "") === String(req.auth?.workspace_id || "")
   ));
   return {
     id: workspace.agent_workspace_id,
@@ -8415,11 +8928,10 @@ function agentWorkspaceMarketplaceSummary(data, workspace, req) {
     description: workspace.marketplace?.description || snapshot.description,
     item_type: "workspace",
     agent_count: snapshot.agents.length,
-    publisher: { user_id: workspace.marketplace?.published_by },
-    published_by: workspace.marketplace?.published_by,
-    publisher_display_name: publisherUser?.display_name
-      || workspace.marketplace?.publisher_display_name
-      || workspace.marketplace?.published_by,
+    publisher: { ...publisher, user_id: publisher.id },
+    publisher_id: publisher.id,
+    published_by: publisher.id,
+    publisher_display_name: publisher.display_name,
     published_at: workspace.marketplace?.published_at || null,
     updated_at: workspace.marketplace?.updated_at || null,
     rating_average: ratings.length ? Number((ratingTotal / ratings.length).toFixed(2)) : 0,
@@ -8448,7 +8960,18 @@ function publishAgentWorkspace(data, workspaceId, actor, body = {}) {
   if (workspace.copy_status === "copying" || workspace.copy_status === "cleanup_required") {
     throwStatus(409, "This copied workspace must finish setup before it can be published.");
   }
-  const snapshot = agentWorkspaceMarketplaceSnapshot(data, workspace);
+  if ("new_revision" in body && typeof body.new_revision !== "boolean") {
+    throwStatus(400, "new_revision must be a boolean.");
+  }
+  const existing = workspace.marketplace && typeof workspace.marketplace === "object"
+    ? workspace.marketplace
+    : null;
+  const wasPublished = existing?.published === true;
+  const createsRevision = !wasPublished || body.new_revision === true;
+  const previousListingId = existing?.listing_id ? agentWorkspaceListingId(workspace) : null;
+  const snapshot = createsRevision
+    ? agentWorkspaceMarketplaceSnapshot(data, workspace)
+    : publishedAgentWorkspaceSnapshot(data, workspace);
   if (!snapshot.agents.length) throwStatus(409, "Add at least one available agent before publishing this workspace.");
   const description = String(body.description || workspace.description || "")
     .replaceAll("\0", "").trim().slice(0, 1200);
@@ -8456,22 +8979,32 @@ function publishAgentWorkspace(data, workspaceId, actor, body = {}) {
   const now = nowIso();
   workspace.marketplace = {
     published: true,
-    listing_id: workspace.marketplace?.listing_id || makeId("listing"),
+    listing_id: createsRevision ? makeId("listing") : agentWorkspaceListingId(workspace),
     item_type: "workspace",
     description,
     snapshot,
-    published_by: workspace.marketplace?.published_by || actor.user_id,
-    publisher_display_name: workspace.marketplace?.publisher_display_name || actor.display_name || actor.user_id,
-    publisher_workspace_id: workspace.marketplace?.publisher_workspace_id ?? actor.workspace_id,
+    published_by: existing?.published_by || actor.user_id,
+    publisher_display_name: existing?.publisher_display_name || actor.display_name || "Community publisher",
+    publisher_workspace_id: existing?.publisher_workspace_id ?? actor.workspace_id,
     updated_by: actor.user_id,
-    published_at: workspace.marketplace?.published_at || now,
-    updated_at: now
+    published_at: createsRevision ? now : existing?.published_at || now,
+    updated_at: now,
+    ...(createsRevision && previousListingId ? { previous_listing_id: previousListingId } : {})
   };
+  assignMarketplacePublisher(data, workspace.marketplace, {
+    ownerId: workspace.marketplace.published_by,
+    displayName: actor.display_name
+  });
   workspace.updated_at = now;
   data.agentWorkspaceRatings = (data.agentWorkspaceRatings || []).filter((rating) => !(
-    rating.listing_id === workspace.marketplace.listing_id
-    && rating.created_by === workspace.marketplace.published_by
-    && String(rating.workspace_id || "") === String(workspace.marketplace.publisher_workspace_id || "")
+    (
+      workspace.marketplace.previous_listing_id
+      && rating.listing_id === workspace.marketplace.previous_listing_id
+    )
+    || (
+      rating.listing_id === workspace.marketplace.listing_id
+      && rating.created_by === workspace.marketplace.published_by
+    )
   ));
   return workspace;
 }
@@ -8492,7 +9025,194 @@ function marketplaceWorkspaceCopyName(data, actor, sourceName) {
   return `${base.slice(0, 64)} ${crypto.randomBytes(3).toString("hex")}`;
 }
 
-async function copyMarketplaceWorkspaceToUser({ store, req, sourceWorkspace }) {
+function requiredMutationIdempotencyKey(req, label) {
+  const key = normalizeIdempotencyKey(req.headers["idempotency-key"]);
+  if (!key) {
+    const error = new Error(`An Idempotency-Key header is required to ${label} safely.`);
+    error.status = 400;
+    error.code = "idempotency_key_required";
+    throw error;
+  }
+  return key;
+}
+
+function requestDigest(value) {
+  return crypto.createHash("sha256").update(JSON.stringify(value), "utf8").digest("hex");
+}
+
+function marketplaceCopyIdempotencyContext(req, sourceId, body = {}) {
+  const idempotencyKey = requiredMutationIdempotencyKey(req, "copy a Marketplace item");
+  const listingId = String(body.listing_id || "").trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$/.test(listingId)) {
+    throwStatus(400, "A valid listing_id from Marketplace item details is required before copying.");
+  }
+  const targetAgentWorkspaceId = String(body.agent_workspace_id || "").trim() || null;
+  const requestedId = String(body.id || "").trim() || null;
+  const tenantScope = {
+    workspace_id: String(req.auth.workspace_id || "workspace_default"),
+    created_by: String(req.auth.user_id || "")
+  };
+  const keyDigest = requestDigest({
+    operation: "marketplace_copy_v1",
+    ...tenantScope,
+    idempotency_key: idempotencyKey
+  });
+  const digest = requestDigest({
+    operation: "marketplace_copy_v1",
+    source_id: String(sourceId || ""),
+    listing_id: listingId,
+    target_agent_workspace_id: targetAgentWorkspaceId,
+    requested_agent_id: requestedId
+  });
+  return {
+    ...tenantScope,
+    source_id: String(sourceId || ""),
+    listing_id: listingId,
+    target_agent_workspace_id: targetAgentWorkspaceId,
+    requested_agent_id: requestedId,
+    key_digest: keyDigest,
+    request_digest: digest,
+    single_flight_key: `${tenantScope.workspace_id}:${tenantScope.created_by}:${keyDigest}`
+  };
+}
+
+function runtimeAdoptionIdempotencyContext(req, agentId, values) {
+  const idempotencyKey = requiredMutationIdempotencyKey(req, "adopt a Runtime specialist");
+  const tenantScope = {
+    workspace_id: String(values.workspace_id || "workspace_default"),
+    adopted_by: String(req.auth.user_id || "")
+  };
+  const keyDigest = requestDigest({
+    operation: "runtime_adoption_v1",
+    ...tenantScope,
+    idempotency_key: idempotencyKey
+  });
+  const digest = requestDigest({
+    operation: "runtime_adoption_v1",
+    agent_id: String(agentId || ""),
+    workspace_id: tenantScope.workspace_id,
+    created_by: String(values.created_by || ""),
+    visibility: String(values.visibility || "")
+  });
+  return {
+    ...tenantScope,
+    agent_id: String(agentId || ""),
+    key_digest: keyDigest,
+    request_digest: digest,
+    single_flight_key: `${tenantScope.workspace_id}:${tenantScope.adopted_by}:${keyDigest}`
+  };
+}
+
+function runtimeAdoptionReplay(data, context) {
+  const matches = (data.agents || []).filter((agent) => (
+    String(agent.workspace_id || "") === context.workspace_id
+    && agent.runtime_adoption_idempotency?.adopted_by === context.adopted_by
+    && agent.runtime_adoption_idempotency?.key_digest === context.key_digest
+  ));
+  if (matches.length > 1) {
+    idempotencyConflict("This Runtime-adoption key has more than one saved result and must be repaired before retrying.");
+  }
+  const agent = matches[0];
+  if (!agent) return null;
+  if (agent.runtime_adoption_idempotency?.request_digest !== context.request_digest) {
+    idempotencyConflict("This idempotency key was already used for a different Runtime adoption.");
+  }
+  return agent;
+}
+
+function idempotencyConflict(message = "This idempotency key was already used for a different request.") {
+  const error = new Error(message);
+  error.status = 409;
+  error.code = "idempotency_conflict";
+  throw error;
+}
+
+function marketplaceCopyReplay(data, req, context) {
+  const workspaces = (data.agentWorkspaces || []).filter((workspace) => (
+    workspace.created_by === context.created_by
+    && String(workspace.workspace_id || "") === context.workspace_id
+    && workspace.marketplace_copy_idempotency?.key_digest === context.key_digest
+  ));
+  const agents = (data.agents || []).filter((agent) => (
+    agent.created_by === context.created_by
+    && String(agent.workspace_id || "") === context.workspace_id
+    && agent.marketplace_copy_idempotency?.key_digest === context.key_digest
+  ));
+  if (workspaces.length + agents.length > 1) {
+    idempotencyConflict("This Marketplace copy key has more than one saved result and must be repaired before retrying.");
+  }
+  const entity = workspaces[0] || agents[0];
+  if (!entity) return null;
+  if (entity.marketplace_copy_idempotency?.request_digest !== context.request_digest) {
+    idempotencyConflict();
+  }
+  if (workspaces[0] && workspaces[0].copy_status !== "ready") {
+    const error = new Error(workspaces[0].copy_error || "The previous copy is still being prepared. Refresh before retrying.");
+    error.status = 409;
+    error.code = workspaces[0].copy_status === "cleanup_required"
+      ? "marketplace_copy_cleanup_required"
+      : "marketplace_copy_in_progress";
+    throw error;
+  }
+  if (agents[0]?.runtime_sync_pending === true || agents[0]?.ready === false) {
+    const error = new Error("The previous copied specialist is still being prepared. Refresh before retrying.");
+    error.status = 409;
+    error.code = "marketplace_copy_in_progress";
+    throw error;
+  }
+  return workspaces[0]
+    ? { kind: "workspace", workspace: workspaces[0] }
+    : { kind: "agent", agent: agents[0] };
+}
+
+function marketplaceCopyResponse(data, req, replay) {
+  if (replay.kind === "workspace") {
+    const workspace = replay.workspace;
+    return {
+      ok: true,
+      status: "copied",
+      listing_id: workspace.marketplace_origin?.listing_id,
+      source_agent_workspace_id: workspace.marketplace_origin?.source_agent_workspace_id,
+      agent_workspace: publicAgentWorkspace(workspace, data)
+    };
+  }
+  const agent = replay.agent;
+  return {
+    ok: true,
+    status: "copied",
+    listing_id: agent.marketplace_origin?.listing_id,
+    source_agent_id: agent.marketplace_origin?.source_agent_id,
+    agent_workspace_id: agent.marketplace_copy_idempotency?.target_agent_workspace_id || null,
+    agent: redactAgentForRequest(agent, req)
+  };
+}
+
+function assertMarketplaceListingRevision(expected, current) {
+  if (expected !== current) {
+    const error = new Error("This Marketplace listing changed after you opened it. Reload the details before copying.");
+    error.status = 409;
+    error.code = "marketplace_listing_changed";
+    throw error;
+  }
+}
+
+async function runIdempotentMutation(inflight, key, digest, operation) {
+  const existing = inflight.get(key);
+  if (existing) {
+    if (existing.request_digest !== digest) idempotencyConflict();
+    const result = await existing.promise;
+    return { ...result, created: false };
+  }
+  const promise = Promise.resolve().then(operation);
+  inflight.set(key, { request_digest: digest, promise });
+  try {
+    return await promise;
+  } finally {
+    if (inflight.get(key)?.promise === promise) inflight.delete(key);
+  }
+}
+
+async function copyMarketplaceWorkspaceToUser({ store, req, sourceWorkspace, idempotency = null }) {
   const sourceData = store.read();
   const snapshot = publishedAgentWorkspaceSnapshot(sourceData, sourceWorkspace);
   if (!snapshot.agents.length) throwStatus(409, "This Marketplace workspace has no copyable agents.");
@@ -8500,6 +9220,7 @@ async function copyMarketplaceWorkspaceToUser({ store, req, sourceWorkspace }) {
     throwStatus(409, `Marketplace workspaces can contain at most ${AGENT_WORKSPACE_MAX_AGENTS} agents.`);
   }
   const listingId = agentWorkspaceListingId(sourceWorkspace);
+  const sourcePublisher = publicPublisher(sourceData, sourceWorkspace.marketplace);
   const createdWorkspace = await store.mutate((data) => {
     const created = createAgentWorkspace(data, req.auth, {
       name: marketplaceWorkspaceCopyName(data, req.auth, snapshot.name),
@@ -8509,9 +9230,18 @@ async function copyMarketplaceWorkspaceToUser({ store, req, sourceWorkspace }) {
     created.marketplace_origin = {
       listing_id: listingId,
       source_agent_workspace_id: sourceWorkspace.agent_workspace_id,
-      publisher_user_id: sourceWorkspace.marketplace?.published_by,
+      publisher_id: sourcePublisher.id,
+      publisher_display_name: sourcePublisher.display_name,
       copied_at: nowIso()
     };
+    if (idempotency) {
+      created.marketplace_copy_idempotency = {
+        key_digest: idempotency.key_digest,
+        request_digest: idempotency.request_digest,
+        target_agent_workspace_id: null,
+        created_at: nowIso()
+      };
+    }
     created.copy_status = "copying";
     return created;
   });
@@ -8532,6 +9262,8 @@ async function copyMarketplaceWorkspaceToUser({ store, req, sourceWorkspace }) {
           published: true,
           listing_id: nestedListingId,
           published_by: sourceWorkspace.marketplace?.published_by,
+          publisher_id: sourcePublisher.id,
+          publisher_display_name: sourcePublisher.display_name,
           publisher_workspace_id: sourceWorkspace.marketplace?.publisher_workspace_id,
           published_at: sourceWorkspace.marketplace?.published_at,
           snapshot: entry.agent
@@ -8643,6 +9375,7 @@ async function copyMarketplaceAgentToWorkspace({
   sourceAgent,
   requestedId,
   targetAgentWorkspaceId = null,
+  idempotency = null,
   ownerMutation = null,
   workflowCommit = null
 }) {
@@ -8660,6 +9393,7 @@ async function copyMarketplaceAgentToWorkspace({
   }
   const snapshot = publishedMarketplaceSnapshot(sourceAgent);
   const listingId = marketplaceListingId(sourceAgent);
+  const sourcePublisher = publicPublisher(store.read(), sourceAgent.marketplace);
   const agentId = marketplaceCopyAgentId(store.read(), sourceAgent, requestedId);
   const copied = normalizeAgentPayload({
     id: agentId,
@@ -8687,9 +9421,18 @@ async function copyMarketplaceAgentToWorkspace({
     marketplace_origin: {
       listing_id: listingId,
       source_agent_id: sourceAgent.id,
-      publisher_user_id: marketplacePublisherUserId(sourceAgent),
+      publisher_id: sourcePublisher.id,
+      publisher_display_name: sourcePublisher.display_name,
       copied_at: nowIso()
-    }
+    },
+    ...(idempotency ? {
+      marketplace_copy_idempotency: {
+        key_digest: idempotency.key_digest,
+        request_digest: idempotency.request_digest,
+        target_agent_workspace_id: String(targetAgentWorkspaceId || "").trim() || null,
+        created_at: nowIso()
+      }
+    } : {})
   });
 
   let runtimeCleanup = null;
@@ -8725,6 +9468,7 @@ async function copyMarketplaceAgentToWorkspace({
       await store.mutate((data) => {
         assertCopyCommit(data);
         findAgentWorkspace(data, selectedWorkspaceId, req.auth, { mutable: true });
+        assertAgentWorkspaceExecutionInputsMutable(data, selectedWorkspaceId);
         reserveAgentWorkspaceCapacity(data, selectedWorkspaceId, req.auth, 1, reservationId);
       });
       workspaceReservation = { workspaceId: selectedWorkspaceId, reservationId };
@@ -9078,6 +9822,87 @@ function mcpApprovalForMutation(data, req, approvalId) {
   }
   if (!matches[0]) throwStatus(404, "MCP approval not found.");
   return matches[0];
+}
+
+const EXECUTION_INPUT_LOCK_STATUSES = new Set(["queued", "planning", "running", "synthesizing"]);
+
+function activeExecutionInputRun(data, predicate) {
+  return (data.runs || []).find((run) => (
+    EXECUTION_INPUT_LOCK_STATUSES.has(String(run?.status || ""))
+    && predicate(run)
+  )) || null;
+}
+
+function executionInputsLocked(run) {
+  const error = new Error("This team is being used by an answer in progress. Wait for that answer to finish before changing its specialists or handoffs.");
+  error.status = 409;
+  error.code = "execution_inputs_locked";
+  error.run_id = run?.run_id || null;
+  throw error;
+}
+
+function assertSessionExecutionInputsMutable(data, sessionId) {
+  if (!sessionId) return;
+  const run = activeExecutionInputRun(data, (candidate) => candidate.session_id === sessionId);
+  if (run) executionInputsLocked(run);
+}
+
+function assertSessionExecutionInputsSettled(data, session) {
+  const agentWorkspace = activeAgentWorkspaceForSession(data, session);
+  if (!agentWorkspace) return;
+  pruneAgentWorkspaceReservations(agentWorkspace);
+  const memberIds = new Set(agentWorkspace.agent_ids || []);
+  const pendingAgent = (data.agents || []).find((agent) => (
+    memberIds.has(agent.id)
+    && agent.runtime_sync_pending === true
+  ));
+  if (
+    (agentWorkspace.reservations || []).length > 0
+    || agentWorkspace.copy_status === "copying"
+    || pendingAgent
+  ) {
+    const error = new Error("This team is still applying a specialist change. Wait for setup to finish before starting a new answer.");
+    error.status = 409;
+    error.code = "execution_inputs_updating";
+    throw error;
+  }
+}
+
+function assertAgentWorkspaceExecutionInputsMutable(data, agentWorkspaceId) {
+  if (!agentWorkspaceId) return;
+  const run = activeExecutionInputRun(data, (candidate) => (
+    candidate.agent_workspace_id === agentWorkspaceId
+  ));
+  if (run) executionInputsLocked(run);
+}
+
+function activeRunMayUseAgent(data, run, agent) {
+  if (!agent?.id) return false;
+  if ((run.requested_agent_ids || []).includes(agent.id)) return true;
+  const session = (data.sessions || []).find((candidate) => candidate.session_id === run.session_id);
+  if (!session || (session.inactive_agent_ids || []).includes(agent.id)) return false;
+  if (agent.scope === "chat" && agent.session_id !== session.session_id) return false;
+  if (agent.workspace_id && String(agent.workspace_id) !== String(run.workspace_id || session.workspace_id || "")) {
+    return false;
+  }
+  if (
+    (agent.visibility || "team") === "private"
+    && agent.created_by
+    && agent.created_by !== run.created_by
+  ) return false;
+  const agentWorkspace = (data.agentWorkspaces || []).find((candidate) => (
+    candidate.agent_workspace_id === run.agent_workspace_id
+  ));
+  if (!agentWorkspace) return true;
+  return (agentWorkspace.agent_ids || []).includes(agent.id)
+    || Boolean(agent.document)
+    || Boolean(agent.resource_for_agent_id);
+}
+
+function assertAgentExecutionInputsMutable(data, agent) {
+  if (!agent?.id) return;
+  const run = activeExecutionInputRun(data, (candidate) => activeRunMayUseAgent(data, candidate, agent));
+  if (run) executionInputsLocked(run);
 }
 
 function throwStatus(status, message) {

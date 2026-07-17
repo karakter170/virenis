@@ -343,6 +343,60 @@ describe("WorldGraph validity and selective replay", () => {
     expect(replayFixture(currentFutureTool).reasons.research_agent).toBe("time_sensitive_request");
   });
 
+  it("applies the same bounded freshness contract to relative events, service status, transit, and false senses", () => {
+    const mutableQueries = [
+      "Tell me what happened in last night's game.",
+      "Summarize yesterday's election result.",
+      "Explain this quarter's earnings.",
+      "What is the newest stable Node release?",
+      "Is Gmail working?",
+      "Show the current traffic near the airport.",
+      "When is the next train?",
+      "Who is the current leader?",
+      "Explain real-time chat architecture and check whether Gmail is working.",
+      "Write a poem about yesterday's election result.",
+      "Write a story inspired by last night's game score.",
+      "Summarize this morning's traffic near the airport.",
+      "What time is my flight tomorrow?",
+      "What has changed since 2020?",
+      "As of 2021, how has Python changed?"
+    ];
+    for (const query of mutableQueries) {
+      const base = fixture({
+        query,
+        agentPatches: { research_agent: { tools: ["web_search"] } }
+      });
+      const repeated = replayFixture(base);
+      expect(repeated.actions.research_agent, query).toBe("refreshed");
+      expect(repeated.reasons.research_agent, query).toBe("time_sensitive_request");
+    }
+
+    const timelessQueries = [
+      "Score this essay.",
+      "Explain a real-time chat architecture.",
+      "Design a stock management workflow.",
+      "Write a poem about yesterday.",
+      "Write a story about tomorrow.",
+      "Write a sentence about last night.",
+      "Use yesterday as the theme of a poem.",
+      "Explain the Python release cycle.",
+      "Is this Python function working?",
+      "The API design is working well.",
+      "Describe the newest character in this story.",
+      "Analyze the report as of 2020.",
+      "Continue with the Python release cycle as of 2021."
+    ];
+    for (const query of timelessQueries) {
+      const base = fixture({
+        query,
+        agentPatches: { research_agent: { tools: ["web_search"] } }
+      });
+      const repeated = replayFixture(base);
+      expect(repeated.actions.research_agent, query).toBe("kept");
+      expect(repeated.reasons.research_agent, query).toBe("inputs_and_evidence_unchanged");
+    }
+  });
+
   it("reuses stable research work when a live tool was available but never called", () => {
     const base = fixture({
       query: "Explain the Renault brand and the Python language.",

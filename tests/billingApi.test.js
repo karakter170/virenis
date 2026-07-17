@@ -25,7 +25,10 @@ const MANAGED_ENV = [
   "APP_BILLING_COMPLETION_CREDITS_PER_1K",
   "APP_BILLING_CACHED_CREDITS_PER_1K",
   "APP_BILLING_UNCLASSIFIED_CREDITS_PER_1K",
-  "APP_BILLING_MINIMUM_RESERVATION_CREDITS"
+  "APP_BILLING_MINIMUM_RESERVATION_CREDITS",
+  "APP_MAX_ACTIVE_RUNS_PER_USER",
+  "APP_MAX_ACTIVE_RUNS_PER_WORKSPACE",
+  "APP_MAX_ACTIVE_RUNS_GLOBAL"
 ];
 
 let app;
@@ -316,6 +319,9 @@ describe("run charging and transparency", () => {
   });
 
   it("preserves every credit under a burst of concurrent reservations", async () => {
+    process.env.APP_MAX_ACTIVE_RUNS_PER_USER = "100";
+    process.env.APP_MAX_ACTIVE_RUNS_PER_WORKSPACE = "100";
+    process.env.APP_MAX_ACTIVE_RUNS_GLOBAL = "100";
     await startApp({ autoRun: false });
     const session = await request(app).post("/api/chat/sessions").set(auth("alice")).send({ title: "Reservation stress" }).expect(201);
     const responses = await Promise.all(Array.from({ length: 30 }, (_, index) => request(app)
@@ -332,6 +338,33 @@ describe("run charging and transparency", () => {
     expect(account.available_micros + account.reserved_micros).toBe(1_000_000_000);
     expect(account.reserved_micros).toBe(reservations.reduce((sum, reservation) => sum + reservation.authorized_micros, 0));
     expect(verifyBillingState(stored)).toEqual({ valid: true, errors: [] });
+  });
+
+  it("returns a clear error and rolls back the message when active-run capacity is reached", async () => {
+    process.env.APP_MAX_ACTIVE_RUNS_PER_USER = "1";
+    process.env.APP_MAX_ACTIVE_RUNS_PER_WORKSPACE = "4";
+    process.env.APP_MAX_ACTIVE_RUNS_GLOBAL = "8";
+    await startApp({ autoRun: false });
+    const session = await request(app)
+      .post("/api/chat/sessions")
+      .set(auth("alice"))
+      .send({ title: "Capacity guard" })
+      .expect(201);
+    await request(app)
+      .post(`/api/chat/sessions/${session.body.session_id}/messages`)
+      .set(auth("alice"))
+      .send({ content: "First active request" })
+      .expect(202);
+    const blocked = await request(app)
+      .post(`/api/chat/sessions/${session.body.session_id}/messages`)
+      .set(auth("alice"))
+      .send({ content: "Second active request" })
+      .expect(429);
+    expect(blocked.body).toMatchObject({ error: "active_run_limit_reached" });
+    const stored = app.locals.store.read();
+    expect(stored.runs).toHaveLength(1);
+    expect(stored.messages.filter((message) => message.session_id === session.body.session_id)).toHaveLength(1);
+    expect(stored.billingReservations.filter((reservation) => reservation.status === "active")).toHaveLength(1);
   });
 });
 

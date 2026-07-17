@@ -9,3 +9,5 @@ data/app-db.json
 data/*.mcp-key
 uploads/
 *.log
+playwright-report/
+test-results/

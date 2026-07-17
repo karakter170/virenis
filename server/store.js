@@ -6,8 +6,42 @@ import { verifyBillingState } from "./billing.js";
 import { normalizedBillingAvailable, syncNormalizedBilling } from "./normalizedBilling.js";
 import { normalizedLedgerAvailable, syncNormalizedLedger } from "./normalizedLedger.js";
 import { ensureGeneralAgentWorkspace, normalizeAgentWorkspaceCollections } from "./agentWorkspaces.js";
+import { normalizePublicMarketplaceRatings } from "./marketplaceRatingIdentity.js";
+import { normalizeMarketplacePublisherIdentities } from "./marketplacePublisherIdentity.js";
+import { validateProductionDatabaseTransport } from "./databaseTransport.js";
 
 const { Client, Pool } = pg;
+
+function boundedDatabaseTimeout(value, fallback = 5000) {
+  const parsed = Number(value ?? fallback);
+  if (!Number.isSafeInteger(parsed)) return fallback;
+  return Math.max(250, Math.min(parsed, 30_000));
+}
+
+function databaseStatementTimeout(queryTimeout) {
+  // Let PostgreSQL cancel first so the protocol reaches ReadyForQuery before
+  // node-postgres' client-side fail-safe fires. The latter remains necessary
+  // for broken networks and an unresponsive server.
+  const grace = Math.min(1000, Math.max(50, Math.floor(queryTimeout / 10)));
+  return Math.max(100, queryTimeout - grace);
+}
+
+function isClientQueryTimeout(error) {
+  return String(error?.message || "").toLowerCase().includes("query read timeout");
+}
+
+async function rollbackAfterFailure(client, originalError) {
+  let rollbackError = null;
+  try {
+    await client.query("ROLLBACK");
+  } catch (error) {
+    rollbackError = error;
+  }
+  // A client-side read timeout can leave an unanswered statement on the wire,
+  // and a failed rollback cannot prove protocol synchronization. Passing an
+  // error to release() makes pg-pool destroy, rather than recycle, the client.
+  return isClientQueryTimeout(originalError) ? originalError : rollbackError;
+}
 
 function clone(value) {
   if (typeof globalThis.structuredClone === "function") {
@@ -41,7 +75,7 @@ function mergeSeedCatalog(agents, seedAgents) {
 function initialData(seedAgents) {
   const now = new Date().toISOString();
   return {
-    version: 14,
+    version: 17,
     created_at: now,
     users: [],
     billingAccounts: [],
@@ -88,7 +122,9 @@ export class JsonStore {
   }
 
   async init() {
-    await fs.mkdir(path.dirname(this.dbPath), { recursive: true });
+    const dataDirectory = path.dirname(this.dbPath);
+    await fs.mkdir(dataDirectory, { recursive: true, mode: 0o700 });
+    await fs.chmod(dataDirectory, 0o700);
     try {
       const raw = await fs.readFile(this.dbPath, "utf8");
       this.data = normalizeData(JSON.parse(raw), this.seedAgents);
@@ -111,6 +147,13 @@ export class JsonStore {
     return clone(selector(this.data));
   }
 
+  async readinessCheck() {
+    // Do not report a stale in-memory snapshot as ready if the durable JSON
+    // backing file has disappeared or become inaccessible.
+    await this.txQueue;
+    await fs.access(this.dbPath, fs.constants.R_OK | fs.constants.W_OK);
+  }
+
   mutate(mutator) {
     const transaction = this.txQueue.then(async () => {
       const before = clone(this.data);
@@ -131,8 +174,13 @@ export class JsonStore {
   async saveNow() {
     assertBillingStateIntegrity(this.data);
     const tmpPath = `${this.dbPath}.tmp`;
-    await fs.writeFile(tmpPath, `${JSON.stringify(this.data)}\n`, "utf8");
+    await fs.writeFile(tmpPath, `${JSON.stringify(this.data)}\n`, {
+      encoding: "utf8",
+      mode: 0o600
+    });
+    await fs.chmod(tmpPath, 0o600);
     await fs.rename(tmpPath, this.dbPath);
+    await fs.chmod(this.dbPath, 0o600);
   }
 
   async close() {
@@ -145,11 +193,13 @@ export class PostgresStore {
     connectionString = process.env.DATABASE_URL,
     tableName = process.env.WEB_DB_TABLE || "tcar_app_store",
     storeKey = process.env.WEB_DB_STORE_KEY || "default",
-    seedAgents
+    seedAgents,
+    clientConstructor = Client
   }) {
     if (!connectionString) {
       throw new Error("PostgresStore requires DATABASE_URL.");
     }
+    validateProductionDatabaseTransport(process.env, connectionString);
     if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(tableName)) {
       throw new Error("WEB_DB_TABLE must be a simple SQL identifier.");
     }
@@ -157,12 +207,33 @@ export class PostgresStore {
     this.storeKey = storeKey;
     this.connectionString = connectionString;
     this.seedAgents = seedAgents;
+    this.clientConstructor = clientConstructor;
     this.data = initialData(seedAgents);
     this.txQueue = Promise.resolve();
+    this.databaseConnectTimeoutMs = boundedDatabaseTimeout(
+      process.env.WEB_DB_CONNECT_TIMEOUT_MS,
+      5000
+    );
+    this.databaseQueryTimeoutMs = boundedDatabaseTimeout(
+      process.env.WEB_DB_QUERY_TIMEOUT_MS,
+      5000
+    );
+    this.databaseStatementTimeoutMs = databaseStatementTimeout(
+      this.databaseQueryTimeoutMs
+    );
     this.pool = new Pool({
       connectionString,
       max: Number(process.env.WEB_DB_POOL_SIZE || 5),
-      idleTimeoutMillis: Number(process.env.WEB_DB_IDLE_TIMEOUT_MS || 30000)
+      idleTimeoutMillis: Number(process.env.WEB_DB_IDLE_TIMEOUT_MS || 30000),
+      // `query_timeout` does not bound time spent acquiring a new socket.
+      // Keep readiness and mutations from hanging indefinitely during a
+      // network outage before PostgreSQL accepts the connection.
+      connectionTimeoutMillis: this.databaseConnectTimeoutMs,
+      // Bound every init/mutate/save/projection query, not just readiness.
+      // PostgreSQL cancels first; the slightly later client timeout is the
+      // fail-safe when no server response can arrive.
+      statement_timeout: this.databaseStatementTimeoutMs,
+      query_timeout: this.databaseQueryTimeoutMs
     });
     this.normalizedLedger = false;
     this.normalizedBilling = false;
@@ -215,6 +286,7 @@ export class PostgresStore {
     const client = await this.pool.connect();
     const seedData = initialData(this.seedAgents);
     let initializedData;
+    let releaseError = null;
     try {
       await client.query("BEGIN");
       await client.query(
@@ -247,11 +319,11 @@ export class PostgresStore {
       await client.query("COMMIT");
       this.data = initializedData;
     } catch (error) {
-      await client.query("ROLLBACK").catch(() => undefined);
+      releaseError = await rollbackAfterFailure(client, error);
       await this.releaseInstanceLock();
       throw error;
     } finally {
-      client.release();
+      client.release(releaseError || undefined);
     }
   }
 
@@ -259,10 +331,31 @@ export class PostgresStore {
     return clone(selector(this.data));
   }
 
+  async readinessCheck() {
+    // `read()` is intentionally an in-memory snapshot for synchronous request
+    // paths. Readiness must instead cross the database boundary so a severed
+    // Postgres connection cannot leave a process advertised as ready.
+    const queryTimeout = boundedDatabaseTimeout(
+      process.env.WEB_DB_READINESS_TIMEOUT_MS,
+      5000
+    );
+    const response = await this.pool.query({
+      text: `SELECT data IS NOT NULL AS ready
+             FROM ${this.tableName}
+             WHERE store_key = $1`,
+      values: [this.storeKey],
+      query_timeout: queryTimeout
+    });
+    if (response.rowCount !== 1 || response.rows[0]?.ready !== true) {
+      throw new Error(`Postgres store key ${this.storeKey} is unavailable.`);
+    }
+  }
+
   mutate(mutator) {
     const transaction = this.txQueue.then(async () => {
       const client = await this.pool.connect();
       let before;
+      let releaseError = null;
       try {
         await client.query("BEGIN");
         const response = await client.query(
@@ -289,11 +382,11 @@ export class PostgresStore {
         await client.query("COMMIT");
         return clone(result);
       } catch (error) {
-        await client.query("ROLLBACK");
+        releaseError = await rollbackAfterFailure(client, error);
         if (before) this.data = before;
         throw error;
       } finally {
-        client.release();
+        client.release(releaseError || undefined);
       }
     });
     this.txQueue = transaction.catch(() => undefined);
@@ -305,6 +398,7 @@ export class PostgresStore {
       const snapshot = clone(this.data);
       assertBillingStateIntegrity(snapshot);
       const client = await this.pool.connect();
+      let releaseError = null;
       try {
         await client.query("BEGIN");
         await client.query(
@@ -318,10 +412,10 @@ export class PostgresStore {
         if (this.normalizedBilling) await syncNormalizedBilling(client, snapshot);
         await client.query("COMMIT");
       } catch (error) {
-        await client.query("ROLLBACK").catch(() => undefined);
+        releaseError = await rollbackAfterFailure(client, error);
         throw error;
       } finally {
-        client.release();
+        client.release(releaseError || undefined);
       }
     });
     this.txQueue = transaction.catch(() => undefined);
@@ -336,7 +430,16 @@ export class PostgresStore {
 
   async acquireInstanceLock() {
     if (this.instanceLockClient) return;
-    const client = new Client({ connectionString: this.connectionString });
+    // This lock must live on one dedicated session, so it cannot use Pool.
+    // Apply the same bounded socket-acquisition contract as Pool plus a
+    // client-side query timeout. Without both, a dead Postgres route could
+    // hang production startup forever before the process reaches readiness.
+    const client = new this.clientConstructor({
+      connectionString: this.connectionString,
+      connectionTimeoutMillis: this.databaseConnectTimeoutMs,
+      statement_timeout: this.databaseStatementTimeoutMs,
+      query_timeout: this.databaseQueryTimeoutMs
+    });
     try {
       await client.connect();
       const result = await client.query(
@@ -425,15 +528,6 @@ function normalizeData(value, seedAgents) {
     delete user.failed_login_count;
     delete user.locked_until;
   }
-  data.marketplaceRatings = (Array.isArray(data.marketplaceRatings) ? data.marketplaceRatings : [])
-    .filter((rating) => rating && typeof rating === "object")
-    .map((rating) => {
-      const safeRating = { ...rating };
-      delete safeRating.review;
-      delete safeRating.comment;
-      delete safeRating.comments;
-      return safeRating;
-    });
   for (const agent of Array.isArray(data.agents) ? data.agents : []) {
     if (!agent.marketplace || typeof agent.marketplace !== "object" || Array.isArray(agent.marketplace)) continue;
     const marketplace = agent.marketplace;
@@ -454,23 +548,16 @@ function normalizeData(value, seedAgents) {
     delete marketplace.version;
     delete marketplace.license;
   }
-  data.marketplaceRatings = data.marketplaceRatings.filter((rating) => {
-    const agent = data.agents.find((candidate) =>
-      (rating.listing_id && candidate.marketplace?.listing_id === rating.listing_id)
-      || (!rating.listing_id && candidate.id === rating.agent_id)
-    );
-    if (!agent) return true;
-    const publisherWorkspaceId = agent.marketplace?.publisher_workspace_id ?? agent.workspace_id ?? null;
-    const samePublisher = String(rating.created_by || "") === String(agent.marketplace?.published_by || "")
-      && (
-        publisherWorkspaceId === null
-        || String(rating.workspace_id || "") === String(publisherWorkspaceId)
-      );
-    const sameSourceOwner = String(rating.created_by || "") === String(agent.created_by || "")
-      && String(rating.workspace_id || "") === String(agent.workspace_id || "");
-    return !samePublisher && !sameSourceOwner;
+  data.marketplaceRatings = normalizePublicMarketplaceRatings(data.marketplaceRatings, {
+    subjects: Array.isArray(data.agents) ? data.agents : [],
+    subjectIdField: "agent_id",
+    subjectId: (agent) => agent.id,
+    listingId: (agent) => agent.marketplace?.listing_id,
+    publisherIds: (agent) => [agent.marketplace?.published_by, agent.created_by],
+    subjectWorkspaceId: (agent) => agent.marketplace?.publisher_workspace_id || agent.workspace_id
   });
   normalizeAgentWorkspaceCollections(data);
+  normalizeMarketplacePublisherIdentities(data);
   mergeSeedCatalog(data.agents, seedAgents);
   for (const user of data.users || []) {
     if (!user?.user_id || !user?.workspace_id || user.status === "deleted") continue;

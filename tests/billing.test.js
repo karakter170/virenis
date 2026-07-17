@@ -30,6 +30,9 @@ const BILLING_ENV = [
   "APP_BILLING_CACHED_CREDITS_PER_1K",
   "APP_BILLING_UNCLASSIFIED_CREDITS_PER_1K",
   "APP_BILLING_MINIMUM_RESERVATION_CREDITS",
+  "APP_MAX_ACTIVE_RUNS_PER_USER",
+  "APP_MAX_ACTIVE_RUNS_PER_WORKSPACE",
+  "APP_MAX_ACTIVE_RUNS_GLOBAL",
   "WORKFLOW_CONTINUATION_CLAIM_TTL_MS",
   "TCAR_RUNTIME_CONTINUATION_TIMEOUT_MS"
 ];
@@ -276,6 +279,48 @@ describe("immutable balance lifecycle", () => {
     })).toThrow(expect.objectContaining({ status: 402, code: "insufficient_balance" }));
   });
 
+  it("atomically bounds active chat runs by user, workspace, and service", () => {
+    const data = blankData();
+    process.env.APP_MAX_ACTIVE_RUNS_PER_USER = "1";
+    process.env.APP_MAX_ACTIVE_RUNS_PER_WORKSPACE = "2";
+    process.env.APP_MAX_ACTIVE_RUNS_GLOBAL = "3";
+    const first = { run_id: "run_capacity_first" };
+    reserveRunCredits(data, { run: first, actor, options: {} });
+    expect(() => reserveRunCredits(data, {
+      run: { run_id: "run_capacity_same_user" },
+      actor,
+      options: {}
+    })).toThrow(expect.objectContaining({ status: 429, code: "active_run_limit_reached" }));
+
+    process.env.APP_MAX_ACTIVE_RUNS_PER_USER = "10";
+    const workspacePeer = { user_id: "user_peer", workspace_id: actor.workspace_id };
+    reserveRunCredits(data, { run: { run_id: "run_capacity_peer" }, actor: workspacePeer, options: {} });
+    expect(() => reserveRunCredits(data, {
+      run: { run_id: "run_capacity_workspace" },
+      actor: { user_id: "user_third", workspace_id: actor.workspace_id },
+      options: {}
+    })).toThrow(expect.objectContaining({ status: 429, code: "active_run_limit_reached" }));
+
+    process.env.APP_MAX_ACTIVE_RUNS_PER_WORKSPACE = "10";
+    reserveRunCredits(data, {
+      run: { run_id: "run_capacity_other_workspace" },
+      actor: { user_id: "user_other", workspace_id: "workspace_other" },
+      options: {}
+    });
+    expect(() => reserveRunCredits(data, {
+      run: { run_id: "run_capacity_global" },
+      actor: { user_id: "user_global", workspace_id: "workspace_global" },
+      options: {}
+    })).toThrow(expect.objectContaining({ status: 503, code: "active_run_capacity_reached" }));
+
+    releaseRunReservation(data, first, { reason: "completed_for_capacity_test" });
+    expect(() => reserveRunCredits(data, {
+      run: { run_id: "run_capacity_after_release" },
+      actor,
+      options: {}
+    })).not.toThrow();
+  });
+
   it("detects ledger, projection, and reservation tampering", () => {
     const data = blankData();
     const run = { run_id: "run_integrity" };
@@ -400,6 +445,81 @@ describe("immutable balance lifecycle", () => {
       expect.objectContaining({ kind: "final_output", component: "conversation_continuation" })
     ]);
     expect(verifyBillingState(snapshot)).toEqual({ valid: true, errors: [] });
+    await store.close();
+  });
+
+  it("joins a live continuation claim instead of starting duplicate provider work", async () => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "virenis-continuation-claim-"));
+    temporaryDirectories.push(directory);
+    const store = new JsonStore({ dbPath: path.join(directory, "db.json"), seedAgents: [] });
+    await store.init();
+    await store.mutate((data) => {
+      data.sessions.push({
+        session_id: "session_claim",
+        workspace_id: actor.workspace_id,
+        created_by: actor.user_id,
+        shared_memory: [],
+        created_at: "2026-07-15T00:00:00.000Z",
+        updated_at: "2026-07-15T00:00:00.000Z"
+      });
+      data.runs.push({
+        run_id: "run_claim",
+        session_id: "session_claim",
+        query: "Continue after approval.",
+        final_answer: "Waiting for approval."
+      });
+      data.conversationCheckpoints.push({
+        checkpoint_id: "checkpoint_claim",
+        type: "mcp_tool_approval",
+        approval_id: "approval_claim",
+        status: "pending",
+        source_run_id: "run_claim",
+        session_id: "session_claim",
+        workspace_id: actor.workspace_id,
+        created_by: actor.user_id,
+        created_at: "2026-07-15T00:00:00.000Z",
+        updated_at: "2026-07-15T00:00:00.000Z",
+        resume_attempts: 0
+      });
+    });
+
+    let continuationCalls = 0;
+    let releaseContinuation;
+    let markStarted;
+    const continuationGate = new Promise((resolve) => { releaseContinuation = resolve; });
+    const started = new Promise((resolve) => { markStarted = resolve; });
+    const options = {
+      store,
+      approval: {
+        approval_id: "approval_claim",
+        run_id: "run_claim",
+        session_id: "session_claim",
+        workspace_id: actor.workspace_id,
+        created_by: actor.user_id,
+        tool_title: "Approved action",
+        result: { ok: true }
+      },
+      decision: "approve",
+      actor,
+      continueConversation: async () => {
+        continuationCalls += 1;
+        markStarted();
+        await continuationGate;
+        return { content: "Continuation completed once." };
+      }
+    };
+
+    const first = resumeMcpApprovalConversation(options);
+    await started;
+    const joined = await resumeMcpApprovalConversation(options);
+    expect(joined).toMatchObject({ status: "resuming", resume_attempts: 1 });
+    expect(continuationCalls).toBe(1);
+
+    releaseContinuation();
+    const completed = await first;
+    expect(completed).toMatchObject({ status: "resumed", resume_attempts: 1 });
+    expect(continuationCalls).toBe(1);
+    expect(store.read().messages.filter((message) => message.checkpoint_id === "checkpoint_claim")).toHaveLength(1);
     await store.close();
   });
 

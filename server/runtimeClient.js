@@ -2,6 +2,8 @@ import http from "node:http";
 import https from "node:https";
 import { appAuthConfigured, basicAuthConfigured, secretConfigured } from "./authConfig.js";
 import { validateClerkEnvironment } from "./clerkIdentity.js";
+import { validateProductionDatabaseTransport } from "./databaseTransport.js";
+import { projectRuntimeFailure, runtimeFailureMessage } from "./diagnostics.js";
 import { readConfiguredSecret } from "./secretConfig.js";
 
 const DEFAULT_TIMEOUT_MS = 900000;
@@ -79,6 +81,9 @@ export function requireRuntimeConfigured() {
   if (isProduction && !process.env.DATABASE_URL && process.env.APP_ALLOW_JSON_STORE !== "1") {
     throw new Error("Production web server requires DATABASE_URL. Set APP_ALLOW_JSON_STORE=1 only for isolated private-beta deployments.");
   }
+  if (isProduction && process.env.DATABASE_URL) {
+    validateProductionDatabaseTransport(process.env);
+  }
   if (isProduction && process.env.APP_ALLOW_MISSING_PUBLIC_ORIGIN !== "1") {
     validatePublicOrigin(process.env.APP_PUBLIC_ORIGIN);
   }
@@ -138,8 +143,13 @@ function validatePublicOrigin(value) {
   const hostname = parsed.hostname.toLowerCase();
   if (
     hostname === "localhost"
+    || hostname === "localhost.localdomain"
     || hostname === "127.0.0.1"
     || hostname === "::1"
+    || hostname === "[::1]"
+    || hostname === "0.0.0.0"
+    || hostname === "::"
+    || hostname === "[::]"
     || hostname === "app.example.com"
     || hostname.endsWith(".example.com")
   ) {
@@ -167,7 +177,7 @@ function validateUnauthenticatedProductionIdentity(env) {
   }
 }
 
-function validateProductionRuntimeApiUrl(env) {
+export function validateProductionRuntimeApiUrl(env) {
   let runtimeUrl;
   try {
     runtimeUrl = new URL(String(env.TCAR_RUNTIME_API_URL || ""));
@@ -191,6 +201,17 @@ function validateProductionRuntimeApiUrl(env) {
   ) {
     throw new Error("Production split deployment requires TCAR_RUNTIME_API_URL to point to the private GPU runtime host, not localhost. Set TCAR_ALLOW_LOOPBACK_RUNTIME_TUNNEL=1 for a supervised SSH/VPN loopback tunnel, or TCAR_ALLOW_LOCAL_RUNTIME_URL=1 only for an explicit same-host private-beta deployment.");
   }
+  if (
+    runtimeUrl.protocol === "http:"
+    && !isLoopbackRuntimeHost(runtimeHost)
+    && env.TCAR_ALLOW_INSECURE_PRIVATE_RUNTIME_HTTP !== "1"
+  ) {
+    throw new Error(
+      "Production remote TCAR_RUNTIME_API_URL must use HTTPS. Set "
+      + "TCAR_ALLOW_INSECURE_PRIVATE_RUNTIME_HTTP=1 only when an authenticated, "
+      + "protected private network provides equivalent transport isolation."
+    );
+  }
   if (env.APP_PUBLIC_ORIGIN && env.TCAR_ALLOW_SAME_ORIGIN_RUNTIME_URL !== "1") {
     try {
       const publicOrigin = new URL(String(env.APP_PUBLIC_ORIGIN).replace(/\/+$/, ""));
@@ -206,14 +227,15 @@ function validateProductionRuntimeApiUrl(env) {
 }
 
 function isLocalRuntimeHost(hostname) {
-  return hostname === "localhost" || hostname === "localhost.localdomain" || hostname === "127.0.0.1" || hostname === "::1" || hostname === "0.0.0.0";
+  return hostname === "localhost" || hostname === "localhost.localdomain" || hostname === "127.0.0.1" || hostname === "::1" || hostname === "[::1]" || hostname === "0.0.0.0";
 }
 
 function isLoopbackRuntimeHost(hostname) {
   return hostname === "localhost"
     || hostname === "localhost.localdomain"
     || hostname === "127.0.0.1"
-    || hostname === "::1";
+    || hostname === "::1"
+    || hostname === "[::1]";
 }
 
 function runtimeBaseUrl() {
@@ -287,30 +309,29 @@ export async function runtimeRequest(path, { method = "GET", body, timeoutMs = D
     : await boundedHttpRequest(requestUrl, requestOptions);
   const text = response.body.toString("utf8");
   let payload = {};
+  let invalidJson = false;
   if (text) {
     try {
       payload = JSON.parse(text);
     } catch {
-      payload = { raw: text };
+      invalidJson = true;
     }
   }
   if (response.status < 200 || response.status >= 300) {
-    const detail = payload.detail || payload.message || payload.error || response.statusMessage;
-    const error = new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+    const projected = projectRuntimeFailure(payload, response.status);
+    const error = new Error(runtimeFailureMessage(projected));
     error.status = response.status;
-    error.payload = payload;
-    if (detail && typeof detail === "object" && !Array.isArray(detail)) {
-      error.code = typeof detail.code === "string" ? detail.code : undefined;
-      error.retryable = detail.retryable === true;
-      error.providerStatus = Number.isFinite(Number(detail.provider_status))
-        ? Number(detail.provider_status)
-        : undefined;
-      error.requestId = typeof detail.request_id === "string"
-        ? detail.request_id.slice(0, 240)
-        : undefined;
-    } else if (typeof payload.code === "string") {
-      error.code = payload.code;
-    }
+    error.code = projected.code;
+    error.retryable = projected.retryable === true;
+    error.providerStatus = projected.provider_status;
+    error.requestId = projected.provider_request_id;
+    error.diagnostic = projected;
+    throw error;
+  }
+  if (invalidJson) {
+    const error = new Error("The Runtime returned an invalid response.");
+    error.status = 502;
+    error.code = "runtime_invalid_json";
     throw error;
   }
   return payload;

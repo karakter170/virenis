@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { normalizePublicMarketplaceRatings } from "./marketplaceRatingIdentity.js";
 
 export const AGENT_WORKSPACE_MAX_AGENTS = 16;
 export const AGENT_WORKSPACE_MAX_PER_USER = 50;
@@ -107,10 +108,17 @@ export function normalizeAgentWorkspaceCollections(data) {
         200
       );
       workspace.marketplace.publisher_display_name = boundedText(
-        workspace.marketplace.publisher_display_name || workspace.marketplace.published_by,
+        workspace.marketplace.publisher_display_name || "Community publisher",
         80
       );
       workspace.marketplace.publisher_workspace_id ??= workspace.workspace_id || null;
+      if (!workspace.marketplace.listing_id) {
+        const digest = crypto.createHash("sha256")
+          .update(`${workspace.agent_workspace_id || "workspace"}:${workspace.marketplace.published_at || "legacy"}`, "utf8")
+          .digest("hex")
+          .slice(0, 16);
+        workspace.marketplace.listing_id = `listing_${digest}`;
+      }
       for (const key of ["summary", "achievements", "proofs", "version", "license", "comments", "review"]) {
         delete workspace.marketplace[key];
       }
@@ -129,26 +137,14 @@ export function normalizeAgentWorkspaceCollections(data) {
       (agentsById.get(id) || []).filter((agent) => agentCanJoinWorkspace(agent, workspace)).length === 1
     ));
   }
-  data.agentWorkspaceRatings = data.agentWorkspaceRatings
-    .filter((rating) => rating && typeof rating === "object")
-    .map((rating) => {
-      const safe = { ...rating };
-      delete safe.review;
-      delete safe.comment;
-      delete safe.comments;
-      return safe;
-    })
-    .filter((rating) => {
-      const workspace = data.agentWorkspaces.find((candidate) => (
-        candidate.marketplace?.listing_id
-        && candidate.marketplace.listing_id === rating.listing_id
-      ));
-      if (!workspace) return true;
-      return !(
-        rating.created_by === workspace.marketplace?.published_by
-        && String(rating.workspace_id || "") === String(workspace.marketplace?.publisher_workspace_id || "")
-      );
-    });
+  data.agentWorkspaceRatings = normalizePublicMarketplaceRatings(data.agentWorkspaceRatings, {
+    subjects: data.agentWorkspaces,
+    subjectIdField: "agent_workspace_id",
+    subjectId: (workspace) => workspace.agent_workspace_id,
+    listingId: (workspace) => workspace.marketplace?.listing_id,
+    publisherIds: (workspace) => [workspace.marketplace?.published_by, workspace.created_by],
+    subjectWorkspaceId: (workspace) => workspace.marketplace?.publisher_workspace_id || workspace.workspace_id
+  });
   return data;
 }
 

@@ -654,7 +654,10 @@ export function scoreChunks(chunks, query, limit = 4) {
 export async function writeDocumentFiles({ uploadRoot, slug, chunks }) {
   const docRoot = path.join(uploadRoot, "sources", "tcar_documents", slug);
   const chunkRoot = path.join(docRoot, "chunks");
-  await fs.mkdir(chunkRoot, { recursive: true });
+  await fs.mkdir(chunkRoot, { recursive: true, mode: 0o700 });
+  for (const privateDirectory of [path.resolve(uploadRoot), docRoot, chunkRoot]) {
+    await fs.chmod(privateDirectory, 0o700);
+  }
 
   const indexRows = [];
   for (const chunk of chunks) {
@@ -671,14 +674,20 @@ export async function writeDocumentFiles({ uploadRoot, slug, chunks }) {
       chunk.body,
       ""
     ].join("\n");
-    await fs.writeFile(path.join(uploadRoot, chunk.path), frontMatter, "utf8");
+    const chunkPath = path.join(uploadRoot, chunk.path);
+    await fs.writeFile(chunkPath, frontMatter, {
+      encoding: "utf8",
+      mode: 0o600
+    });
+    await fs.chmod(chunkPath, 0o600);
     const { body: _body, ...indexRow } = chunk;
     indexRows.push(indexRow);
   }
 
   const indexPath = path.join(uploadRoot, "sources", "tcar_documents", slug, "index.jsonl");
   const indexBytes = indexRows.map((row) => JSON.stringify(row)).join("\n") + "\n";
-  await fs.writeFile(indexPath, indexBytes, "utf8");
+  await fs.writeFile(indexPath, indexBytes, { encoding: "utf8", mode: 0o600 });
+  await fs.chmod(indexPath, 0o600);
   return {
     document_root: `sources/tcar_documents/${slug}`,
     index_path: `sources/tcar_documents/${slug}/index.jsonl`,

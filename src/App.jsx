@@ -86,7 +86,20 @@ import {
   realityRankTieBreak,
   shortRevision
 } from "./lifecycleUi.js";
-import { loadAuthenticatedResourceBatch } from "./workspaceBootstrap.js";
+import { loadAuthenticatedResourceBatch, loadCompleteResource } from "./workspaceBootstrap.js";
+import {
+  SSE_RECOVERY_MAX_ATTEMPTS,
+  WORKFLOW_POLL_DEADLINE_MS,
+  isTerminalRunStatus,
+  runIsActiveForSession,
+  shouldApplySessionResponse,
+  shouldRefreshOriginSession,
+  sseRecoveryDelay,
+  workflowPollDelay
+} from "./chatLifecycle.js";
+
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+const UPLOAD_REQUEST_TIMEOUT_MS = 120_000;
 
 const api = {
   async get(path) {
@@ -112,32 +125,63 @@ const api = {
     return request(path, { method: "DELETE" });
   },
   async postForm(path, body) {
-    return request(path, { method: "POST", body });
+    return request(path, { method: "POST", body, timeoutMs: UPLOAD_REQUEST_TIMEOUT_MS });
   }
 };
 
-async function request(path, options) {
-  const response = await fetch(path, { credentials: "same-origin", ...options });
-  const text = await response.text();
-  let payload = {};
-  if (text) {
-    try {
-      payload = JSON.parse(text);
-    } catch {
-      payload = { message: text };
+export async function request(path, options = {}) {
+  const {
+    timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
+    signal: upstreamSignal,
+    ...fetchOptions
+  } = options || {};
+  const controller = new AbortController();
+  let timedOut = false;
+  const abortFromUpstream = () => controller.abort(upstreamSignal?.reason);
+  if (upstreamSignal?.aborted) abortFromUpstream();
+  else upstreamSignal?.addEventListener?.("abort", abortFromUpstream, { once: true });
+  const timer = Number(timeoutMs) > 0
+    ? setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, Number(timeoutMs))
+    : null;
+  try {
+    const response = await fetch(path, {
+      credentials: "same-origin",
+      ...fetchOptions,
+      signal: controller.signal
+    });
+    const text = await response.text();
+    let payload = {};
+    if (text) {
+      try {
+        payload = JSON.parse(text);
+      } catch {
+        payload = { message: text };
+      }
     }
+    if (!response.ok) {
+      const error = new Error(payload.message || "The request could not be completed.");
+      error.status = response.status;
+      error.code = payload.error;
+      error.details = payload.details;
+      error.requestId = payload.request_id;
+      error.authReason = response.headers.get("x-clerk-auth-reason") || "";
+      if (response.status === 401) notifyAuthenticationRequired(error);
+      throw error;
+    }
+    return payload;
+  } catch (error) {
+    if (!timedOut) throw error;
+    const timeoutError = new Error("The request timed out. Check your connection and try again.");
+    timeoutError.code = "client_request_timeout";
+    timeoutError.cause = error;
+    throw timeoutError;
+  } finally {
+    if (timer) clearTimeout(timer);
+    upstreamSignal?.removeEventListener?.("abort", abortFromUpstream);
   }
-  if (!response.ok) {
-    const error = new Error(payload.message || "The request could not be completed.");
-    error.status = response.status;
-    error.code = payload.error;
-    error.details = payload.details;
-    error.requestId = payload.request_id;
-    error.authReason = response.headers.get("x-clerk-auth-reason") || "";
-    if (response.status === 401) notifyAuthenticationRequired(error);
-    throw error;
-  }
-  return payload;
 }
 
 function friendlyError(error) {
@@ -149,6 +193,14 @@ function friendlyError(error) {
     .replace(/adapter source/gi, "model source")
     .replace(/adapters/gi, "specialists")
     .replace(/adapter/gi, "specialist");
+}
+
+export function preserveAmbiguousChatSubmission(previous, next) {
+  return previous?.content === next?.content
+    && previous?.sessionId === next?.sessionId
+    && previous?.routingKey === next?.routingKey
+    ? previous
+    : next;
 }
 
 export function availableSessionAgents(agents = []) {
@@ -530,6 +582,7 @@ function Workspace({ onHome, onSignedOut }) {
   const [progressiveRunId, setProgressiveRunId] = useState(null);
   const [draft, setDraft] = useState("");
   const [loading, setLoading] = useState(true);
+  const [bootstrapFailure, setBootstrapFailure] = useState("");
   const [error, setError] = useState("");
   const [historyOpen, setHistoryOpen] = useState(false);
   const [resourcesOpen, setResourcesOpen] = useState(false);
@@ -563,11 +616,24 @@ function Workspace({ onHome, onSignedOut }) {
   const [workspaceDeleteTarget, setWorkspaceDeleteTarget] = useState(null);
   const [workflowWorkspacePrompt, setWorkflowWorkspacePrompt] = useState(null);
   const [teamNotice, setTeamNotice] = useState("");
+  const [sessionSwitching, setSessionSwitching] = useState("");
+  const [teamMutationBusy, setTeamMutationBusy] = useState("");
+  const [runRecoveryState, setRunRecoveryState] = useState(null);
+  const [workflowPollingIssue, setWorkflowPollingIssue] = useState(null);
+  const [workflowPollRetry, setWorkflowPollRetry] = useState(0);
+  const [sendPending, setSendPending] = useState(false);
   const threadRef = useRef(null);
   const nearBottomRef = useRef(true);
   const eventSourceRef = useRef(null);
   const sendInFlightRef = useRef(false);
   const sendRetryRef = useRef(null);
+  const bootstrapInFlightRef = useRef(false);
+  const sessionLoadSequenceRef = useRef(0);
+  const desiredSessionIdRef = useRef("");
+  const displayedSessionIdRef = useRef("");
+  const teamMutationSequenceRef = useRef(0);
+  const teamMutationInFlightRef = useRef(false);
+  const newChatInFlightRef = useRef(false);
   const progressivelyRenderedRunIdsRef = useRef(new Set());
   const oauthReturnRef = useRef((() => {
     const parameters = new URLSearchParams(window.location.search);
@@ -585,6 +651,11 @@ function Workspace({ onHome, onSignedOut }) {
     workspace.agent_workspace_id === session?.agent_workspace_id
   )) || agentWorkspaces.find((workspace) => workspace.is_general) || agentWorkspaces[0] || null;
   const activeAgentWorkspaceAgents = agentsForWorkspace(agents, activeAgentWorkspace);
+
+  useEffect(() => {
+    displayedSessionIdRef.current = session?.session_id || "";
+    if (!desiredSessionIdRef.current && session?.session_id) desiredSessionIdRef.current = session.session_id;
+  }, [session?.session_id]);
 
   useEffect(() => {
     bootstrap();
@@ -631,24 +702,100 @@ function Workspace({ onHome, onSignedOut }) {
     .map((workflow) => workflow.workflow_id)
     .sort()
     .join(":");
+  const workflowPollingIssueSignature = workflowPollingIssue
+    ? `${workflowPollingIssue.sessionId || ""}:${(workflowPollingIssue.workflowIds || []).join(":")}`
+    : "";
 
   useEffect(() => {
     if (!activatingWorkflowSignature || !session?.session_id) return undefined;
-    let refreshInFlight = false;
-    const timer = window.setInterval(() => {
-      if (refreshInFlight) return;
-      refreshInFlight = true;
-      openSession(session.session_id, { hydrateRuns: false })
-        .catch(() => undefined)
-        .finally(() => {
-          refreshInFlight = false;
+    const originSessionId = session.session_id;
+    const workflowIds = activatingWorkflowSignature.split(":").filter(Boolean);
+    if (
+      workflowPollingIssue?.sessionId === originSessionId
+      && workflowIds.some((workflowId) => workflowPollingIssue.workflowIds?.includes(workflowId))
+    ) return undefined;
+    let cancelled = false;
+    let timer = null;
+    let attempt = 0;
+    let hiddenAt = document.visibilityState === "hidden" ? Date.now() : null;
+    let deadlineAt = Date.now() + WORKFLOW_POLL_DEADLINE_MS;
+
+    const schedule = (delay) => {
+      if (cancelled) return;
+      if (document.visibilityState === "hidden") {
+        if (hiddenAt === null) hiddenAt = Date.now();
+        return;
+      }
+      window.clearTimeout(timer);
+      timer = window.setTimeout(poll, delay);
+    };
+
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "hidden") {
+        if (hiddenAt === null) hiddenAt = Date.now();
+        window.clearTimeout(timer);
+        return;
+      }
+      if (hiddenAt !== null) {
+        deadlineAt += Date.now() - hiddenAt;
+        hiddenAt = null;
+      }
+      schedule(0);
+    };
+
+    async function poll() {
+      if (cancelled || document.visibilityState === "hidden") return;
+      const results = await Promise.allSettled(
+        workflowIds.map((workflowId) => api.get(`/api/workflows/${encodeURIComponent(workflowId)}`))
+      );
+      if (cancelled) return;
+      const updates = new Map();
+      results.forEach((result, index) => {
+        if (result.status === "fulfilled") updates.set(workflowIds[index], result.value);
+      });
+      if (updates.size) {
+        setWorkflows((items) => items.map((workflow) => updates.get(workflow.workflow_id) || workflow));
+      }
+      const remaining = workflowIds.filter((workflowId, index) => (
+        results[index].status === "rejected" || results[index].value?.status === "activating"
+      ));
+      if (!remaining.length) {
+        setWorkflowPollingIssue(null);
+        if (shouldRefreshOriginSession(
+          originSessionId,
+          displayedSessionIdRef.current,
+          desiredSessionIdRef.current
+        )) {
+          await openSession(originSessionId, { hydrateRuns: false, navigation: false }).catch(() => undefined);
+        }
+        return;
+      }
+      if (Date.now() >= deadlineAt) {
+        setWorkflowPollingIssue({
+          sessionId: originSessionId,
+          workflowIds: remaining,
+          message: "Team setup is taking longer than expected. Automatic checks paused so the page will not keep making requests."
         });
-    }, 1000);
-    return () => window.clearInterval(timer);
-  }, [activatingWorkflowSignature, session?.session_id]);
+        return;
+      }
+      attempt += 1;
+      schedule(workflowPollDelay(attempt));
+    }
+
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    schedule(workflowPollDelay(0));
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, [activatingWorkflowSignature, session?.session_id, workflowPollRetry, workflowPollingIssueSignature]);
 
   async function bootstrap() {
+    if (bootstrapInFlightRef.current) return;
+    bootstrapInFlightRef.current = true;
     setLoading(true);
+    setBootstrapFailure("");
     setError("");
     try {
       const { identity: me, resources: results } = await loadAuthenticatedResourceBatch(api, [
@@ -734,8 +881,9 @@ function Workspace({ onHome, onSignedOut }) {
         notifyAuthenticationRequired(bootstrapError);
         return;
       }
-      setError(friendlyError(bootstrapError));
+      setBootstrapFailure(friendlyError(bootstrapError));
     } finally {
+      bootstrapInFlightRef.current = false;
       setLoading(false);
     }
   }
@@ -820,7 +968,7 @@ function Workspace({ onHome, onSignedOut }) {
       .filter((scope) => loaders[scope])
       .filter((scope) => scope !== "metrics" || auth?.is_admin)
       .map((scope) => ({ scope, path: loaders[scope][0], apply: loaders[scope][1] }));
-    const results = await Promise.allSettled(selected.map((item) => api.get(item.path)));
+    const results = await Promise.allSettled(selected.map((item) => loadCompleteResource(api, item.path)));
     results.forEach((result, index) => {
       if (result.status === "fulfilled") selected[index].apply(result.value);
     });
@@ -829,12 +977,19 @@ function Workspace({ onHome, onSignedOut }) {
     }
   }
 
-  async function fetchRun(runId, { makeActive = false, hydrateContracts = false } = {}) {
+  async function fetchRun(runId, { makeActive = false, hydrateContracts = false, expectedSessionId = "" } = {}) {
     if (!runId) return null;
     const run = await api.get(`/api/chat/runs/${encodeURIComponent(runId)}`);
     setRunsById((current) => ({ ...current, [runId]: run }));
     applyRunBilling(run.billing);
-    if (makeActive) setActiveRun(run);
+    const runSessionId = run.session_id || expectedSessionId;
+    if (makeActive && shouldRefreshOriginSession(
+      runSessionId,
+      displayedSessionIdRef.current,
+      desiredSessionIdRef.current
+    )) {
+      setActiveRun(run);
+    }
     if (hydrateContracts) {
       await Promise.allSettled(
         missingOutcomeContractIds(run, contractsById).map((contractId) => fetchContract(contractId))
@@ -881,52 +1036,101 @@ function Workspace({ onHome, onSignedOut }) {
     return contract;
   }
 
-  async function openSession(sessionId, { hydrateRuns = true } = {}) {
-    setError("");
-    const [payload, agentList] = await Promise.all([
-      api.get(`/api/chat/sessions/${encodeURIComponent(sessionId)}`),
-      api.get(`/api/agents?session_id=${encodeURIComponent(sessionId)}`)
-    ]);
-    setSession(payload);
-    if (payload.agent_workspace) {
-      setAgentWorkspaces((items) => {
-        const exists = items.some((workspace) => workspace.agent_workspace_id === payload.agent_workspace.agent_workspace_id);
-        return exists
-          ? items.map((workspace) => workspace.agent_workspace_id === payload.agent_workspace.agent_workspace_id ? payload.agent_workspace : workspace)
-          : [...items, payload.agent_workspace];
-      });
+  async function openSession(sessionId, { hydrateRuns = true, navigation = true } = {}) {
+    const targetSessionId = String(sessionId || "");
+    if (!targetSessionId) return null;
+    if (!navigation && desiredSessionIdRef.current && desiredSessionIdRef.current !== targetSessionId) {
+      return null;
     }
-    setMessages(payload.messages || []);
-    for (const message of payload.messages || []) applyRunBilling(message.billing);
-    setWorkflows(payload.workflows || []);
-    setCheckpoints(payload.checkpoints || []);
-    setChatDocuments(payload.chat_documents || []);
-    setAgents(agentList.agents || []);
-    setHistoryOpen(false);
-    nearBottomRef.current = true;
-    const assistantRunIds = [...new Set(
-      (payload.messages || [])
-        .filter((message) => message.role === "assistant" && message.run_id)
-        .map((message) => message.run_id)
-    )];
-    const latestRunId = [...(payload.messages || [])].reverse().find((message) => message.run_id)?.run_id;
-    if (latestRunId && hydrateRuns) {
-      await fetchRun(latestRunId, { makeActive: true });
-    } else if (!latestRunId) {
-      setActiveRun(null);
+    if (navigation) {
+      desiredSessionIdRef.current = targetSessionId;
+      setSessionSwitching(targetSessionId);
+      setError("");
     }
-    if (hydrateRuns) {
-      assistantRunIds.slice(-12).filter((runId) => runId !== latestRunId).forEach((runId) => {
-        fetchRun(runId).catch(() => undefined);
-      });
+    const requestId = ++sessionLoadSequenceRef.current;
+    try {
+      const [payload, agentList] = await Promise.all([
+        api.get(`/api/chat/sessions/${encodeURIComponent(targetSessionId)}`),
+        loadCompleteResource(api, `/api/agents?session_id=${encodeURIComponent(targetSessionId)}`)
+      ]);
+      if (!shouldApplySessionResponse({
+        requestId,
+        latestRequestId: sessionLoadSequenceRef.current,
+        targetSessionId,
+        desiredSessionId: desiredSessionIdRef.current
+      })) return null;
+
+      displayedSessionIdRef.current = targetSessionId;
+      setSession(payload);
+      if (payload.agent_workspace) {
+        setAgentWorkspaces((items) => {
+          const exists = items.some((workspace) => workspace.agent_workspace_id === payload.agent_workspace.agent_workspace_id);
+          return exists
+            ? items.map((workspace) => workspace.agent_workspace_id === payload.agent_workspace.agent_workspace_id ? payload.agent_workspace : workspace)
+            : [...items, payload.agent_workspace];
+        });
+      }
+      setMessages(payload.messages || []);
+      for (const message of payload.messages || []) applyRunBilling(message.billing);
+      setWorkflows(payload.workflows || []);
+      setCheckpoints(payload.checkpoints || []);
+      setChatDocuments(payload.chat_documents || []);
+      setAgents(agentList.agents || []);
+      if (navigation) {
+        setHistoryOpen(false);
+        nearBottomRef.current = true;
+      }
+      const assistantRunIds = [...new Set(
+        (payload.messages || [])
+          .filter((message) => message.role === "assistant" && message.run_id)
+          .map((message) => message.run_id)
+      )];
+      const latestRunId = [...(payload.messages || [])].reverse().find((message) => message.run_id)?.run_id;
+      if (latestRunId && hydrateRuns) {
+        const latestRun = await fetchRun(latestRunId, {
+          makeActive: true,
+          expectedSessionId: targetSessionId
+        });
+        if (
+          runIsActiveForSession(latestRun, targetSessionId)
+          && shouldRefreshOriginSession(targetSessionId, displayedSessionIdRef.current, desiredSessionIdRef.current)
+          && eventSourceRef.current?.runId !== latestRunId
+        ) {
+          subscribeRun(latestRunId, targetSessionId);
+        }
+      } else if (!latestRunId && shouldRefreshOriginSession(
+        targetSessionId,
+        displayedSessionIdRef.current,
+        desiredSessionIdRef.current
+      )) {
+        setActiveRun(null);
+      }
+      if (hydrateRuns) {
+        assistantRunIds.slice(-12).filter((runId) => runId !== latestRunId).forEach((runId) => {
+          fetchRun(runId, { expectedSessionId: targetSessionId }).catch(() => undefined);
+        });
+      }
+      return payload;
+    } catch (sessionError) {
+      if (navigation && requestId === sessionLoadSequenceRef.current) {
+        desiredSessionIdRef.current = displayedSessionIdRef.current;
+      }
+      throw sessionError;
+    } finally {
+      if (navigation && requestId === sessionLoadSequenceRef.current) {
+        setSessionSwitching("");
+      }
     }
   }
 
   async function newChat() {
-    if (!canWrite) return;
+    if (!canWrite || newChatInFlightRef.current || sessionSwitching) return;
+    newChatInFlightRef.current = true;
+    const previousSessionId = displayedSessionIdRef.current;
+    desiredSessionIdRef.current = "pending:new-chat";
+    setSessionSwitching("new-chat");
     setError("");
     try {
-      eventSourceRef.current?.close();
       const created = await api.post("/api/chat/sessions", {
         title: "New chat",
         visibility: "private",
@@ -938,51 +1142,93 @@ function Workspace({ onHome, onSignedOut }) {
       setHistoryOpen(false);
       setFocusComposer((value) => value + 1);
     } catch (chatError) {
+      desiredSessionIdRef.current = previousSessionId;
+      setSessionSwitching("");
       setError(friendlyError(chatError));
+    } finally {
+      newChatInFlightRef.current = false;
     }
   }
 
   async function switchAgentWorkspace(agentWorkspaceId, { refresh = true } = {}) {
-    if (!session?.session_id || !agentWorkspaceId || !canWrite) return null;
-    const result = await api.patch(
-      `/api/chat/sessions/${encodeURIComponent(session.session_id)}/agent-workspace`,
-      { agent_workspace_id: agentWorkspaceId }
-    );
-    setSession((current) => current ? {
-      ...current,
-      agent_workspace_id: result.agent_workspace_id,
-      agent_workspace: result.agent_workspace
-    } : current);
-    setSessions((items) => items.map((item) => item.session_id === session.session_id
-      ? { ...item, agent_workspace_id: result.agent_workspace_id }
-      : item));
-    if (refresh) await openSession(session.session_id, { hydrateRuns: false });
-    return result;
+    const originSessionId = session?.session_id;
+    if (
+      !originSessionId
+      || !agentWorkspaceId
+      || !canWrite
+      || teamMutationInFlightRef.current
+      || sendInFlightRef.current
+      || sendPending
+      || runIsActiveForSession(activeRun, originSessionId)
+    ) return null;
+    const mutationId = ++teamMutationSequenceRef.current;
+    teamMutationInFlightRef.current = true;
+    setTeamMutationBusy(`workspace:${agentWorkspaceId}`);
+    try {
+      const result = await api.patch(
+        `/api/chat/sessions/${encodeURIComponent(originSessionId)}/agent-workspace`,
+        { agent_workspace_id: agentWorkspaceId }
+      );
+      if (
+        mutationId !== teamMutationSequenceRef.current
+        || !shouldRefreshOriginSession(originSessionId, displayedSessionIdRef.current, desiredSessionIdRef.current)
+      ) return null;
+      setSession((current) => current?.session_id === originSessionId ? {
+        ...current,
+        agent_workspace_id: result.agent_workspace_id,
+        agent_workspace: result.agent_workspace
+      } : current);
+      setSessions((items) => items.map((item) => item.session_id === originSessionId
+        ? { ...item, agent_workspace_id: result.agent_workspace_id }
+        : item));
+      if (refresh) await openSession(originSessionId, { hydrateRuns: false, navigation: false });
+      return result;
+    } catch (workspaceError) {
+      if (shouldRefreshOriginSession(
+        originSessionId,
+        displayedSessionIdRef.current,
+        desiredSessionIdRef.current
+      )) throw workspaceError;
+      return null;
+    } finally {
+      if (mutationId === teamMutationSequenceRef.current) {
+        teamMutationInFlightRef.current = false;
+        setTeamMutationBusy("");
+      }
+    }
   }
 
   async function sendMessage(event, contentOverride = null, requestMetadata = {}) {
     event?.preventDefault();
     const content = String(contentOverride ?? draft).trim();
+    const originSessionId = session?.session_id || "";
+    const originAgentWorkspaceId = session?.agent_workspace_id || null;
     const requestedAgentIds = [...new Set(
       (Array.isArray(requestMetadata.requestedAgentIds) ? requestMetadata.requestedAgentIds : [])
         .map((agentId) => String(agentId || "").trim())
         .filter(Boolean)
     )];
-    if (!content || !session || !canWrite || sendInFlightRef.current) return;
+    if (
+      !content
+      || !originSessionId
+      || !canWrite
+      || sendInFlightRef.current
+      || runIsActiveForSession(activeRun, originSessionId)
+      || teamMutationInFlightRef.current
+      || Boolean(sessionSwitching)
+      || Boolean(bootstrapFailure)
+    ) return false;
     const previousSubmission = sendRetryRef.current;
-    const routingKey = requestedAgentIds.join("|");
-    const submission = previousSubmission?.content === content
-      && previousSubmission?.sessionId === session.session_id
-      && previousSubmission?.routingKey === routingKey
-      ? previousSubmission
-      : {
-          content,
-          sessionId: session.session_id,
-          routingKey,
-          requestedAgentIds,
-          idempotencyKey: mutationIdempotencyKey("message")
-        };
+    const routingKey = `message:${requestedAgentIds.join("|")}`;
+    const submission = preserveAmbiguousChatSubmission(previousSubmission, {
+      content,
+      sessionId: originSessionId,
+      routingKey,
+      requestedAgentIds,
+      idempotencyKey: mutationIdempotencyKey("message")
+    });
     sendInFlightRef.current = true;
+    setSendPending(true);
     sendRetryRef.current = submission;
     const optimisticId = `local_${Date.now()}`;
     nearBottomRef.current = true;
@@ -995,20 +1241,23 @@ function Workspace({ onHome, onSignedOut }) {
       created_at: new Date().toISOString()
     }]);
     try {
-      const queued = await api.post(`/api/chat/sessions/${encodeURIComponent(session.session_id)}/messages`, {
+      const queued = await api.post(`/api/chat/sessions/${encodeURIComponent(originSessionId)}/messages`, {
         content,
         attachments: [],
         ...(submission.requestedAgentIds.length ? { requested_agent_ids: submission.requestedAgentIds } : {}),
         options: { show_route_details: true }
       }, { idempotencyKey: submission.idempotencyKey });
       sendRetryRef.current = null;
-      setMessages((items) => items.map((message) => message.message_id === optimisticId
-        ? { ...message, message_id: queued.message_id, run_id: queued.run_id }
-        : message));
+      const originIsVisible = displayedSessionIdRef.current === originSessionId;
+      if (originIsVisible) {
+        setMessages((items) => items.map((message) => message.message_id === optimisticId
+          ? { ...message, message_id: queued.message_id, run_id: queued.run_id }
+          : message));
+      }
       const stub = {
         run_id: queued.run_id,
-        session_id: session.session_id,
-        agent_workspace_id: session.agent_workspace_id || null,
+        session_id: originSessionId,
+        agent_workspace_id: originAgentWorkspaceId,
         query: content,
         status: queued.status || "queued",
         expert_outputs: [],
@@ -1016,47 +1265,226 @@ function Workspace({ onHome, onSignedOut }) {
         outcome_contracts: [],
         events: []
       };
-      setActiveRun(stub);
+      if (originIsVisible) setActiveRun(stub);
       setRunsById((current) => ({ ...current, [queued.run_id]: stub }));
-      subscribeRun(queued.run_id, session.session_id);
+      if (originIsVisible) subscribeRun(queued.run_id, originSessionId);
+      return true;
     } catch (sendError) {
-      setMessages((items) => items.filter((message) => message.message_id !== optimisticId));
-      setDraft(content);
-      setError(friendlyError(sendError));
+      if (displayedSessionIdRef.current === originSessionId) {
+        setMessages((items) => items.filter((message) => message.message_id !== optimisticId));
+      }
+      if (shouldRefreshOriginSession(
+        originSessionId,
+        displayedSessionIdRef.current,
+        desiredSessionIdRef.current
+      )) {
+        setDraft((current) => current.trim() ? current : content);
+        setError(friendlyError(sendError));
+      }
+      return false;
     } finally {
       sendInFlightRef.current = false;
+      setSendPending(false);
     }
   }
 
-  function subscribeRun(runId, sessionId) {
+  function subscribeRun(runId, originSessionId) {
     eventSourceRef.current?.close();
     const source = new EventSource(`/api/chat/runs/${encodeURIComponent(runId)}/events`);
-    eventSourceRef.current = source;
+    let closed = false;
+    let recoveryAttempts = 0;
+    let recoveryInFlight = false;
+    let recoveryTimer = null;
+    const seenLiveEventKeys = new Set();
+    const subscription = {
+      runId,
+      sessionId: originSessionId,
+      source,
+      close() {
+        if (closed) return;
+        closed = true;
+        window.clearTimeout(recoveryTimer);
+        source.close();
+      }
+    };
+    eventSourceRef.current = subscription;
+
+    const originIsDisplayed = () => shouldRefreshOriginSession(
+      originSessionId,
+      displayedSessionIdRef.current,
+      desiredSessionIdRef.current
+    );
+
+    const clearRecoveryState = () => {
+      setRunRecoveryState((current) => current?.runId === runId ? null : current);
+    };
+
+    const pauseRecovery = (message) => {
+      subscription.close();
+      if (eventSourceRef.current === subscription) eventSourceRef.current = null;
+      setRunRecoveryState({
+        runId,
+        sessionId: originSessionId,
+        status: "paused",
+        message: message || "Live updates paused after repeated connection failures. The run is still safe on the server.",
+        retryable: true
+      });
+    };
+
+    const finalize = async (eventType, resolvedRun = null) => {
+      subscription.close();
+      if (eventSourceRef.current === subscription) eventSourceRef.current = null;
+      const shouldDisplay = originIsDisplayed();
+      if (eventType === "final.completed" && shouldDisplay && !progressivelyRenderedRunIdsRef.current.has(runId)) {
+        progressivelyRenderedRunIdsRef.current.add(runId);
+        setProgressiveRunId(runId);
+      }
+      let finalRun = resolvedRun;
+      if (!finalRun) {
+        finalRun = await fetchRun(runId, {
+          makeActive: shouldDisplay,
+          expectedSessionId: originSessionId
+        }).catch(() => null);
+      }
+      if (finalRun && isTerminalRunStatus(finalRun.status)) {
+        setRunsById((current) => ({ ...current, [runId]: finalRun }));
+      }
+      if (!shouldDisplay) return;
+      try {
+        await openSession(originSessionId, { hydrateRuns: false, navigation: false });
+        clearRecoveryState();
+      } catch (sessionError) {
+        setRunRecoveryState({
+          runId,
+          sessionId: originSessionId,
+          status: "paused",
+          message: friendlyError(sessionError),
+          retryable: true
+        });
+      }
+    };
+
     source.onmessage = async (message) => {
-      const event = JSON.parse(message.data);
-      setActiveRun((current) => current?.run_id === runId ? mergeLiveRunEvent(current, event) : current);
+      if (closed) return;
+      let event;
+      try {
+        event = JSON.parse(message.data);
+      } catch {
+        setRunRecoveryState({
+          runId,
+          sessionId: originSessionId,
+          status: "reconnecting",
+          message: "A live update could not be read. Waiting for the server's saved run state…",
+          retryable: false
+        });
+        return;
+      }
+      const eventKey = liveRunEventKey(event);
+      if (!seenLiveEventKeys.has(eventKey)) {
+        seenLiveEventKeys.add(eventKey);
+        recoveryAttempts = 0;
+      }
+      clearRecoveryState();
+      if (originIsDisplayed()) {
+        setActiveRun((current) => current?.run_id === runId ? mergeLiveRunEvent(current, event) : current);
+      }
       setRunsById((current) => ({
         ...current,
-        [runId]: mergeLiveRunEvent(current[runId] || { run_id: runId }, event)
+        [runId]: mergeLiveRunEvent(current[runId] || {
+          run_id: runId,
+          session_id: originSessionId
+        }, event)
       }));
       if (["final.completed", "run.failed"].includes(event.type)) {
-        if (event.type === "final.completed" && !progressivelyRenderedRunIdsRef.current.has(runId)) {
-          progressivelyRenderedRunIdsRef.current.add(runId);
-          setProgressiveRunId(runId);
-        }
-        await fetchRun(runId, { makeActive: true }).catch(() => undefined);
-      }
-      if (event.type === "final.completed" || event.type === "run.failed") {
-        source.close();
-        if (eventSourceRef.current === source) eventSourceRef.current = null;
-        await openSession(sessionId, { hydrateRuns: false }).catch((sessionError) => setError(friendlyError(sessionError)));
+        await finalize(event.type);
       }
     };
+
     source.onerror = () => {
-      // Native EventSource retries transient disconnects. Keep it alive and
-      // refresh once so the visible state progresses while reconnection occurs.
-      fetchRun(runId, { makeActive: true }).catch(() => undefined);
+      if (closed || recoveryInFlight) return;
+      recoveryAttempts += 1;
+      setRunRecoveryState({
+        runId,
+        sessionId: originSessionId,
+        status: "reconnecting",
+        message: `Live updates were interrupted. Checking the saved run (${recoveryAttempts}/${SSE_RECOVERY_MAX_ATTEMPTS})…`,
+        retryable: false
+      });
+      window.clearTimeout(recoveryTimer);
+      recoveryTimer = window.setTimeout(async () => {
+        if (closed) return;
+        recoveryInFlight = true;
+        try {
+          const recovered = await fetchRun(runId, {
+            makeActive: originIsDisplayed(),
+            expectedSessionId: originSessionId
+          });
+          if (isTerminalRunStatus(recovered?.status)) {
+            await finalize(recovered.status === "completed" ? "final.completed" : "run.failed", recovered);
+            return;
+          }
+          if (recoveryAttempts >= SSE_RECOVERY_MAX_ATTEMPTS) {
+            pauseRecovery();
+          }
+        } catch (recoveryError) {
+          if (recoveryAttempts >= SSE_RECOVERY_MAX_ATTEMPTS) {
+            pauseRecovery(friendlyError(recoveryError));
+          }
+        } finally {
+          recoveryInFlight = false;
+        }
+      }, sseRecoveryDelay(recoveryAttempts));
     };
+  }
+
+  async function retryRunRecovery() {
+    const recovery = runRecoveryState;
+    if (!recovery?.runId || recovery.status === "checking") return;
+    setRunRecoveryState({ ...recovery, status: "checking", message: "Checking the saved run…", retryable: false });
+    try {
+      const recovered = await fetchRun(recovery.runId, {
+        makeActive: true,
+        expectedSessionId: recovery.sessionId
+      });
+      if (isTerminalRunStatus(recovered?.status)) {
+        if (shouldRefreshOriginSession(
+          recovery.sessionId,
+          displayedSessionIdRef.current,
+          desiredSessionIdRef.current
+        )) {
+          await openSession(recovery.sessionId, { hydrateRuns: false, navigation: false });
+        }
+        setRunRecoveryState(null);
+        return;
+      }
+      if (!shouldRefreshOriginSession(
+        recovery.sessionId,
+        displayedSessionIdRef.current,
+        desiredSessionIdRef.current
+      )) {
+        setRunRecoveryState({
+          ...recovery,
+          status: "paused",
+          message: "Live updates remain paused for this chat. Return to it and check the run again.",
+          retryable: true
+        });
+        return;
+      }
+      subscribeRun(recovery.runId, recovery.sessionId);
+      setRunRecoveryState({
+        ...recovery,
+        status: "reconnecting",
+        message: "Live updates restarted.",
+        retryable: false
+      });
+    } catch (recoveryError) {
+      setRunRecoveryState({
+        ...recovery,
+        status: "paused",
+        message: friendlyError(recoveryError),
+        retryable: true
+      });
+    }
   }
 
   async function openRunDetails(runId) {
@@ -1068,7 +1496,7 @@ function Workspace({ onHome, onSignedOut }) {
     }
   }
 
-  async function retryAnswer(run) {
+  async function editAnswerForRetry(run) {
     if (!canWrite) return;
     setDraft(run?.query || "");
     setFocusComposer((value) => value + 1);
@@ -1076,10 +1504,35 @@ function Workspace({ onHome, onSignedOut }) {
 
   async function rerunTrackedAnswer(run, { runFresh = false } = {}) {
     const content = String(run?.query || "").trim();
-    if (!content || !session || !canWrite || sendInFlightRef.current) return false;
+    const originSessionId = session?.session_id || "";
+    const originAgentWorkspaceId = session?.agent_workspace_id || null;
+    const requestedAgentIds = Array.isArray(run?.requested_agent_ids)
+      ? [...new Set(run.requested_agent_ids.map((agentId) => String(agentId || "").trim()).filter(Boolean))]
+      : [];
+    const routingKey = `${runFresh ? "fresh" : "selective"}:${String(run?.run_id || requestedAgentIds.join("|") || "prompt")}`;
+    if (
+      !content
+      || !originSessionId
+      || !canWrite
+      || sendInFlightRef.current
+      || runIsActiveForSession(activeRun, originSessionId)
+      || teamMutationInFlightRef.current
+      || Boolean(sessionSwitching)
+    ) return false;
     sendInFlightRef.current = true;
+    setSendPending(true);
     setError("");
     nearBottomRef.current = true;
+    const previousSubmission = sendRetryRef.current;
+    const submission = preserveAmbiguousChatSubmission(previousSubmission, {
+      content,
+      sessionId: originSessionId,
+      routingKey,
+      requestedAgentIds,
+      executionOptions: { ...(run?.execution_options || {}) },
+      idempotencyKey: mutationIdempotencyKey(runFresh ? "fresh-message" : "selective-message")
+    });
+    sendRetryRef.current = submission;
     const optimisticId = `local_${runFresh ? "fresh" : "selective"}_${Date.now()}`;
     setMessages((items) => [...items, {
       message_id: optimisticId,
@@ -1088,26 +1541,30 @@ function Workspace({ onHome, onSignedOut }) {
       created_at: new Date().toISOString()
     }]);
     try {
-      const queued = await api.post(`/api/chat/sessions/${encodeURIComponent(session.session_id)}/messages`, {
+      const queued = await api.post(`/api/chat/sessions/${encodeURIComponent(originSessionId)}/messages`, {
         content,
         attachments: [],
-        ...(Array.isArray(run?.requested_agent_ids) && run.requested_agent_ids.length
-          ? { requested_agent_ids: run.requested_agent_ids }
+        ...(submission.requestedAgentIds.length
+          ? { requested_agent_ids: submission.requestedAgentIds }
           : {}),
         options: {
-          ...(run?.execution_options || {}),
+          ...submission.executionOptions,
           show_route_details: true,
           run_fresh: runFresh
         }
-      }, { idempotencyKey: mutationIdempotencyKey(runFresh ? "fresh-message" : "selective-message") });
-      setDetailsRunId(null);
-      setMessages((items) => items.map((message) => message.message_id === optimisticId
-        ? { ...message, message_id: queued.message_id, run_id: queued.run_id }
-        : message));
+      }, { idempotencyKey: submission.idempotencyKey });
+      sendRetryRef.current = null;
+      const originIsVisible = displayedSessionIdRef.current === originSessionId;
+      if (originIsVisible) {
+        setDetailsRunId(null);
+        setMessages((items) => items.map((message) => message.message_id === optimisticId
+          ? { ...message, message_id: queued.message_id, run_id: queued.run_id }
+          : message));
+      }
       const stub = {
         run_id: queued.run_id,
-        session_id: session.session_id,
-        agent_workspace_id: session.agent_workspace_id || null,
+        session_id: originSessionId,
+        agent_workspace_id: originAgentWorkspaceId,
         query: content,
         status: queued.status || "queued",
         expert_outputs: [],
@@ -1116,16 +1573,25 @@ function Workspace({ onHome, onSignedOut }) {
         world_graph: { kept: 0, refreshed: 0, total: 0, decisions: [] },
         events: []
       };
-      setActiveRun(stub);
+      if (originIsVisible) setActiveRun(stub);
       setRunsById((current) => ({ ...current, [queued.run_id]: stub }));
-      subscribeRun(queued.run_id, session.session_id);
+      if (originIsVisible) subscribeRun(queued.run_id, originSessionId);
       return true;
     } catch (rerunError) {
-      setMessages((items) => items.filter((message) => message.message_id !== optimisticId));
-      setError(friendlyError(rerunError));
+      if (displayedSessionIdRef.current === originSessionId) {
+        setMessages((items) => items.filter((message) => message.message_id !== optimisticId));
+      }
+      if (shouldRefreshOriginSession(
+        originSessionId,
+        displayedSessionIdRef.current,
+        desiredSessionIdRef.current
+      )) {
+        setError(friendlyError(rerunError));
+      }
       return false;
     } finally {
       sendInFlightRef.current = false;
+      setSendPending(false);
     }
   }
 
@@ -1148,15 +1614,47 @@ function Workspace({ onHome, onSignedOut }) {
 
   async function waitForWorkflowActivation(workflow) {
     let current = workflow;
-    for (let attempt = 0; current?.status === "activating" && attempt < 30; attempt += 1) {
-      await new Promise((resolve) => window.setTimeout(resolve, 500));
+    let attempt = 0;
+    let deadlineAt = Date.now() + WORKFLOW_POLL_DEADLINE_MS;
+    const originSessionId = current?.session_id || session?.session_id || "";
+    while (
+      current?.status === "activating"
+      && Date.now() < deadlineAt
+      && (!originSessionId || desiredSessionIdRef.current === originSessionId)
+    ) {
+      if (document.visibilityState === "hidden") {
+        const hiddenAt = Date.now();
+        await new Promise((resolve) => {
+          const onVisibilityChange = () => {
+            if (document.visibilityState === "hidden") return;
+            document.removeEventListener("visibilitychange", onVisibilityChange);
+            resolve();
+          };
+          document.addEventListener("visibilitychange", onVisibilityChange);
+        });
+        deadlineAt += Date.now() - hiddenAt;
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, workflowPollDelay(attempt)));
+      attempt += 1;
       current = await api.get(`/api/workflows/${encodeURIComponent(current.workflow_id)}`);
+    }
+    if (current?.status === "activating" && shouldRefreshOriginSession(
+      originSessionId,
+      displayedSessionIdRef.current,
+      desiredSessionIdRef.current
+    )) {
+      setWorkflowPollingIssue({
+        sessionId: originSessionId,
+        workflowIds: [current.workflow_id],
+        message: "Team setup is taking longer than expected. Automatic checks paused so the page will not keep making requests."
+      });
     }
     return current;
   }
 
   async function submitWorkflowDecision(workflow, decision) {
     if (!workflow || workflowBusy) return;
+    const originSessionId = workflow.session_id || session?.session_id || "";
     setWorkflowBusy(workflow.workflow_id);
     setError("");
     try {
@@ -1165,10 +1663,12 @@ function Workspace({ onHome, onSignedOut }) {
         revision: workflow.revision
       });
       await waitForWorkflowActivation(updated);
-      await openSession(workflow.session_id || session.session_id);
+      await openSession(originSessionId, { hydrateRuns: false, navigation: false });
     } catch (workflowError) {
-      setError(friendlyError(workflowError));
-      await openSession(session.session_id).catch(() => undefined);
+      if (shouldRefreshOriginSession(originSessionId, displayedSessionIdRef.current, desiredSessionIdRef.current)) {
+        setError(friendlyError(workflowError));
+      }
+      await openSession(originSessionId, { hydrateRuns: false, navigation: false }).catch(() => undefined);
     } finally {
       setWorkflowBusy("");
     }
@@ -1191,15 +1691,18 @@ function Workspace({ onHome, onSignedOut }) {
 
   async function resumeWorkflow(workflow) {
     if (!workflow || workflowBusy) return;
+    const originSessionId = workflow.session_id || session?.session_id || "";
     setWorkflowBusy(workflow.workflow_id);
     setError("");
     try {
       const updated = await api.post(`/api/workflows/${encodeURIComponent(workflow.workflow_id)}/resume`, {});
       await waitForWorkflowActivation(updated);
-      await openSession(workflow.session_id || session.session_id);
+      await openSession(originSessionId, { hydrateRuns: false, navigation: false });
     } catch (workflowError) {
-      setError(friendlyError(workflowError));
-      await openSession(session.session_id).catch(() => undefined);
+      if (shouldRefreshOriginSession(originSessionId, displayedSessionIdRef.current, desiredSessionIdRef.current)) {
+        setError(friendlyError(workflowError));
+      }
+      await openSession(originSessionId, { hydrateRuns: false, navigation: false }).catch(() => undefined);
     } finally {
       setWorkflowBusy("");
     }
@@ -1207,6 +1710,7 @@ function Workspace({ onHome, onSignedOut }) {
 
   async function connectWorkflowRequirement(workflow, requirement, connectionId = null) {
     if (!workflow || !requirement || workflowBusy) return;
+    const originSessionId = workflow.session_id || session?.session_id || "";
     if (requirement.status === "connected") {
       await resumeWorkflow(workflow);
       return;
@@ -1226,10 +1730,12 @@ function Workspace({ onHome, onSignedOut }) {
           { connection_id: connectionId, revision: workflow.revision }
         );
         await waitForWorkflowActivation(updated);
-        await openSession(workflow.session_id || session.session_id);
+        await openSession(originSessionId, { hydrateRuns: false, navigation: false });
       } catch (connectionError) {
-        setError(friendlyError(connectionError));
-        await openSession(session.session_id).catch(() => undefined);
+        if (shouldRefreshOriginSession(originSessionId, displayedSessionIdRef.current, desiredSessionIdRef.current)) {
+          setError(friendlyError(connectionError));
+        }
+        await openSession(originSessionId, { hydrateRuns: false, navigation: false }).catch(() => undefined);
       } finally {
         setWorkflowBusy("");
       }
@@ -1286,6 +1792,7 @@ function Workspace({ onHome, onSignedOut }) {
 
   async function decideToolCheckpoint(checkpoint, approval, decision) {
     if (!checkpoint || !approval || checkpointBusy) return;
+    const originSessionId = checkpoint.session_id || session?.session_id || "";
     setCheckpointBusy(checkpoint.checkpoint_id);
     setError("");
     try {
@@ -1294,10 +1801,12 @@ function Workspace({ onHome, onSignedOut }) {
       } else {
         await api.post(`/api/mcp/approvals/${encodeURIComponent(approval.approval_id)}`, { decision });
       }
-      await openSession(checkpoint.session_id || session.session_id);
+      await openSession(originSessionId, { hydrateRuns: false, navigation: false });
       await refreshStudioResources(["approvals", "connections"]);
     } catch (approvalError) {
-      setError(friendlyError(approvalError));
+      if (shouldRefreshOriginSession(originSessionId, displayedSessionIdRef.current, desiredSessionIdRef.current)) {
+        setError(friendlyError(approvalError));
+      }
     } finally {
       setCheckpointBusy("");
     }
@@ -1305,13 +1814,16 @@ function Workspace({ onHome, onSignedOut }) {
 
   async function retryCheckpoint(checkpoint) {
     if (!checkpoint || checkpointBusy) return;
+    const originSessionId = checkpoint.session_id || session?.session_id || "";
     setCheckpointBusy(checkpoint.checkpoint_id);
     setError("");
     try {
       await api.post(`/api/conversation/checkpoints/${encodeURIComponent(checkpoint.checkpoint_id)}/resume`, {});
-      await openSession(checkpoint.session_id || session.session_id);
+      await openSession(originSessionId, { hydrateRuns: false, navigation: false });
     } catch (checkpointError) {
-      setError(friendlyError(checkpointError));
+      if (shouldRefreshOriginSession(originSessionId, displayedSessionIdRef.current, desiredSessionIdRef.current)) {
+        setError(friendlyError(checkpointError));
+      }
     } finally {
       setCheckpointBusy("");
     }
@@ -1362,25 +1874,60 @@ function Workspace({ onHome, onSignedOut }) {
   }
 
   async function toggleAgentForSession(agent, active) {
-    if (!session?.session_id || !canWrite) return;
+    const originSessionId = session?.session_id;
+    if (
+      !originSessionId
+      || !canWrite
+      || teamMutationInFlightRef.current
+      || sendInFlightRef.current
+      || sendPending
+      || runIsActiveForSession(activeRun, originSessionId)
+    ) return;
+    const mutationId = ++teamMutationSequenceRef.current;
+    teamMutationInFlightRef.current = true;
     setTogglingAgentId(agent.id);
+    setTeamMutationBusy(`agent:${agent.id}`);
     setError("");
     try {
       const result = await api.patch(
-        `/api/chat/sessions/${encodeURIComponent(session.session_id)}/agents/${encodeURIComponent(agent.id)}`,
+        `/api/chat/sessions/${encodeURIComponent(originSessionId)}/agents/${encodeURIComponent(agent.id)}`,
         { active }
       );
+      if (
+        mutationId !== teamMutationSequenceRef.current
+        || !shouldRefreshOriginSession(originSessionId, displayedSessionIdRef.current, desiredSessionIdRef.current)
+      ) return;
       setAgents((items) => items.map((item) => item.id === agent.id ? { ...item, session_active: result.active } : item));
-      setSession((current) => current ? { ...current, inactive_agent_ids: result.inactive_agent_ids } : current);
+      setSession((current) => current?.session_id === originSessionId
+        ? { ...current, inactive_agent_ids: result.inactive_agent_ids }
+        : current);
     } catch (toggleError) {
-      setError(friendlyError(toggleError));
+      if (shouldRefreshOriginSession(
+        originSessionId,
+        displayedSessionIdRef.current,
+        desiredSessionIdRef.current
+      )) {
+        setError(friendlyError(toggleError));
+      }
     } finally {
-      setTogglingAgentId("");
+      if (mutationId === teamMutationSequenceRef.current) {
+        teamMutationInFlightRef.current = false;
+        setTogglingAgentId("");
+        setTeamMutationBusy("");
+      }
     }
   }
 
   async function setGraphConnection(fromId, toId, connected) {
-    if (!canWrite || !fromId || !toId || fromId === toId) return;
+    if (
+      !canWrite
+      || !fromId
+      || !toId
+      || fromId === toId
+      || sendInFlightRef.current
+      || sendPending
+      || runIsActiveForSession(activeRun, session?.session_id)
+    ) return;
     const target = agents.find((agent) => agent.id === toId);
     if (!target) throw new Error("The receiving specialist is no longer available.");
     setError("");
@@ -1401,7 +1948,7 @@ function Workspace({ onHome, onSignedOut }) {
     setWorkspaceDeleteTarget(null);
     await refreshStudioResources(["agentWorkspaces", "agents", "marketplace"]);
     if (session?.agent_workspace_id === workspace.agent_workspace_id && result.fallback_agent_workspace_id) {
-      await openSession(session.session_id, { hydrateRuns: false });
+      await openSession(session.session_id, { hydrateRuns: false, navigation: false });
     }
     setResourcesOpen(true);
     setResourceView("agents");
@@ -1480,7 +2027,23 @@ function Workspace({ onHome, onSignedOut }) {
     nearBottomRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 120;
   }
 
-  const isBusy = activeRun && !["completed", "failed"].includes(activeRun.status);
+  const isBusy = runIsActiveForSession(activeRun, session?.session_id);
+  const executionConfigurationBusy = Boolean(
+    teamMutationBusy
+    || sessionSwitching
+    || isBusy
+    || sendPending
+    || sendInFlightRef.current
+  );
+  const sendBlocked = Boolean(
+    loading
+    || bootstrapFailure
+    || sessionSwitching
+    || teamMutationBusy
+    || isBusy
+    || sendPending
+    || sendInFlightRef.current
+  );
   const workflowsById = Object.fromEntries(workflows.map((workflow) => [workflow.workflow_id, workflow]));
   const actionableCheckpoints = checkpoints.filter((checkpoint) =>
     checkpoint.type === "mcp_tool_approval"
@@ -1491,7 +2054,7 @@ function Workspace({ onHome, onSignedOut }) {
     <div className="app-shell">
       <header className="app-header">
         <div className="header-side">
-          <IconButton label="Open chat history" onClick={() => setHistoryOpen(true)}>
+          <IconButton label="Open chat history" onClick={() => setHistoryOpen(true)} disabled={Boolean(loading || bootstrapFailure)}>
             <Menu size={20} />
           </IconButton>
           <button className="wordmark" type="button" onClick={onHome} aria-label="Go to Virenis homepage">Virenis</button>
@@ -1500,6 +2063,7 @@ function Workspace({ onHome, onSignedOut }) {
           <button
             className="balance-pill"
             type="button"
+            disabled={Boolean(loading || bootstrapFailure)}
             onClick={() => {
               setResourceView("account");
               setResourcesOpen(true);
@@ -1515,7 +2079,7 @@ function Workspace({ onHome, onSignedOut }) {
               <strong>{formatCreditDisplay(billing?.account?.balance_credits)}</strong>
             </span>
           </button>
-          <IconButton label="New chat" onClick={newChat} disabled={!canWrite}>
+          <IconButton label="New chat" onClick={newChat} disabled={!canWrite || Boolean(sessionSwitching)}>
             <SquarePen size={19} />
           </IconButton>
           <button
@@ -1523,6 +2087,7 @@ function Workspace({ onHome, onSignedOut }) {
             type="button"
             aria-label="Open your team studio"
             onClick={() => setResourcesOpen(true)}
+            disabled={Boolean(loading || bootstrapFailure)}
           >
             <Layers3 size={16} />
             <span>My team</span>
@@ -1546,7 +2111,11 @@ function Workspace({ onHome, onSignedOut }) {
               </div>
             )}
 
-            {!loading && messages.length === 0 && !isBusy && (
+            {!loading && bootstrapFailure && (
+              <WorkspaceLoadFailure message={bootstrapFailure} onRetry={bootstrap} />
+            )}
+
+            {!loading && !bootstrapFailure && messages.length === 0 && !isBusy && (
               <EmptyTeamWelcome
                 readOnly={auth?.is_viewer}
                 workspace={activeAgentWorkspace}
@@ -1563,7 +2132,7 @@ function Workspace({ onHome, onSignedOut }) {
               />
             )}
 
-            {!loading && messages.map((message, index) => (
+            {!loading && !bootstrapFailure && messages.map((message, index) => (
               <ChatMessage
                 key={message.message_id}
                 message={message}
@@ -1583,7 +2152,8 @@ function Workspace({ onHome, onSignedOut }) {
                   setResourcesOpen(true);
                 }}
                 onCopy={copyText}
-                onRetry={retryAnswer}
+                onRetry={refreshTrackedAnswer}
+                retryDisabled={sendBlocked}
                 onFeedback={setFeedbackRunId}
                 onDetails={openRunDetails}
                 progressivelyRender={message.run_id === progressiveRunId}
@@ -1596,7 +2166,7 @@ function Workspace({ onHome, onSignedOut }) {
               />
             ))}
 
-            {actionableCheckpoints.map((checkpoint) => (
+            {!bootstrapFailure && actionableCheckpoints.map((checkpoint) => (
               <ToolApprovalCheckpoint
                 key={checkpoint.checkpoint_id}
                 checkpoint={checkpoint}
@@ -1607,7 +2177,7 @@ function Workspace({ onHome, onSignedOut }) {
               />
             ))}
 
-            {isBusy && <RunProgress run={activeRun} agents={agents} />}
+            {!bootstrapFailure && isBusy && <RunProgress run={activeRun} agents={agents} />}
 
             {activeRun?.status === "failed" && !messages.some((message) => message.role === "assistant" && message.run_id === activeRun.run_id) && (
               <div className="inline-error" role="alert">
@@ -1618,7 +2188,13 @@ function Workspace({ onHome, onSignedOut }) {
                 </span>
                 <button type="button" onClick={() => openRunDetails(activeRun.run_id)}>Details</button>
                 {canWrite && activeRun.error?.action !== "contact_support" && (
-                  <button type="button" onClick={() => retryAnswer(activeRun)}>
+                  <button
+                    type="button"
+                    disabled={sendBlocked}
+                    onClick={() => activeRun.error?.action === "reduce_context"
+                      ? editAnswerForRetry(activeRun)
+                      : refreshTrackedAnswer(activeRun)}
+                  >
                     {activeRun.error?.action === "reduce_context" ? "Edit request" : "Try again"}
                   </button>
                 )}
@@ -1638,6 +2214,24 @@ function Workspace({ onHome, onSignedOut }) {
           {runtime?.ok === false && (
             <div className="service-notice" role="status">The service is temporarily unavailable.</div>
           )}
+          {teamMutationBusy && (
+            <div className="service-notice" role="status">Updating the team for this chat…</div>
+          )}
+          {runRecoveryState && runRecoveryState.sessionId === session?.session_id && (
+            <div className={`service-notice run-recovery-notice ${runRecoveryState.status === "paused" ? "error" : ""}`} role={runRecoveryState.status === "paused" ? "alert" : "status"}>
+              <span>{runRecoveryState.message}</span>
+              {runRecoveryState.retryable && <button type="button" onClick={retryRunRecovery}>Check run</button>}
+            </div>
+          )}
+          {workflowPollingIssue && workflowPollingIssue.sessionId === session?.session_id && (
+            <div className="service-notice workflow-polling-notice" role="alert">
+              <span>{workflowPollingIssue.message}</span>
+              <button type="button" onClick={() => {
+                setWorkflowPollingIssue(null);
+                setWorkflowPollRetry((value) => value + 1);
+              }}>Check setup again</button>
+            </div>
+          )}
           {error && (
             <div className="global-error" role="alert">
               <span>{error}</span>
@@ -1646,7 +2240,7 @@ function Workspace({ onHome, onSignedOut }) {
               </IconButton>
             </div>
           )}
-          <Composer
+          {!bootstrapFailure && <Composer
             value={draft}
             onChange={setDraft}
             onSubmit={sendMessage}
@@ -1659,6 +2253,8 @@ function Workspace({ onHome, onSignedOut }) {
             activeWorkspace={activeAgentWorkspace}
             sessionId={session?.session_id}
             canWrite={canWrite}
+            sendBlocked={sendBlocked}
+            configurationBusy={executionConfigurationBusy}
             focusRequest={focusComposer}
             onOpenAgents={() => {
               setResourceView("agents");
@@ -1669,7 +2265,7 @@ function Workspace({ onHome, onSignedOut }) {
             })}
             onToggleAgent={toggleAgentForSession}
             togglingAgentId={togglingAgentId}
-          />
+          />}
         </div>
       </main>
 
@@ -1691,6 +2287,7 @@ function Workspace({ onHome, onSignedOut }) {
           agents={agents}
           agentWorkspaces={agentWorkspaces}
           activeAgentWorkspace={activeAgentWorkspace}
+          configurationBusy={executionConfigurationBusy}
           documents={documents}
           runtime={runtime}
           metrics={metrics}
@@ -1769,6 +2366,15 @@ function Workspace({ onHome, onSignedOut }) {
           onRefresh={refreshResources}
           onRefreshBilling={refreshBilling}
           onRefreshConnections={() => refreshStudioResources(["connections", "templates", "approvals", "agents"])}
+          onRefreshConversation={async () => {
+            const originSessionId = session?.session_id || "";
+            if (!originSessionId || !shouldRefreshOriginSession(
+              originSessionId,
+              displayedSessionIdRef.current,
+              desiredSessionIdRef.current
+            )) return;
+            await openSession(originSessionId, { hydrateRuns: false, navigation: false });
+          }}
           onOpenCustomMcp={() => {
             setResourcesOpen(false);
             setCustomMcpOpen(true);
@@ -1863,6 +2469,7 @@ function Workspace({ onHome, onSignedOut }) {
           mcpConnections={mcpConnections}
           agentWorkspaceId={activeAgentWorkspace?.agent_workspace_id || null}
           teamName={activeAgentWorkspace?.name || "General team"}
+          configurationBusy={executionConfigurationBusy}
           onClose={() => setAgentEditor(undefined)}
           onSaved={async (savedAgent = {}) => {
             const teammateName = agentFacingText(savedAgent.title || agentEditor.agent?.title || "Your new teammate");
@@ -1908,7 +2515,7 @@ function Workspace({ onHome, onSignedOut }) {
           onSaved={async () => {
             setWorkspaceMembersTarget(null);
             await refreshStudioResources(["agentWorkspaces", "agents"]);
-            if (session?.session_id) await openSession(session.session_id, { hydrateRuns: false });
+            if (session?.session_id) await openSession(session.session_id, { hydrateRuns: false, navigation: false });
             setResourcesOpen(true);
             setResourceView("agents");
           }}
@@ -2014,11 +2621,16 @@ function Workspace({ onHome, onSignedOut }) {
           }}
           agentWorkspaces={agentWorkspaces}
           activeAgentWorkspaceId={activeAgentWorkspace?.agent_workspace_id || ""}
+          lockedAgentWorkspaceIds={isBusy && activeAgentWorkspace?.agent_workspace_id
+            ? [activeAgentWorkspace.agent_workspace_id]
+            : []}
           onCopied={async (result) => {
             setMarketplaceTarget(null);
             await refreshStudioResources(["agents", "agentWorkspaces", "marketplace"]);
-            if (result?.agent_workspace?.agent_workspace_id) {
+            if (result?.agent_workspace?.agent_workspace_id && !isBusy) {
               await switchAgentWorkspace(result.agent_workspace.agent_workspace_id, { refresh: true });
+            } else if (result?.agent_workspace?.agent_workspace_id) {
+              setTeamNotice("The shared team was added. You can switch to it after the current answer finishes.");
             }
             setResourcesOpen(true);
             setResourceView("agents");
@@ -2358,6 +2970,7 @@ export function ChatMessage({
   onWorkflowGraph,
   onCopy,
   onRetry,
+  retryDisabled = false,
   onFeedback,
   onDetails,
   progressivelyRender = false,
@@ -2401,10 +3014,10 @@ export function ChatMessage({
                 <Copy size={16} />
               </IconButton>
               <IconButton
-                label="Try this prompt again"
+                label="Run this prompt again"
                 compact
                 onClick={() => onRetry(run || { query: previousUser?.content || "" })}
-                disabled={!canWrite}
+                disabled={!canWrite || retryDisabled}
               >
                 <RotateCcw size={16} />
               </IconButton>
@@ -2670,7 +3283,10 @@ export function ToolApprovalCheckpoint({ checkpoint, approval, busy = false, onD
 
 function workflowSourceLabel(node) {
   if (node.source === "workspace") return "Already on your team";
-  if (node.source === "marketplace") return `Marketplace${node.publisher ? ` · ${node.publisher}` : ""}`;
+  if (node.source === "marketplace") {
+    const publisher = node.publisher_display_name || node.publisher_id || node.publisher;
+    return `Marketplace${publisher ? ` · ${publisher}` : ""}`;
+  }
   if (node.source === "generated") return "Created for you";
   return node.type || "Workflow step";
 }
@@ -3137,11 +3753,13 @@ export function EmptyTeamWelcome({
   onBuildWorkflow = () => undefined,
   onOpenTeam = () => undefined
 }) {
-  const readyAgents = availableSessionAgents(agents).filter((agent) => agent.session_active !== false);
+  const configuredAgents = availableSessionAgents(agents);
+  const readyAgents = configuredAgents.filter((agent) => agent.session_active !== false);
   const visibleAgents = readyAgents.slice(0, 4);
   const remaining = Math.max(0, readyAgents.length - visibleAgents.length);
   const teamName = workspace?.name || "General";
   const hasTeam = readyAgents.length > 0;
+  const allSpecialistsPaused = configuredAgents.length > 0 && !hasTeam;
 
   if (readOnly) {
     return (
@@ -3155,11 +3773,13 @@ export function EmptyTeamWelcome({
 
   return (
     <div className="empty-chat team-welcome">
-      <span className="team-welcome-kicker"><Sparkles size={13} /> {hasTeam ? `${teamName} is ready` : "Your team space is ready"}</span>
-      <h1>{hasTeam ? "What should your team accomplish?" : "What do you want to accomplish?"}</h1>
+      <span className="team-welcome-kicker"><Sparkles size={13} /> {hasTeam ? `${teamName} is ready` : allSpecialistsPaused ? `${teamName} specialists are paused` : "Your team space is ready"}</span>
+      <h1>{hasTeam ? "What should your team accomplish?" : allSpecialistsPaused ? "What would you like to ask directly?" : "What do you want to accomplish?"}</h1>
       <p>{hasTeam
         ? `Describe the outcome. Virenis will assign the right work across your ${readyAgents.length} available ${readyAgents.length === 1 ? "specialist" : "specialists"}.`
-        : "Start with a request now, or add a specialist when you want repeatable expertise."}</p>
+        : allSpecialistsPaused
+          ? "You can continue without a specialist, or open your team and make one available for this chat."
+          : "Start with a request now, or add a specialist when you want repeatable expertise."}</p>
       {hasTeam && (
         <div className="team-welcome-roster" aria-label={`${teamName} team members`}>
           <div className="team-welcome-avatars" aria-hidden="true">
@@ -3176,9 +3796,26 @@ export function EmptyTeamWelcome({
       <div className="team-welcome-actions">
         <button type="button" className="welcome-action primary" onClick={onStart}><MessageCircle size={16} /><span><strong>Start with a request</strong><small>Ask once; your team handles the division of work</small></span></button>
         <button type="button" className="welcome-action" onClick={onBuildWorkflow}><WandSparkles size={16} /><span><strong>Build a repeatable workflow</strong><small>Describe a process and review the proposed team</small></span></button>
-        <button type="button" className="welcome-action" onClick={onOpenTeam}><Layers3 size={16} /><span><strong>{hasTeam ? "Manage your team" : "Add your first specialist"}</strong><small>{hasTeam ? "Choose roles, tools, knowledge, and handoffs" : "Create a reusable role in a few guided steps"}</small></span></button>
+        <button type="button" className="welcome-action" onClick={onOpenTeam}><Layers3 size={16} /><span><strong>{hasTeam || allSpecialistsPaused ? "Manage your team" : "Add your first specialist"}</strong><small>{hasTeam || allSpecialistsPaused ? "Choose which specialists are available for this chat" : "Create a reusable role in a few guided steps"}</small></span></button>
       </div>
     </div>
+  );
+}
+
+export function WorkspaceLoadFailure({
+  message = "Your workspace could not be opened.",
+  onRetry = () => undefined
+}) {
+  return (
+    <section className="workspace-load-failure" role="alert" aria-live="assertive">
+      <span className="workspace-load-failure-icon" aria-hidden="true"><AlertCircle size={20} /></span>
+      <div>
+        <h1>We couldn’t open your workspace</h1>
+        <p>{message}</p>
+        <small>Your chats were not changed. Retry when your connection is ready.</small>
+      </div>
+      <button type="button" onClick={onRetry}><RefreshCw size={15} />Retry</button>
+    </section>
   );
 }
 
@@ -3208,6 +3845,8 @@ export function Composer({
   activeWorkspace = null,
   sessionId,
   canWrite,
+  sendBlocked = false,
+  configurationBusy = false,
   focusRequest,
   onOpenAgents,
   onSelectWorkspace,
@@ -3393,13 +4032,24 @@ export function Composer({
     }
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
+      if (sendBlocked) return;
       onSubmit(event);
     }
   }
 
   return (
     <div className="composer-shell">
-      <form className="composer" onSubmit={onSubmit}>
+      <form
+        className="composer"
+        onSubmit={(event) => {
+          if (sendBlocked) {
+            event.preventDefault();
+            return;
+          }
+          onSubmit(event);
+        }}
+        aria-busy={sendBlocked || undefined}
+      >
       {commandSuggestions.length > 0 && !mention && (
         <div className="command-menu" id={`${listId}-commands`} role="listbox" aria-label="Workflow commands">
           {commandSuggestions.map((item, index) => (
@@ -3504,10 +4154,10 @@ export function Composer({
         />
       </label>
       <IconButton
-        label="Send message"
+        label={sendBlocked ? "Wait for the current operation to finish" : "Send message"}
         className="send-control"
         type="submit"
-        disabled={!canWrite || !value.trim()}
+        disabled={!canWrite || sendBlocked || !value.trim()}
       >
         <ArrowUp size={19} />
       </IconButton>
@@ -3522,7 +4172,7 @@ export function Composer({
           aria-expanded={agentMenuOpen}
           aria-haspopup="dialog"
           aria-controls={teamPopupId}
-          disabled={!sessionId}
+          disabled={!sessionId || configurationBusy}
           onClick={() => setAgentMenuOpen((open) => !open)}
         >
           <Network size={18} aria-hidden="true" />
@@ -3561,7 +4211,7 @@ export function Composer({
                     className={`team-picker-workspace ${selected ? "selected" : ""}`}
                     data-team-option="true"
                     key={workspace.agent_workspace_id}
-                    disabled={!canWrite}
+                    disabled={!canWrite || configurationBusy}
                     onClick={() => chooseWorkspace(workspace.agent_workspace_id, selected)}
                   >
                     <span><strong>{workspace.name || "Untitled team"}</strong><small>{memberCount} specialist{memberCount === 1 ? "" : "s"}</small></span>
@@ -3587,7 +4237,7 @@ export function Composer({
                       type="checkbox"
                       aria-label={`${agent.session_active === false ? "Make" : "Pause"} ${formatAgentName(agent.id, agents)} for this chat`}
                       checked={agent.session_active !== false}
-                      disabled={!canWrite || togglingAgentId === agent.id}
+                      disabled={!canWrite || configurationBusy || togglingAgentId === agent.id}
                       onChange={(event) => onToggleAgent(agent, event.target.checked)}
                     />
                   </span>
@@ -3608,6 +4258,7 @@ function ResourcesSheet({
   agents,
   agentWorkspaces,
   activeAgentWorkspace,
+  configurationBusy = false,
   documents,
   runtime,
   metrics,
@@ -3646,6 +4297,7 @@ function ResourcesSheet({
   onRefresh,
   onRefreshBilling,
   onRefreshConnections,
+  onRefreshConversation,
   onOpenCustomMcp,
   onSignedOut
 }) {
@@ -3680,6 +4332,7 @@ function ResourcesSheet({
             workspaces={agentWorkspaces}
             activeWorkspace={activeAgentWorkspace}
             auth={auth}
+            configurationBusy={configurationBusy}
             onCreate={onCreateAgent}
             onSelectWorkspace={onSelectAgentWorkspace}
             onCreateWorkspace={onCreateAgentWorkspace}
@@ -3704,6 +4357,7 @@ function ResourcesSheet({
             agents={activeWorkspaceAgents}
             auth={auth}
             workspace={activeAgentWorkspace}
+            configurationBusy={configurationBusy}
             run={workspaceLatestRun}
             storageKey={`virenis:agent-graph:${auth?.workspace_id || "workspace"}:${activeAgentWorkspace?.agent_workspace_id || "general"}`}
             onConnect={onConnectAgents}
@@ -3743,6 +4397,7 @@ function ResourcesSheet({
             canWrite={canWrite}
             isAdmin={auth?.is_admin === true}
             onRefresh={onRefreshConnections}
+            onRefreshConversation={onRefreshConversation}
             resumeWorkflowId={resumeWorkflowId}
             onOpenCustomMcp={onOpenCustomMcp}
           />
@@ -3768,6 +4423,31 @@ function ResourcesSheet({
   );
 }
 
+export async function settleConnectionApproval({
+  approvalId,
+  decision,
+  client = api,
+  onRefresh = () => undefined,
+  onRefreshConversation = () => undefined
+}) {
+  await client.post(`/api/mcp/approvals/${encodeURIComponent(approvalId)}`, { decision });
+  await onRefresh();
+  await onRefreshConversation();
+}
+
+export function approvalActivityPresentation(status) {
+  const normalized = String(status || "").toLowerCase();
+  if (normalized === "executed") return { label: "Approved and completed", tone: "success", icon: "check" };
+  if (normalized === "denied") return { label: "Declined · nothing ran", tone: "muted", icon: "deny" };
+  if (normalized === "execution_outcome_uncertain") return { label: "Needs provider verification", tone: "warning", icon: "warning" };
+  if (normalized === "failed") return { label: "Action failed", tone: "error", icon: "warning" };
+  if (["approved", "executing"].includes(normalized)) return { label: "Approved · in progress", tone: "working", icon: "working" };
+  const label = normalized
+    ? normalized.replaceAll("_", " ").replace(/\b\w/g, (character) => character.toUpperCase())
+    : "Activity recorded";
+  return { label, tone: "muted", icon: "check" };
+}
+
 export function ConnectionsPanel({
   connections = [],
   agents = [],
@@ -3775,7 +4455,8 @@ export function ConnectionsPanel({
   approvals = [],
   canWrite,
   isAdmin = false,
-  onRefresh,
+  onRefresh = () => undefined,
+  onRefreshConversation = () => undefined,
   resumeWorkflowId = "",
   onOpenCustomMcp = () => undefined
 }) {
@@ -3912,8 +4593,12 @@ export function ConnectionsPanel({
     setBusy(approval.approval_id);
     setError("");
     try {
-      await api.post(`/api/mcp/approvals/${encodeURIComponent(approval.approval_id)}`, { decision });
-      await onRefresh();
+      await settleConnectionApproval({
+        approvalId: approval.approval_id,
+        decision,
+        onRefresh,
+        onRefreshConversation
+      });
     } catch (approvalError) {
       setError(friendlyError(approvalError));
     } finally {
@@ -4018,14 +4703,24 @@ export function ConnectionsPanel({
 
       {recentApprovals.length > 0 && (
         <details className="recent-connection-activity">
-          <summary>Recent approved actions <span>{recentApprovals.length}</span></summary>
+          <summary>Recent app activity <span>{recentApprovals.length}</span></summary>
           <div>
-            {recentApprovals.map((approval) => (
-              <article key={approval.approval_id}>
-                <span className={approval.status === "executed" ? "success" : "muted"}><Check size={13} /></span>
-                <div><strong>{approval.tool_title || approval.tool_name}</strong><small>{approval.status === "executed" ? "Approved and completed" : approval.status} · {formatDate(approval.decided_at, { includeTime: true })}</small>{approval.result && <pre>{JSON.stringify(approval.result, null, 2)}</pre>}</div>
-              </article>
-            ))}
+            {recentApprovals.map((approval) => {
+              const activity = approvalActivityPresentation(approval.status);
+              const ActivityIcon = activity.icon === "deny"
+                ? X
+                : activity.icon === "warning"
+                  ? AlertCircle
+                  : activity.icon === "working"
+                    ? LoaderCircle
+                    : Check;
+              return (
+                <article key={approval.approval_id}>
+                  <span className={activity.tone}><ActivityIcon className={activity.icon === "working" ? "spin" : undefined} size={13} /></span>
+                  <div><strong>{approval.tool_title || approval.tool_name}</strong><small>{activity.label} · {formatDate(approval.decided_at, { includeTime: true })}</small>{approval.result && <pre>{JSON.stringify(approval.result, null, 2)}</pre>}</div>
+                </article>
+              );
+            })}
           </div>
         </details>
       )}
@@ -4194,6 +4889,7 @@ export function AgentCatalog({
   workspaces = [],
   activeWorkspace = null,
   auth,
+  configurationBusy = false,
   togglingAgentId,
   sessionId,
   onCreate,
@@ -4227,7 +4923,7 @@ export function AgentCatalog({
             <select
               value={activeWorkspace.agent_workspace_id}
               onChange={(event) => onSelectWorkspace(event.target.value)}
-              disabled={!canWrite}
+              disabled={!canWrite || configurationBusy}
             >
               {workspaces.map((workspace) => (
                 <option value={workspace.agent_workspace_id} key={workspace.agent_workspace_id}>
@@ -4237,8 +4933,8 @@ export function AgentCatalog({
             </select>
           </label>
           <div className="team-toolbar-actions">
-            <button type="button" className="team-add-button" onClick={onCreate} disabled={!canWrite || (activeWorkspace?.agent_count || 0) >= (activeWorkspace?.max_agents || 16)}><Plus size={15} />Add specialist</button>
-            <button type="button" onClick={() => onManageWorkspace(activeWorkspace)} disabled={!canWrite}><Layers3 size={14} />Choose members</button>
+            <button type="button" className="team-add-button" onClick={onCreate} disabled={!canWrite || configurationBusy || (activeWorkspace?.agent_count || 0) >= (activeWorkspace?.max_agents || 16)}><Plus size={15} />Add specialist</button>
+            <button type="button" onClick={() => onManageWorkspace(activeWorkspace)} disabled={!canWrite || configurationBusy}><Layers3 size={14} />Choose members</button>
             <details className="team-more-menu">
               <summary aria-label="More team actions"><Menu size={15} />More</summary>
               <div>
@@ -4261,12 +4957,13 @@ export function AgentCatalog({
                   ><Globe2 size={14} />Remove public listing</button>
                 )}
                 {!activeWorkspace.is_general && (
-                  <button type="button" className="danger" onClick={() => onDeleteWorkspace(activeWorkspace)} disabled={!canWrite}><Trash2 size={14} />Delete team</button>
+                  <button type="button" className="danger" onClick={() => onDeleteWorkspace(activeWorkspace)} disabled={!canWrite || configurationBusy}><Trash2 size={14} />Delete team</button>
                 )}
               </div>
             </details>
           </div>
           <p>{activeWorkspace.description || "Your specialists share work here and can be assigned together in chat."}</p>
+          {configurationBusy && <div className="agent-workspace-lock" role="status"><Clock3 size={14} />This answer is using the current team. Team membership and specialist settings unlock when it finishes.</div>}
           {activeWorkspace.setup_error && <div className="agent-workspace-error" role="alert"><AlertCircle size={14} />{activeWorkspace.setup_error}</div>}
         </div>
       )}
@@ -4311,7 +5008,7 @@ export function AgentCatalog({
                       <input
                         type="checkbox"
                         checked={agent.session_active !== false}
-                        disabled={togglingAgentId === agent.id}
+                        disabled={configurationBusy || togglingAgentId === agent.id}
                         onChange={(event) => onToggle(agent, event.target.checked)}
                       />
                       <i aria-hidden="true" />
@@ -4324,7 +5021,7 @@ export function AgentCatalog({
                       <div>
                         {!archived && <button type="button" onClick={() => onPublish(agent)}>{agent.marketplace?.published ? <Pencil size={14} /> : <Upload size={14} />}{agent.marketplace?.published ? "Edit public description" : "Publish publicly"}</button>}
                         {agent.marketplace?.published && <button type="button" onClick={() => onUnpublish(agent)}><Globe2 size={14} />Remove public listing</button>}
-                        {archived ? agent.system_managed !== true && <button type="button" className="danger" onClick={() => onDelete(agent)}><Trash2 size={14} />Delete permanently</button> : <button type="button" onClick={() => onArchive(agent)}><Archive size={14} />Archive specialist</button>}
+                        {archived ? agent.system_managed !== true && <button type="button" className="danger" onClick={() => onDelete(agent)}><Trash2 size={14} />Delete permanently</button> : <button type="button" onClick={() => onArchive(agent)} disabled={configurationBusy}><Archive size={14} />Archive specialist</button>}
                       </div>
                     </details>
                   )}
@@ -4338,7 +5035,7 @@ export function AgentCatalog({
             <span><UserPlus size={22} /></span>
             <h3>{query ? "No specialists match that search" : "Build your first specialist"}</h3>
             <p>{query ? "Try a role name or a broader phrase." : "Give one role a clear job. You can add knowledge, apps, and teammates in the guided setup."}</p>
-            {!query && <button type="button" className="text-button primary" onClick={onCreate} disabled={!canWrite}><Plus size={15} />Add a specialist</button>}
+            {!query && <button type="button" className="text-button primary" onClick={onCreate} disabled={!canWrite || configurationBusy}><Plus size={15} />Add a specialist</button>}
           </div>
         )}
       </div>
@@ -4593,7 +5290,7 @@ export function storedGraphPositions(storageKey) {
   }
 }
 
-export function AgentGraph({ agents, auth, workspace = null, storageKey, onConnect, onDisconnect, onCreate, onEdit, run = null }) {
+export function AgentGraph({ agents, auth, workspace = null, storageKey, onConnect, onDisconnect, onCreate, onEdit, run = null, configurationBusy = false }) {
   const eligibleGraphAgents = agents
     .filter((agent) => !agent.document && !agent.resource_for_agent_id && agent.enabled !== false);
   const graphAgents = eligibleGraphAgents.slice(0, 25);
@@ -4675,6 +5372,12 @@ export function AgentGraph({ agents, auth, workspace = null, storageKey, onConne
     const frame = window.requestAnimationFrame(() => inspectorRef.current?.focus());
     return () => window.cancelAnimationFrame(frame);
   }, [connectMode, focusedId]);
+
+  useEffect(() => {
+    if (!configurationBusy) return;
+    setConnectMode(false);
+    setConnectFromId(null);
+  }, [configurationBusy]);
 
   useEffect(() => {
     if (typeof window === "undefined" || !storageKey) return;
@@ -4763,6 +5466,7 @@ export function AgentGraph({ agents, auth, workspace = null, storageKey, onConne
   }
 
   function toggleConnectMode() {
+    if (configurationBusy) return;
     setConnectMode((current) => !current);
     setConnectFromId(null);
     setGraphError("");
@@ -4786,6 +5490,10 @@ export function AgentGraph({ agents, auth, workspace = null, storageKey, onConne
     }
     if (!connectMode) {
       setFocusedId((current) => current === agent.id ? null : agent.id);
+      return;
+    }
+    if (configurationBusy) {
+      setGraphError("Wait for the current answer to finish before changing handoffs.");
       return;
     }
     if (!connectFromId) {
@@ -4826,7 +5534,7 @@ export function AgentGraph({ agents, auth, workspace = null, storageKey, onConne
   }
 
   async function removeConnection(edge) {
-    if (edge.kind !== "handoff" || connectionBusy) return;
+    if (edge.kind !== "handoff" || connectionBusy || configurationBusy) return;
     const target = eligibleGraphAgents.find((agent) => agent.id === edge.to);
     if (!canManageAgent(target, auth)) {
       setGraphError("You can remove handoffs only from specialists you can edit.");
@@ -4852,14 +5560,14 @@ export function AgentGraph({ agents, auth, workspace = null, storageKey, onConne
           <span className="graph-count">{graphAgents.length}{eligibleGraphAgents.length > graphAgents.length ? ` of ${eligibleGraphAgents.length}` : ""} {eligibleGraphAgents.length === 1 ? "specialist" : "specialists"} · {edges.length} {edges.length === 1 ? "handoff" : "handoffs"}</span>
         </div>
         <div className="graph-toolbar" aria-label="Graph tools">
-          <button type="button" className={connectMode ? "active" : ""} onClick={toggleConnectMode} disabled={auth?.is_viewer || graphAgents.length < 2 || connectionBusy}>
+          <button type="button" className={connectMode ? "active" : ""} onClick={toggleConnectMode} disabled={auth?.is_viewer || graphAgents.length < 2 || connectionBusy || configurationBusy} title={configurationBusy ? "Available when the current answer finishes" : undefined}>
             <Network size={15} />{connectMode ? "Cancel" : "Connect teammates"}
           </button>
           <button type="button" onClick={resetLayout} disabled={!graphAgents.length || connectionBusy}><RefreshCw size={15} />Auto-arrange</button>
         </div>
       </div>
       <div className={`graph-guidance ${connectMode ? "active" : ""}`} role="status" aria-live="polite">
-        <span>{connectMode ? connectFromId ? "Step 2 of 2 · Choose the teammate who receives the completed work." : "Step 1 of 2 · Choose the teammate who works first and sends the result." : "Drag teammates to organize the map. Select one to see who gives them work and where their result goes."}</span>
+        <span>{configurationBusy ? "This answer is using the current team. You can inspect or arrange the map now; handoff changes unlock when it finishes." : connectMode ? connectFromId ? "Step 2 of 2 · Choose the teammate who receives the completed work." : "Step 1 of 2 · Choose the teammate who works first and sends the result." : "Drag teammates to organize the map. Select one to see who gives them work and where their result goes."}</span>
         <span className="graph-scroll-hint">On a small screen, scroll the map sideways.</span>
         {connectFromId && <strong>From: {formatAgentName(connectFromId, agents)}</strong>}
         {graphError && <em>{graphError}</em>}
@@ -4941,7 +5649,7 @@ export function AgentGraph({ agents, auth, workspace = null, storageKey, onConne
             </button>
           );
         })}
-        {graphAgents.length === 0 && <div className="graph-empty"><span><Layers3 size={22} /></span><strong>Your team map is ready</strong><small>Add the first specialist, then connect work as your team grows.</small>{onCreate && <button type="button" onClick={onCreate} disabled={auth?.is_viewer}><Plus size={14} />Add a specialist</button>}</div>}
+        {graphAgents.length === 0 && <div className="graph-empty"><span><Layers3 size={22} /></span><strong>Your team map is ready</strong><small>Add the first specialist, then connect work as your team grows.</small>{onCreate && <button type="button" onClick={onCreate} disabled={auth?.is_viewer || configurationBusy}><Plus size={14} />Add a specialist</button>}</div>}
         </div>
         </div>
         {focusedAgent && !connectMode && (
@@ -4968,7 +5676,7 @@ export function AgentGraph({ agents, auth, workspace = null, storageKey, onConne
                 return (
                   <div key={`${edge.from}-${edge.to}-${edge.kind}`}>
                     <span><small>{relationship}</small><b>{formatAgentName(otherId, agents)}</b><i>{edge.kind === "handoff" ? "Handoff" : "Knowledge"}</i></span>
-                    {removable && <button type="button" onClick={() => removeConnection(edge)} disabled={connectionBusy} aria-label={`Remove connection with ${formatAgentName(otherId, agents)}`}><X size={13} /></button>}
+                    {removable && <button type="button" onClick={() => removeConnection(edge)} disabled={connectionBusy || configurationBusy} aria-label={`Remove connection with ${formatAgentName(otherId, agents)}`}><X size={13} /></button>}
                   </div>
                 );
               })}
@@ -4994,7 +5702,7 @@ export function AgentGraph({ agents, auth, workspace = null, storageKey, onConne
 export function MarketplacePanel({ items, auth, onOpen = () => undefined, onRate = () => undefined }) {
   const [query, setQuery] = useState("");
   const filtered = items.filter((item) =>
-    !query || `${item.title} ${item.description} ${item.capability} ${item.publisher_display_name || ""} ${item.published_by}`.toLowerCase().includes(query.toLowerCase())
+    !query || `${item.title} ${item.description} ${item.capability} ${item.publisher?.display_name || item.publisher_display_name || ""} ${item.publisher?.id || item.publisher_id || item.published_by || ""}`.toLowerCase().includes(query.toLowerCase())
   );
   return (
     <section className="resource-section marketplace-section" aria-labelledby="marketplace-heading">
@@ -5021,7 +5729,7 @@ export function MarketplacePanel({ items, auth, onOpen = () => undefined, onRate
               </span><ChevronRight size={15} /></header>
               <h4>{agentFacingText(item.title, "Community specialist")}</h4>
               <p>{agentFacingText(item.description || item.capability)}</p>
-              <small className="market-author">Published by {item.publisher_display_name || item.publisher?.user_id || item.published_by || "Virenis"}</small>
+              <small className="market-author">Published by {item.publisher?.display_name || item.publisher_display_name || item.publisher?.id || item.publisher_id || item.published_by || "Community publisher"}</small>
               {item.workspace_copy && <span className="market-copy-state"><Check size={12} />Copied as {item.workspace_copy.title || item.workspace_copy.name}</span>}
             </button>
             <footer>
@@ -5126,7 +5834,7 @@ export function MarketplaceWorkspaceAgentDetails({
     <>
       <div className="marketplace-detail-layout workspace-agent-detail-layout">
         <main className="marketplace-detail-content">
-          <button type="button" className="workspace-agent-detail-back" onClick={onBack}><ArrowLeft size={14} />Back to team</button>
+          <button type="button" className="workspace-agent-detail-back" data-autofocus onClick={onBack}><ArrowLeft size={14} />Back to team</button>
           <section className="builder-panel marketplace-detail-intro">
             <div className="builder-heading">
               <span>TEAM SPECIALIST</span>
@@ -5185,11 +5893,21 @@ export function MarketplaceWorkspaceAgentDetails({
   );
 }
 
+export function marketplaceDetailActionsDisabled({ loading, detailReady, detailError }) {
+  return Boolean(loading || !detailReady || detailError);
+}
+
+export function MarketplaceDetailFailure({ message, loading = false, onRetry = () => undefined }) {
+  if (!message) return null;
+  return <div className="marketplace-detail-failure" role="alert"><span><AlertCircle size={16} />{message}</span><button type="button" onClick={onRetry} disabled={loading}><RefreshCw size={14} />Retry details</button></div>;
+}
+
 export function MarketplaceAgentDialog({
   item,
   auth,
   agentWorkspaces = [],
   activeAgentWorkspaceId = "",
+  lockedAgentWorkspaceIds = [],
   onClose,
   onRate,
   onCopied,
@@ -5198,39 +5916,73 @@ export function MarketplaceAgentDialog({
 }) {
   const [detail, setDetail] = useState(item);
   const [loading, setLoading] = useState(true);
+  const [detailReady, setDetailReady] = useState(false);
+  const [detailError, setDetailError] = useState("");
+  const [detailAttempt, setDetailAttempt] = useState(0);
   const [copying, setCopying] = useState(false);
   const [error, setError] = useState("");
   const [targetWorkspaceId, setTargetWorkspaceId] = useState(activeAgentWorkspaceId);
   const [selectedWorkspaceAgent, setSelectedWorkspaceAgent] = useState(null);
+  const copySubmissionRef = useRef(null);
 
   useEffect(() => {
     let active = true;
     setLoading(true);
+    setDetailReady(false);
+    setDetailError("");
+    setError("");
     setSelectedWorkspaceAgent(null);
     api.get(`/api/marketplace/items/${encodeURIComponent(item.id)}`)
       .then((payload) => {
-        if (active) setDetail(payload);
+        if (!payload?.id || payload.id !== item.id || !payload.listing_id) {
+          throw new Error("Marketplace returned incomplete item details.");
+        }
+        if (active) {
+          setDetail(payload);
+          setDetailReady(true);
+          copySubmissionRef.current = null;
+        }
       })
       .catch((detailError) => {
-        if (active) setError(friendlyError(detailError));
+        if (active) setDetailError(friendlyError(detailError));
       })
       .finally(() => {
         if (active) setLoading(false);
-      });
+    });
     return () => { active = false; };
-  }, [item.id]);
+  }, [detailAttempt, item.id]);
 
   async function copyToWorkspace() {
-    if (copying) return;
+    if (copying || !detailReady || !detail.listing_id) return;
+    const targetId = detail.item_type === "agent" ? targetWorkspaceId || null : null;
+    if (targetId && lockedAgentWorkspaceIds.includes(targetId)) {
+      setError("That team is being used by the current answer. Choose another team or wait for it to finish.");
+      return;
+    }
     setCopying(true);
     setError("");
     try {
+      const submissionIdentity = `${detail.item_type || "agent"}:${detail.id}:${detail.listing_id}:${targetId || "new-team"}`;
+      if (copySubmissionRef.current?.identity !== submissionIdentity) {
+        copySubmissionRef.current = {
+          identity: submissionIdentity,
+          idempotencyKey: mutationIdempotencyKey("marketplace-copy")
+        };
+      }
       const result = await api.post(`/api/marketplace/items/${encodeURIComponent(item.id)}/copy`, {
-        ...(detail.item_type === "agent" && targetWorkspaceId ? { agent_workspace_id: targetWorkspaceId } : {})
-      });
+        listing_id: detail.listing_id,
+        ...(targetId ? { agent_workspace_id: targetId } : {})
+      }, { idempotencyKey: copySubmissionRef.current.idempotencyKey });
+      copySubmissionRef.current = null;
       await onCopied(result);
     } catch (copyError) {
-      setError(friendlyError(copyError));
+      if (copyError?.code === "marketplace_listing_changed" || copyError?.status === 404) {
+        setDetailReady(false);
+        setDetailError(friendlyError(copyError));
+        copySubmissionRef.current = null;
+      } else {
+        setError(friendlyError(copyError));
+      }
     } finally {
       setCopying(false);
     }
@@ -5239,7 +5991,7 @@ export function MarketplaceAgentDialog({
   const agent = detail.agent || {};
   const sharedWorkspace = detail.workspace || {};
   const workspaceListing = detail.item_type === "workspace";
-  const publisher = detail.publisher_display_name || detail.publisher?.user_id || detail.published_by || "Virenis";
+  const publisher = detail.publisher?.display_name || detail.publisher_display_name || detail.publisher?.id || detail.publisher_id || detail.published_by || "Community publisher";
   const exclusions = agent.exclusions || {};
   const tools = agent.tools || [];
   const consumes = agent.consumes || [];
@@ -5251,12 +6003,18 @@ export function MarketplaceAgentDialog({
     targetWorkspace
     && targetWorkspace.agent_count >= (targetWorkspace.max_agents || 16)
   );
+  const targetWorkspaceLocked = Boolean(
+    targetWorkspaceId
+    && lockedAgentWorkspaceIds.includes(targetWorkspaceId)
+  );
+  const sensitiveActionsDisabled = marketplaceDetailActionsDisabled({ loading, detailReady, detailError });
   if (workspaceListing) {
     const workspaceAgents = sharedWorkspace.agents || [];
     const workspaceEdges = sharedWorkspace.edges || [];
     if (selectedWorkspaceAgent) {
       return (
         <ModalSurface
+          key={`marketplace-workspace-agent-${selectedWorkspaceAgent.source_agent_id || "detail"}`}
           title={agentFacingText(selectedWorkspaceAgent.agent?.title, "Team specialist")}
           description={`Part of ${agentFacingText(detail.title, "Shared team")}`}
           onClose={onClose}
@@ -5276,6 +6034,7 @@ export function MarketplaceAgentDialog({
     }
     return (
       <ModalSurface
+        key="marketplace-workspace-overview"
         title={agentFacingText(detail.title, "Shared team")}
         description={`Published by ${publisher}`}
         onClose={onClose}
@@ -5284,6 +6043,7 @@ export function MarketplaceAgentDialog({
       >
         <div className="marketplace-detail-body workspace-marketplace-detail">
           {error && <div className="form-error" role="alert">{error}</div>}
+          <MarketplaceDetailFailure message={detailError} loading={loading} onRetry={() => setDetailAttempt((value) => value + 1)} />
           {loading && <div className="marketplace-detail-loading"><LoaderCircle className="spin" size={18} />Loading team details</div>}
           <section className="builder-panel marketplace-detail-intro">
             <div className="builder-heading"><span>SHARED TEAM</span><h3>{detail.description || sharedWorkspace.description}</h3><p>{workspaceAgents.length} coordinated specialist{workspaceAgents.length === 1 ? "" : "s"} · Published by <strong>{publisher}</strong>.</p></div>
@@ -5318,10 +6078,10 @@ export function MarketplaceAgentDialog({
             <button type="button" className="text-button ghost" onClick={onClose} disabled={copying}>Close</button>
             <span><Star size={14} fill="currentColor" /> {detail.rating_count ? `${detail.rating_average.toFixed(1)} (${detail.rating_count})` : "New"}</span>
             <div>
-              {detail.can_manage && <button type="button" className="text-button ghost" onClick={() => onEditDescription(detail)}><Pencil size={15} />Edit description</button>}
-              {detail.can_manage && <button type="button" className="text-button danger" onClick={() => onUnpublish(detail)}><Globe2 size={15} />Unpublish</button>}
-              {!detail.is_self_published && <button type="button" className="text-button ghost" onClick={() => onRate(detail)} disabled={auth?.is_viewer}><Star size={15} />{detail.my_rating ? "Update rating" : "Rate"}</button>}
-              <button type="button" className="text-button primary" onClick={copyToWorkspace} disabled={auth?.is_viewer || loading || copying}>{copying ? <LoaderCircle className="spin" size={16} /> : <Copy size={16} />}{copying ? "Adding team" : "Add this team"}</button>
+              {detail.can_manage && <button type="button" className="text-button ghost" onClick={() => onEditDescription(detail)} disabled={sensitiveActionsDisabled}><Pencil size={15} />Edit description</button>}
+              {detail.can_manage && <button type="button" className="text-button danger" onClick={() => onUnpublish(detail)} disabled={sensitiveActionsDisabled}><Globe2 size={15} />Unpublish</button>}
+              {!detail.is_self_published && <button type="button" className="text-button ghost" onClick={() => onRate(detail)} disabled={auth?.is_viewer || sensitiveActionsDisabled}><Star size={15} />{detail.my_rating ? "Update rating" : "Rate"}</button>}
+              <button type="button" className="text-button primary" onClick={copyToWorkspace} disabled={auth?.is_viewer || sensitiveActionsDisabled || copying}>{copying ? <LoaderCircle className="spin" size={16} /> : <Copy size={16} />}{copying ? "Adding team" : "Add this team"}</button>
             </div>
           </footer>
         </div>
@@ -5338,6 +6098,7 @@ export function MarketplaceAgentDialog({
     >
       <div className="marketplace-detail-body">
         {error && <div className="form-error" role="alert">{error}</div>}
+        <MarketplaceDetailFailure message={detailError} loading={loading} onRetry={() => setDetailAttempt((value) => value + 1)} />
           {loading && <div className="marketplace-detail-loading"><LoaderCircle className="spin" size={18} />Loading specialist details</div>}
         <div className="marketplace-detail-layout">
           <main className="marketplace-detail-content">
@@ -5396,14 +6157,14 @@ export function MarketplaceAgentDialog({
           <button type="button" className="text-button ghost" onClick={onClose} disabled={copying}>Close</button>
           <span>Published by {publisher}</span>
           <div>
-            {detail.can_manage && <button type="button" className="text-button ghost marketplace-edit-action" onClick={() => onEditDescription(detail)} disabled={loading}><Pencil size={15} />Edit description</button>}
-            {detail.can_manage && <button type="button" className="text-button danger marketplace-unpublish-action" onClick={() => onUnpublish(detail)} disabled={loading}><Globe2 size={15} />Unpublish</button>}
-            {!detail.is_self_published && <button type="button" className="text-button ghost marketplace-rate-action" onClick={() => onRate(detail)} disabled={auth?.is_viewer || loading}><Star size={15} />{detail.my_rating ? "Update rating" : "Rate"}</button>}
+            {detail.can_manage && <button type="button" className="text-button ghost marketplace-edit-action" onClick={() => onEditDescription(detail)} disabled={sensitiveActionsDisabled}><Pencil size={15} />Edit description</button>}
+            {detail.can_manage && <button type="button" className="text-button danger marketplace-unpublish-action" onClick={() => onUnpublish(detail)} disabled={sensitiveActionsDisabled}><Globe2 size={15} />Unpublish</button>}
+            {!detail.is_self_published && <button type="button" className="text-button ghost marketplace-rate-action" onClick={() => onRate(detail)} disabled={auth?.is_viewer || sensitiveActionsDisabled}><Star size={15} />{detail.my_rating ? "Update rating" : "Rate"}</button>}
             {detail.is_self_published && <span className="market-own-listing"><Check size={12} />Your listing</span>}
             {!detail.is_self_published && agentWorkspaces.length > 0 && (
-              <label className="marketplace-copy-target"><span>Add to team</span><select value={targetWorkspaceId} onChange={(event) => setTargetWorkspaceId(event.target.value)}>{agentWorkspaces.map((workspace) => <option value={workspace.agent_workspace_id} key={workspace.agent_workspace_id}>{workspace.name} · {workspace.agent_count} specialist{workspace.agent_count === 1 ? "" : "s"}</option>)}</select></label>
+              <label className="marketplace-copy-target"><span>Add to team</span><select value={targetWorkspaceId} onChange={(event) => setTargetWorkspaceId(event.target.value)} disabled={copying}>{agentWorkspaces.map((workspace) => <option value={workspace.agent_workspace_id} key={workspace.agent_workspace_id}>{workspace.name} · {workspace.agent_count} specialist{workspace.agent_count === 1 ? "" : "s"}{lockedAgentWorkspaceIds.includes(workspace.agent_workspace_id) ? " · in use" : ""}</option>)}</select></label>
             )}
-            <button type="button" className="text-button primary" onClick={copyToWorkspace} disabled={auth?.is_viewer || loading || copying || targetWorkspaceFull}>{copying ? <LoaderCircle className="spin" size={16} /> : <Copy size={16} />}{targetWorkspaceFull ? "Team is full" : copying ? "Adding" : detail.workspace_copy ? "Add another copy" : "Add to my team"}</button>
+            <button type="button" className="text-button primary" onClick={copyToWorkspace} disabled={auth?.is_viewer || sensitiveActionsDisabled || copying || targetWorkspaceFull || targetWorkspaceLocked}>{copying ? <LoaderCircle className="spin" size={16} /> : <Copy size={16} />}{targetWorkspaceFull ? "Team is full" : targetWorkspaceLocked ? "Team is in use" : copying ? "Adding" : detail.workspace_copy ? "Add another copy" : "Add to my team"}</button>
           </div>
         </footer>
       </div>
@@ -5740,10 +6501,18 @@ function AdminPanel({ runtime, metrics, agents, documents, onRefresh }) {
     try {
       const queued = await api.post("/api/admin/validation/run", { suite: "mock_smoke", case_filter: "patient_newsletter_faq" });
       let result = queued;
-      for (let attempt = 0; attempt < 20; attempt += 1) {
+      const deadline = Date.now() + 30_000;
+      for (let attempt = 0; Date.now() < deadline; attempt += 1) {
         result = await api.get(`/api/admin/validation/runs/${queued.validation_run_id}`);
         if (["completed", "failed"].includes(result.status)) break;
-        await new Promise((resolve) => setTimeout(resolve, 100));
+        await new Promise((resolve) => setTimeout(resolve, Math.min(1_500, 250 * (attempt + 1))));
+      }
+      if (!["completed", "failed"].includes(result.status)) {
+        result = {
+          ...result,
+          status: "timed_out",
+          message: "The check is still running. Refresh status before starting another check."
+        };
       }
       setCheckResult(result);
       await onRefresh();
@@ -6570,7 +7339,7 @@ function createAgentForm(agent) {
   };
 }
 
-function AgentDialog({ auth, runtime, agent, agents, documents, mcpConnections = [], agentWorkspaceId = null, teamName = "General team", onClose, onSaved }) {
+function AgentDialog({ auth, runtime, agent, agents, documents, mcpConnections = [], agentWorkspaceId = null, teamName = "General team", configurationBusy = false, onClose, onSaved }) {
   const editing = Boolean(agent);
   const [form, setForm] = useState(() => createAgentForm(agent));
   const [step, setStep] = useState(0);
@@ -6612,6 +7381,8 @@ function AgentDialog({ auth, runtime, agent, agents, documents, mcpConnections =
 
   function toggleTool(option) {
     const selected = option.values.every((value) => form.tools.includes(value));
+    const unavailable = option.values.some((value) => runtime?.tool_readiness?.[value]?.available === false);
+    if (unavailable && !selected) return;
     setForm((current) => {
       const values = new Set(current.tools);
       for (const value of option.values) {
@@ -6644,6 +7415,8 @@ function AgentDialog({ auth, runtime, agent, agents, documents, mcpConnections =
   }
 
   function applyTemplate(template) {
+    const templateTools = template.tools.filter((tool) => runtime?.tool_readiness?.[tool]?.available !== false);
+    const skippedTools = template.tools.filter((tool) => !templateTools.includes(tool));
     setTemplateUndo({
       capability: form.capability,
       tools: form.tools,
@@ -6653,10 +7426,13 @@ function AgentDialog({ auth, runtime, agent, agents, documents, mcpConnections =
     setForm((current) => ({
       ...current,
       capability: template.capability,
-      tools: [...template.tools],
+      tools: templateTools,
       consumes: [...new Set(["user_request", ...template.consumes])],
       produces: [...template.produces]
     }));
+    setError(skippedTools.length
+      ? "This starter role was applied without an unavailable ability. Ask an administrator to finish that tool's setup before adding it."
+      : "");
   }
 
   function undoTemplate() {
@@ -6717,6 +7493,10 @@ function AgentDialog({ auth, runtime, agent, agents, documents, mcpConnections =
     if (unavailableCollaboratorTokens.length) {
       setStep(1);
       setError("Remove unavailable teammate handoffs before saving this specialist.");
+      return;
+    }
+    if (configurationBusy) {
+      setError("This answer is using the current team. Keep drafting here and save when the answer finishes.");
       return;
     }
     setBusy(true);
@@ -6789,6 +7569,7 @@ function AgentDialog({ auth, runtime, agent, agents, documents, mcpConnections =
       className="agent-builder-dialog"
     >
       <form className="agent-builder" onSubmit={submit}>
+        {configurationBusy && <div className="agent-workspace-lock" role="status"><Clock3 size={14} />This answer is using the current team. You can review this profile now and save after it finishes.</div>}
         <nav className="builder-steps" aria-label="Specialist setup progress">
           {steps.map((item, index) => (
             <button
@@ -6876,7 +7657,7 @@ function AgentDialog({ auth, runtime, agent, agents, documents, mcpConnections =
                       const detail = unavailable?.message || setupRequired?.message || option.detail;
                       return (
                         <label className={[selected ? "selected" : "", unavailable ? "setup-needed" : ""].filter(Boolean).join(" ")} key={option.id}>
-                          <input type="checkbox" checked={selected} onChange={() => toggleTool(option)} />
+                          <input type="checkbox" checked={selected} disabled={Boolean(unavailable && !selected)} onChange={() => toggleTool(option)} />
                           <Icon size={18} />
                           <span><strong>{option.title}</strong><small>{detail}</small></span>
                           <i>{selected && <Check size={13} />}</i>
@@ -7062,7 +7843,7 @@ function AgentDialog({ auth, runtime, agent, agents, documents, mcpConnections =
             {step === 0 ? "Cancel" : <><ArrowLeft size={15} /> Back</>}
           </button>
           <span>Step {step + 1} of 3</span>
-          <button type="submit" className="text-button primary" disabled={busy || !canContinue}>
+          <button type="submit" className="text-button primary" disabled={busy || !canContinue || (configurationBusy && step === 2)}>
             {busy ? <LoaderCircle className="spin" size={16} /> : step < 2 ? <ArrowRight size={16} /> : editing ? <Check size={16} /> : <Plus size={16} />}
             {busy ? uploadProgress || "Saving" : step < 2 ? "Continue" : editing ? "Save changes" : "Add to team"}
           </button>
@@ -7077,6 +7858,7 @@ function AdoptionDialog({ auth, agent, onClose, onSaved }) {
   const [visibility, setVisibility] = useState("private");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const submissionRef = useRef(null);
 
   async function submit(event) {
     event.preventDefault();
@@ -7084,10 +7866,18 @@ function AdoptionDialog({ auth, agent, onClose, onSaved }) {
     setBusy(true);
     setError("");
     try {
+      const identity = `${agent.id}:${owner.trim()}:${visibility}`;
+      if (submissionRef.current?.identity !== identity) {
+        submissionRef.current = {
+          identity,
+          idempotencyKey: mutationIdempotencyKey("runtime-adoption")
+        };
+      }
       await api.post(`/api/admin/runtime-agents/${encodeURIComponent(agent.id)}/adopt`, {
         created_by: owner.trim(),
         visibility
-      });
+      }, { idempotencyKey: submissionRef.current.idempotencyKey });
+      submissionRef.current = null;
       await onSaved();
     } catch (adoptionError) {
       setError(friendlyError(adoptionError));

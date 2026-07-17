@@ -44,8 +44,23 @@ Agent workspaces can be published, described, rated, unpublished, and copied.
 The listing snapshot includes at most 16 sanitized agent contracts and the
 handoffs between them. It excludes source text, uploaded/private knowledge,
 credentials, MCP bindings, and live connection identifiers. Copying creates an
-independent workspace, independent agents, and remapped handoffs. Self-ratings
-are rejected, and only the publisher can edit or unpublish the listing.
+independent workspace, independent agents, and remapped handoffs.
+
+Published agent and workspace snapshots are immutable. Posting a new
+`description` to an already-published item edits only its marketing description;
+it preserves the listing id, executable snapshot, and ratings. To publish
+changed agent behavior or changed workspace membership, the owner must send
+`new_revision: true` to the same publish route. That creates a fresh listing id
+from the current sanitized contracts, retires the prior listing's ratings, and
+starts with no ratings. Republishing an item after it was unpublished also
+creates a fresh listing automatically.
+
+Self-ratings are rejected by publisher `user_id`, regardless of which workspace
+the user currently selected. Legacy self-ratings are excluded from summaries
+and removed during store normalization. Only the publisher can edit or
+unpublish a workspace listing. Agent listing mutations may also be performed by
+an administrator in that same tenant; cross-tenant support visibility remains
+read-only on ordinary resource routes.
 
 ## API summary
 

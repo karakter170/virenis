@@ -11,6 +11,7 @@ const DEFAULT_PROMPT_CREDITS_PER_1K = "0.10";
 const DEFAULT_COMPLETION_CREDITS_PER_1K = "0.20";
 const DEFAULT_CACHED_CREDITS_PER_1K = "0.02";
 const DEFAULT_MINIMUM_RESERVATION_CREDITS = "0.10";
+const ACTIVE_CHAT_RESERVATION_KINDS = new Set(["chat", "workflow_composition"]);
 
 export class BillingError extends Error {
   constructor(status, code, message, details = null) {
@@ -232,6 +233,7 @@ export function reserveRunCredits(data, { run, actor, options = {}, kind = "chat
     attachReservationToRun(run, existing, account);
     return existing;
   }
+  assertActiveRunCapacity(data, account, kind);
   const pricing = activePricingVersion(data);
   const estimated = estimateReservation(pricing, options, kind);
   if (account.available_micros < estimated.amount_micros) {
@@ -270,6 +272,43 @@ export function reserveRunCredits(data, { run, actor, options = {}, kind = "chat
   data.billingReservations.push(reservation);
   attachReservationToRun(run, reservation, account);
   return reservation;
+}
+
+function assertActiveRunCapacity(data, account, kind) {
+  if (!ACTIVE_CHAT_RESERVATION_KINDS.has(kind)) return;
+  const active = (data.billingReservations || []).filter((reservation) => (
+    reservation?.status === "active"
+    && ACTIVE_CHAT_RESERVATION_KINDS.has(reservation.kind)
+  ));
+  const perUserLimit = boundedEnvInteger("APP_MAX_ACTIVE_RUNS_PER_USER", 2, 1, 100);
+  const perWorkspaceLimit = boundedEnvInteger("APP_MAX_ACTIVE_RUNS_PER_WORKSPACE", 8, 1, 1_000);
+  const globalLimit = boundedEnvInteger("APP_MAX_ACTIVE_RUNS_GLOBAL", 16, 1, 10_000);
+  const userActive = active.filter((reservation) => reservation.user_id === account.user_id).length;
+  const workspaceActive = active.filter((reservation) => reservation.workspace_id === account.workspace_id).length;
+  if (userActive >= perUserLimit) {
+    throw new BillingError(
+      429,
+      "active_run_limit_reached",
+      "You already have the maximum number of active requests. Wait for one to finish, then try again.",
+      { scope: "user", limit: perUserLimit }
+    );
+  }
+  if (workspaceActive >= perWorkspaceLimit) {
+    throw new BillingError(
+      429,
+      "active_run_limit_reached",
+      "This workspace is at its active-request limit. Wait for a request to finish, then try again.",
+      { scope: "workspace", limit: perWorkspaceLimit }
+    );
+  }
+  if (active.length >= globalLimit) {
+    throw new BillingError(
+      503,
+      "active_run_capacity_reached",
+      "The model service is at capacity. Wait a moment, then try again.",
+      { scope: "service", limit: globalLimit }
+    );
+  }
 }
 
 export function settleRunCredits(data, run, rawTokenAccounting) {

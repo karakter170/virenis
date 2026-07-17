@@ -96,18 +96,15 @@ describe("Clerk identity UI", () => {
     expect(markup).not.toContain("Current password");
   });
 
-  it("renders Clerk-aware administrator controls without manual verification", () => {
+  it("does not expose mutable administrator defaults before authoritative settings load", () => {
     const markup = renderToStaticMarkup(React.createElement(AdminUsersPanel));
     expect(markup).toContain("Registered users");
     expect(markup).toContain("Assign product roles");
     expect(markup).toContain("Clerk manages identity verification");
-    expect(markup).toContain("No Clerk users have signed up yet");
-    expect(markup).toContain("Token pricing");
-    expect(markup).toContain("Save pricing");
-    expect(markup).toContain("Model output limits");
-    expect(markup).toContain("Each agent");
-    expect(markup).toContain("Final answer");
-    expect(markup).toContain("Save limits");
+    expect(markup).toContain("Loading authoritative account and model settings");
+    expect(markup).not.toContain("No Clerk users have signed up yet");
+    expect(markup).not.toContain("Save pricing");
+    expect(markup).not.toContain("Save limits");
     expect(markup).not.toContain(">Verify<");
   });
 });

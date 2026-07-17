@@ -69,6 +69,8 @@ function RoutingDemo() {
 
 export default function LandingPage({ isSignedIn = false, onSignIn, onSignUp, onWorkspace }) {
   const onEnter = isSignedIn ? onWorkspace : onSignUp;
+  const privacyPolicyUrl = String(import.meta.env.VITE_PRIVACY_POLICY_URL || "").trim();
+  const termsOfServiceUrl = String(import.meta.env.VITE_TERMS_OF_SERVICE_URL || "").trim();
   return (
     <div className="landing-page">
       <header className="landing-header">
@@ -238,7 +240,15 @@ export default function LandingPage({ isSignedIn = false, onSignIn, onSignUp, on
 
       <footer className="landing-footer">
         <span>Virenis</span>
-        <p>The right specialists. One clear answer.</p>
+        <div className="landing-footer-meta">
+          <p>The right specialists. One clear answer.</p>
+          {(privacyPolicyUrl || termsOfServiceUrl) && (
+            <nav aria-label="Legal information">
+              {privacyPolicyUrl && <a href={privacyPolicyUrl}>Privacy</a>}
+              {termsOfServiceUrl && <a href={termsOfServiceUrl}>Terms</a>}
+            </nav>
+          )}
+        </div>
         <button type="button" onClick={onEnter}>{isSignedIn ? "Open my team" : "Build my team"} <ArrowUpRight size={14} /></button>
       </footer>
     </div>

@@ -9,7 +9,9 @@ import { createApp } from "../server/app.js";
 
 const TOKENS = {
   workspace_alice: { user_id: "alice", workspace_id: "tenant_shared", role: "user" },
-  workspace_bob: { user_id: "bob", workspace_id: "tenant_shared", role: "user" }
+  workspace_bob: { user_id: "bob", workspace_id: "tenant_shared", role: "user" },
+  workspace_alice_other: { user_id: "alice", workspace_id: "tenant_other", role: "user" },
+  workspace_bob_other: { user_id: "bob", workspace_id: "tenant_bob_other", role: "user" }
 };
 
 let app;
@@ -349,6 +351,153 @@ describe("agent workspaces", () => {
     expect(sessionDetail.body.messages.filter((message) => message.role === "user")).toHaveLength(2);
   });
 
+  it("freezes only execution-affecting team inputs while an answer is active", async () => {
+    const activeWorkspace = await createWorkspace("Active answer team");
+    const unrelatedWorkspace = await createWorkspace("Unrelated team");
+    await createAgent({ id: "active_answer_specialist", workspaceId: activeWorkspace.agent_workspace_id });
+    await createAgent({ id: "unrelated_specialist", workspaceId: unrelatedWorkspace.agent_workspace_id });
+    const session = await createSession(activeWorkspace.agent_workspace_id);
+    await app.locals.store.mutate((data) => {
+      data.runs.push({
+        run_id: "run_execution_input_lock",
+        session_id: session.session_id,
+        workspace_id: "tenant_shared",
+        agent_workspace_id: activeWorkspace.agent_workspace_id,
+        created_by: "alice",
+        status: "running",
+        requested_agent_ids: [],
+        created_at: new Date().toISOString()
+      });
+    });
+
+    const lockedRequests = [
+      request(app)
+        .patch(`/api/chat/sessions/${session.session_id}/agent-workspace`)
+        .set("Authorization", as("alice"))
+        .send({ agent_workspace_id: unrelatedWorkspace.agent_workspace_id }),
+      request(app)
+        .patch(`/api/chat/sessions/${session.session_id}/agents/active_answer_specialist`)
+        .set("Authorization", as("alice"))
+        .send({ active: false }),
+      request(app)
+        .patch(`/api/agent-workspaces/${activeWorkspace.agent_workspace_id}`)
+        .set("Authorization", as("alice"))
+        .send({ agent_ids: [] }),
+      request(app)
+        .patch("/api/agents/active_answer_specialist")
+        .set("Authorization", as("alice"))
+        .send({ consumes: ["user_request", "agent:unrelated_specialist:output"] }),
+      request(app)
+        .delete(`/api/agent-workspaces/${activeWorkspace.agent_workspace_id}`)
+        .set("Authorization", as("alice"))
+    ];
+    for (const pendingRequest of lockedRequests) {
+      const response = await pendingRequest.expect(409);
+      expect(response.body).toMatchObject({ error: "execution_inputs_locked" });
+    }
+    await request(app)
+      .post("/api/agents")
+      .set("Authorization", as("alice"))
+      .send({
+        id: "late_active_team_specialist",
+        title: "Late specialist",
+        capability: "Would otherwise change the Router's active candidate set.",
+        boundary: "Work only on the declared task.",
+        consumes: ["user_request"],
+        produces: ["answer"],
+        routing_cues: ["late specialist"],
+        tools: [],
+        agent_workspace_id: activeWorkspace.agent_workspace_id
+      })
+      .expect(409)
+      .expect((response) => expect(response.body.error).toBe("execution_inputs_locked"));
+
+    const publication = await request(app)
+      .post("/api/marketplace/items/unrelated_specialist")
+      .set("Authorization", as("alice"))
+      .send({ description: "An unrelated specialist that may be copied." })
+      .expect(201);
+    await request(app)
+      .post("/api/marketplace/items/unrelated_specialist/copy")
+      .set("Authorization", as("alice"))
+      .set("Idempotency-Key", "copy-into-active-team-0001")
+      .send({
+        listing_id: publication.body.listing_id,
+        agent_workspace_id: activeWorkspace.agent_workspace_id
+      })
+      .expect(409)
+      .expect((response) => expect(response.body.error).toBe("execution_inputs_locked"));
+
+    await request(app)
+      .patch(`/api/agent-workspaces/${activeWorkspace.agent_workspace_id}`)
+      .set("Authorization", as("alice"))
+      .send({ description: "Harmless description update while the answer runs." })
+      .expect(200);
+    await request(app)
+      .patch("/api/agents/unrelated_specialist")
+      .set("Authorization", as("alice"))
+      .send({ boundary: "This unrelated team can still be maintained." })
+      .expect(200);
+    await request(app)
+      .patch(`/api/agent-workspaces/${unrelatedWorkspace.agent_workspace_id}`)
+      .set("Authorization", as("alice"))
+      .send({ agent_ids: ["unrelated_specialist"] })
+      .expect(200);
+
+    await app.locals.store.mutate((data) => {
+      data.runs.find((run) => run.run_id === "run_execution_input_lock").status = "completed";
+    });
+    await request(app)
+      .patch(`/api/chat/sessions/${session.session_id}/agent-workspace`)
+      .set("Authorization", as("alice"))
+      .send({ agent_workspace_id: unrelatedWorkspace.agent_workspace_id })
+      .expect(200);
+  });
+
+  it("does not start an answer inside a team mutation transaction window", async () => {
+    const workspace = await createWorkspace("Serialized setup team");
+    await createAgent({ id: "serialized_setup_specialist", workspaceId: workspace.agent_workspace_id });
+    const session = await createSession(workspace.agent_workspace_id);
+    await app.locals.store.mutate((data) => {
+      const target = data.agentWorkspaces.find((item) => item.agent_workspace_id === workspace.agent_workspace_id);
+      target.reservations.push({
+        reservation_id: "reservation_inflight_setup",
+        count: 1,
+        expires_at: new Date(Date.now() + 60_000).toISOString()
+      });
+    });
+
+    await request(app)
+      .post(`/api/chat/sessions/${session.session_id}/messages`)
+      .set("Authorization", as("alice"))
+      .send({ content: "Do not start until the team mutation commits." })
+      .expect(409)
+      .expect((response) => expect(response.body.error).toBe("execution_inputs_updating"));
+    expect(app.locals.store.read().runs.some((run) => run.query?.includes("team mutation commits"))).toBe(false);
+
+    await app.locals.store.mutate((data) => {
+      const target = data.agentWorkspaces.find((item) => item.agent_workspace_id === workspace.agent_workspace_id);
+      target.reservations = [];
+      data.agents.find((agent) => agent.id === "serialized_setup_specialist").runtime_sync_pending = true;
+    });
+    await request(app)
+      .post(`/api/chat/sessions/${session.session_id}/messages`)
+      .set("Authorization", as("alice"))
+      .send({ content: "Do not start while a specialist contract is syncing." })
+      .expect(409)
+      .expect((response) => expect(response.body.error).toBe("execution_inputs_updating"));
+
+    await app.locals.store.mutate((data) => {
+      delete data.agents.find((agent) => agent.id === "serialized_setup_specialist").runtime_sync_pending;
+    });
+    const accepted = await request(app)
+      .post(`/api/chat/sessions/${session.session_id}/messages`)
+      .set("Authorization", as("alice"))
+      .send({ content: "Start after the team inputs are stable." })
+      .expect(202);
+    expect((await waitForRun(accepted.body.run_id)).status).toBe("completed");
+  });
+
   it("executes approved workflow specialists from metadata without exposing their IDs in chat", async () => {
     const workspace = await createWorkspace("Support workflow team");
     await createAgent({ id: "workflow_mail_reader", workspaceId: workspace.agent_workspace_id });
@@ -463,6 +612,24 @@ describe("agent workspaces", () => {
       .set("Authorization", as("alice"))
       .send({ score: 5 })
       .expect(403);
+    await request(app)
+      .post(`/api/marketplace/items/${workspace.agent_workspace_id}/ratings`)
+      .set("Authorization", "Bearer workspace_alice_other")
+      .send({ score: 5 })
+      .expect(403);
+
+    await app.locals.store.mutate((data) => {
+      data.agentWorkspaceRatings.push({
+        rating_id: "rating_legacy_workspace_self",
+        listing_id: publication.body.listing_id,
+        agent_workspace_id: workspace.agent_workspace_id,
+        workspace_id: "tenant_other",
+        created_by: "alice",
+        score: 5,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      });
+    });
 
     const detail = await request(app)
       .get(`/api/marketplace/items/${workspace.agent_workspace_id}`)
@@ -473,6 +640,7 @@ describe("agent workspaces", () => {
       agents: expect.any(Array),
       edges: [{ from: "private_draft_writer", to: "private_draft_reviewer", label: "handoff" }]
     });
+    expect(detail.body).toMatchObject({ rating_average: 0, rating_count: 0 });
     const publishedWriter = detail.body.workspace.agents.find((entry) => entry.source_agent_id === "private_draft_writer").agent;
     expect(publishedWriter).toMatchObject({
       title: "private draft writer",
@@ -497,8 +665,29 @@ describe("agent workspaces", () => {
     const copied = await request(app)
       .post(`/api/marketplace/items/${workspace.agent_workspace_id}/copy`)
       .set("Authorization", as("bob"))
-      .send({})
+      .set("Idempotency-Key", "workspace-copy-editorial-0001")
+      .send({ listing_id: detail.body.listing_id })
       .expect(201);
+    expect(copied.body.duplicate).toBe(false);
+    const replayedCopy = await request(app)
+      .post(`/api/marketplace/items/${workspace.agent_workspace_id}/copy`)
+      .set("Authorization", as("bob"))
+      .set("Idempotency-Key", "workspace-copy-editorial-0001")
+      .send({ listing_id: detail.body.listing_id })
+      .expect(200);
+    expect(replayedCopy.body).toMatchObject({
+      duplicate: true,
+      agent_workspace: {
+        agent_workspace_id: copied.body.agent_workspace.agent_workspace_id
+      }
+    });
+    await request(app)
+      .post(`/api/marketplace/items/${workspace.agent_workspace_id}/copy`)
+      .set("Authorization", as("bob"))
+      .set("Idempotency-Key", "workspace-copy-editorial-0001")
+      .send({ listing_id: detail.body.listing_id, id: "different-request" })
+      .expect(409)
+      .expect((response) => expect(response.body.error).toBe("idempotency_conflict"));
     expect(copied.body.agent_workspace).toMatchObject({ agent_count: 2, max_agents: 16 });
     const copiedDetail = await request(app)
       .get(`/api/agent-workspaces/${copied.body.agent_workspace.agent_workspace_id}`)
@@ -512,6 +701,222 @@ describe("agent workspaces", () => {
     const remappedSource = reviewer.consumes.find((input) => input.startsWith("agent:")).split(":")[1];
     expect(copiedIds.has(remappedSource)).toBe(true);
     expect(remappedSource).not.toBe("private_draft_writer");
+
+    await request(app)
+      .patch("/api/agents/private_draft_writer")
+      .set("Authorization", as("alice"))
+      .send({ capability: "Creates concise drafts and structured editorial outlines." })
+      .expect(200);
+    await request(app)
+      .patch(`/api/agent-workspaces/${workspace.agent_workspace_id}`)
+      .set("Authorization", as("alice"))
+      .send({ agent_ids: ["private_draft_writer"] })
+      .expect(200);
+
+    const descriptionOnly = await request(app)
+      .post(`/api/marketplace/items/${workspace.agent_workspace_id}`)
+      .set("Authorization", as("alice"))
+      .send({ description: "An updated description for the editorial team." })
+      .expect(200);
+    expect(descriptionOnly.body).toMatchObject({
+      listing_id: publication.body.listing_id,
+      agent_count: 2,
+      rating_average: 4,
+      rating_count: 1
+    });
+    const stillFrozen = await request(app)
+      .get(`/api/marketplace/items/${workspace.agent_workspace_id}`)
+      .set("Authorization", as("bob"))
+      .expect(200);
+    expect(stillFrozen.body.workspace.agents).toHaveLength(2);
+    expect(stillFrozen.body.workspace.agents
+      .find((entry) => entry.source_agent_id === "private_draft_writer").agent.capability)
+      .toContain("private_draft_writer specialty");
+
+    const revised = await request(app)
+      .post(`/api/marketplace/items/${workspace.agent_workspace_id}`)
+      .set("Authorization", as("alice"))
+      .send({
+        description: "A revised single-agent editorial drafting workspace.",
+        new_revision: true
+      })
+      .expect(200);
+    expect(revised.body.listing_id).not.toBe(publication.body.listing_id);
+    expect(revised.body).toMatchObject({ agent_count: 1, rating_average: 0, rating_count: 0 });
+    expect(app.locals.store.read().agentWorkspaceRatings
+      .some((ratingEntry) => ratingEntry.listing_id === publication.body.listing_id)).toBe(false);
+    const revisedDetail = await request(app)
+      .get(`/api/marketplace/items/${workspace.agent_workspace_id}`)
+      .set("Authorization", as("bob"))
+      .expect(200);
+    expect(revisedDetail.body.workspace.agents).toHaveLength(1);
+    expect(revisedDetail.body.workspace.agents[0].agent.capability)
+      .toBe("Creates concise drafts and structured editorial outlines.");
+  });
+
+  it("preserves configured handoffs with hyphenated agent ids in a published workspace", async () => {
+    const workspace = await createWorkspace("Hyphenated handoff team");
+    await app.locals.store.mutate((data) => {
+      const createdAt = new Date().toISOString();
+      data.agents.push(
+        {
+          id: "source-agent",
+          title: "Source Agent",
+          capability: "Prepares approved source material.",
+          boundary: "Use only approved material.",
+          consumes: ["user_request"],
+          produces: ["source_output"],
+          routing_cues: ["source material"],
+          workspace_id: "tenant_shared",
+          created_by: "alice",
+          visibility: "private",
+          enabled: true,
+          mounted: true,
+          created_at: createdAt,
+          updated_at: createdAt
+        },
+        {
+          id: "reply-writer",
+          title: "Reply Writer",
+          capability: "Turns approved source material into a reply.",
+          boundary: "Do not invent missing facts.",
+          consumes: ["user_request", "agent:source-agent:output"],
+          produces: ["reply"],
+          routing_cues: ["write reply"],
+          workspace_id: "tenant_shared",
+          created_by: "alice",
+          visibility: "private",
+          enabled: true,
+          mounted: true,
+          created_at: createdAt,
+          updated_at: createdAt
+        }
+      );
+      const mutableWorkspace = data.agentWorkspaces.find((item) => (
+        item.agent_workspace_id === workspace.agent_workspace_id
+      ));
+      mutableWorkspace.agent_ids = ["source-agent", "reply-writer"];
+    });
+
+    await request(app)
+      .post(`/api/marketplace/items/${workspace.agent_workspace_id}`)
+      .set("Authorization", as("alice"))
+      .send({ item_type: "workspace", description: "A source and reply team." })
+      .expect(201);
+
+    const detail = await request(app)
+      .get(`/api/marketplace/items/${workspace.agent_workspace_id}`)
+      .set("Authorization", as("bob"))
+      .expect(200);
+    expect(detail.body.workspace.edges).toEqual([
+      { from: "source-agent", to: "reply-writer", label: "handoff" }
+    ]);
+
+    await request(app)
+      .post("/api/marketplace/items/reply-writer")
+      .set("Authorization", as("alice"))
+      .send({ item_type: "agent", description: "Writes a reply from an upstream source." })
+      .expect(201);
+    const standaloneDetail = await request(app)
+      .get("/api/marketplace/items/reply-writer")
+      .set("Authorization", as("bob"))
+      .expect(200);
+    expect(standaloneDetail.body.agent.consumes).toEqual(["user_request"]);
+    expect(standaloneDetail.body.agent.exclusions.agent_connections).toBe(true);
+  });
+
+  it("uses public user identity for workspace ratings and repairs legacy cross-workspace duplicates", async () => {
+    const workspace = await createWorkspace("Public rating identity team");
+    await createAgent({ id: "public_rating_identity_agent", workspaceId: workspace.agent_workspace_id });
+    const publication = await request(app)
+      .post(`/api/marketplace/items/${workspace.agent_workspace_id}`)
+      .set("Authorization", as("alice"))
+      .send({ item_type: "workspace", description: "A workspace used to verify public rating identity." })
+      .expect(201);
+
+    await request(app)
+      .post(`/api/marketplace/items/${workspace.agent_workspace_id}/ratings`)
+      .set("Authorization", as("bob"))
+      .send({ score: 4 })
+      .expect(201);
+    const crossWorkspaceUpdate = await request(app)
+      .post(`/api/marketplace/items/${workspace.agent_workspace_id}/ratings`)
+      .set("Authorization", as("bob_other"))
+      .send({ score: 2 })
+      .expect(200);
+    expect(crossWorkspaceUpdate.body).toMatchObject({
+      rating_average: 2,
+      rating_count: 1,
+      my_rating: { score: 2 }
+    });
+    const originalWorkspaceView = await request(app)
+      .get(`/api/marketplace/items/${workspace.agent_workspace_id}`)
+      .set("Authorization", as("bob"))
+      .expect(200);
+    expect(originalWorkspaceView.body.my_rating).toEqual({ score: 2 });
+
+    await app.locals.store.mutate((data) => {
+      data.agentWorkspaceRatings.push(
+        {
+          rating_id: "legacy_workspace_rating_a",
+          listing_id: publication.body.listing_id,
+          agent_workspace_id: workspace.agent_workspace_id,
+          workspace_id: "tenant_legacy_a",
+          created_by: "bob",
+          score: 3,
+          created_at: "2099-01-02T00:00:00.000Z",
+          updated_at: "2099-01-03T00:00:00.000Z"
+        },
+        {
+          rating_id: "legacy_workspace_rating_z",
+          listing_id: publication.body.listing_id,
+          agent_workspace_id: workspace.agent_workspace_id,
+          workspace_id: "tenant_legacy_z",
+          created_by: "bob",
+          score: 5,
+          review: "Legacy review text must not survive.",
+          created_at: "2099-01-02T00:00:00.000Z",
+          updated_at: "2099-01-03T00:00:00.000Z"
+        },
+        {
+          rating_id: "legacy_workspace_self_rating",
+          listing_id: publication.body.listing_id,
+          agent_workspace_id: workspace.agent_workspace_id,
+          workspace_id: "tenant_other",
+          created_by: "alice",
+          score: 5,
+          created_at: "2099-01-04T00:00:00.000Z",
+          updated_at: "2099-01-04T00:00:00.000Z"
+        }
+      );
+    });
+    await app.locals.store.close();
+    app = await createApp({
+      dbPath: path.join(tmpDir, "db.json"),
+      uploadRoot: tmpDir,
+      workflowComposer: composer
+    });
+
+    const storedRatings = app.locals.store.read().agentWorkspaceRatings.filter((rating) => (
+      rating.listing_id === publication.body.listing_id
+    ));
+    expect(storedRatings).toHaveLength(1);
+    expect(storedRatings[0]).toMatchObject({
+      rating_id: "legacy_workspace_rating_z",
+      created_by: "bob",
+      score: 5
+    });
+    expect(storedRatings[0]).not.toHaveProperty("review");
+
+    const repaired = await request(app)
+      .get(`/api/marketplace/items/${workspace.agent_workspace_id}`)
+      .set("Authorization", as("bob_other"))
+      .expect(200);
+    expect(repaired.body).toMatchObject({
+      rating_average: 5,
+      rating_count: 1,
+      my_rating: { score: 5 }
+    });
   });
 
   it("moves chats to General when a custom workspace is deleted without deleting its agents", async () => {

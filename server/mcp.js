@@ -1454,7 +1454,10 @@ async function mcpRpc(endpointUrl, auth, session, method, params, { returnTransp
   });
   const message = parseMcpResponse(response.body, id);
   if (message.error) {
-    throw mcpError(502, `MCP ${method} failed: ${boundedText(message.error.message || "server error", "MCP error", 300)}.`, "mcp_rpc_error");
+    // MCP responses are untrusted and may echo authorization headers, tool
+    // arguments, document content, or provider diagnostics. Preserve only the
+    // locally controlled method name and error class.
+    throw mcpError(502, `MCP ${boundedText(method, "MCP method", 80)} failed.`, "mcp_rpc_error");
   }
   return returnTransport ? { result: message.result || {}, headers: response.headers } : (message.result || {});
 }

@@ -12,6 +12,10 @@ import {
 import { makeId, nowIso } from "./store.js";
 import { readConfiguredSecret } from "./secretConfig.js";
 import { ensureGeneralAgentWorkspace } from "./agentWorkspaces.js";
+import {
+  ensurePublisherPublicId,
+  scrubDeletedPublisherReferences
+} from "./marketplacePublisherIdentity.js";
 
 const MAX_IDENTITY_AUDIT_EVENTS = 10_000;
 const MAX_IDENTITY_DELETION_TOMBSTONES = 50_000;
@@ -288,6 +292,7 @@ export function createClerkIdentityManager({
           created_at: profile.created_at || timestamp
         };
         data.users.push(user);
+        ensurePublisherPublicId(data, user.user_id, profile.display_name);
       }
       if (user.provider_updated_at && profile.updated_at
         && Date.parse(profile.updated_at) < Date.parse(user.provider_updated_at)) {
@@ -1414,6 +1419,18 @@ function buildAccountExport(data, user) {
 function deleteAccountData(data, user) {
   const { user_id: userId, workspace_id: workspaceId } = user;
   const graph = buildAccountResourceGraph(data, user);
+  const ownedMarketplaceSubjects = [
+    ...(graph.agents?.records || []),
+    ...(graph.agentWorkspaces?.records || [])
+  ].filter((item) => item?.marketplace && typeof item.marketplace === "object");
+  scrubDeletedPublisherReferences(data, {
+    ownerId: userId,
+    publisherIds: [
+      user.public_publisher_id,
+      ...ownedMarketplaceSubjects.map((item) => item.marketplace.publisher_id)
+    ].filter(Boolean),
+    listingIds: ownedMarketplaceSubjects.map((item) => item.marketplace.listing_id).filter(Boolean)
+  });
   const removeExact = (collection, selection) => {
     const selected = selection instanceof Set ? selection : new Set(selection || []);
     return (collection || []).filter((item) => !selected.has(item));

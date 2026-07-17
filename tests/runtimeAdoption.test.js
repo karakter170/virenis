@@ -244,8 +244,13 @@ describe("runtime-only agent adoption", () => {
           visibility: "global",
           mounted: true
         });
-      });
+    });
     await request(app).get("/api/agents/external_audit_lora").set(alice).expect(404);
+    await request(app)
+      .patch("/api/agents/external_audit_lora")
+      .set(alice)
+      .send({ boundary: "A tenant user must not discover runtime-only inventory." })
+      .expect(404);
     await request(app)
       .patch("/api/agents/external_audit_lora")
       .set(admin)
@@ -256,10 +261,17 @@ describe("runtime-only agent adoption", () => {
       .set(alice)
       .send({ created_by: "alice", visibility: "private" })
       .expect(403);
+    await request(app)
+      .post("/api/admin/runtime-agents/external_audit_lora/adopt")
+      .set(admin)
+      .send({ created_by: "alice", visibility: "private" })
+      .expect(400)
+      .expect((response) => expect(response.body.error).toBe("idempotency_key_required"));
 
     const adopted = await request(app)
       .post("/api/admin/runtime-agents/external_audit_lora/adopt")
       .set(admin)
+      .set("Idempotency-Key", "runtime-adoption-external-0001")
       .send({ created_by: "alice", visibility: "private" })
       .expect(201);
     expect(adopted.body).toMatchObject({
@@ -273,6 +285,7 @@ describe("runtime-only agent adoption", () => {
         agent_revision: `sha256:${"a".repeat(64)}`
       }
     });
+    expect(adopted.body.agent).not.toHaveProperty("runtime_adoption_idempotency");
 
     const detail = await request(app).get("/api/agents/external_audit_lora").set(alice).expect(200);
     expect(detail.body).toMatchObject({
@@ -317,11 +330,24 @@ describe("runtime-only agent adoption", () => {
       }
     });
 
+    const replayed = await request(app)
+      .post("/api/admin/runtime-agents/external_audit_lora/adopt")
+      .set(admin)
+      .set("Idempotency-Key", "runtime-adoption-external-0001")
+      .send({ created_by: "alice", visibility: "private" })
+      .expect(200);
+    expect(replayed.body).toMatchObject({
+      status: "adopted",
+      duplicate: true,
+      agent: { id: "external_audit_lora" }
+    });
     await request(app)
       .post("/api/admin/runtime-agents/external_audit_lora/adopt")
       .set(admin)
-      .send({ created_by: "alice", visibility: "private" })
-      .expect(409);
+      .set("Idempotency-Key", "runtime-adoption-external-0001")
+      .send({ created_by: "bob", visibility: "private" })
+      .expect(409)
+      .expect((response) => expect(response.body.error).toBe("idempotency_conflict"));
   });
 
   it("binds adoption to the latest valid registration epoch after a Runtime re-registration", async () => {
@@ -343,6 +369,7 @@ describe("runtime-only agent adoption", () => {
     const adopted = await request(app)
       .post("/api/admin/runtime-agents/external_audit_lora/adopt")
       .set(admin)
+      .set("Idempotency-Key", "runtime-adoption-reregistered-0001")
       .send({ created_by: "alice", visibility: "private" })
       .expect(201);
     expect(adopted.body.agent.agent_revision).toBe(`sha256:${"d".repeat(64)}`);

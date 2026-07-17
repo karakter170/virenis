@@ -274,10 +274,13 @@ export function AdminUsersPanel() {
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [loadState, setLoadState] = useState("loading");
 
   useEffect(() => { refresh(); }, []);
 
   async function refresh() {
+    setLoadState("loading");
+    setError("");
     try {
       const [userResult, accountResult, pricingResult, outputResult] = await Promise.all([
         identityRequest("/api/admin/users"),
@@ -292,9 +295,26 @@ export function AdminUsersPanel() {
       setOutputSettings(outputResult.settings || null);
       setOutputDraft(outputSettingsDraftFrom(outputResult.settings));
       setPricingMutationKey("");
+      setLoadState("ready");
     } catch (requestError) {
       setError(requestError.message);
+      setLoadState("failed");
     }
+  }
+
+  function confirmIdentityChange(user, message) {
+    const identity = user.display_name || user.email || user.user_id;
+    return globalThis.confirm?.(`${message}\n\nAffected account: ${identity}`) !== false;
+  }
+
+  async function confirmAndUpdate(user, patch) {
+    const message = patch.role
+      ? `Change this account's role from ${user.role} to ${patch.role}?`
+      : patch.status === "suspended"
+        ? "Suspend this account and block its access?"
+        : "Reactivate this account?";
+    if (!confirmIdentityChange(user, message)) return;
+    await update(user, patch);
   }
 
   async function update(user, patch) {
@@ -313,6 +333,7 @@ export function AdminUsersPanel() {
   }
 
   async function revoke(user) {
+    if (!confirmIdentityChange(user, "Revoke every active Clerk session for this account?")) return;
     setBusy(user.user_id);
     setError("");
     setNotice("");
@@ -354,6 +375,7 @@ export function AdminUsersPanel() {
 
   async function savePricing(event) {
     event.preventDefault();
+    if (!pricingDraft || loadState !== "ready") return;
     const idempotencyKey = pricingMutationKey || mutationKey("pricing");
     setPricingMutationKey(idempotencyKey);
     setBusy("pricing");
@@ -385,6 +407,7 @@ export function AdminUsersPanel() {
 
   async function saveOutputSettings(event) {
     event.preventDefault();
+    if (!outputDraft || !outputSettings || loadState !== "ready") return;
     setBusy("output-settings");
     setError("");
     setNotice("");
@@ -409,10 +432,16 @@ export function AdminUsersPanel() {
 
   return (
     <section className="admin-users" aria-labelledby="admin-users-heading">
-      <div className="account-card-heading"><div><h4 id="admin-users-heading">Registered users</h4><p>Assign product roles, suspend access, or revoke Clerk sessions. Clerk manages identity verification.</p></div><button className="icon-button compact" type="button" aria-label="Refresh registered users" onClick={refresh}><RefreshCw size={15} /></button></div>
+      <div className="account-card-heading"><div><h4 id="admin-users-heading">Registered users</h4><p>Assign product roles, suspend access, or revoke Clerk sessions. Clerk manages identity verification.</p></div><button className="icon-button compact" type="button" aria-label="Refresh registered users" onClick={refresh} disabled={loadState === "loading"}><RefreshCw className={loadState === "loading" ? "spin" : ""} size={15} /></button></div>
       {error && <div className="identity-message error" role="alert"><AlertCircle size={15} />{error}</div>}
       {notice && <div className="identity-message success" role="status"><Check size={15} />{notice}</div>}
-      <form className="admin-output-form" onSubmit={saveOutputSettings}>
+      {loadState === "loading" && <p className="muted-empty" role="status">Loading authoritative account and model settings…</p>}
+      {loadState === "failed" && (
+        <button className="text-button secondary" type="button" onClick={refresh}>
+          <RefreshCw size={14} />Retry admin settings
+        </button>
+      )}
+      {loadState === "ready" && outputSettings && outputDraft && <form className="admin-output-form" onSubmit={saveOutputSettings}>
         <div className="admin-form-intro">
           <span><Gauge size={16} aria-hidden="true" /></span>
           <div><strong>Model output limits</strong><small>Maximum generated tokens per agent and for the final answer. Safe limits automatically reserve room for prompts, handoffs, and tool results.</small></div>
@@ -453,8 +482,8 @@ export function AdminUsersPanel() {
           {busy === "output-settings" ? <LoaderCircle className="spin" size={14} /> : <Check size={14} />}Save limits
         </button>
         <small className="admin-form-revision">Revision {outputSettings?.revision || 0}</small>
-      </form>
-      {pricingDraft && (
+      </form>}
+      {loadState === "ready" && pricing && pricingDraft && (
         <form className="admin-pricing-form" onSubmit={savePricing}>
           <div><strong>Token pricing</strong><span>Credits per 1,000 provider-reported tokens. New rates apply only to new reservations.</span></div>
           <label><span>Input</span><input inputMode="decimal" value={pricingDraft.prompt} onChange={(event) => { setPricingDraft({ ...pricingDraft, prompt: event.target.value }); setPricingMutationKey(""); }} required /></label>
@@ -466,13 +495,13 @@ export function AdminUsersPanel() {
           {pricing && <small>Current version {pricing.pricing_version_id}</small>}
         </form>
       )}
-      <div className="admin-user-list">
+      {loadState === "ready" && <div className="admin-user-list">
         {users.map((user) => (
           <div className="admin-user-row" key={user.user_id}>
             {user.avatar_url ? <img className="profile-avatar" src={user.avatar_url} alt="" /> : <span className="profile-initials" aria-hidden="true">{initialsFor(user)}</span>}
             <div className="admin-user-copy"><strong>{user.display_name || user.email}</strong><span>{user.email}</span><small>{user.email_verified ? "Verified by Clerk" : "Verification pending"} · joined {formatIdentityDate(user.created_at)}</small></div>
-            <label><span className="sr-only">Role for {user.email}</span><select value={user.role} disabled={busy === user.user_id} onChange={(event) => update(user, { role: event.target.value })}><option value="user">User</option><option value="viewer">Viewer</option><option value="admin">Admin</option></select></label>
-            <label><span className="sr-only">Status for {user.email}</span><select value={user.status} disabled={busy === user.user_id} onChange={(event) => update(user, { status: event.target.value })}><option value="active">Active</option><option value="suspended">Suspended</option></select></label>
+            <label><span className="sr-only">Role for {user.email}</span><select value={user.role} disabled={busy === user.user_id} onChange={(event) => { const role = event.target.value; event.target.value = user.role; void confirmAndUpdate(user, { role }); }}><option value="user">User</option><option value="viewer">Viewer</option><option value="admin">Admin</option></select></label>
+            <label><span className="sr-only">Status for {user.email}</span><select value={user.status} disabled={busy === user.user_id} onChange={(event) => { const status = event.target.value; event.target.value = user.status; void confirmAndUpdate(user, { status }); }}><option value="active">Active</option><option value="suspended">Suspended</option></select></label>
             <div className="admin-user-actions"><button type="button" onClick={() => revoke(user)} disabled={busy === user.user_id}>Revoke sessions</button></div>
             <div className="admin-billing-summary">
               <span>Balance</span>
@@ -489,7 +518,7 @@ export function AdminUsersPanel() {
           </div>
         ))}
         {users.length === 0 && <p className="muted-empty">No Clerk users have signed up yet.</p>}
-      </div>
+      </div>}
     </section>
   );
 }
@@ -571,6 +600,7 @@ function billingEntryAmount(entry) {
 }
 
 function pricingDraftFrom(pricing) {
+  if (!pricing) return null;
   const rule = pricing?.rules?.[0] || {};
   return {
     prompt: rule.prompt_credits_per_1k ?? "0.1",
@@ -582,6 +612,7 @@ function pricingDraftFrom(pricing) {
 }
 
 function outputSettingsDraftFrom(settings) {
+  if (!settings) return null;
   return {
     agent: String(settings?.agent_output_tokens ?? 1024),
     final: String(settings?.final_output_tokens ?? 2048),

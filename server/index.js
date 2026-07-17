@@ -10,10 +10,13 @@ import {
 } from "./clerkIdentity.js";
 import { assertFrontendClerkPublishableKey } from "./productionBuild.js";
 import { requireRuntimeConfigured } from "./runtimeClient.js";
+import { safeDiagnosticLog } from "./diagnostics.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, "..");
 const distRoot = process.env.WEB_DIST_DIR ? path.resolve(process.env.WEB_DIST_DIR) : path.join(root, "dist");
+const dataRoot = process.env.WEB_DATA_DIR ? path.resolve(process.env.WEB_DATA_DIR) : path.join(root, "data");
+const uploadRoot = process.env.WEB_UPLOAD_DIR ? path.resolve(process.env.WEB_UPLOAD_DIR) : path.join(root, "uploads");
 const port = Number(process.env.PORT || 5173);
 const isProduction = process.env.NODE_ENV === "production";
 const host = process.env.HOST || (isProduction ? "127.0.0.1" : "0.0.0.0");
@@ -29,8 +32,8 @@ if (isProduction) {
 }
 
 const app = await createApp({
-  dbPath: path.join(root, "data", "app-db.json"),
-  uploadRoot: path.join(root, "uploads")
+  dbPath: path.join(dataRoot, "app-db.json"),
+  uploadRoot
 });
 
 let vite;
@@ -101,7 +104,7 @@ async function shutdown(signal) {
     process.exit(0);
   } catch (error) {
     clearTimeout(forceExit);
-    console.error("virenis shutdown failed.", error);
+    safeDiagnosticLog("server.shutdown_failed", { operation: "server_shutdown" }, error);
     process.exit(1);
   }
 }

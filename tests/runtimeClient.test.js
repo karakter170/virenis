@@ -333,7 +333,7 @@ describe("TCAR runtime HTTP transport", () => {
     await waitForSocketsToClose(runtime.sockets);
   });
 
-  it("preserves structured runtime HTTP errors", async () => {
+  it("drops untrusted runtime HTTP bodies while preserving safe classification", async () => {
     const runtime = await startHttpServer((_request, response) => {
       response.writeHead(409, { "Content-Type": "application/json" });
       response.end(JSON.stringify({ detail: "execution already claimed", private_field: "retained-for-admin-redaction" }));
@@ -342,10 +342,12 @@ describe("TCAR runtime HTTP transport", () => {
 
     await expect(runtimeRequest("/conflict", { timeoutMs: 500 })).rejects.toMatchObject({
       status: 409,
-      message: "execution already claimed",
-      payload: {
-        detail: "execution already claimed",
-        private_field: "retained-for-admin-redaction"
+      code: "runtime_request_rejected",
+      message: "The Runtime rejected the request.",
+      diagnostic: {
+        code: "runtime_request_rejected",
+        status: 409,
+        retryable: false
       }
     });
   });

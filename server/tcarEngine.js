@@ -2,6 +2,7 @@ import { approvedSourceSnippets, BASE_MODEL, DEFAULT_VLLM_BASE_URL } from "./cat
 import { releaseRunReservation, settleRunCredits } from "./billing.js";
 import { makeId, nowIso } from "./store.js";
 import { assertStoredDocumentIntegrity, scoreChunks, slugify } from "./documents.js";
+import { normalizeDiagnosticError } from "./diagnostics.js";
 import { executeRuntimeChat, realRuntimeEnabled, runtimeApiKey } from "./runtimeClient.js";
 import { agentRevision, digestValue, normalizeSha256Digest, realityRankMap, recordExecution } from "./outcomes.js";
 import {
@@ -158,7 +159,7 @@ export function planRoutes({ query, agents, documents = [], agentRankings = {}, 
     if (!agent || activeAdds.has(adapter)) return idByAdapter.get(adapter);
     activeAdds.add(adapter);
     const resourceAgents = (agent?.resources || [])
-      .map((value) => String(value || "").match(/^agent:([a-z0-9_]+)$/)?.[1])
+      .map((value) => String(value || "").match(/^agent:([a-z0-9_-]+)$/i)?.[1])
       .filter((resourceAgentId) => resourceAgentId && resourceAgentId !== adapter && hasAgent(resourceAgentId));
     for (const resourceAgentId of resourceAgents) {
       addStep(
@@ -170,7 +171,7 @@ export function planRoutes({ query, agents, documents = [], agentRankings = {}, 
       );
     }
     const handoffAgents = (agent?.consumes || [])
-      .map((value) => String(value || "").match(/^agent:([a-z0-9_]+):output$/)?.[1])
+      .map((value) => String(value || "").match(/^agent:([a-z0-9_-]+):output$/i)?.[1])
       .filter((handoffAgentId) => handoffAgentId && handoffAgentId !== adapter && hasAgent(handoffAgentId));
     for (const handoffAgentId of handoffAgents) {
       add(
@@ -213,8 +214,8 @@ export function planRoutes({ query, agents, documents = [], agentRankings = {}, 
     for (const step of steps) {
       const agent = enabled.find((candidate) => candidate.id === step.adapter);
       const configuredDependencies = [
-        ...(agent?.consumes || []).map((value) => String(value || "").match(/^agent:([a-z0-9_]+):output$/)?.[1]),
-        ...(agent?.resources || []).map((value) => String(value || "").match(/^agent:([a-z0-9_]+)$/)?.[1])
+        ...(agent?.consumes || []).map((value) => String(value || "").match(/^agent:([a-z0-9_-]+):output$/i)?.[1]),
+        ...(agent?.resources || []).map((value) => String(value || "").match(/^agent:([a-z0-9_-]+)$/i)?.[1])
       ].filter((adapter) => adapter && adapter !== step.adapter && approvedSet.has(adapter));
       step.depends_on = safeDependencyIds(step.id, [...new Set(configuredDependencies)]);
     }
@@ -1383,7 +1384,6 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
 function normalizeRunFailure(error, fallbackCode) {
   const classified = classifyRunFailure(error, fallbackCode);
   const code = classified.code;
-  const message = String(error?.message || "Run failed.");
   return {
     public: {
       code,
@@ -1392,13 +1392,10 @@ function normalizeRunFailure(error, fallbackCode) {
       action: classified.action
     },
     admin: {
-      code,
-      message,
-      status: error?.status || null,
-      payload: error?.payload || null,
-      provider_status: error?.providerStatus || null,
-      provider_request_id: error?.requestId || null,
-      stack: error?.stack || null
+      ...normalizeDiagnosticError(error, { fallbackCode: code }),
+      // Keep support classification aligned with the public retry policy while
+      // retaining structural status/provider metadata and no raw content.
+      code
     }
   };
 }
