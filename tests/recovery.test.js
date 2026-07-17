@@ -117,6 +117,59 @@ describe("durable background recovery", () => {
     expect(JSON.stringify(response.body)).not.toContain("private provider timeout diagnostics");
   });
 
+  it("classifies an idle Runtime event stream as transport recovery, not a model timeout", async () => {
+    const dbPath = path.join(tmpDir, "stream-idle-errors.json");
+    const failingProcessor = async () => {
+      const error = new Error("private transport diagnostics");
+      error.code = "runtime_stream_idle_timeout";
+      error.status = 504;
+      error.retryable = true;
+      throw error;
+    };
+    process.env.APP_API_TOKENS_JSON = JSON.stringify({
+      streamidleusertoken: { user_id: "stream_idle_user", workspace_id: "workspace_default", role: "user" },
+      streamidleadmintoken: { user_id: "stream_idle_admin", workspace_id: "workspace_default", role: "admin" }
+    });
+    app = await createApp({ dbPath, uploadRoot: tmpDir, chatProcessor: failingProcessor });
+    const session = await request(app)
+      .post("/api/chat/sessions")
+      .set("Authorization", "Bearer streamidleusertoken")
+      .send({ title: "Stream idle failure" })
+      .expect(201);
+    const queued = await request(app)
+      .post(`/api/chat/sessions/${session.body.session_id}/messages`)
+      .set("Authorization", "Bearer streamidleusertoken")
+      .send({ content: "Test the Runtime transport." })
+      .expect(202);
+    await app.locals.drainBackgroundTasks({ timeoutMs: 5000 });
+
+    const response = await request(app)
+      .get(`/api/chat/runs/${queued.body.run_id}`)
+      .set("Authorization", "Bearer streamidleusertoken")
+      .expect(200);
+    expect(response.body.error).toEqual({
+      code: "model_connection_interrupted",
+      message: "The connection to the model runtime stopped receiving progress. Your message is still available—try again.",
+      retryable: true,
+      action: "retry"
+    });
+    expect(response.body.error.code).not.toBe("model_timeout");
+    expect(JSON.stringify(response.body)).not.toContain("private transport diagnostics");
+
+    const adminResponse = await request(app)
+      .get(`/api/chat/runs/${queued.body.run_id}`)
+      .set("Authorization", "Bearer streamidleadmintoken")
+      .expect(200);
+    expect(adminResponse.body.error).toMatchObject({ code: "model_connection_interrupted" });
+    expect(adminResponse.body.error_admin_only).toMatchObject({
+      code: "runtime_stream_idle_timeout",
+      public_code: "model_connection_interrupted",
+      status: 504,
+      retryable: true
+    });
+    expect(JSON.stringify(adminResponse.body.error_admin_only)).not.toContain("private transport diagnostics");
+  });
+
   it("resumes unclaimed queued chat and validation work exactly once", async () => {
     const dbPath = path.join(tmpDir, "db.json");
     app = await createApp({ dbPath, uploadRoot: tmpDir, autoRun: false });

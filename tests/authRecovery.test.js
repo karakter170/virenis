@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   AUTHENTICATION_REQUIRED_EVENT,
   authenticationFailureDetails,
+  isAuthenticationRequiredResponse,
   notifyAuthenticationRequired,
   resetAuthenticationNotification,
   shouldOpenWorkspaceFromIdentity
@@ -59,6 +60,17 @@ describe("authentication recovery", () => {
     expect(notifyAuthenticationRequired({ status: 401 }, fakeWindow)).toBe(true);
     expect(events).toHaveLength(2);
     resetAuthenticationNotification();
+  });
+
+  it("does not treat a downstream Runtime 401 as a rejected Clerk session", () => {
+    expect(isAuthenticationRequiredResponse(
+      { status: 401 },
+      { error: "runtime_request_rejected" }
+    )).toBe(false);
+    expect(isAuthenticationRequiredResponse(
+      { status: 401 },
+      { error: "authentication_required" }
+    )).toBe(true);
   });
 });
 

@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 
@@ -13,6 +14,7 @@ import {
 } from "../server/runtimeClient.js";
 
 const TOKEN = "runtime_stream_owner_token_0123456789";
+const ADMIN_TOKEN = "runtime_stream_admin_token_0123456789";
 const AUTH = `Bearer ${TOKEN}`;
 const RUN_ID = "run_stream_parser_1";
 const ENV_KEYS = [
@@ -21,6 +23,10 @@ const ENV_KEYS = [
   "TCAR_ENGINE_MODE",
   "TCAR_RUNTIME_API_URL",
   "TCAR_RUNTIME_API_KEY",
+  "TCAR_RUNTIME_BODY_IDLE_TIMEOUT_MS",
+  "TCAR_RUNTIME_CHAT_TIMEOUT_MS",
+  "TCAR_RUNTIME_CONNECT_TIMEOUT_MS",
+  "TCAR_RUNTIME_HEADER_TIMEOUT_MS",
   "WEB_STORE_DRIVER"
 ];
 
@@ -37,6 +43,7 @@ let app;
 let previousEnv;
 let restoreFetch;
 let tmpDir;
+const runtimeServers = [];
 
 function event(type, sequence, data, runId = RUN_ID) {
   return {
@@ -51,7 +58,12 @@ function event(type, sequence, data, runId = RUN_ID) {
 function ndjsonResponse(records) {
   return new Response(
     records.map((record) => `${JSON.stringify(record)}\n`).join(""),
-    { headers: { "Content-Type": "application/x-ndjson" } }
+    {
+      headers: {
+        "Content-Type": "application/x-ndjson",
+        "X-TCAR-Stream-Protocol": "heartbeat-v1"
+      }
+    }
   );
 }
 
@@ -93,6 +105,17 @@ async function waitFor(predicate, timeoutMs = 3000) {
   throw new Error("Timed out waiting for the streamed planner transition.");
 }
 
+async function startRuntimeServer(handler) {
+  const server = http.createServer(handler);
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  runtimeServers.push(server);
+  return `http://127.0.0.1:${address.port}`;
+}
+
 beforeEach(async () => {
   previousEnv = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]]));
   process.env.APP_IDENTITY_PROVIDER = "configured";
@@ -101,7 +124,8 @@ beforeEach(async () => {
   process.env.TCAR_RUNTIME_API_URL = "http://runtime.stream.test";
   process.env.TCAR_RUNTIME_API_KEY = "runtime-stream-api-key-0123456789";
   process.env.APP_API_TOKENS_JSON = JSON.stringify({
-    [TOKEN]: { user_id: "stream_owner", workspace_id: "stream_workspace", role: "user" }
+    [TOKEN]: { user_id: "stream_owner", workspace_id: "stream_workspace", role: "user" },
+    [ADMIN_TOKEN]: { user_id: "stream_admin", workspace_id: "stream_workspace", role: "admin" }
   });
   tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "virenis-runtime-stream-"));
 });
@@ -112,6 +136,10 @@ afterEach(async () => {
   app = null;
   restoreFetch?.();
   restoreFetch = null;
+  await Promise.allSettled(runtimeServers.splice(0).map((server) => new Promise((resolve) => {
+    server.closeAllConnections?.();
+    server.close(resolve);
+  })));
   for (const [key, value] of Object.entries(previousEnv || {})) {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
@@ -183,13 +211,234 @@ describe.sequential("Runtime early-plan stream", () => {
     ];
     restoreFetch = setRuntimeFetchForTests(async () => new Response(
       `${records.map((record) => `${JSON.stringify(record)}\n`).join("")}\n`,
-      { headers: { "Content-Type": "application/x-ndjson" } }
+      {
+        headers: {
+          "Content-Type": "application/x-ndjson",
+          "X-TCAR-Stream-Protocol": "heartbeat-v1"
+        }
+      }
     ));
     await expect(executeRuntimeChatStream({
       query: "Prepare a note.",
       executionContext: { run_id: RUN_ID },
       onPlannerCompleted: async () => {}
     })).rejects.toMatchObject({ code: "runtime_stream_invalid", status: 502 });
+  });
+
+  it("accepts bounded content-free heartbeats and rejects malformed or excessive ones", async () => {
+    restoreFetch = setRuntimeFetchForTests(async () => ndjsonResponse([
+      event("run.heartbeat", 1, {}),
+      event("planner.completed", 2, {
+        plan: safePlan,
+        contract_digest: contractDigest(safePlan)
+      }),
+      event("run.heartbeat", 3, { private_status: "must not be accepted" }),
+      event("run.completed", 4, { result: { ok: true, plan: safePlan } })
+    ]));
+    await expect(executeRuntimeChatStream({
+      query: "Prepare a note.",
+      executionContext: { run_id: RUN_ID },
+      onPlannerCompleted: async () => {}
+    })).rejects.toMatchObject({ code: "runtime_stream_invalid", status: 502 });
+
+    restoreFetch();
+    const excessive = Array.from({ length: 513 }, (_, index) => (
+      event("run.heartbeat", index + 1, {})
+    ));
+    excessive.push(event("run.failed", 514, {
+      error: { code: "synthetic_failure", status: 500, retryable: false }
+    }));
+    restoreFetch = setRuntimeFetchForTests(async () => ndjsonResponse(excessive));
+    await expect(executeRuntimeChatStream({
+      query: "Prepare a note.",
+      executionContext: { run_id: RUN_ID }
+    })).rejects.toMatchObject({ code: "runtime_stream_invalid", status: 502 });
+  });
+
+  it("keeps a real HTTP stream alive with heartbeats beyond the body-idle threshold", async () => {
+    const observedTypes = [];
+    const runtimeUrl = await startRuntimeServer((incoming, response) => {
+      expect(incoming.url).toBe("/chat/execute/stream");
+      expect(incoming.headers["x-tcar-stream-protocol"]).toBe("heartbeat-v1");
+      let requestText = "";
+      incoming.setEncoding("utf8");
+      incoming.on("data", (chunk) => { requestText += chunk; });
+      incoming.on("end", () => {
+        const requestBody = JSON.parse(requestText);
+        const runId = requestBody.execution_context.run_id;
+        let sequence = 0;
+        const write = (type, data) => {
+          sequence += 1;
+          observedTypes.push(type);
+          response.write(`${JSON.stringify(event(type, sequence, data, runId))}\n`);
+        };
+        response.writeHead(200, {
+          "Content-Type": "application/x-ndjson",
+          "X-TCAR-Stream-Protocol": "heartbeat-v1"
+        });
+        write("run.heartbeat", {});
+        write("planner.completed", {
+          plan: safePlan,
+          contract_digest: contractDigest(safePlan)
+        });
+        const heartbeat = setInterval(() => write("run.heartbeat", {}), 20);
+        const terminal = setTimeout(() => {
+          clearInterval(heartbeat);
+          write("run.completed", { result: { ok: true, plan: safePlan, finalAnswer: "Ready." } });
+          response.end();
+        }, 240);
+        response.once("close", () => {
+          clearInterval(heartbeat);
+          clearTimeout(terminal);
+        });
+      });
+    });
+    process.env.TCAR_RUNTIME_API_URL = runtimeUrl;
+    process.env.TCAR_RUNTIME_CONNECT_TIMEOUT_MS = "100";
+    process.env.TCAR_RUNTIME_HEADER_TIMEOUT_MS = "100";
+    process.env.TCAR_RUNTIME_BODY_IDLE_TIMEOUT_MS = "60";
+    process.env.TCAR_RUNTIME_CHAT_TIMEOUT_MS = "1000";
+    let plannerCallbacks = 0;
+
+    await expect(executeRuntimeChatStream({
+      query: "Prepare a note.",
+      executionContext: { run_id: "run_real_heartbeat" },
+      onPlannerCompleted: async () => { plannerCallbacks += 1; }
+    })).resolves.toMatchObject({
+      legacy: false,
+      result: { ok: true, finalAnswer: "Ready." }
+    });
+    expect(plannerCallbacks).toBe(1);
+    expect(observedTypes.filter((type) => type === "run.heartbeat").length).toBeGreaterThan(2);
+    expect(observedTypes.at(-1)).toBe("run.completed");
+  });
+
+  it("reports a stalled real HTTP event stream as a transport-idle timeout", async () => {
+    const runtimeUrl = await startRuntimeServer((incoming, response) => {
+      expect(incoming.headers["x-tcar-stream-protocol"]).toBe("heartbeat-v1");
+      incoming.resume();
+      incoming.once("end", () => {
+        response.writeHead(200, {
+          "Content-Type": "application/x-ndjson",
+          "X-TCAR-Stream-Protocol": "heartbeat-v1"
+        });
+        response.write(`${JSON.stringify(event("run.heartbeat", 1, {}, "run_real_idle"))}\n`);
+      });
+    });
+    process.env.TCAR_RUNTIME_API_URL = runtimeUrl;
+    process.env.TCAR_RUNTIME_CONNECT_TIMEOUT_MS = "100";
+    process.env.TCAR_RUNTIME_HEADER_TIMEOUT_MS = "100";
+    process.env.TCAR_RUNTIME_BODY_IDLE_TIMEOUT_MS = "40";
+    process.env.TCAR_RUNTIME_CHAT_TIMEOUT_MS = "500";
+
+    await expect(executeRuntimeChatStream({
+      query: "Prepare a note.",
+      executionContext: { run_id: "run_real_idle" }
+    })).rejects.toMatchObject({
+      code: "runtime_stream_idle_timeout",
+      status: 504,
+      retryable: true,
+      component: "runtime_stream"
+    });
+  });
+
+  it("persists a stalled stream as a public connection interruption with private transport diagnostics", async () => {
+    const runtimeUrl = await startRuntimeServer((incoming, response) => {
+      let requestText = "";
+      incoming.setEncoding("utf8");
+      incoming.on("data", (chunk) => { requestText += chunk; });
+      incoming.once("end", () => {
+        const requestBody = JSON.parse(requestText);
+        const runId = requestBody.execution_context.run_id;
+        response.writeHead(200, {
+          "Content-Type": "application/x-ndjson",
+          "X-TCAR-Stream-Protocol": "heartbeat-v1"
+        });
+        response.write(`${JSON.stringify(event("run.heartbeat", 1, {}, runId))}\n`);
+        response.write(`${JSON.stringify(event("planner.completed", 2, {
+          plan: safePlan,
+          contract_digest: contractDigest(safePlan)
+        }, runId))}\n`);
+      });
+    });
+    process.env.TCAR_RUNTIME_API_URL = runtimeUrl;
+    process.env.TCAR_RUNTIME_CONNECT_TIMEOUT_MS = "100";
+    process.env.TCAR_RUNTIME_HEADER_TIMEOUT_MS = "100";
+    process.env.TCAR_RUNTIME_BODY_IDLE_TIMEOUT_MS = "40";
+    process.env.TCAR_RUNTIME_CHAT_TIMEOUT_MS = "500";
+    app = await createApp({
+      dbPath: path.join(tmpDir, "stream-idle-app.json"),
+      uploadRoot: path.join(tmpDir, "stream-idle-uploads")
+    });
+    const session = await request(app)
+      .post("/api/chat/sessions")
+      .set("Authorization", AUTH)
+      .send({ title: "Transport timeout" })
+      .expect(201);
+    const queued = await request(app)
+      .post(`/api/chat/sessions/${session.body.session_id}/messages`)
+      .set("Authorization", AUTH)
+      .send({ content: "@writing_synthesis_lora prepare the concise note." })
+      .expect(202);
+    expect((await app.locals.drainBackgroundTasks({ timeoutMs: 2000 })).ok).toBe(true);
+
+    const userRun = await request(app)
+      .get(`/api/chat/runs/${queued.body.run_id}`)
+      .set("Authorization", AUTH)
+      .expect(200);
+    expect(userRun.body.status).toBe("failed");
+    expect(userRun.body.error).toEqual({
+      code: "model_connection_interrupted",
+      message: "The connection to the model runtime stopped receiving progress. Your message is still available—try again.",
+      retryable: true,
+      action: "retry"
+    });
+    expect(userRun.body.events.filter((item) => item.type === "planner.completed")).toHaveLength(1);
+    expect(userRun.body.events.some((item) => item.type === "run.heartbeat")).toBe(false);
+    expect(userRun.body).not.toHaveProperty("error_admin_only");
+
+    const adminRun = await request(app)
+      .get(`/api/chat/runs/${queued.body.run_id}`)
+      .set("Authorization", `Bearer ${ADMIN_TOKEN}`)
+      .expect(200);
+    expect(adminRun.body.error_admin_only).toMatchObject({
+      code: "runtime_stream_idle_timeout",
+      public_code: "model_connection_interrupted",
+      status: 504,
+      retryable: true
+    });
+  });
+
+  it("uses a rollout-safe idle budget when an older Runtime does not negotiate heartbeats", async () => {
+    const runtimeUrl = await startRuntimeServer((incoming, response) => {
+      incoming.resume();
+      incoming.once("end", () => {
+        response.writeHead(200, { "Content-Type": "application/x-ndjson" });
+        response.write(`${JSON.stringify(event("planner.completed", 1, {
+          plan: safePlan,
+          contract_digest: contractDigest(safePlan)
+        }, "run_legacy_stream"))}\n`);
+        setTimeout(() => {
+          if (response.destroyed) return;
+          response.end(`${JSON.stringify(event("run.completed", 2, {
+            result: { ok: true, plan: safePlan, finalAnswer: "Legacy ready." }
+          }, "run_legacy_stream"))}\n`);
+        }, 180);
+      });
+    });
+    process.env.TCAR_RUNTIME_API_URL = runtimeUrl;
+    process.env.TCAR_RUNTIME_CONNECT_TIMEOUT_MS = "100";
+    process.env.TCAR_RUNTIME_HEADER_TIMEOUT_MS = "100";
+    process.env.TCAR_RUNTIME_BODY_IDLE_TIMEOUT_MS = "40";
+    process.env.TCAR_RUNTIME_CHAT_TIMEOUT_MS = "500";
+
+    await expect(executeRuntimeChatStream({
+      query: "Prepare a note.",
+      executionContext: { run_id: "run_legacy_stream" },
+      onPlannerCompleted: async () => {}
+    })).resolves.toMatchObject({
+      result: { ok: true, finalAnswer: "Legacy ready." }
+    });
   });
 
   it("persists and publishes the validated plan while Runtime workers are still delayed", async () => {
@@ -208,6 +457,8 @@ describe.sequential("Runtime early-plan stream", () => {
       }]
     };
     expect(exactTask.length).toBeGreaterThan(600);
+    expect(Array.from(projectedTask)).toHaveLength(600);
+    expect(projectedTask.length).toBeGreaterThan(600);
     let runtimeAgent;
     const baseDigest = "2".repeat(64);
     const executorDigest = "3".repeat(64);
@@ -337,23 +588,40 @@ describe.sequential("Runtime early-plan stream", () => {
       return new Response(new ReadableStream({
         start(controller) {
           controller.enqueue(encoder.encode(`${JSON.stringify(event(
-            "planner.completed",
+            "run.heartbeat",
             1,
+            {},
+            runId
+          ))}\n`));
+          controller.enqueue(encoder.encode(`${JSON.stringify(event(
+            "planner.completed",
+            2,
             { plan: streamedSafePlan, contract_digest: contractDigest(plan) },
+            runId
+          ))}\n`));
+          controller.enqueue(encoder.encode(`${JSON.stringify(event(
+            "run.heartbeat",
+            3,
+            {},
             runId
           ))}\n`));
           plannerTransported.resolve();
           void releaseTerminal.promise.then(() => {
             controller.enqueue(encoder.encode(`${JSON.stringify(event(
               "run.completed",
-              2,
+              4,
               { result },
               runId
             ))}\n`));
             controller.close();
           });
         }
-      }), { headers: { "Content-Type": "application/x-ndjson; charset=utf-8" } });
+      }), {
+        headers: {
+          "Content-Type": "application/x-ndjson; charset=utf-8",
+          "X-TCAR-Stream-Protocol": "heartbeat-v1"
+        }
+      });
     });
 
     app = await createApp({
@@ -392,6 +660,7 @@ describe.sequential("Runtime early-plan stream", () => {
     expect(running.events.filter((item) => item.type === "planner.completed")).toHaveLength(1);
     expect(running.events.some((item) => item.type === "route.completed")).toBe(false);
     expect(running.events.some((item) => item.type === "final.completed")).toBe(false);
+    expect(running.events.some((item) => item.type === "run.heartbeat")).toBe(false);
     const plannerEvent = running.events.find((item) => item.type === "planner.completed");
     expect(Object.keys(plannerEvent).sort()).toEqual(["at", "steps", "type"]);
     expect(JSON.stringify(plannerEvent)).not.toContain("private_prompt");

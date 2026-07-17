@@ -1450,6 +1450,9 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
 function normalizeRunFailure(error, fallbackCode) {
   const classified = classifyRunFailure(error, fallbackCode);
   const code = classified.code;
+  const diagnostic = normalizeDiagnosticError(error, { fallbackCode: code });
+  const preserveRuntimeTransportCode = code === "model_connection_interrupted"
+    && diagnostic.code === "runtime_stream_idle_timeout";
   return {
     public: {
       code,
@@ -1458,10 +1461,11 @@ function normalizeRunFailure(error, fallbackCode) {
       action: classified.action
     },
     admin: {
-      ...normalizeDiagnosticError(error, { fallbackCode: code }),
+      ...diagnostic,
       // Keep support classification aligned with the public retry policy while
       // retaining structural status/provider metadata and no raw content.
-      code
+      code: preserveRuntimeTransportCode ? diagnostic.code : code,
+      ...(preserveRuntimeTransportCode ? { public_code: code } : {})
     }
   };
 }
@@ -1478,6 +1482,14 @@ function classifyRunFailure(error, fallbackCode = "run_failed") {
       message: "The selected model is temporarily rate-limited. Wait a moment, then try again.",
       retryable: true,
       action: "retry_later"
+    };
+  }
+  if (rawCode === "runtime_stream_idle_timeout") {
+    return {
+      code: "model_connection_interrupted",
+      message: "The connection to the model runtime stopped receiving progress. Your message is still available—try again.",
+      retryable: true,
+      action: "retry"
     };
   }
   if ([408, 504].includes(status) || matches("timeout", "timed_out", "aborterror", "etimedout")) {

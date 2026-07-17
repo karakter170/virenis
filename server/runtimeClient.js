@@ -9,12 +9,19 @@ import { readConfiguredSecret } from "./secretConfig.js";
 const DEFAULT_TIMEOUT_MS = 900000;
 const DEFAULT_CONNECT_TIMEOUT_MS = 10000;
 const DEFAULT_BODY_IDLE_TIMEOUT_MS = 60000;
+const LEGACY_STREAM_BODY_IDLE_TIMEOUT_MS = 300000;
 const DEFAULT_MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
 const RUNTIME_STREAM_CONTENT_TYPE = "application/x-ndjson";
-const MAX_RUNTIME_STREAM_EVENTS = 3;
+const RUNTIME_STREAM_PROTOCOL = "heartbeat-v1";
+// Runtime can heartbeat every five seconds for the full 30-minute hard request
+// limit (360 records). Keep a finite margin for scheduling jitter/config
+// changes while retaining a strict parser bound.
+const MAX_RUNTIME_STREAM_HEARTBEATS = 512;
+const MAX_RUNTIME_STREAM_EVENTS = MAX_RUNTIME_STREAM_HEARTBEATS + 2;
 const MAX_RUNTIME_STREAM_PLAN_STEPS = 24;
 const MAX_RUNTIME_STREAM_TASK_CHARS = 600;
 const MAX_RUNTIME_STREAM_PLAN_EVENT_BYTES = 256 * 1024;
+const MAX_RUNTIME_STREAM_HEARTBEAT_BYTES = 1024;
 const MAX_REQUEST_TIMEOUT_MS = 1800000;
 const MAX_CONNECT_TIMEOUT_MS = 120000;
 const MAX_BODY_IDLE_TIMEOUT_MS = 300000;
@@ -538,7 +545,8 @@ async function runtimeStreamRequest(path, {
   const headers = {
     Accept: RUNTIME_STREAM_CONTENT_TYPE,
     "Content-Type": "application/json",
-    "Content-Length": String(encodedBody.length)
+    "Content-Length": String(encodedBody.length),
+    "X-TCAR-Stream-Protocol": RUNTIME_STREAM_PROTOCOL
   };
   const configuredRuntimeApiKey = runtimeApiKey();
   if (configuredRuntimeApiKey) headers["X-TCAR-API-Key"] = configuredRuntimeApiKey;
@@ -628,9 +636,13 @@ function boundedHttpStreamRequest(urlValue, options) {
     const headerTimer = schedule(() => finish(runtimeTimeoutError(options.headerTimeoutMs)), options.headerTimeoutMs);
     let connectTimer = schedule(() => finish(runtimeTimeoutError(options.connectTimeoutMs)), options.connectTimeoutMs);
     let bodyTimer;
+    let effectiveBodyIdleTimeoutMs = options.bodyIdleTimeoutMs;
     const resetBodyTimer = () => {
       clearTimer(bodyTimer);
-      bodyTimer = schedule(() => finish(runtimeTimeoutError(options.bodyIdleTimeoutMs)), options.bodyIdleTimeoutMs);
+      bodyTimer = schedule(
+        () => finish(runtimeStreamIdleTimeoutError(effectiveBodyIdleTimeoutMs)),
+        effectiveBodyIdleTimeoutMs
+      );
     };
 
     try {
@@ -659,6 +671,18 @@ function boundedHttpStreamRequest(urlValue, options) {
     request.once("response", (incoming) => {
       response = incoming;
       clearTimer(headerTimer);
+      try {
+        const heartbeatNegotiated = validateRuntimeStreamProtocol(incoming.headers);
+        effectiveBodyIdleTimeoutMs = heartbeatNegotiated
+          ? options.bodyIdleTimeoutMs
+          : Math.min(
+            options.requestTimeoutMs,
+            Math.max(options.bodyIdleTimeoutMs, LEGACY_STREAM_BODY_IDLE_TIMEOUT_MS)
+          );
+      } catch (error) {
+        finish(error);
+        return;
+      }
       resetBodyTimer();
       const timedBody = (async function* timedRuntimeBody() {
         for await (const chunk of incoming) {
@@ -705,6 +729,7 @@ async function consumeRuntimeStreamResponse({
   onPlannerCompleted
 }) {
   const contentType = responseContentType(headers);
+  const heartbeatsNegotiated = validateRuntimeStreamProtocol(headers);
   if (status < 200 || status >= 300) {
     const responseBody = await readBoundedStreamBody(body, maxResponseBytes);
     const payload = parseJsonObject(responseBody.toString("utf8")) || {};
@@ -732,7 +757,8 @@ async function consumeRuntimeStreamResponse({
   const parser = createRuntimeNdjsonParser({
     expectedRunId,
     maxResponseBytes,
-    onPlannerCompleted
+    onPlannerCompleted,
+    heartbeatsNegotiated
   });
   if (body) {
     for await (const chunk of body) {
@@ -742,12 +768,18 @@ async function consumeRuntimeStreamResponse({
   return parser.finish();
 }
 
-function createRuntimeNdjsonParser({ expectedRunId, maxResponseBytes, onPlannerCompleted }) {
+function createRuntimeNdjsonParser({
+  expectedRunId,
+  maxResponseBytes,
+  onPlannerCompleted,
+  heartbeatsNegotiated
+}) {
   const decoder = new TextDecoder("utf-8", { fatal: true });
   let buffered = "";
   let receivedBytes = 0;
   let expectedSequence = 1;
   let eventCount = 0;
+  let heartbeatCount = 0;
   let streamedPlan = null;
   let terminal = null;
 
@@ -763,9 +795,7 @@ function createRuntimeNdjsonParser({ expectedRunId, maxResponseBytes, onPlannerC
       throw invalidRuntimeStream("too many events");
     }
     if (terminal) throw invalidRuntimeStream("an event followed the terminal event");
-    if (eventCount === 1 && Buffer.byteLength(line, "utf8") > MAX_RUNTIME_STREAM_PLAN_EVENT_BYTES) {
-      throw invalidRuntimeStream("the planner event exceeded its size limit");
-    }
+    const lineBytes = Buffer.byteLength(line, "utf8");
     const event = parseJsonObject(line);
     if (!event) throw invalidRuntimeStream("an event was not valid JSON");
     assertExactObjectKeys(event, ["at", "data", "run_id", "sequence", "type"], "event envelope");
@@ -780,8 +810,25 @@ function createRuntimeNdjsonParser({ expectedRunId, maxResponseBytes, onPlannerC
     if (!validStreamTimestamp(event.at)) throw invalidRuntimeStream("event timestamp was malformed");
     if (!isPlainObject(event.data)) throw invalidRuntimeStream("event data was malformed");
 
+    if (event.type === "run.heartbeat") {
+      if (!heartbeatsNegotiated) {
+        throw invalidRuntimeStream("a heartbeat arrived without protocol negotiation");
+      }
+      heartbeatCount += 1;
+      if (heartbeatCount > MAX_RUNTIME_STREAM_HEARTBEATS) {
+        throw invalidRuntimeStream("too many heartbeat events");
+      }
+      if (lineBytes > MAX_RUNTIME_STREAM_HEARTBEAT_BYTES) {
+        throw invalidRuntimeStream("a heartbeat event exceeded its size limit");
+      }
+      assertExactObjectKeys(event.data, [], "heartbeat event data");
+      return;
+    }
     if (event.type === "planner.completed") {
       if (streamedPlan) throw invalidRuntimeStream("planner.completed was duplicated");
+      if (lineBytes > MAX_RUNTIME_STREAM_PLAN_EVENT_BYTES) {
+        throw invalidRuntimeStream("the planner event exceeded its size limit");
+      }
       assertExactObjectKeys(event.data, ["contract_digest", "plan"], "planner event data");
       const contractDigest = String(event.data.contract_digest || "");
       if (!/^sha256:[a-f0-9]{64}$/.test(contractDigest)) {
@@ -937,6 +984,16 @@ function responseContentType(headers) {
   return String(Array.isArray(value) ? value[0] : value).split(";", 1)[0].trim().toLowerCase();
 }
 
+function validateRuntimeStreamProtocol(headers) {
+  const value = headers?.["x-tcar-stream-protocol"] ?? headers?.["X-TCAR-Stream-Protocol"] ?? "";
+  const protocol = String(Array.isArray(value) ? value[0] : value).trim();
+  if (!protocol) return false;
+  if (protocol !== RUNTIME_STREAM_PROTOCOL) {
+    throw invalidRuntimeStream("the response selected an unsupported stream protocol");
+  }
+  return true;
+}
+
 function projectedRuntimeError(payload, status) {
   const projected = projectRuntimeFailure(payload, status);
   const error = new Error(runtimeFailureMessage(projected));
@@ -1030,6 +1087,15 @@ function normalizeRuntimeTransportError(error) {
 function runtimeTimeoutError(timeoutMs) {
   const error = new Error(`TCAR runtime request timed out after ${timeoutMs}ms.`);
   error.status = 504;
+  return error;
+}
+
+function runtimeStreamIdleTimeoutError(timeoutMs) {
+  const error = new Error(`TCAR runtime event stream was idle for ${timeoutMs}ms.`);
+  error.status = 504;
+  error.code = "runtime_stream_idle_timeout";
+  error.retryable = true;
+  error.component = "runtime_stream";
   return error;
 }
 

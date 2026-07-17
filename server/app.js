@@ -6482,7 +6482,13 @@ function publicRunFailureMessage(code = null) {
   if (code === "run_interrupted") {
     return interruptedRunMessage();
   }
-  return publicRunFailureDetails(code).message;
+  return publicRunFailureDetails(publicRunFailureCode(code)).message;
+}
+
+function publicRunFailureCode(code = null) {
+  return code === "runtime_stream_idle_timeout"
+    ? "model_connection_interrupted"
+    : code;
 }
 
 function publicRunFailureDetails(code = null) {
@@ -6494,6 +6500,11 @@ function publicRunFailureDetails(code = null) {
     },
     model_timeout: {
       message: "The model took too long to respond. Your message is still available—try again.",
+      retryable: true,
+      action: "retry"
+    },
+    model_connection_interrupted: {
+      message: "The connection to the model runtime stopped receiving progress. Your message is still available—try again.",
       retryable: true,
       action: "retry"
     },
@@ -6541,7 +6552,8 @@ async function recordBackgroundChatFailure({ store, bus, run_id, error, attemptI
     ) {
       return null;
     }
-    const code = String(error?.code || "background_run_failed");
+    const diagnosticCode = String(error?.code || "background_run_failed");
+    const code = publicRunFailureCode(diagnosticCode);
     const publicFailure = publicRunFailureDetails(code);
     run.status = "failed";
     run.completed_at = completedAt;
@@ -6551,7 +6563,10 @@ async function recordBackgroundChatFailure({ store, bus, run_id, error, attemptI
       retryable: publicFailure.retryable,
       action: publicFailure.action
     };
-    run.error_admin_only = normalizeDiagnosticError(error, { fallbackCode: code });
+    run.error_admin_only = {
+      ...normalizeDiagnosticError(error, { fallbackCode: diagnosticCode }),
+      ...(diagnosticCode !== code ? { public_code: code } : {})
+    };
     run.events = Array.isArray(run.events) ? run.events : [];
     run.events.push({ type: "run.failed", code, message: publicRunFailureMessage(code), at: completedAt });
     releaseRunReservation(data, run, { reason: code });
@@ -6588,9 +6603,10 @@ function redactRunErrorForRequest(run, req) {
         message: interruptedRunMessage()
       };
     }
-    const publicFailure = publicRunFailureDetails(run.error.code);
+    const code = publicRunFailureCode(run.error.code);
+    const publicFailure = publicRunFailureDetails(code);
     return {
-      code: run.error.code || "run_failed",
+      code: code || "run_failed",
       message: publicFailure.message,
       retryable: run.error.retryable === true || publicFailure.retryable,
       action: run.error.action || publicFailure.action
@@ -6624,6 +6640,7 @@ function redactRunEventForRequest(event = {}, req) {
     ...safeEvent
   } = event || {};
   if (safeEvent.type === "run.failed") {
+    safeEvent.code = publicRunFailureCode(safeEvent.code);
     safeEvent.message = publicRunFailureMessage(safeEvent.code);
     delete safeEvent.error;
   }

@@ -13,7 +13,7 @@ import {
 } from "lucide-react";
 import { SignIn, SignUp, useClerk, useUser } from "@clerk/react";
 import { useEffect, useState } from "react";
-import { notifyAuthenticationRequired } from "./authRecovery.js";
+import { isAuthenticationRequiredResponse, notifyAuthenticationRequired } from "./authRecovery.js";
 
 export function IdentityPage({ mode = "login", onHome }) {
   const registering = mode === "register";
@@ -544,7 +544,7 @@ async function identityRequest(path, { method = "GET", body, idempotencyKey } = 
     error.code = payload.error;
     error.requestId = payload.request_id;
     error.authReason = response.headers.get("x-clerk-auth-reason") || "";
-    if (response.status === 401) notifyAuthenticationRequired(error);
+    if (isAuthenticationRequiredResponse(response, payload)) notifyAuthenticationRequired(error);
     throw error;
   }
   return payload;

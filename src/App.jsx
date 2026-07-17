@@ -66,6 +66,7 @@ import { AccountPanel, AdminUsersPanel, IdentityPage, SessionRecoveryPage } from
 import {
   AUTHENTICATION_REQUIRED_EVENT,
   authenticationFailureDetails,
+  isAuthenticationRequiredResponse,
   notifyAuthenticationRequired,
   resetAuthenticationNotification,
   shouldOpenWorkspaceFromIdentity
@@ -168,7 +169,7 @@ export async function request(path, options = {}) {
       error.details = payload.details;
       error.requestId = payload.request_id;
       error.authReason = response.headers.get("x-clerk-auth-reason") || "";
-      if (response.status === 401) notifyAuthenticationRequired(error);
+      if (isAuthenticationRequiredResponse(response, payload)) notifyAuthenticationRequired(error);
       throw error;
     }
     return payload;

@@ -2,6 +2,10 @@ export const AUTHENTICATION_REQUIRED_EVENT = "virenis:authentication-required";
 
 let authenticationNotificationPending = false;
 
+export function isAuthenticationRequiredResponse(response, payload = {}) {
+  return Number(response?.status) === 401 && payload?.error === "authentication_required";
+}
+
 export function authenticationFailureDetails(error = {}, origin = currentOrigin()) {
   const reason = String(error?.authReason || error?.reason || "").trim();
   const originMismatch = reason === "token-invalid-authorized-parties";
