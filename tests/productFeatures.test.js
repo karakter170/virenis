@@ -1243,6 +1243,18 @@ describe("Agent Studio product surfaces", () => {
     expect(markup).not.toContain("agent-trigger");
   });
 
+  it("keeps the team picker open while switching teams", () => {
+    const appSource = readFileSync(new URL("../src/App.jsx", import.meta.url), "utf8");
+    const workspaceSelection = appSource.match(/function chooseWorkspace\([\s\S]*?\n {2}\}/)?.[0] || "";
+
+    expect(workspaceSelection).toContain("onSelectWorkspace?.(workspaceId)");
+    expect(workspaceSelection).toContain("configurationBusy");
+    expect(workspaceSelection).not.toContain("setAgentMenuOpen(false)");
+    expect(workspaceSelection).not.toContain("agentMenuTriggerRef.current?.focus()");
+    expect(appSource).toMatch(/\[agentMenuOpen, activeWorkspace\?\.agent_workspace_id, configurationBusy\]/);
+    expect(appSource).toContain("aria-busy={configurationBusy || undefined}");
+  });
+
   it("builds directed handoff/knowledge edges and bounded large-graph positions", () => {
     const agents = [
       { id: "source_agent", resources: [], consumes: [] },
@@ -1727,6 +1739,15 @@ describe("Agent Studio product surfaces", () => {
     expect(appSource).toContain('aria-haspopup="dialog"');
     expect(appSource).toMatch(/role="dialog"\s+aria-modal="false"/);
     expect(appSource).toContain('event.key !== "Escape"');
+  });
+
+  it("keeps the new-chat composer anchored without an empty-state spacer", () => {
+    const styles = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
+    const composerZone = styles.match(/\.composer-zone\s*\{([\s\S]*?)\}/)?.[1] || "";
+
+    expect(composerZone).toContain("env(safe-area-inset-bottom)");
+    expect(styles).not.toMatch(/\.chat-main\.is-empty\s+\.composer-zone\s*\{/);
+    expect(styles).not.toContain("min(24vh, 210px)");
   });
 
   it("compacts signed-in header controls for 320px phones", () => {

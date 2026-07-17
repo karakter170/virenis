@@ -3896,6 +3896,7 @@ export function Composer({
   useEffect(() => {
     if (!agentMenuOpen) return undefined;
     const frame = window.requestAnimationFrame(() => {
+      if (configurationBusy) return;
       const selectedWorkspace = agentMenuRef.current?.querySelector('[data-team-option][aria-checked="true"]:not(:disabled)');
       const firstControl = agentMenuRef.current?.querySelector("button:not(:disabled), input:not(:disabled), [tabindex='0']");
       (selectedWorkspace || firstControl)?.focus();
@@ -3917,7 +3918,7 @@ export function Composer({
       document.removeEventListener("pointerdown", closeOutside);
       document.removeEventListener("keydown", closeOnEscape);
     };
-  }, [agentMenuOpen]);
+  }, [agentMenuOpen, activeWorkspace?.agent_workspace_id, configurationBusy]);
 
   useEffect(() => {
     const input = inputRef.current;
@@ -3963,10 +3964,8 @@ export function Composer({
   }
 
   function chooseWorkspace(workspaceId, selected) {
-    if (selected || !canWrite) return;
-    setAgentMenuOpen(false);
+    if (selected || !canWrite || configurationBusy) return;
     onSelectWorkspace?.(workspaceId);
-    requestAnimationFrame(() => agentMenuTriggerRef.current?.focus());
   }
 
   function onWorkspaceKeyDown(event) {
@@ -4186,6 +4185,7 @@ export function Composer({
           className="team-picker-popover"
           role="dialog"
           aria-modal="false"
+          aria-busy={configurationBusy || undefined}
           aria-label="Choose team and specialists for this chat"
           tabIndex="-1"
           hidden={!agentMenuOpen}

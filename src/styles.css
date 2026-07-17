@@ -1719,10 +1719,6 @@ summary:focus-visible,
   background: rgba(255, 255, 255, 0.97);
 }
 
-.chat-main.is-empty .composer-zone {
-  padding-bottom: min(24vh, 210px);
-}
-
 .composer-shell {
   position: relative;
   width: min(878px, 100%);
@@ -6253,10 +6249,6 @@ summary:focus-visible,
 
   .composer-zone {
     padding: 6px 14px max(14px, env(safe-area-inset-bottom));
-  }
-
-  .chat-main.is-empty .composer-zone {
-    padding-bottom: max(18px, env(safe-area-inset-bottom));
   }
 
   .view-switch.four-up button {
