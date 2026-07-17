@@ -27,6 +27,7 @@ import {
   RunReceipt,
   ToolApprovalCheckpoint,
   UsageReceipt,
+  WorkspaceSidebar,
   WorldGraphChanges,
   WorkflowDraftCard,
   agentPayloadFromForm,
@@ -44,10 +45,13 @@ import {
   mergeLiveRunEvent,
   marketplaceDetailActionsDisabled,
   progressiveRevealPlan,
+  promotePastChat,
   responseStyleFromBoundary,
   runProgressGraph,
   runProgressSpecialists,
+  scheduleAfterMobileSidebarClose,
   settleConnectionApproval,
+  sortedPastChats,
   storedGraphPositions,
   unavailableCollaboratorHandoffs,
   workflowProposedNewSpecialists,
@@ -1762,6 +1766,162 @@ describe("Agent Studio product surfaces", () => {
     expect(appSource).toContain('event.key !== "Escape"');
   });
 
+  it("keeps recent conversations ordered and promotes a newly active chat without overwriting established titles", () => {
+    const sessions = [
+      {
+        session_id: "chat_older",
+        title: "Launch checklist",
+        updated_at: "2026-07-15T09:00:00.000Z"
+      },
+      {
+        session_id: "chat_active",
+        title: "New chat",
+        updated_at: "2026-07-16T09:00:00.000Z",
+        last_message_at: "2026-07-16T10:00:00.000Z"
+      },
+      {
+        session_id: "chat_latest",
+        title: "Backend techniques",
+        updated_at: "2026-07-17T09:00:00.000Z"
+      }
+    ];
+
+    expect(sortedPastChats(sessions).map((item) => item.session_id)).toEqual([
+      "chat_latest",
+      "chat_active",
+      "chat_older"
+    ]);
+    expect(sortedPastChats(sessions, "BACKEND").map((item) => item.session_id)).toEqual(["chat_latest"]);
+
+    const promoted = promotePastChat(
+      sessions,
+      "chat_active",
+      "  Compare   backend\narchitecture patterns  ",
+      "2026-07-18T12:30:00.000Z"
+    );
+    expect(promoted.map((item) => item.session_id)).toEqual(["chat_active", "chat_older", "chat_latest"]);
+    expect(promoted[0]).toMatchObject({
+      title: "Compare backend architecture patterns",
+      updated_at: "2026-07-18T12:30:00.000Z",
+      last_message_at: "2026-07-18T12:30:00.000Z"
+    });
+
+    const establishedTitle = promotePastChat(
+      promoted,
+      "chat_latest",
+      "This prompt must not replace an established title",
+      "2026-07-19T12:30:00.000Z"
+    );
+    expect(establishedTitle[0].title).toBe("Backend techniques");
+  });
+
+  it("closes the mobile sidebar and restores a stable focus target before navigation", () => {
+    const events = [];
+    let scheduled;
+    const deferred = scheduleAfterMobileSidebarClose({
+      mobileOpen: true,
+      close: () => events.push("close"),
+      restoreFocus: () => events.push("focus-launcher"),
+      action: () => events.push("navigate"),
+      schedule: (callback) => { scheduled = callback; }
+    });
+
+    expect(deferred).toBe(true);
+    expect(events).toEqual(["close"]);
+    scheduled();
+    expect(events).toEqual(["close", "focus-launcher", "navigate"]);
+
+    events.length = 0;
+    expect(scheduleAfterMobileSidebarClose({
+      mobileOpen: false,
+      close: () => events.push("close"),
+      restoreFocus: () => events.push("focus-launcher"),
+      action: () => events.push("navigate"),
+      schedule: () => events.push("schedule")
+    })).toBe(false);
+    expect(events).toEqual(["navigate"]);
+  });
+
+  it("puts workspace tools, account actions, and past chats in one accessible sidebar", () => {
+    const commonProps = {
+      auth: {
+        user_id: "alice",
+        display_name: "Alice",
+        email: "alice@example.com",
+        is_admin: false,
+        is_viewer: false
+      },
+      billing: { account: { balance_credits: "42.5" } },
+      sessions: [
+        {
+          session_id: "chat_active",
+          title: "Backend techniques",
+          updated_at: "2026-07-17T12:00:00.000Z"
+        },
+        {
+          session_id: "chat_other",
+          title: "Launch checklist",
+          updated_at: "2026-07-16T12:00:00.000Z"
+        }
+      ],
+      activeSessionId: "chat_active",
+      activeView: "graph",
+      canWrite: true,
+      navigationDisabled: false,
+      newChatDisabled: false,
+      accountControl: createElement("span", { "data-testid": "account-control" }, "Profile"),
+      onHome: vi.fn(),
+      onToggleCollapsed: vi.fn(),
+      onMobileClose: vi.fn(),
+      onNewChat: vi.fn(),
+      onOpenSession: vi.fn(),
+      onOpenView: vi.fn()
+    };
+    const markup = renderToStaticMarkup(createElement(WorkspaceSidebar, commonProps));
+
+    expect(markup).toContain('aria-label="Workspace navigation"');
+    expect(markup).toContain('aria-label="Go to Virenis homepage"');
+    expect(markup).toContain('aria-label="New chat"');
+    expect(markup).toContain('aria-label="Workspace tools"');
+    expect(markup).toContain('aria-label="Past Chats"');
+    expect(markup).toContain('data-testid="account-control"');
+    expect(markup).toContain("Balance");
+    expect(markup).toContain("42.5 credits");
+    expect(markup).toContain("My team");
+    expect(markup).toContain("Team map");
+    expect(markup).toContain("Discover");
+    expect(markup).toContain("Apps");
+    expect(markup).toContain("Knowledge");
+    expect(markup).toContain("Account");
+    expect(markup).toContain("Past Chats");
+    expect(markup).toContain("Backend techniques");
+    expect(markup).toContain("Launch checklist");
+    expect(markup).not.toContain('title="Admin"');
+    expect(markup.match(/aria-current="page"/g) || []).toHaveLength(2);
+    expect(markup).toMatch(/<button class="sidebar-nav-item"[^>]*aria-current="page"[^>]*>[\s\S]*?<span class="sidebar-label">Team map<\/span><\/button>/);
+    expect(markup).toMatch(/<button type="button" class="sidebar-chat-row"[^>]*aria-current="page"[^>]*>[\s\S]*?<span>Backend techniques<\/span>/);
+
+    const adminMarkup = renderToStaticMarkup(createElement(WorkspaceSidebar, {
+      ...commonProps,
+      auth: { ...commonProps.auth, is_admin: true }
+    }));
+    expect(adminMarkup).toContain('title="Admin"');
+
+    const viewerMarkup = renderToStaticMarkup(createElement(WorkspaceSidebar, {
+      ...commonProps,
+      auth: { ...commonProps.auth, is_viewer: true },
+      canWrite: false
+    }));
+    expect(viewerMarkup).toMatch(/<button(?=[^>]*aria-label="New chat")(?=[^>]*disabled="")[^>]*>/);
+
+    const mobileMarkup = renderToStaticMarkup(createElement(WorkspaceSidebar, {
+      ...commonProps,
+      mobileOpen: true
+    }));
+    expect(mobileMarkup).toContain('role="dialog"');
+    expect(mobileMarkup).toContain('aria-modal="true"');
+  });
+
   it("keeps the new-chat composer anchored without an empty-state spacer", () => {
     const styles = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
     const composerZone = styles.match(/\.composer-zone\s*\{([\s\S]*?)\}/)?.[1] || "";
@@ -1771,11 +1931,28 @@ describe("Agent Studio product surfaces", () => {
     expect(styles).not.toContain("min(24vh, 210px)");
   });
 
-  it("compacts signed-in header controls for 320px phones", () => {
+  it("keeps the workspace header-free while the navigation becomes an off-canvas mobile panel", () => {
     const styles = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
-    expect(styles).toContain("@media (max-width: 420px)");
-    expect(styles).toMatch(/\.app-header \.balance-pill-copy\s*\{\s*display:\s*none/);
-    expect(styles).toMatch(/\.app-header \.studio-button\s*\{[\s\S]*?width:\s*36px/);
+    const appSource = readFileSync(new URL("../src/App.jsx", import.meta.url), "utf8");
+    const appShell = styles.match(/\.app-shell\s*\{([\s\S]*?)\}/)?.[1] || "";
+
+    expect(appSource).toContain("<WorkspaceSidebar");
+    expect(appSource).toContain('className="sidebar-mobile-launcher"');
+    expect(appSource).not.toContain('className="app-header"');
+    expect(appSource).not.toContain("HistorySheet");
+    expect(appSource).not.toContain("historyOpen");
+    expect(appSource).toContain('inert={mobileSidebarModalOpen ? "" : undefined}');
+    expect(appSource).toContain('aria-hidden={mobileSidebarModalOpen ? "true" : undefined}');
+    expect(styles).not.toContain(".app-header");
+    expect(appShell).toMatch(/grid-template-columns:\s*[^;]+\s+minmax\(0,\s*1fr\)/);
+    expect(appShell).not.toContain("grid-template-rows: 62px");
+    expect(styles).toMatch(/\.sidebar-mobile-launcher,\s*\.workspace-sidebar-scrim\s*\{\s*display:\s*none/);
+    expect(styles).toMatch(/@media \(max-width: 900px\)[\s\S]*?\.workspace-sidebar(?:,\s*\.workspace-sidebar\.is-collapsed)?\s*\{[\s\S]*?position:\s*fixed;[\s\S]*?transform:\s*translateX\((?:-100%|calc\(-100%\s*-\s*18px\))\);/);
+    expect(styles).toMatch(/\.workspace-sidebar\.is-open(?:,\s*\.workspace-sidebar\.is-collapsed\.is-open)?\s*\{[\s\S]*?transform:\s*translateX\(0\);/);
+    expect(styles).toMatch(/@media \(max-width: 900px\)[\s\S]*?\.sidebar-mobile-launcher\s*\{[\s\S]*?display:\s*(?:grid|inline-grid|flex|inline-flex);/);
+    expect(styles).toMatch(/@media \(max-width: 900px\)[\s\S]*?\.workspace-sidebar-scrim\s*\{[\s\S]*?display:\s*block;/);
+    expect(styles).toMatch(/\.sidebar-history\s*\{[\s\S]*?grid-row:\s*4;/);
+    expect(styles).toMatch(/\.sidebar-footer\s*\{[\s\S]*?grid-row:\s*5;/);
   });
 
   it("prevents unavailable built-in tools from being newly selected", () => {

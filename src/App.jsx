@@ -383,6 +383,53 @@ function formatDate(value, { includeTime = false } = {}) {
   return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" }).format(date);
 }
 
+export function sortedPastChats(sessions = [], query = "") {
+  const normalizedQuery = String(query || "").trim().toLowerCase();
+  return (Array.isArray(sessions) ? sessions : [])
+    .map((item, index) => ({ item, index }))
+    .filter(({ item }) => !normalizedQuery || String(item?.title || "").toLowerCase().includes(normalizedQuery))
+    .sort((left, right) => {
+      const rightActivity = Date.parse(right.item?.last_message_at || right.item?.updated_at || "") || 0;
+      const leftActivity = Date.parse(left.item?.last_message_at || left.item?.updated_at || "") || 0;
+      return rightActivity - leftActivity || left.index - right.index;
+    })
+    .map(({ item }) => item);
+}
+
+export function promotePastChat(sessions = [], sessionId, content, activityAt = new Date().toISOString()) {
+  const sessionList = Array.isArray(sessions) ? sessions : [];
+  const targetId = String(sessionId || "");
+  const current = sessionList.find((item) => String(item?.session_id || "") === targetId);
+  if (!current) return sessionList;
+  const normalizedTitle = String(content || "").replace(/\s+/g, " ").trim().slice(0, 90);
+  const updated = {
+    ...current,
+    title: current.title === "New chat" && normalizedTitle ? normalizedTitle : current.title,
+    updated_at: activityAt,
+    last_message_at: activityAt
+  };
+  return [updated, ...sessionList.filter((item) => String(item?.session_id || "") !== targetId)];
+}
+
+export function scheduleAfterMobileSidebarClose({
+  mobileOpen,
+  close,
+  restoreFocus,
+  action,
+  schedule = (callback) => window.requestAnimationFrame(callback)
+}) {
+  if (!mobileOpen) {
+    action();
+    return false;
+  }
+  close();
+  schedule(() => {
+    restoreFocus();
+    action();
+  });
+  return true;
+}
+
 function formatCreditDisplay(value) {
   if (value === undefined || value === null || value === "") return "—";
   const numeric = Number(value);
@@ -393,16 +440,6 @@ function formatCreditDisplay(value) {
 function formatTokenCount(value) {
   const numeric = Number(value || 0);
   return new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 }).format(Number.isFinite(numeric) ? numeric : 0);
-}
-
-function initialsFor(auth) {
-  return String(auth?.display_name || auth?.user_id || "User")
-    .split(/[^a-z0-9]+/i)
-    .filter(Boolean)
-    .slice(0, 2)
-    .map((part) => part[0])
-    .join("")
-    .toUpperCase() || "U";
 }
 
 export default function App() {
@@ -585,7 +622,17 @@ function Workspace({ onHome, onSignedOut }) {
   const [loading, setLoading] = useState(true);
   const [bootstrapFailure, setBootstrapFailure] = useState("");
   const [error, setError] = useState("");
-  const [historyOpen, setHistoryOpen] = useState(false);
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
+  const [compactNavigation, setCompactNavigation] = useState(() => (
+    typeof window.matchMedia === "function" && window.matchMedia("(max-width: 900px)").matches
+  ));
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
+    try {
+      return window.localStorage.getItem("virenis:workspace-sidebar-collapsed") === "true";
+    } catch {
+      return false;
+    }
+  });
   const [resourcesOpen, setResourcesOpen] = useState(false);
   const [resourceView, setResourceView] = useState("agents");
   const [detailsRunId, setDetailsRunId] = useState(null);
@@ -628,6 +675,7 @@ function Workspace({ onHome, onSignedOut }) {
   const eventSourceRef = useRef(null);
   const sendInFlightRef = useRef(false);
   const sendRetryRef = useRef(null);
+  const mobileSidebarLauncherRef = useRef(null);
   const bootstrapInFlightRef = useRef(false);
   const sessionLoadSequenceRef = useRef(0);
   const desiredSessionIdRef = useRef("");
@@ -652,6 +700,32 @@ function Workspace({ onHome, onSignedOut }) {
     workspace.agent_workspace_id === session?.agent_workspace_id
   )) || agentWorkspaces.find((workspace) => workspace.is_general) || agentWorkspaces[0] || null;
   const activeAgentWorkspaceAgents = agentsForWorkspace(agents, activeAgentWorkspace);
+  const mobileSidebarModalOpen = compactNavigation && mobileSidebarOpen;
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem("virenis:workspace-sidebar-collapsed", String(sidebarCollapsed));
+    } catch {
+      // Storage can be unavailable in private browsing; the in-memory preference still works.
+    }
+  }, [sidebarCollapsed]);
+
+  useEffect(() => {
+    if (typeof window.matchMedia !== "function") return undefined;
+    const query = window.matchMedia("(max-width: 900px)");
+    function synchronizeNavigationMode(event) {
+      const compact = event.matches;
+      setCompactNavigation(compact);
+      if (!compact) setMobileSidebarOpen(false);
+    }
+    synchronizeNavigationMode(query);
+    if (typeof query.addEventListener === "function") query.addEventListener("change", synchronizeNavigationMode);
+    else query.addListener?.(synchronizeNavigationMode);
+    return () => {
+      if (typeof query.removeEventListener === "function") query.removeEventListener("change", synchronizeNavigationMode);
+      else query.removeListener?.(synchronizeNavigationMode);
+    };
+  }, []);
 
   useEffect(() => {
     displayedSessionIdRef.current = session?.session_id || "";
@@ -1078,7 +1152,7 @@ function Workspace({ onHome, onSignedOut }) {
       setChatDocuments(payload.chat_documents || []);
       setAgents(agentList.agents || []);
       if (navigation) {
-        setHistoryOpen(false);
+        setMobileSidebarOpen(false);
         nearBottomRef.current = true;
       }
       const assistantRunIds = [...new Set(
@@ -1140,7 +1214,7 @@ function Workspace({ onHome, onSignedOut }) {
       setSessions((current) => [created, ...current.filter((item) => item.session_id !== created.session_id)]);
       await openSession(created.session_id);
       setDraft("");
-      setHistoryOpen(false);
+      setMobileSidebarOpen(false);
       setFocusComposer((value) => value + 1);
     } catch (chatError) {
       desiredSessionIdRef.current = previousSessionId;
@@ -1232,6 +1306,7 @@ function Workspace({ onHome, onSignedOut }) {
     setSendPending(true);
     sendRetryRef.current = submission;
     const optimisticId = `local_${Date.now()}`;
+    const submittedAt = new Date().toISOString();
     nearBottomRef.current = true;
     setDraft("");
     setError("");
@@ -1239,7 +1314,7 @@ function Workspace({ onHome, onSignedOut }) {
       message_id: optimisticId,
       role: "user",
       content,
-      created_at: new Date().toISOString()
+      created_at: submittedAt
     }]);
     try {
       const queued = await api.post(`/api/chat/sessions/${encodeURIComponent(originSessionId)}/messages`, {
@@ -1249,6 +1324,7 @@ function Workspace({ onHome, onSignedOut }) {
         options: { show_route_details: true }
       }, { idempotencyKey: submission.idempotencyKey });
       sendRetryRef.current = null;
+      setSessions((items) => promotePastChat(items, originSessionId, content, submittedAt));
       const originIsVisible = displayedSessionIdRef.current === originSessionId;
       if (originIsVisible) {
         setMessages((items) => items.map((message) => message.message_id === optimisticId
@@ -2028,6 +2104,32 @@ function Workspace({ onHome, onSignedOut }) {
     nearBottomRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 120;
   }
 
+  function openWorkspaceView(view) {
+    runAfterMobileSidebarClose(() => {
+      setResourceView(view);
+      setResourcesOpen(true);
+      if (view === "account") void refreshBilling();
+    });
+  }
+
+  function closeMobileSidebar() {
+    scheduleAfterMobileSidebarClose({
+      mobileOpen: mobileSidebarModalOpen,
+      close: () => setMobileSidebarOpen(false),
+      restoreFocus: () => mobileSidebarLauncherRef.current?.focus(),
+      action: () => undefined
+    });
+  }
+
+  function runAfterMobileSidebarClose(action) {
+    scheduleAfterMobileSidebarClose({
+      mobileOpen: mobileSidebarModalOpen,
+      close: () => setMobileSidebarOpen(false),
+      restoreFocus: () => mobileSidebarLauncherRef.current?.focus(),
+      action
+    });
+  }
+
   const isBusy = runIsActiveForSession(activeRun, session?.session_id);
   const executionConfigurationBusy = Boolean(
     teamMutationBusy
@@ -2051,53 +2153,59 @@ function Workspace({ onHome, onSignedOut }) {
     && ["pending", "resuming", "resume_failed"].includes(checkpoint.status)
   );
 
-  return (
-    <div className="app-shell">
-      <header className="app-header">
-        <div className="header-side">
-          <IconButton label="Open chat history" onClick={() => setHistoryOpen(true)} disabled={Boolean(loading || bootstrapFailure)}>
-            <Menu size={20} />
-          </IconButton>
-          <button className="wordmark" type="button" onClick={onHome} aria-label="Go to Virenis homepage">Virenis</button>
-        </div>
-        <div className="header-side header-actions">
-          <button
-            className="balance-pill"
-            type="button"
-            disabled={Boolean(loading || bootstrapFailure)}
-            onClick={() => {
-              setResourceView("account");
-              setResourcesOpen(true);
-              void refreshBilling();
-            }}
-            title={billing?.account?.reserved_micros > 0
-              ? `${billing.account.reserved_credits} credits are reserved for active requests`
-              : "Open balance details"}
-          >
-            <span className="balance-pill-icon" aria-hidden="true"><WalletCards size={14} /></span>
-            <span className="balance-pill-copy">
-              <span>Balance</span>
-              <strong>{formatCreditDisplay(billing?.account?.balance_credits)}</strong>
-            </span>
-          </button>
-          <IconButton label="New chat" onClick={newChat} disabled={!canWrite || Boolean(sessionSwitching)}>
-            <SquarePen size={19} />
-          </IconButton>
-          <button
-            className="studio-button"
-            type="button"
-            aria-label="Open your team studio"
-            onClick={() => setResourcesOpen(true)}
-            disabled={Boolean(loading || bootstrapFailure)}
-          >
-            <Layers3 size={16} />
-            <span>My team</span>
-          </button>
-          <span className="clerk-user-control"><UserButton afterSignOutUrl="/" /></span>
-        </div>
-      </header>
+  const workspaceNavigationDisabled = Boolean(loading || bootstrapFailure);
 
-      <main className={`chat-main ${messages.length === 0 ? "is-empty" : ""}`}>
+  return (
+    <div className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}>
+      <WorkspaceSidebar
+        auth={auth}
+        billing={billing}
+        sessions={sessions}
+        activeSessionId={sessionSwitching && sessionSwitching !== "new-chat" ? sessionSwitching : session?.session_id}
+        activeView={resourcesOpen ? resourceView : ""}
+        canWrite={canWrite}
+        navigationDisabled={workspaceNavigationDisabled}
+        newChatDisabled={!canWrite || Boolean(sessionSwitching)}
+        collapsed={sidebarCollapsed}
+        mobileOpen={mobileSidebarModalOpen}
+        onHome={onHome}
+        onToggleCollapsed={() => setSidebarCollapsed((value) => !value)}
+        onMobileClose={closeMobileSidebar}
+        onNewChat={() => runAfterMobileSidebarClose(() => { void newChat(); })}
+        onOpenSession={(sessionId) => runAfterMobileSidebarClose(() => {
+          openSession(sessionId).catch((openError) => setError(friendlyError(openError)));
+        })}
+        onOpenView={openWorkspaceView}
+        accountControl={<UserButton afterSignOutUrl="/" />}
+      />
+
+      {mobileSidebarModalOpen && (
+        <div
+          className="workspace-sidebar-scrim"
+          aria-hidden="true"
+          onClick={closeMobileSidebar}
+        />
+      )}
+
+      <button
+        className="sidebar-mobile-launcher"
+        ref={mobileSidebarLauncherRef}
+        type="button"
+        aria-label="Open workspace navigation"
+        aria-controls="workspace-sidebar"
+        aria-expanded={mobileSidebarModalOpen}
+        aria-hidden={mobileSidebarModalOpen ? "true" : undefined}
+        tabIndex={mobileSidebarModalOpen ? -1 : undefined}
+        onClick={() => setMobileSidebarOpen(true)}
+      >
+        <Menu size={20} />
+      </button>
+
+      <main
+        className={`chat-main ${messages.length === 0 ? "is-empty" : ""}`}
+        aria-hidden={mobileSidebarModalOpen ? "true" : undefined}
+        inert={mobileSidebarModalOpen ? "" : undefined}
+      >
         <section
           className="message-thread"
           ref={threadRef}
@@ -2269,17 +2377,6 @@ function Workspace({ onHome, onSignedOut }) {
           />}
         </div>
       </main>
-
-      {historyOpen && (
-        <HistorySheet
-          sessions={sessions}
-          activeSessionId={session?.session_id}
-          canWrite={canWrite}
-          onClose={() => setHistoryOpen(false)}
-          onNewChat={newChat}
-          onOpenSession={(sessionId) => openSession(sessionId).catch((openError) => setError(friendlyError(openError)))}
-        />
-      )}
 
       {resourcesOpen && (
         <ResourcesSheet
@@ -2919,39 +3016,197 @@ function ModalSurface({ title, description, side, onClose, children, className =
   );
 }
 
-function HistorySheet({ sessions, activeSessionId, canWrite, onClose, onNewChat, onOpenSession }) {
+const WORKSPACE_SIDEBAR_VIEWS = [
+  { id: "agents", label: "My team", icon: Layers3 },
+  { id: "graph", label: "Team map", icon: Network },
+  { id: "marketplace", label: "Discover", icon: Sparkles },
+  { id: "connections", label: "Apps", icon: Plug },
+  { id: "knowledge", label: "Knowledge", icon: BookOpen },
+  { id: "account", label: "Account", icon: ContactRound, secondary: true }
+];
+
+export function WorkspaceSidebar({
+  auth,
+  billing,
+  sessions = [],
+  activeSessionId = "",
+  activeView = "",
+  canWrite = false,
+  navigationDisabled = false,
+  newChatDisabled = false,
+  collapsed = false,
+  mobileOpen = false,
+  onHome = () => undefined,
+  onToggleCollapsed = () => undefined,
+  onMobileClose = () => undefined,
+  onNewChat = () => undefined,
+  onOpenSession = () => undefined,
+  onOpenView = () => undefined,
+  accountControl = null
+}) {
   const [query, setQuery] = useState("");
-  const filtered = sessions.filter((item) => !query || String(item.title).toLowerCase().includes(query.toLowerCase()));
+  const sidebarRef = useRef(null);
+  const mobileCloseButtonRef = useRef(null);
+  const onMobileCloseRef = useRef(onMobileClose);
+  const filteredSessions = useMemo(() => sortedPastChats(sessions, query), [query, sessions]);
+  const views = auth?.is_admin
+    ? [...WORKSPACE_SIDEBAR_VIEWS, { id: "admin", label: "Admin", icon: ShieldCheck, secondary: true }]
+    : WORKSPACE_SIDEBAR_VIEWS;
+
+  useEffect(() => {
+    onMobileCloseRef.current = onMobileClose;
+  }, [onMobileClose]);
+
+  useEffect(() => {
+    if (!mobileOpen) return undefined;
+    const focusFrame = window.requestAnimationFrame(() => mobileCloseButtonRef.current?.focus());
+    function closeOnEscape(event) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onMobileCloseRef.current();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = [...(sidebarRef.current?.querySelectorAll(
+        "button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex='-1'])"
+      ) || [])].filter((element) => element.getClientRects().length > 0);
+      if (!focusable.length) return;
+      const first = focusable[0];
+      const last = focusable.at(-1);
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    }
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.cancelAnimationFrame(focusFrame);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [mobileOpen]);
+
   return (
-    <ModalSurface title="Chats" side="left" onClose={onClose}>
-      <div className="sheet-body">
-        <div className="sheet-toolbar">
-          <label className="search-field">
-            <Search size={17} aria-hidden="true" />
-            <span className="sr-only">Search chats</span>
-            <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search chats" />
-          </label>
-          <IconButton label="New chat" onClick={onNewChat} disabled={!canWrite}>
-            <SquarePen size={18} />
-          </IconButton>
+    <aside
+      ref={sidebarRef}
+      id="workspace-sidebar"
+      className={`workspace-sidebar ${collapsed ? "is-collapsed" : ""} ${mobileOpen ? "is-open" : ""}`.trim()}
+      role={mobileOpen ? "dialog" : undefined}
+      aria-modal={mobileOpen ? "true" : undefined}
+      aria-label="Workspace navigation"
+    >
+      <header className="sidebar-brand-row">
+        <button className="sidebar-brand" type="button" onClick={onHome} aria-label="Go to Virenis homepage" title="Virenis home">
+          <span className="sidebar-brand-mark" aria-hidden="true">V</span>
+          <span className="sidebar-label">Virenis</span>
+        </button>
+        <button
+          className="sidebar-collapse-button"
+          type="button"
+          aria-label={collapsed ? "Expand workspace navigation" : "Collapse workspace navigation"}
+          aria-expanded={!collapsed}
+          onClick={onToggleCollapsed}
+        >
+          {collapsed ? <ArrowRight size={17} /> : <ArrowLeft size={17} />}
+        </button>
+        <button ref={mobileCloseButtonRef} className="sidebar-mobile-close" type="button" aria-label="Close workspace navigation" onClick={onMobileClose}>
+          <X size={18} />
+        </button>
+      </header>
+
+      <button
+        className="sidebar-new-chat"
+        type="button"
+        aria-label="New chat"
+        title="New chat"
+        disabled={newChatDisabled || !canWrite}
+        onClick={onNewChat}
+      >
+        <SquarePen size={18} />
+        <span className="sidebar-label">New chat</span>
+      </button>
+
+      <nav className="sidebar-resource-nav" aria-label="Workspace tools">
+        <span className="sidebar-section-label sidebar-label">Workspace</span>
+        {views.map(({ id, label, icon: Icon, secondary }) => (
+          <button
+            className={`sidebar-nav-item ${secondary ? "is-secondary" : ""}`.trim()}
+            type="button"
+            key={id}
+            title={label}
+            aria-current={activeView === id ? "page" : undefined}
+            disabled={navigationDisabled}
+            onClick={() => onOpenView(id)}
+          >
+            <Icon size={17} />
+            <span className="sidebar-label">{label}</span>
+          </button>
+        ))}
+      </nav>
+
+      <section className="sidebar-history" aria-labelledby="past-chats-heading">
+        <div className="sidebar-history-heading">
+          <h2 id="past-chats-heading"><MessageCircle size={14} aria-hidden="true" />Past Chats</h2>
+          <span>{sessions.length}</span>
         </div>
-        <nav className="flat-list chat-list" aria-label="Chat history">
-          {filtered.map((item) => (
+        <label className="sidebar-chat-search">
+          <Search size={15} aria-hidden="true" />
+          <span className="sr-only">Search past chats</span>
+          <input
+            type="search"
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="Search chats"
+            autoComplete="off"
+          />
+        </label>
+        <nav className="sidebar-chat-list" aria-label="Past Chats">
+          {filteredSessions.map((item) => (
             <button
               type="button"
-              className="chat-row"
+              className="sidebar-chat-row"
               key={item.session_id}
               aria-current={activeSessionId === item.session_id ? "page" : undefined}
+              disabled={navigationDisabled}
               onClick={() => onOpenSession(item.session_id)}
             >
-              <span>{item.title}</span>
+              <span>{item.title || "Untitled chat"}</span>
               <small>{formatDate(item.last_message_at || item.updated_at)}</small>
             </button>
           ))}
-          {filtered.length === 0 && <p className="muted-empty">No chats found.</p>}
+          {filteredSessions.length === 0 && (
+            <p className="sidebar-empty-chats">{sessions.length ? "No chats found." : "Your conversations will appear here."}</p>
+          )}
         </nav>
-      </div>
-    </ModalSurface>
+      </section>
+
+      <footer className="sidebar-footer">
+        <button
+          className="sidebar-balance"
+          type="button"
+          title={billing?.account?.reserved_micros > 0
+            ? `${billing.account.reserved_credits} credits are reserved for active requests`
+            : "Open balance details"}
+          disabled={navigationDisabled}
+          onClick={() => onOpenView("account")}
+        >
+          <span className="sidebar-balance-icon" aria-hidden="true"><WalletCards size={15} /></span>
+          <span className="sidebar-balance-copy sidebar-label">
+            <span>Balance</span>
+            <strong>{formatCreditDisplay(billing?.account?.balance_credits)}</strong>
+          </span>
+        </button>
+        <div className="sidebar-profile">
+          <span className="clerk-user-control">{accountControl}</span>
+          <button className="sidebar-profile-copy sidebar-label" type="button" disabled={navigationDisabled} onClick={() => onOpenView("account")}>
+            <strong>{auth?.display_name || auth?.user_id || "Your account"}</strong>
+            <small>{auth?.email || (auth?.is_admin ? "Admin" : auth?.is_viewer ? "Viewer" : "Private workspace")}</small>
+          </button>
+        </div>
+      </footer>
+    </aside>
   );
 }
 
@@ -4404,13 +4659,6 @@ function ResourcesSheet({
           <AdminPanel runtime={runtime} metrics={metrics} agents={agents} documents={documents} onRefresh={onRefresh} />
         )}
 
-        <footer className="profile-footer">
-          <span className="profile-initials" aria-hidden="true">{initialsFor(auth)}</span>
-          <span>
-            <strong>{auth?.display_name || auth?.user_id || "User"}</strong>
-            <small>{auth?.email || (auth?.is_admin ? "Admin" : auth?.is_viewer ? "Viewer" : "Private workspace")}</small>
-          </span>
-        </footer>
       </div>
     </ModalSurface>
   );
