@@ -145,7 +145,7 @@ describe("Agent Studio product surfaces", () => {
     expect(JSON.stringify(working)).not.toContain("internal_note");
   });
 
-  it("shows selected and active agents in a compact accessible dependency graph", () => {
+  it("shows selected and active specialists in a compact accessible status list", () => {
     const run = {
       status: "running",
       plan: {
@@ -182,14 +182,14 @@ describe("Agent Studio product surfaces", () => {
     expect(graph.edges).toEqual([expect.objectContaining({ from: "s1", to: "s2" })]);
 
     const markup = renderToStaticMarkup(createElement(RunProgress, { run, agents }));
-    expect(markup).toContain("1 active · 2 selected");
+    expect(markup).toContain("1 working · 2 selected");
     expect(markup).toContain("Renault Specialist");
     expect(markup).toContain("Business Idea Specialist");
     expect(markup).toContain("Working");
     expect(markup).toContain("Done");
-    expect(markup).toContain("run-progress-dag");
-    expect(markup).toContain('role="img"');
-    expect(markup).toContain('marker-end="url(#run-progress-arrow-');
+    expect(markup).toContain("run-progress-agents");
+    expect(markup).toContain('role="list"');
+    expect(markup).toContain('role="listitem"');
     expect(markup).toContain("Working after Renault Specialist");
     expect(markup).toContain("Private model reasoning is not displayed");
     expect(markup).not.toContain("Why selected:");
@@ -197,6 +197,13 @@ describe("Agent Studio product surfaces", () => {
     expect(markup).not.toContain("Review the Renault context");
     expect(markup).not.toContain("Create the combined idea");
     expect(markup).not.toContain("hidden chain of thought");
+
+    const styles = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
+    const progressStyles = styles.match(/\.run-progress\s*\{([\s\S]*?)\}/)?.[1] || "";
+    expect(progressStyles).not.toContain("border:");
+    expect(progressStyles).not.toContain("background:");
+    expect(styles).toContain(".run-progress-agents");
+    expect(styles).not.toContain(".run-progress-dag");
   });
 
   it("keeps pre-plan Router progress minimal and screen-reader friendly", () => {
@@ -204,13 +211,22 @@ describe("Agent Studio product surfaces", () => {
       run: { status: "planning", events: [{ type: "planner.started" }] },
       agents: []
     }));
-    expect(markup).toContain("Selecting agents");
+    expect(markup).toContain("Selecting specialists");
     expect(markup).toContain('role="status"');
     expect(markup).toContain('aria-live="polite"');
     expect(markup).not.toContain("Choosing the right teammates");
     expect(markup).not.toContain("matching your request");
     expect(markup).not.toContain("Request read");
     expect(markup).not.toContain("Roles matched");
+  });
+
+  it("shows when the Router intentionally selects no specialists", () => {
+    const markup = renderToStaticMarkup(createElement(RunProgress, {
+      run: { status: "running", plan: { steps: [] }, events: [{ type: "planner.completed", steps: [] }] },
+      agents: []
+    }));
+    expect(markup).toContain("Answering directly");
+    expect(markup).not.toContain("Selecting specialists");
   });
 
   it("requires enough open team places for a proposed workflow", () => {
@@ -481,17 +497,18 @@ describe("Agent Studio product surfaces", () => {
       onCorrectOutcome: () => undefined
     }));
     expect(markup).toContain("Specialist outputs");
-    expect(markup).toContain("How your team built this answer");
+    expect(markup).toContain("Run summary");
     expect(markup).toContain("Router");
     expect(markup).toContain("Final answer");
     expect(markup).toContain("Specialist result");
     expect(markup).toContain("Opening evidence");
     expect(markup).toContain("Closing evidence");
-    expect(markup.indexOf("Specialist result")).toBeLessThan(markup.indexOf("How your team built this answer"));
-    expect(markup.indexOf("How your team built this answer")).toBeLessThan(markup.indexOf('class="usage-receipt"'));
+    expect(markup).toContain("Model usage");
+    expect(markup.indexOf("Specialist result")).toBeLessThan(markup.indexOf("Run summary"));
+    expect(markup.indexOf("Run summary")).toBeLessThan(markup.indexOf('class="usage-receipt"'));
   });
 
-  it("keeps WorldGraph evidence inside Team and exposes Activity only to admins", () => {
+  it("keeps work-reuse evidence inside Team and exposes Activity only to admins", () => {
     const run = {
       run_id: "run_answer_details_team",
       status: "completed",
@@ -537,11 +554,12 @@ describe("Agent Studio product surfaces", () => {
     expect(standardMarkup).not.toContain(">What changed</button>");
     expect(standardMarkup).not.toContain(">Activity</button>");
     expect(standardMarkup).toContain("Specialist outputs");
-    expect(standardMarkup).toContain("How your team built this answer");
-    expect(standardMarkup).toContain("WorldGraph record ready");
+    expect(standardMarkup).toContain("Run summary");
+    expect(standardMarkup).toContain("Work summary");
+    expect(standardMarkup).not.toMatch(/WorldGraph/i);
     expect(standardMarkup).toContain('class="detail-section world-changes embedded" role="region"');
-    expect(standardMarkup.indexOf("Complete result.")).toBeLessThan(standardMarkup.indexOf("How your team built this answer"));
-    expect(standardMarkup.indexOf("How your team built this answer")).toBeLessThan(standardMarkup.indexOf("WorldGraph record ready"));
+    expect(standardMarkup.indexOf("Complete result.")).toBeLessThan(standardMarkup.indexOf("Run summary"));
+    expect(standardMarkup.indexOf("Run summary")).toBeLessThan(standardMarkup.indexOf("Work summary"));
     expect(adminMarkup).toContain('class="view-switch four-up"');
     expect(adminMarkup).toContain(">Activity</button>");
     expect(adminMarkup).not.toContain(">What changed</button>");
@@ -569,8 +587,8 @@ describe("Agent Studio product surfaces", () => {
       agents: [{ id: "research_agent", title: "Research Agent" }],
       canWrite: true
     }));
-    expect(markup).toContain("WorldGraph record ready");
-    expect(markup).toContain("WorldGraph · change-aware reuse");
+    expect(markup).toContain("Work reuse summary");
+    expect(markup).not.toMatch(/WorldGraph/i);
     expect(markup).toContain("Check what changed");
     expect(markup).not.toContain("This answer is current");
   });
@@ -1584,6 +1602,7 @@ describe("Agent Studio product surfaces", () => {
       ]
     }));
     expect(markup).toContain("Customer Care is ready");
+    expect(markup).toContain('class="team-welcome-kicker">Customer Care is ready</span>');
     expect(markup).toContain("What should your team accomplish?");
     expect(markup).toContain("2 available specialists");
     expect(markup).toContain("Start with a request");
@@ -1624,7 +1643,8 @@ describe("Agent Studio product surfaces", () => {
         }
       }
     }));
-    expect(markup).toContain("WorldGraph · 2 parts checked again · live information was enabled");
+    expect(markup).toContain("2 parts checked again · live information was enabled");
+    expect(markup).not.toMatch(/WorldGraph/i);
   });
 
   it("shows readable approval fields before exact technical arguments", () => {
@@ -1730,7 +1750,8 @@ describe("Agent Studio product surfaces", () => {
     expect(styles).toContain(".graph-node.world-mixed");
     expect(styles).toContain(".graph-node.world-fresh");
     expect(styles).toMatch(/\.details-sheet-body > \.view-switch button\s*\{[\s\S]*?min-height: 44px;/);
-    expect(styles).toMatch(/\.answer-team-worldgraph\s*\{[\s\S]*?border-radius: 14px;/);
+    expect(styles).toMatch(/\.answer-team-reuse \.world-changes\.embedded\s*\{[\s\S]*?gap: 10px;/);
+    expect(styles).not.toContain(".answer-team-worldgraph");
     expect(styles).toMatch(/\.answer-team-build\s*\{[\s\S]*?padding-top: 20px;[\s\S]*?border-top: 1px solid var\(--line\);/);
     expect(styles).not.toContain(".view-switch.five-up");
     expect(styles).toMatch(/\.team-picker-popover\s*\{[\s\S]*?max-height: min\(520px, calc\(100dvh - 145px\)\);/);

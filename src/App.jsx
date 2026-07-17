@@ -3462,7 +3462,6 @@ export function RunReceipt({ run, onClick }) {
   const parts = [];
   if (!["completed", "failed"].includes(run.status)) parts.push(runStatusLabel(run.status));
   if (run.world_graph?.total > 0) {
-    parts.push("WorldGraph");
     const counts = worldGraphChangeCounts(run.world_graph.decisions || []);
     const kept = counts.reused;
     const refreshed = counts.fresh + counts.rechecked;
@@ -3702,15 +3701,17 @@ export function runProgressGraph(run, agents = []) {
 
 export function RunProgress({ run, agents = [] }) {
   const graph = runProgressGraph(run, agents);
-  const arrowId = `run-progress-arrow-${useId().replaceAll(":", "")}`;
   const synthesizing = run?.status === "synthesizing";
+  const selectionComplete = (run?.events || []).some((event) => event?.type === "planner.completed");
   const title = synthesizing
-    ? "Composing answer"
+    ? "Preparing the answer"
     : graph.activeAgentCount
-      ? `${graph.activeAgentCount} active · ${graph.agentCount} selected`
+      ? `${graph.activeAgentCount} working · ${graph.agentCount} selected`
       : graph.agentCount
-        ? `${graph.agentCount} ${graph.agentCount === 1 ? "agent" : "agents"} selected`
-        : "Selecting agents";
+        ? `${graph.agentCount} ${graph.agentCount === 1 ? "specialist" : "specialists"} selected`
+        : selectionComplete
+          ? "Answering directly"
+          : "Selecting specialists";
   return (
     <section className="run-progress" aria-label="Live Router progress">
       <div className="run-progress-heading" role="status" aria-live="polite" aria-atomic="true">
@@ -3719,25 +3720,16 @@ export function RunProgress({ run, agents = [] }) {
         </span>
         <span className="run-progress-router">Router</span>
         <strong>{title}</strong>
-        {graph.nodes.length > 0 && <small>{graph.finishedCount}/{graph.nodes.length} done</small>}
       </div>
       {graph.nodes.length > 0 && (
-        <div className="run-progress-dag-scroll">
-          <svg className="run-progress-dag" width={graph.width} height={graph.height} viewBox={`0 0 ${graph.width} ${graph.height}`} role="img" aria-label={graph.accessibleSummary}>
-            <defs><marker id={arrowId} markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto"><path d="M 0 0 L 6 3 L 0 6 z" /></marker></defs>
-            <g className="run-progress-dag-edges" aria-hidden="true">
-              {graph.edges.map((edge) => <path d={edge.path} markerEnd={`url(#${arrowId})`} key={`${edge.from}:${edge.to}`} />)}
-            </g>
-              {graph.nodes.map((node) => (
-              <g className={`run-progress-dag-node ${node.state}`} transform={`translate(${node.x} ${node.y})`} key={node.id}>
-                <title>{`${node.name}: ${node.state_label}`}</title>
-                <rect width={node.width} height={node.height} rx="8" />
-                <circle cx="10" cy="11" r="3" />
-                <text className="run-progress-dag-name" x="18" y="14">{node.name.length > 18 ? `${node.name.slice(0, 17)}…` : node.name}</text>
-                <text className="run-progress-dag-state" x="18" y="27">{node.state_label}</text>
-              </g>
-            ))}
-          </svg>
+        <div className="run-progress-agents" role="list" aria-label={graph.accessibleSummary}>
+          {graph.nodes.map((node) => (
+            <span className={`run-progress-agent ${node.state}`} role="listitem" key={node.id}>
+              <span className="run-progress-agent-dot" aria-hidden="true" />
+              <strong>{node.name}</strong>
+              <small>{node.state_label}</small>
+            </span>
+          ))}
         </div>
       )}
       <span className="sr-only">This live view shows assignments, dependencies, and completion events only. Private model reasoning is not displayed.</span>
@@ -3773,7 +3765,7 @@ export function EmptyTeamWelcome({
 
   return (
     <div className="empty-chat team-welcome">
-      <span className="team-welcome-kicker"><Sparkles size={13} /> {hasTeam ? `${teamName} is ready` : allSpecialistsPaused ? `${teamName} specialists are paused` : "Your team space is ready"}</span>
+      <span className="team-welcome-kicker">{hasTeam ? `${teamName} is ready` : allSpecialistsPaused ? `${teamName} specialists are paused` : "Your team space is ready"}</span>
       <h1>{hasTeam ? "What should your team accomplish?" : allSpecialistsPaused ? "What would you like to ask directly?" : "What do you want to accomplish?"}</h1>
       <p>{hasTeam
         ? `Describe the outcome. Virenis will assign the right work across your ${readyAgents.length} available ${readyAgents.length === 1 ? "specialist" : "specialists"}.`
@@ -6649,6 +6641,74 @@ export function WorldGraphChanges({ run, agents, canWrite, onRefreshTracked, onR
       setActionBusy("");
     }
   }
+
+  if (embedded) {
+    const summary = [
+      fresh.length ? `${fresh.length} new` : "",
+      kept.length ? `${kept.length} reused` : "",
+      refreshed.length ? `${refreshed.length} rechecked` : ""
+    ].filter(Boolean).join(" · ");
+    const unavailableCopy = run?.status === "failed"
+      ? "The run did not finish."
+      : run && !["completed", "failed"].includes(run.status)
+        ? "Available when the answer is complete."
+        : "No reuse record is available.";
+    const affectedNames = [...new Set((currentCheck?.decisions || [])
+      .filter((item) => item.projected_action === "wake")
+      .map((item) => formatAgentName(item.adapter, agents))
+      .filter(Boolean))];
+    const canAct = canWrite && run?.status === "completed";
+
+    return (
+      <div className={containerClassName} role="region" aria-labelledby="work-summary-heading">
+        <div className="work-summary-row">
+          <span className={`work-summary-state ${hasCompletedChangeRecord ? "ready" : "muted"}`} aria-hidden="true">
+            {hasCompletedChangeRecord ? <Check size={15} /> : <AlertCircle size={15} />}
+          </span>
+          <span className="work-summary-copy">
+            <strong id="work-summary-heading">Work summary</strong>
+            <small>{hasCompletedChangeRecord ? summary : unavailableCopy}</small>
+          </span>
+          {hasCompletedChangeRecord && canAct && (
+            <button type="button" className="text-button ghost work-summary-check" onClick={checkWhatChanged} disabled={checkBusy || Boolean(actionBusy)} aria-busy={checkBusy}>
+              {checkBusy ? <LoaderCircle className="spin" size={14} /> : <RefreshCw size={14} />}
+              {checkBusy ? "Checking" : "Check changes"}
+            </button>
+          )}
+        </div>
+
+        {preparation.status && preparation.capsule_created === false && preparation.primary_reason !== "no_matching_result" && (
+          <small className="work-summary-note">Earlier work was not reused: {preparation.plain_reason || "it could not be verified."}</small>
+        )}
+        {checkError && <p className="form-error work-summary-error" role="alert">{checkError}</p>}
+        {currentCheck?.availability === "ready" && (
+          <div className={`work-summary-result ${currentCheck.validity === "current" ? "current" : "needs-refresh"}`} role="status" aria-live="polite">
+            <strong>{currentCheck.validity === "current"
+              ? "Everything is up to date."
+              : `${worldGraphUniqueWakeSpecialists(currentCheck)} ${worldGraphUniqueWakeSpecialists(currentCheck) === 1 ? "specialist needs" : "specialists need"} an update.`}</strong>
+            {currentCheck.validity !== "current" && affectedNames.length > 0 && <span>{affectedNames.join(" · ")}</span>}
+          </div>
+        )}
+        {canAct && (
+          <div className="work-summary-actions">
+            {currentCheck?.validity === "needs_refresh" && (
+              <button type="button" className="text-button primary" onClick={() => startRefresh(false)} disabled={Boolean(actionBusy) || checkBusy}>
+                {actionBusy === "selective" ? <LoaderCircle className="spin" size={14} /> : <RefreshCw size={14} />}
+                {actionBusy === "selective" ? "Starting" : "Update changed work"}
+              </button>
+            )}
+            <button type="button" className="text-button ghost" onClick={() => startRefresh(true)} disabled={Boolean(actionBusy) || checkBusy}>
+              {actionBusy === "fresh" ? <LoaderCircle className="spin" size={14} /> : null}
+              {actionBusy === "fresh" ? "Starting" : "Run all fresh"}
+            </button>
+          </div>
+        )}
+        {actionError && <p className="form-error work-summary-error" role="alert">{actionError}</p>}
+        {hasCompletedChangeRecord && <small className="work-summary-safety">Live data and tool actions are always checked again.</small>}
+      </div>
+    );
+  }
+
   const row = (decision) => {
     const step = planById.get(decision.step_id);
     const kind = worldGraphDecisionKind(decision);
@@ -6677,7 +6737,6 @@ export function WorldGraphChanges({ run, agents, canWrite, onRefreshTracked, onR
         : "This answer does not include a verified change record.";
     return (
       <Container className={containerClassName} role={embedded ? "region" : undefined} aria-labelledby="world-changes-heading">
-        <span className="worldgraph-product-label">WorldGraph · change-aware reuse</span>
         <div className="world-unavailable-card">
           <span><AlertCircle size={18} aria-hidden="true" /></span>
           <div>
@@ -6706,11 +6765,10 @@ export function WorldGraphChanges({ run, agents, canWrite, onRefreshTracked, onR
   }
   return (
     <Container className={containerClassName} role={embedded ? "region" : undefined} aria-labelledby="world-changes-heading">
-      <span className="worldgraph-product-label">WorldGraph · change-aware reuse</span>
       <div className="world-current-card" role="status" aria-live="polite">
         <span><Check size={18} aria-hidden="true" /></span>
         <div>
-          <strong id="world-changes-heading">WorldGraph record ready</strong>
+          <strong id="world-changes-heading">Work reuse summary</strong>
           <p>Your team {[
             kept.length ? `reused ${kept.length} previous ${kept.length === 1 ? "result" : "results"}` : "",
             fresh.length ? `completed ${fresh.length} ${fresh.length === 1 ? "part" : "parts"} fresh` : "",
@@ -6900,9 +6958,7 @@ export function RunDetailsSheet({
                             <strong>{formatAgentName(route.adapter, agents)}</strong>
                             <small>{route.execution_mode === "reused" ? "Kept from earlier" : selection?.reason || route.task || "Completed its part of the answer"}</small>
                           </span>
-                          {tieBreak
-                            ? <em>Past results</em>
-                            : selection?.confidence != null && <em>{Math.round(selection.confidence * 100)}%</em>}
+                          {tieBreak && <em>Past results</em>}
                         </summary>
                         <div className="detail-row-content">
                           {tieBreak && <RankTieBreakNote tieBreak={tieBreak} adapter={route.adapter} agents={agents} />}
@@ -6924,14 +6980,6 @@ export function RunDetailsSheet({
                           ) : route.allowed_tools?.length > 0 && (
                             <p><strong>Tools available</strong>{route.allowed_tools.map(workflowToolLabel).join(", ")}</p>
                           )}
-                          {route.token_usage && (
-                            <p>
-                              <strong>Token usage</strong>
-                              {route.token_usage.reported
-                                ? `${formatTokenCount(route.token_usage.total_tokens)} total (${formatTokenCount(route.token_usage.prompt_tokens)} input · ${formatTokenCount(route.token_usage.completion_tokens)} output) · ${formatCreditDisplay(route.token_usage.charged_credits)}`
-                                : "Provider token usage was not reported for this contribution."}
-                            </p>
-                          )}
                           {route.consumption_validation?.valid === false && (
                             <p><strong>Missing context</strong>{(route.consumption_validation.missing_from_upstream || []).map((value) => contractFieldLabel(value, agents)).join(", ") || "A required verified handoff was unavailable."}</p>
                           )}
@@ -6944,9 +6992,9 @@ export function RunDetailsSheet({
                 </div>
                 <section className="answer-team-build" aria-labelledby="team-build-heading">
                   <div className="section-heading compact-heading">
-                    <div><h3 id="team-build-heading">How your team built this answer</h3><p>See what was completed now, what was safely reused, and how the Router combined the work.</p></div>
+                    <div><h3 id="team-build-heading">Run summary</h3></div>
                   </div>
-                  <div className="answer-team-worldgraph">
+                  <div className="answer-team-reuse">
                     <WorldGraphChanges
                       run={run}
                       agents={agents}
@@ -6956,12 +7004,17 @@ export function RunDetailsSheet({
                       embedded
                     />
                   </div>
-                  <UsageReceipt
-                    receipt={run.usage_receipt}
-                    agents={agents}
-                    expertOutputs={run.expert_outputs || []}
-                    includeFinalOutput
-                  />
+                  {run.usage_receipt && (
+                    <details className="answer-usage-disclosure">
+                      <summary>Model usage</summary>
+                      <UsageReceipt
+                        receipt={run.usage_receipt}
+                        agents={agents}
+                        expertOutputs={run.expert_outputs || []}
+                        includeFinalOutput
+                      />
+                    </details>
+                  )}
                 </section>
               </section>
             )}
@@ -7119,6 +7172,7 @@ function eventLabel(type) {
     "run.started": "Started",
     "planner.started": "Choosing teammates",
     "planner.completed": "Teammates selected",
+    "world_graph.prepared": "Previous work checked",
     "runtime.requested": "Request accepted",
     "route.started": "Specialist started",
     "route.completed": "Specialist finished",

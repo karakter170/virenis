@@ -1,9 +1,11 @@
+import crypto from "node:crypto";
+
 import { approvedSourceSnippets, BASE_MODEL, DEFAULT_VLLM_BASE_URL } from "./catalog.js";
 import { releaseRunReservation, settleRunCredits } from "./billing.js";
 import { makeId, nowIso } from "./store.js";
 import { assertStoredDocumentIntegrity, scoreChunks, slugify } from "./documents.js";
 import { normalizeDiagnosticError } from "./diagnostics.js";
-import { executeRuntimeChat, realRuntimeEnabled, runtimeApiKey } from "./runtimeClient.js";
+import { executeRuntimeChatStream, realRuntimeEnabled, runtimeApiKey } from "./runtimeClient.js";
 import { agentRevision, digestValue, normalizeSha256Digest, realityRankMap, recordExecution } from "./outcomes.js";
 import {
   prepareWorldGraphReplay,
@@ -1114,7 +1116,15 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
         { type: "runtime.requested" }
       ]
     });
-    const result = await executeRuntimeChat({
+    const routeLimit = Number(options.max_routing_adapters) || Number(process.env.TCAR_MAX_ROUTING_ADAPTERS || 12);
+    const parallelWorkers = Math.max(
+      1,
+      Math.min(Number(options.parallel_workers) || Number(process.env.TCAR_PARALLEL_WORKERS || 2), 32)
+    );
+    let streamedSafePlanDigest = null;
+    let streamedExactPlanDigest = null;
+    let plannerCompletedPersisted = false;
+    const streamed = await executeRuntimeChatStream({
       query,
       sharedMemory,
       executionContext: {
@@ -1128,8 +1138,8 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
       worldGraph: replayCapsule,
       options: {
         planner_mode: options.planner_mode || process.env.TCAR_PLANNER_MODE || "session",
-        max_routing_adapters: Number(options.max_routing_adapters) || Number(process.env.TCAR_MAX_ROUTING_ADAPTERS || 12),
-        parallel_workers: Number(options.parallel_workers) || Number(process.env.TCAR_PARALLEL_WORKERS || 2),
+        max_routing_adapters: routeLimit,
+        parallel_workers: parallelWorkers,
         max_tokens: Number(options.max_tokens) || Number(process.env.TCAR_MAX_TOKENS || 1024),
         refiner_max_tokens: Number(options.refiner_max_tokens) || Number(process.env.TCAR_REFINER_MAX_TOKENS || 2048),
         temperature: Number(options.temperature ?? process.env.TCAR_TEMPERATURE ?? 0),
@@ -1140,8 +1150,35 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
             .filter(([, ranking]) => ranking.routing_eligible === true)
             .map(([agentId, ranking]) => [agentId, ranking.routing_score])
         )
+      },
+      onPlannerCompleted: async (safeStreamPlan, exactContractDigest) => {
+        if (plannerCompletedPersisted) {
+          const error = new Error("Runtime streamed planner.completed more than once.");
+          error.code = "runtime_stream_invalid";
+          throw error;
+        }
+        const earlyPlan = enrichRuntimeRoutingTrace(
+          assertRuntimePlan(normalizeRuntimePlan(safeStreamPlan), {
+            allowedAdapters: scoped.allowedAdapters,
+            maxSteps: routeLimit
+          }),
+          agentRankings,
+          scoped.agents
+        );
+        const earlyParallel = buildParallelBatches(earlyPlan.steps, parallelWorkers);
+        streamedSafePlanDigest = runtimePlanSafeProjectionDigest(earlyPlan);
+        streamedExactPlanDigest = exactContractDigest;
+        await updateRun(
+          store,
+          bus,
+          run_id,
+          { plan: earlyPlan, parallel: earlyParallel, status: "running" },
+          { type: "planner.completed", steps: earlyPlan.steps }
+        );
+        plannerCompletedPersisted = true;
       }
     });
+    const result = streamed.result;
     if (result.ok === false) {
       throw new Error(result.error || "TCAR runtime returned an unsuccessful response.");
     }
@@ -1149,15 +1186,30 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
     const plan = enrichRuntimeRoutingTrace(
       assertRuntimePlan(normalizeRuntimePlan(result.plan), {
         allowedAdapters: scoped.allowedAdapters,
-        maxSteps: Number(options.max_routing_adapters) || Number(process.env.TCAR_MAX_ROUTING_ADAPTERS || 12)
+        maxSteps: routeLimit
       }),
       agentRankings,
       scoped.agents
     );
-    const parallel = buildParallelBatches(
-      plan.steps,
-      Math.max(1, Math.min(Number(options.parallel_workers) || Number(process.env.TCAR_PARALLEL_WORKERS || 2), 32))
-    );
+    const parallel = buildParallelBatches(plan.steps, parallelWorkers);
+    if (
+      streamedSafePlanDigest
+      && runtimePlanSafeProjectionDigest(plan) !== streamedSafePlanDigest
+    ) {
+      const error = new Error("Runtime terminal plan did not match its streamed planner contract.");
+      error.code = "runtime_stream_plan_mismatch";
+      error.status = 502;
+      throw error;
+    }
+    if (
+      streamedExactPlanDigest
+      && runtimePlanExactContractDigest(plan) !== streamedExactPlanDigest
+    ) {
+      const error = new Error("Runtime terminal plan did not match its exact execution contract digest.");
+      error.code = "runtime_stream_plan_mismatch";
+      error.status = 502;
+      throw error;
+    }
     const outputs = assertRuntimeRouteCoverage(plan, result.expertOutputs);
     if (outputs.some((output) => output?.execution_mode === "reused")) {
       const reportedCalls = Array.isArray(result.tokenAccounting?.calls) ? result.tokenAccounting.calls : [];
@@ -1202,7 +1254,21 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
         createdAt: nowIso()
       });
     }
-    await updateRun(store, bus, run_id, { plan, parallel, status: "running" }, { type: "planner.completed", steps: plan.steps });
+    if (plannerCompletedPersisted) {
+      // The early event intentionally carries only the safe execution graph.
+      // Once the terminal response has been cross-checked, enrich the stored
+      // plan with its bounded routing trace without publishing a duplicate.
+      await updateRun(store, bus, run_id, { plan, parallel, status: "running" }, null);
+    } else {
+      await updateRun(
+        store,
+        bus,
+        run_id,
+        { plan, parallel, status: "running" },
+        { type: "planner.completed", steps: plan.steps }
+      );
+      plannerCompletedPersisted = true;
+    }
 
     const completedRoutes = outputs.map((output) => {
       const reused = output.execution_mode === "reused";
@@ -1529,6 +1595,59 @@ function assertRuntimeRouteCoverage(plan, value) {
   if (seen.size !== expected.size) fail("runtime omitted a planned route output");
   const byStep = new Map(outputs.map((output) => [String(output.id || output.step_id), output]));
   return steps.map((step) => byStep.get(String(step.id)));
+}
+
+function runtimePlanSafeProjectionDigest(plan) {
+  return digestValue((Array.isArray(plan?.steps) ? plan.steps : []).map((step) => ({
+    id: String(step.id || ""),
+    adapter: String(step.adapter || ""),
+    // The progress stream deliberately projects tasks onto the same compact
+    // public representation as Runtime: strip controls, collapse whitespace,
+    // and cap at 600 characters. Compare identical projections so a legitimate
+    // multiline or detailed task cannot fail merely because its safe preview
+    // differs from the exact terminal execution text.
+    task: Array.from(stripRuntimePlanTaskControls(String(step.task || ""))
+      .replace(/\p{White_Space}+/gu, " ")
+      .trim()).slice(0, 600).join(""),
+    depends_on: (Array.isArray(step.depends_on) ? step.depends_on : []).map(String)
+  })));
+}
+
+function stripRuntimePlanTaskControls(value) {
+  return Array.from(value).filter((character) => {
+    const code = character.codePointAt(0);
+    return !(
+      code <= 0x08
+      || code === 0x0b
+      || code === 0x0c
+      || (code >= 0x0e && code <= 0x1f)
+      || code === 0x7f
+    );
+  }).join("");
+}
+
+function runtimePlanExactContractDigest(plan) {
+  const material = {
+    schema_version: "tcar-runtime-plan-contract-v1",
+    steps: (Array.isArray(plan?.steps) ? plan.steps : []).map((step) => ({
+      id: String(step.id || ""),
+      adapter: String(step.adapter || ""),
+      depends_on: (Array.isArray(step.depends_on) ? step.depends_on : []).map(String),
+      task_sha256: crypto.createHash("sha256")
+        .update(String(step.task || ""), "utf8")
+        .digest("hex")
+    }))
+  };
+  const canonical = JSON.stringify(canonicalRuntimeContractValue(material));
+  return `sha256:${crypto.createHash("sha256").update(canonical, "utf8").digest("hex")}`;
+}
+
+function canonicalRuntimeContractValue(value) {
+  if (Array.isArray(value)) return value.map(canonicalRuntimeContractValue);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.keys(value).sort().map((key) => [key, canonicalRuntimeContractValue(value[key])])
+  );
 }
 
 function assertRuntimePlan(plan, { allowedAdapters = [], maxSteps = 12 } = {}) {

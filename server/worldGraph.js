@@ -49,11 +49,11 @@ function assertUnicodeScalarString(value) {
     if (unit >= 0xd800 && unit <= 0xdbff) {
       const next = text.charCodeAt(index + 1);
       if (!(next >= 0xdc00 && next <= 0xdfff)) {
-        throw new TypeError("WorldGraph strings must contain valid Unicode scalar values.");
+        throw new TypeError("Work-reuse strings must contain valid Unicode scalar values.");
       }
       index += 1;
     } else if (unit >= 0xdc00 && unit <= 0xdfff) {
-      throw new TypeError("WorldGraph strings must contain valid Unicode scalar values.");
+      throw new TypeError("Work-reuse strings must contain valid Unicode scalar values.");
     }
   }
   return text;
@@ -61,7 +61,7 @@ function assertUnicodeScalarString(value) {
 
 function binary64Hex(value) {
   if (!Number.isFinite(value)) {
-    throw new TypeError("WorldGraph numbers must be finite IEEE-754 binary64 values.");
+    throw new TypeError("Work-reuse numbers must be finite IEEE-754 binary64 values.");
   }
   const bytes = Buffer.allocUnsafe(8);
   bytes.writeDoubleBE(value === 0 ? 0 : value, 0);
@@ -88,7 +88,7 @@ function worldGraphCanonicalValue(value) {
       .map((key) => [assertUnicodeScalarString(key), worldGraphCanonicalValue(value[key])]);
     return ["object", entries];
   }
-  throw new TypeError(`WorldGraph value has unsupported type: ${typeof value}.`);
+  throw new TypeError(`Work-reuse value has unsupported type: ${typeof value}.`);
 }
 
 export function worldGraphCanonicalJson(value) {
@@ -876,7 +876,7 @@ export function recordWorldGraphRun({
     const replay = replayOutput({ ...output, id: step.id, step_id: step.id, adapter: step.adapter, task: step.task, depends_on: step.depends_on || [] });
     if (!replay) {
       if (executionMode === "reused") {
-        const error = new Error(`Reused WorldGraph output exceeded the verified replay boundary for step ${step.id}.`);
+        const error = new Error(`Reused output exceeded the verified replay boundary for step ${step.id}.`);
         error.code = "world_graph_reuse_contract_invalid";
         throw error;
       }
@@ -884,7 +884,7 @@ export function recordWorldGraphRun({
     }
     if (!validRouteOutput(replay)) {
       if (executionMode === "reused") {
-        const error = new Error(`Reused WorldGraph output was not validated for step ${step.id}.`);
+        const error = new Error(`Reused output was not validated for step ${step.id}.`);
         error.code = "world_graph_reuse_contract_invalid";
         throw error;
       }
@@ -935,7 +935,7 @@ export function recordWorldGraphRun({
       )) || null
       : null;
     if (executionMode === "reused" && !sourceArtifact) {
-      const error = new Error(`Unverified WorldGraph reuse was claimed for step ${step.id}.`);
+      const error = new Error(`Unverified work reuse was claimed for step ${step.id}.`);
       error.code = "world_graph_reuse_contract_invalid";
       throw error;
     }

@@ -10,6 +10,11 @@ const DEFAULT_TIMEOUT_MS = 900000;
 const DEFAULT_CONNECT_TIMEOUT_MS = 10000;
 const DEFAULT_BODY_IDLE_TIMEOUT_MS = 60000;
 const DEFAULT_MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
+const RUNTIME_STREAM_CONTENT_TYPE = "application/x-ndjson";
+const MAX_RUNTIME_STREAM_EVENTS = 3;
+const MAX_RUNTIME_STREAM_PLAN_STEPS = 24;
+const MAX_RUNTIME_STREAM_TASK_CHARS = 600;
+const MAX_RUNTIME_STREAM_PLAN_EVENT_BYTES = 256 * 1024;
 const MAX_REQUEST_TIMEOUT_MS = 1800000;
 const MAX_CONNECT_TIMEOUT_MS = 120000;
 const MAX_BODY_IDLE_TIMEOUT_MS = 300000;
@@ -489,6 +494,524 @@ function boundedHttpRequest(urlValue, {
   });
 }
 
+async function runtimeStreamRequest(path, {
+  body,
+  expectedRunId,
+  onPlannerCompleted,
+  timeoutMs = DEFAULT_TIMEOUT_MS
+} = {}) {
+  const requestTimeoutMs = boundedInteger(timeoutMs, "runtime stream timeout", 1, MAX_REQUEST_TIMEOUT_MS);
+  const connectTimeoutMs = Math.min(
+    requestTimeoutMs,
+    optionalBoundedEnvironmentInteger(
+      "TCAR_RUNTIME_CONNECT_TIMEOUT_MS",
+      DEFAULT_CONNECT_TIMEOUT_MS,
+      1,
+      MAX_CONNECT_TIMEOUT_MS
+    )
+  );
+  const headerTimeoutMs = Math.min(
+    requestTimeoutMs,
+    optionalBoundedEnvironmentInteger(
+      "TCAR_RUNTIME_HEADER_TIMEOUT_MS",
+      requestTimeoutMs,
+      1,
+      MAX_REQUEST_TIMEOUT_MS
+    )
+  );
+  const bodyIdleTimeoutMs = Math.min(
+    requestTimeoutMs,
+    optionalBoundedEnvironmentInteger(
+      "TCAR_RUNTIME_BODY_IDLE_TIMEOUT_MS",
+      DEFAULT_BODY_IDLE_TIMEOUT_MS,
+      1,
+      MAX_BODY_IDLE_TIMEOUT_MS
+    )
+  );
+  const maxResponseBytes = optionalBoundedEnvironmentInteger(
+    "TCAR_RUNTIME_MAX_RESPONSE_BYTES",
+    DEFAULT_MAX_RESPONSE_BYTES,
+    1024,
+    MAX_RESPONSE_BYTES
+  );
+  const encodedBody = Buffer.from(JSON.stringify(body ?? {}), "utf8");
+  const headers = {
+    Accept: RUNTIME_STREAM_CONTENT_TYPE,
+    "Content-Type": "application/json",
+    "Content-Length": String(encodedBody.length)
+  };
+  const configuredRuntimeApiKey = runtimeApiKey();
+  if (configuredRuntimeApiKey) headers["X-TCAR-API-Key"] = configuredRuntimeApiKey;
+
+  const requestOptions = {
+    method: "POST",
+    headers,
+    body: encodedBody,
+    requestTimeoutMs,
+    connectTimeoutMs,
+    headerTimeoutMs,
+    bodyIdleTimeoutMs,
+    maxResponseBytes,
+    expectedRunId,
+    onPlannerCompleted
+  };
+  const requestUrl = `${runtimeBaseUrl()}${path}`;
+  return testFetchTransport
+    ? boundedTestStreamFetch(requestUrl, requestOptions, testFetchTransport)
+    : boundedHttpStreamRequest(requestUrl, requestOptions);
+}
+
+async function boundedTestStreamFetch(url, options, fetchImpl) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), options.requestTimeoutMs);
+  try {
+    const response = await fetchImpl(url, {
+      method: options.method,
+      headers: options.headers,
+      body: options.body.toString("utf8"),
+      signal: controller.signal
+    });
+    return await consumeRuntimeStreamResponse({
+      status: response.status,
+      headers: Object.fromEntries(response.headers?.entries?.() || []),
+      body: response.body,
+      maxResponseBytes: options.maxResponseBytes,
+      expectedRunId: options.expectedRunId,
+      onPlannerCompleted: options.onPlannerCompleted
+    });
+  } catch (error) {
+    if (error.name === "AbortError") throw runtimeTimeoutError(options.requestTimeoutMs);
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function boundedHttpStreamRequest(urlValue, options) {
+  const url = new URL(urlValue);
+  const transport = url.protocol === "https:" ? https : url.protocol === "http:" ? http : null;
+  if (!transport) throw new Error("TCAR runtime URL must use http or https.");
+
+  return new Promise((resolve, reject) => {
+    let request;
+    let response;
+    let settled = false;
+    const timers = new Set();
+    const clearTimer = (timer) => {
+      if (!timer) return;
+      clearTimeout(timer);
+      timers.delete(timer);
+    };
+    const schedule = (callback, milliseconds) => {
+      const timer = setTimeout(callback, milliseconds);
+      timers.add(timer);
+      return timer;
+    };
+    const cleanup = () => {
+      for (const timer of timers) clearTimeout(timer);
+      timers.clear();
+    };
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (error) {
+        response?.destroy();
+        request?.socket?.destroy();
+        request?.destroy();
+        reject(error);
+      } else {
+        resolve(value);
+      }
+    };
+    schedule(() => finish(runtimeTimeoutError(options.requestTimeoutMs)), options.requestTimeoutMs);
+    const headerTimer = schedule(() => finish(runtimeTimeoutError(options.headerTimeoutMs)), options.headerTimeoutMs);
+    let connectTimer = schedule(() => finish(runtimeTimeoutError(options.connectTimeoutMs)), options.connectTimeoutMs);
+    let bodyTimer;
+    const resetBodyTimer = () => {
+      clearTimer(bodyTimer);
+      bodyTimer = schedule(() => finish(runtimeTimeoutError(options.bodyIdleTimeoutMs)), options.bodyIdleTimeoutMs);
+    };
+
+    try {
+      request = transport.request(url, {
+        method: options.method,
+        headers: options.headers,
+        agent: url.protocol === "https:" ? HTTPS_AGENT : HTTP_AGENT
+      });
+    } catch (error) {
+      cleanup();
+      reject(error);
+      return;
+    }
+    request.once("socket", (socket) => {
+      const readyEvent = socket.encrypted ? "secureConnect" : "connect";
+      if (!socket.connecting && (!socket.encrypted || socket.authorized !== undefined)) {
+        clearTimer(connectTimer);
+        connectTimer = undefined;
+        return;
+      }
+      socket.once(readyEvent, () => {
+        clearTimer(connectTimer);
+        connectTimer = undefined;
+      });
+    });
+    request.once("response", (incoming) => {
+      response = incoming;
+      clearTimer(headerTimer);
+      resetBodyTimer();
+      const timedBody = (async function* timedRuntimeBody() {
+        for await (const chunk of incoming) {
+          clearTimer(bodyTimer);
+          yield chunk;
+          if (!settled) resetBodyTimer();
+        }
+        clearTimer(bodyTimer);
+      })();
+      void consumeRuntimeStreamResponse({
+        status: incoming.statusCode || 0,
+        headers: incoming.headers,
+        body: timedBody,
+        maxResponseBytes: options.maxResponseBytes,
+        expectedRunId: options.expectedRunId,
+        onPlannerCompleted: options.onPlannerCompleted
+      }).then(
+        (value) => finish(null, value),
+        (error) => {
+          if (incoming.complete === false && !error?.code) {
+            const incomplete = new Error("TCAR runtime closed the response before it completed.");
+            incomplete.status = 502;
+            incomplete.code = "runtime_response_incomplete";
+            incomplete.retryable = true;
+            finish(incomplete);
+            return;
+          }
+          finish(normalizeRuntimeTransportError(error));
+        }
+      );
+    });
+    request.once("error", (error) => finish(normalizeRuntimeTransportError(error)));
+    request.write(options.body);
+    request.end();
+  });
+}
+
+async function consumeRuntimeStreamResponse({
+  status,
+  headers,
+  body,
+  maxResponseBytes,
+  expectedRunId,
+  onPlannerCompleted
+}) {
+  const contentType = responseContentType(headers);
+  if (status < 200 || status >= 300) {
+    const responseBody = await readBoundedStreamBody(body, maxResponseBytes);
+    const payload = parseJsonObject(responseBody.toString("utf8")) || {};
+    const error = projectedRuntimeError(payload, status);
+    // Only the HTTP response that proves the additive endpoint itself is
+    // unavailable may be replayed through /chat/execute. An NDJSON terminal
+    // failure can carry the same numeric status after the execution id was
+    // claimed and must never trigger a second model request.
+    error.runtimeStreamFallbackSafe = status === 404 || status === 405;
+    throw error;
+  }
+  // A JSON success is accepted as a compatibility response. This keeps older
+  // Runtime deployments and existing /chat/execute-compatible test doubles
+  // usable, but it cannot manufacture an early planner event.
+  if (contentType === "application/json") {
+    const responseBody = await readBoundedStreamBody(body, maxResponseBytes);
+    const payload = parseJsonObject(responseBody.toString("utf8"));
+    if (!payload) throw invalidRuntimeStream("the compatibility response was not valid JSON");
+    return { result: payload, streamedPlan: null, legacy: true };
+  }
+  if (contentType !== RUNTIME_STREAM_CONTENT_TYPE) {
+    throw invalidRuntimeStream(`unexpected content type ${contentType || "missing"}`);
+  }
+
+  const parser = createRuntimeNdjsonParser({
+    expectedRunId,
+    maxResponseBytes,
+    onPlannerCompleted
+  });
+  if (body) {
+    for await (const chunk of body) {
+      await parser.push(chunk);
+    }
+  }
+  return parser.finish();
+}
+
+function createRuntimeNdjsonParser({ expectedRunId, maxResponseBytes, onPlannerCompleted }) {
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let buffered = "";
+  let receivedBytes = 0;
+  let expectedSequence = 1;
+  let eventCount = 0;
+  let streamedPlan = null;
+  let terminal = null;
+
+  const consumeLine = async (rawLine) => {
+    const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+    // A single trailing delimiter does not call consumeLine because the buffer
+    // is empty after splitting it. Any actual empty record therefore represents
+    // additional stream data and is rejected, including CRLF/blank-line
+    // smuggling after a terminal event.
+    if (!line) throw invalidRuntimeStream("the response contained an empty event record");
+    eventCount += 1;
+    if (eventCount > MAX_RUNTIME_STREAM_EVENTS) {
+      throw invalidRuntimeStream("too many events");
+    }
+    if (terminal) throw invalidRuntimeStream("an event followed the terminal event");
+    if (eventCount === 1 && Buffer.byteLength(line, "utf8") > MAX_RUNTIME_STREAM_PLAN_EVENT_BYTES) {
+      throw invalidRuntimeStream("the planner event exceeded its size limit");
+    }
+    const event = parseJsonObject(line);
+    if (!event) throw invalidRuntimeStream("an event was not valid JSON");
+    assertExactObjectKeys(event, ["at", "data", "run_id", "sequence", "type"], "event envelope");
+    if (!Number.isSafeInteger(event.sequence) || event.sequence !== expectedSequence) {
+      throw invalidRuntimeStream("event sequences were not strictly contiguous");
+    }
+    expectedSequence += 1;
+    if (String(event.run_id || "") !== String(expectedRunId || "")) {
+      throw invalidRuntimeStream("event run identity did not match the request");
+    }
+    if (!safeIdentifier(event.run_id)) throw invalidRuntimeStream("event run identity was malformed");
+    if (!validStreamTimestamp(event.at)) throw invalidRuntimeStream("event timestamp was malformed");
+    if (!isPlainObject(event.data)) throw invalidRuntimeStream("event data was malformed");
+
+    if (event.type === "planner.completed") {
+      if (streamedPlan) throw invalidRuntimeStream("planner.completed was duplicated");
+      assertExactObjectKeys(event.data, ["contract_digest", "plan"], "planner event data");
+      const contractDigest = String(event.data.contract_digest || "");
+      if (!/^sha256:[a-f0-9]{64}$/.test(contractDigest)) {
+        throw invalidRuntimeStream("the planner contract digest was malformed");
+      }
+      streamedPlan = validateStreamPlan(event.data.plan);
+      if (typeof onPlannerCompleted === "function") {
+        await onPlannerCompleted(streamedPlan, contractDigest);
+      }
+      return;
+    }
+    if (event.type === "run.completed") {
+      if (!streamedPlan) throw invalidRuntimeStream("run.completed arrived before planner.completed");
+      assertExactObjectKeys(event.data, ["result"], "completion event data");
+      if (!isPlainObject(event.data.result)) throw invalidRuntimeStream("the terminal result was malformed");
+      terminal = { type: event.type, result: event.data.result };
+      return;
+    }
+    if (event.type === "run.failed") {
+      assertExactObjectKeys(event.data, ["error"], "failure event data");
+      terminal = { type: event.type, error: validateStreamFailure(event.data.error) };
+      return;
+    }
+    throw invalidRuntimeStream("an unsupported event type was returned");
+  };
+
+  return {
+    async push(value) {
+      const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+      receivedBytes += chunk.length;
+      if (receivedBytes > maxResponseBytes) {
+        const error = new Error("TCAR runtime response exceeded the configured size limit.");
+        error.status = 502;
+        error.code = "runtime_response_too_large";
+        throw error;
+      }
+      try {
+        buffered += decoder.decode(chunk, { stream: true });
+      } catch {
+        throw invalidRuntimeStream("the response was not valid UTF-8");
+      }
+      while (true) {
+        const newline = buffered.indexOf("\n");
+        if (newline < 0) break;
+        const line = buffered.slice(0, newline);
+        buffered = buffered.slice(newline + 1);
+        await consumeLine(line);
+      }
+    },
+    async finish() {
+      try {
+        buffered += decoder.decode();
+      } catch {
+        throw invalidRuntimeStream("the response ended with invalid UTF-8");
+      }
+      if (buffered) await consumeLine(buffered);
+      if (!terminal) throw invalidRuntimeStream("the response ended before a terminal event");
+      if (terminal.type === "run.failed") {
+        const error = new Error("TCAR runtime reported a failed streamed execution.");
+        error.status = terminal.error.status;
+        error.code = terminal.error.code;
+        error.retryable = terminal.error.retryable;
+        error.component = terminal.error.component;
+        throw error;
+      }
+      return { result: terminal.result, streamedPlan, legacy: false };
+    }
+  };
+}
+
+function validateStreamPlan(value) {
+  if (!isPlainObject(value)) throw invalidRuntimeStream("the planner payload was malformed");
+  assertExactObjectKeys(value, ["steps"], "planner payload");
+  if (!Array.isArray(value.steps) || value.steps.length > MAX_RUNTIME_STREAM_PLAN_STEPS) {
+    throw invalidRuntimeStream("the planner step list was malformed");
+  }
+  return {
+    steps: value.steps.map((step) => {
+      if (!isPlainObject(step)) throw invalidRuntimeStream("a planner step was malformed");
+      assertExactObjectKeys(step, ["adapter", "depends_on", "id", "task"], "planner step");
+      if (!safeIdentifier(step.id) || !safeIdentifier(step.adapter)) {
+        throw invalidRuntimeStream("a planner step identity was malformed");
+      }
+      if (
+        typeof step.task !== "string"
+        || Array.from(step.task).length > MAX_RUNTIME_STREAM_TASK_CHARS
+        || normalizeStreamTask(step.task) !== step.task
+      ) {
+        throw invalidRuntimeStream("a planner task was malformed");
+      }
+      if (
+        !Array.isArray(step.depends_on)
+        || step.depends_on.length > MAX_RUNTIME_STREAM_PLAN_STEPS
+        || new Set(step.depends_on).size !== step.depends_on.length
+        || step.depends_on.some((dependency) => !safeIdentifier(dependency))
+      ) {
+        throw invalidRuntimeStream("planner dependencies were malformed");
+      }
+      return {
+        id: step.id,
+        adapter: step.adapter,
+        task: step.task,
+        depends_on: [...step.depends_on]
+      };
+    })
+  };
+}
+
+function validateStreamFailure(value) {
+  if (!isPlainObject(value)) throw invalidRuntimeStream("the failure payload was malformed");
+  const keys = Object.keys(value).sort();
+  const allowed = new Set(["code", "component", "retryable", "status"]);
+  if (!keys.every((key) => allowed.has(key)) || !keys.includes("code") || !keys.includes("retryable") || !keys.includes("status")) {
+    throw invalidRuntimeStream("the failure payload contained unsupported fields");
+  }
+  if (!safeIdentifier(value.code)) throw invalidRuntimeStream("the failure code was malformed");
+  if (!Number.isSafeInteger(value.status) || value.status < 400 || value.status > 599) {
+    throw invalidRuntimeStream("the failure status was malformed");
+  }
+  if (typeof value.retryable !== "boolean") throw invalidRuntimeStream("the failure retry flag was malformed");
+  if (value.component !== undefined && !safeIdentifier(value.component)) {
+    throw invalidRuntimeStream("the failure component was malformed");
+  }
+  return {
+    code: value.code,
+    status: value.status,
+    retryable: value.retryable,
+    ...(value.component ? { component: value.component } : {})
+  };
+}
+
+async function readBoundedStreamBody(body, maximum) {
+  const chunks = [];
+  let length = 0;
+  if (body) {
+    for await (const value of body) {
+      const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+      length += chunk.length;
+      if (length > maximum) {
+        const error = new Error("TCAR runtime response exceeded the configured size limit.");
+        error.status = 502;
+        error.code = "runtime_response_too_large";
+        throw error;
+      }
+      chunks.push(chunk);
+    }
+  }
+  return Buffer.concat(chunks, length);
+}
+
+function responseContentType(headers) {
+  const value = headers?.["content-type"] ?? headers?.["Content-Type"] ?? "";
+  return String(Array.isArray(value) ? value[0] : value).split(";", 1)[0].trim().toLowerCase();
+}
+
+function projectedRuntimeError(payload, status) {
+  const projected = projectRuntimeFailure(payload, status);
+  const error = new Error(runtimeFailureMessage(projected));
+  error.status = status;
+  error.code = projected.code;
+  error.retryable = projected.retryable === true;
+  error.providerStatus = projected.provider_status;
+  error.requestId = projected.provider_request_id;
+  error.diagnostic = projected;
+  return error;
+}
+
+function parseJsonObject(text) {
+  if (!text) return null;
+  try {
+    const value = JSON.parse(text);
+    return isPlainObject(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function assertExactObjectKeys(value, expected, label) {
+  const actual = Object.keys(value).sort();
+  const sortedExpected = [...expected].sort();
+  if (actual.length !== sortedExpected.length || actual.some((key, index) => key !== sortedExpected[index])) {
+    throw invalidRuntimeStream(`${label} contained unsupported fields`);
+  }
+}
+
+function safeIdentifier(value) {
+  return typeof value === "string"
+    && value.length > 0
+    && value.length <= 200
+    && /^[A-Za-z0-9][A-Za-z0-9_.:@/-]*$/.test(value);
+}
+
+function normalizeStreamTask(value) {
+  const normalized = stripStreamTaskControls(String(value || ""))
+    .replace(/\p{White_Space}+/gu, " ")
+    .trim();
+  return Array.from(normalized).slice(0, MAX_RUNTIME_STREAM_TASK_CHARS).join("");
+}
+
+function stripStreamTaskControls(value) {
+  return Array.from(value).filter((character) => {
+    const code = character.codePointAt(0);
+    return !(
+      code <= 0x08
+      || code === 0x0b
+      || code === 0x0c
+      || (code >= 0x0e && code <= 0x1f)
+      || code === 0x7f
+    );
+  }).join("");
+}
+
+function validStreamTimestamp(value) {
+  return typeof value === "string"
+    && value.length <= 48
+    && /(?:Z|[+-]\d{2}:\d{2})$/.test(value)
+    && Number.isFinite(Date.parse(value));
+}
+
+function invalidRuntimeStream(detail) {
+  const error = new Error(`The Runtime returned an invalid event stream: ${detail}.`);
+  error.status = 502;
+  error.code = "runtime_stream_invalid";
+  return error;
+}
+
 function normalizeRuntimeTransportError(error) {
   if (Number(error?.status) > 0) return error;
   const code = String(error?.code || "").toUpperCase();
@@ -695,6 +1218,43 @@ export function executeRuntimeChat({ query, sharedMemory = [], options = {}, exe
     },
     timeoutMs: Number(process.env.TCAR_RUNTIME_CHAT_TIMEOUT_MS || DEFAULT_TIMEOUT_MS)
   });
+}
+
+export async function executeRuntimeChatStream({
+  query,
+  sharedMemory = [],
+  options = {},
+  executionContext = {},
+  worldGraph = null,
+  onPlannerCompleted
+}) {
+  const body = {
+    query,
+    shared_memory: sharedMemory,
+    execution_context: executionContext,
+    options,
+    ...(worldGraph ? { world_graph: worldGraph } : {})
+  };
+  try {
+    return await runtimeStreamRequest("/chat/execute/stream", {
+      body,
+      expectedRunId: executionContext.run_id,
+      onPlannerCompleted,
+      timeoutMs: Number(process.env.TCAR_RUNTIME_CHAT_TIMEOUT_MS || DEFAULT_TIMEOUT_MS)
+    });
+  } catch (error) {
+    // Old Runtime deployments do not expose the stream route. Only an explicit
+    // endpoint/method miss is safe to replay through the compatible endpoint;
+    // malformed, truncated, or failed streams are never retried implicitly.
+    if (error?.runtimeStreamFallbackSafe === true) {
+      return {
+        result: await executeRuntimeChat({ query, sharedMemory, options, executionContext, worldGraph }),
+        streamedPlan: null,
+        legacy: true
+      };
+    }
+    throw error;
+  }
 }
 
 export function composeRuntimeWorkflow({
