@@ -3098,18 +3098,32 @@ export function WorkspaceSidebar({
     >
       <header className="sidebar-brand-row">
         <button className="sidebar-brand" type="button" onClick={onHome} aria-label="Go to Virenis homepage" title="Virenis home">
-          <span className="sidebar-brand-mark" aria-hidden="true">V</span>
           <span className="sidebar-label">Virenis</span>
         </button>
-        <button
-          className="sidebar-collapse-button"
-          type="button"
-          aria-label={collapsed ? "Expand workspace navigation" : "Collapse workspace navigation"}
-          aria-expanded={!collapsed}
-          onClick={onToggleCollapsed}
-        >
-          {collapsed ? <ArrowRight size={17} /> : <ArrowLeft size={17} />}
-        </button>
+        {collapsed && (
+          <button
+            className="sidebar-collapsed-trigger"
+            type="button"
+            aria-label="Expand workspace navigation"
+            aria-controls="workspace-sidebar"
+            aria-expanded="false"
+            onClick={onToggleCollapsed}
+          >
+            V
+          </button>
+        )}
+        {!collapsed && (
+          <button
+            className="sidebar-collapse-button"
+            type="button"
+            aria-label="Collapse workspace navigation"
+            aria-controls="workspace-sidebar"
+            aria-expanded="true"
+            onClick={onToggleCollapsed}
+          >
+            <ArrowLeft size={17} />
+          </button>
+        )}
         <button ref={mobileCloseButtonRef} className="sidebar-mobile-close" type="button" aria-label="Close workspace navigation" onClick={onMobileClose}>
           <X size={18} />
         </button>
@@ -3123,7 +3137,7 @@ export function WorkspaceSidebar({
         disabled={newChatDisabled || !canWrite}
         onClick={onNewChat}
       >
-        <SquarePen size={16} />
+        <SquarePen size={15} />
         <span className="sidebar-label">New chat</span>
       </button>
 
@@ -3182,25 +3196,25 @@ export function WorkspaceSidebar({
       </section>
 
       <footer className="sidebar-footer">
-        <button
-          className="sidebar-balance"
-          type="button"
-          title={billing?.account?.reserved_micros > 0
-            ? `${billing.account.reserved_credits} credits are reserved for active requests`
-            : "Open balance details"}
-          disabled={navigationDisabled}
-          onClick={() => onOpenView("account")}
-        >
-          <span className="sidebar-balance-icon" aria-hidden="true"><WalletCards size={15} /></span>
-          <span className="sidebar-balance-copy sidebar-label">
-            <span>Balance</span>
-            <strong>{formatCreditDisplay(billing?.account?.balance_credits)}</strong>
-          </span>
-        </button>
         <div className="sidebar-profile">
           <span className="clerk-user-control">{accountControl}</span>
-          <button className="sidebar-profile-copy sidebar-label" type="button" aria-label="Open account" disabled={navigationDisabled} onClick={() => onOpenView("account")}>
-            <strong>{auth?.display_name || auth?.user_id || "Your account"}</strong>
+          <button
+            className="sidebar-profile-copy sidebar-label"
+            type="button"
+            aria-label={`Open account. Balance ${formatCreditDisplay(billing?.account?.balance_credits)}`}
+            title={billing?.account?.reserved_micros > 0
+              ? `${billing.account.reserved_credits} credits are reserved for active requests`
+              : "Open account and balance"}
+            disabled={navigationDisabled}
+            onClick={() => onOpenView("account")}
+          >
+            <span className="sidebar-profile-primary">
+              <strong>{auth?.display_name || auth?.user_id || "Your account"}</strong>
+              <span className="sidebar-profile-balance" aria-hidden="true">
+                <WalletCards size={11} />
+                <b>{formatCreditDisplay(billing?.account?.balance_credits)}</b>
+              </span>
+            </span>
             <small>{auth?.email || (auth?.is_admin ? "Admin" : auth?.is_viewer ? "Viewer" : "Private workspace")}</small>
           </button>
         </div>

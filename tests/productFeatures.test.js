@@ -1901,6 +1901,8 @@ describe("Agent Studio product surfaces", () => {
 
     expect(markup).toContain('aria-label="Workspace navigation"');
     expect(markup).toContain('aria-label="Go to Virenis homepage"');
+    expect(markup).toContain('aria-label="Collapse workspace navigation"');
+    expect(markup).not.toContain('aria-label="Expand workspace navigation"');
     expect(markup).toContain('aria-label="New chat"');
     expect(markup).toContain('aria-label="Workspace tools"');
     expect(markup).toContain('aria-label="Past Chats"');
@@ -1912,7 +1914,10 @@ describe("Agent Studio product surfaces", () => {
     expect(markup).toContain("Discover");
     expect(markup).toContain("Apps");
     expect(markup).toContain("Knowledge");
-    expect(markup).toContain('aria-label="Open account"');
+    expect(markup).toContain('aria-label="Open account. Balance 42.5 credits"');
+    expect(markup).toContain('class="sidebar-profile-balance"');
+    expect(markup).not.toContain('class="sidebar-balance"');
+    expect(markup).not.toContain('class="sidebar-brand-mark"');
     expect(markup).not.toContain('<span class="sidebar-label">Account</span>');
     expect(markup.match(/class="sidebar-nav-item/g) || []).toHaveLength(5);
     expect(markup).toContain("Past Chats");
@@ -1930,6 +1935,16 @@ describe("Agent Studio product surfaces", () => {
     expect(adminMarkup).toContain('title="Admin"');
     expect(adminMarkup.match(/class="sidebar-nav-item/g) || []).toHaveLength(6);
 
+    const collapsedMarkup = renderToStaticMarkup(createElement(WorkspaceSidebar, {
+      ...commonProps,
+      collapsed: true
+    }));
+    expect(collapsedMarkup).toContain('class="sidebar-collapsed-trigger"');
+    expect(collapsedMarkup).toContain('aria-label="Expand workspace navigation"');
+    expect(collapsedMarkup).not.toContain('aria-label="Collapse workspace navigation"');
+    expect(collapsedMarkup).not.toContain("lucide-arrow-left");
+    expect(collapsedMarkup).not.toContain("lucide-arrow-right");
+
     const viewerMarkup = renderToStaticMarkup(createElement(WorkspaceSidebar, {
       ...commonProps,
       auth: { ...commonProps.auth, is_viewer: true },
@@ -1939,10 +1954,12 @@ describe("Agent Studio product surfaces", () => {
 
     const mobileMarkup = renderToStaticMarkup(createElement(WorkspaceSidebar, {
       ...commonProps,
+      collapsed: true,
       mobileOpen: true
     }));
     expect(mobileMarkup).toContain('role="dialog"');
     expect(mobileMarkup).toContain('aria-modal="true"');
+    expect(mobileMarkup).toContain('<span class="sidebar-label">Virenis</span>');
   });
 
   it("reserves more sidebar height for Past Chats while preserving mobile touch targets", () => {
@@ -1956,7 +1973,7 @@ describe("Agent Studio product surfaces", () => {
 
     expect(sidebar).toContain("grid-template-rows: auto auto auto minmax(0, 1fr) auto");
     expect(sidebar).toContain("gap: 8px");
-    expect(newChat).toContain("min-height: 40px");
+    expect(newChat).toContain("min-height: 36px");
     expect(newChat).toContain("font-size: 12px");
     expect(resourceNav).toContain("gap: 1px");
     expect(navItem).toContain("min-height: 34px");
@@ -1964,7 +1981,32 @@ describe("Agent Studio product surfaces", () => {
     expect(history).toContain("min-height: 0");
     expect(history).toContain("gap: 6px");
     expect(history).toContain("padding-top: 8px");
-    expect(mobile).toMatch(/\.workspace-sidebar \.sidebar-new-chat,[\s\S]*?\.workspace-sidebar\.is-collapsed \.sidebar-balance\s*\{[\s\S]*?min-height: 44px;/);
+    expect(mobile).toMatch(/\.workspace-sidebar \.sidebar-new-chat,[\s\S]*?\.workspace-sidebar\.is-collapsed \.sidebar-nav-item\s*\{[\s\S]*?min-height: 44px;/);
+  });
+
+  it("uses a compact wordmark, a V-only collapsed trigger, and one integrated account card", () => {
+    const styles = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
+    const appSource = readFileSync(new URL("../src/App.jsx", import.meta.url), "utf8");
+    const brandName = styles.match(/\.sidebar-brand \.sidebar-label\s*\{([\s\S]*?)\}/)?.[1] || "";
+    const footer = styles.match(/\.sidebar-footer\s*\{([\s\S]*?)\}/)?.[1] || "";
+    const profile = styles.match(/\.sidebar-profile\s*\{([\s\S]*?)\}/)?.[1] || "";
+    const profilePrimary = styles.match(/\.sidebar-profile-primary\s*\{([\s\S]*?)\}/)?.[1] || "";
+    const collapsedTrigger = styles.match(/\.workspace-sidebar\.is-collapsed \.sidebar-collapsed-trigger\s*\{([\s\S]*?)\}/)?.[1] || "";
+    const mobile = styles.slice(styles.indexOf("@media (max-width: 900px)"));
+
+    expect(brandName).toContain("font-size: 16px");
+    expect(footer).toContain("padding-top: 8px");
+    expect(profile).toContain("grid-template-columns: auto minmax(0, 1fr)");
+    expect(profile).toContain("min-height: 48px");
+    expect(profilePrimary).toContain("grid-template-columns: minmax(0, 1fr) auto");
+    expect(collapsedTrigger).toContain("display: grid");
+    expect(collapsedTrigger).toContain("width: 44px");
+    expect(styles).toMatch(/\.workspace-sidebar\.is-collapsed \.sidebar-brand,[\s\S]*?\.workspace-sidebar\.is-collapsed \.sidebar-collapse-button\s*\{[\s\S]*?display: none;/);
+    expect(styles).not.toContain(".sidebar-balance {");
+    expect(styles).not.toContain(".sidebar-brand-mark");
+    expect(appSource).toMatch(/className="sidebar-collapsed-trigger"[\s\S]*?onClick=\{onToggleCollapsed\}/);
+    expect(mobile).toMatch(/\.workspace-sidebar\.is-collapsed \.sidebar-brand,[\s\S]*?\.workspace-sidebar \.sidebar-brand\s*\{[\s\S]*?display: flex;/);
+    expect(mobile).toMatch(/\.workspace-sidebar \.sidebar-collapsed-trigger,[\s\S]*?\.workspace-sidebar\.is-collapsed \.sidebar-collapsed-trigger\s*\{[\s\S]*?display: none;/);
   });
 
   it("keeps the new-chat composer anchored without an empty-state spacer", () => {
