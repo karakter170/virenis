@@ -889,6 +889,7 @@ async function processLocalChatRun({ store, bus, run_id, options = {} }) {
             artifact_validation: result.artifact_validation,
             consumed_artifacts: result.consumed_artifacts,
             consumption_validation: result.consumption_validation,
+            source_validation: result.source_validation,
             used_memory: result.used_memory,
             boundary_check: result.boundary_check,
             allowed_tools: result.allowed_tools,
@@ -1548,6 +1549,7 @@ function assertRuntimePlan(plan, { allowedAdapters = [], maxSteps = 12 } = {}) {
     const id = String(step.id || "");
     const adapter = String(step.adapter || "");
     const task = String(step.task || "");
+    const evidenceRequirement = String(step.evidence_requirement || "").trim().toLowerCase();
     if (!/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,119}$/.test(id)) fail("runtime plan contains an invalid step id");
     if (!adapter || adapter.length > 240 || !allowed.has(adapter)) {
       fail(`runtime plan selected an unauthorized agent for step ${id}`);
@@ -1560,7 +1562,17 @@ function assertRuntimePlan(plan, { allowedAdapters = [], maxSteps = 12 } = {}) {
       || new Set(dependsOn).size !== dependsOn.length
       || dependsOn.some((dependency) => !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,119}$/.test(dependency))
     ) fail(`runtime dependencies are invalid for step ${id}`);
-    return { id, adapter, task, depends_on: dependsOn };
+    if (
+      evidenceRequirement
+      && !["live_external", "supplied_context", "none", "unknown"].includes(evidenceRequirement)
+    ) fail(`runtime plan contains an invalid evidence requirement for step ${id}`);
+    return {
+      id,
+      adapter,
+      task,
+      depends_on: dependsOn,
+      ...(evidenceRequirement ? { evidence_requirement: evidenceRequirement } : {})
+    };
   });
   try {
     buildParallelBatches(normalizedSteps, 1);
@@ -1607,9 +1619,13 @@ export function normalizeRuntimeRouting(routing) {
       decision: boundedText(rawOrchestrator.decision, 40),
       model: boundedText(rawOrchestrator.model, 240),
       intent: boundedText(rawOrchestrator.intent, 600),
+      evidence_requirement: ["live_external", "supplied_context", "none", "unknown"].includes(
+        String(rawOrchestrator.evidence_requirement || "").trim().toLowerCase()
+      ) ? String(rawOrchestrator.evidence_requirement).trim().toLowerCase() : "unknown",
       required_capabilities: boundedStringList(rawOrchestrator.required_capabilities, 24, 240),
       missing_capabilities: boundedStringList(rawOrchestrator.missing_capabilities, 24, 240),
       clarification_question: boundedText(rawOrchestrator.clarification_question, 600),
+      direct_answer: boundedText(rawOrchestrator.direct_answer, 4000),
       synthesis_brief: boundedText(rawOrchestrator.synthesis_brief, 1200),
       discovery_method: boundedText(rawOrchestrator.discovery_method, 120),
       authorized_agent_count: Math.max(0, Math.min(Number(rawOrchestrator.authorized_agent_count) || 0, 100000)),
@@ -2208,6 +2224,11 @@ function buildRouteOutput({ step, query, agents, documents, upstream = [], share
     approved_sources: agent?.sources || [],
     policy_violations: sanitized.violations,
     citations,
+    source_validation: {
+      valid: true,
+      violations: [],
+      approved_source_count: citations.length
+    },
     raw_text: sanitized.text
   };
 }

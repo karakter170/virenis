@@ -5,7 +5,7 @@ import { runtimeApiKey } from "./runtimeClient.js";
 import { makeId, nowIso } from "./store.js";
 
 export const WORLD_GRAPH_SCHEMA_VERSION = "virenis-world-graph-v1";
-export const WORLD_GRAPH_ENGINE_REVISION = "world-graph-engine-v3";
+export const WORLD_GRAPH_ENGINE_REVISION = "world-graph-engine-v5";
 
 const WORLD_GRAPH_DIGEST_DOMAIN = "worldgraph-digest-v2\n";
 const WORLD_GRAPH_CAPSULE_ENCODING = "json-utf8-exact-v1";
@@ -21,7 +21,10 @@ const MAX_CAPSULE_BYTES = 2 * 1024 * 1024;
 const STORAGE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const DEFAULT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const REMOTE_MAX_AGE_MS = 30 * 60 * 1000;
-const VOLATILE_QUERY = /\b(?:current|currently|today|tonight|latest|live|real[- ]?time|right now|this (?:week|month|year)|weather|price|stock|score|breaking|recent)\b/i;
+const STRONG_FRESHNESS_QUERY = /\b(?:currently|today|tonight|latest|right now|at the moment|as of (?:today|now|\d{4})|this (?:week|month|year)|recently|most recent)\b/i;
+const CONTEXTUAL_FRESHNESS_QUERY = /\bcurrent\b.{0,80}\b(?:president|prime minister|ceo|mayor|governor|leader|office[- ]?holder|weather|forecast|price|cost|value|exchange rate|share|stock price|score|standings|news|sales|market share|version|release|status|availability)\b|\b(?:what(?:'s| is)|who is|tell me|give me|show me|check|find|get)\b.{0,80}\b(?:weather|forecast|price|cost|exchange rate|share price|stock price|score|standings|news headlines?)\b|\bhow much\b.{0,100}\b(?:cost|worth|price)\b|\b(?:EUR|USD|GBP|JPY|TRY|CAD|AUD)[ /-](?:EUR|USD|GBP|JPY|TRY|CAD|AUD)\b.{0,40}\b(?:rate|value|quote)?\b|\b(?:share|stock)\s+(?:price|value|quote)\b|\bexchange\s+rate\b|\bwhen is\b.{0,100}\bnext\b.{0,80}\b(?:earnings|call|release|event)\b|\bis\b.{0,80}\b(?:down|offline|operational)\b|\b(?:live|real[- ]?time)\b.{0,50}\b(?:data|status|result|score|price|quote|traffic|weather|feed)\b|\b(?:weather|forecast|price|score|schedule)\b.{0,50}\b(?:tomorrow|yesterday)\b|\b(?:tomorrow|yesterday)\b.{0,50}\b(?:weather|forecast|price|score|schedule)\b/i;
+const MULTILINGUAL_VOLATILE_QUERY = /(?<!\p{L})(?:güncel|bugün|bugünkü|yarın|şu\s*anda|en\s*son|gerçek\s*zamanlı|ne\s+kadar|cumhurbaşkanı\s+kim|actualmente|hoy|ahora|reciente|aujourd'hui|maintenant|dernier|aktuell|heute|jetzt|neueste|hoje|agora|últim[oa]|hari\s+ini|sekarang|terbaru|сегодня|сейчас|последние|последний|последняя|اليوم|الآن|أحدث|今天|现在|最新|实时|今日|現在|リアルタイム|오늘|현재|최신|실시간)(?!\p{L})/iu;
+const FRESHNESS_FALSE_SENSE = /\b(?:score (?:this|the) (?:essay|answer|response)|breaking changes?|real[- ]?time (?:chat|system|architecture|application)|live (?:music|concert|event)|stock management|inventory stock|news article (?:I |we )?(?:pasted|provided|attached)|(?:yesterday|tomorrow).{0,50}(?:poem|theme|story|sentence)|tiempo verbal)\b/is;
 const VOLATILE_TOOLS = new Set([
   "web_search", "market_data", "earthquake_feed", "document_search", "document_read",
   "search_index", "policy_lookup", "news_search", "weather", "http_get", "url_fetch",
@@ -188,7 +191,6 @@ function sourceStateReplayable(agent, documents) {
 function routeOptionState(options = {}) {
   return {
     max_tokens: Number(options.max_tokens) || null,
-    refiner_max_tokens: Number(options.refiner_max_tokens) || null,
     temperature: Number(options.temperature) || 0,
     required_adapters: normalizedStrings(options.required_adapters)
   };
@@ -223,30 +225,78 @@ function memoryState(agent, sharedMemory) {
   }));
 }
 
+function exactRepeatAntecedentMemory(query, sharedMemory) {
+  const rows = Array.isArray(sharedMemory) ? sharedMemory : [];
+  const target = String(query || "").replace(/\s+/g, " ").trim();
+  let cut = rows.length;
+  let rewound = false;
+  while (cut > 0) {
+    let latestUserIndex = -1;
+    for (let index = cut - 1; index >= 0; index -= 1) {
+      if (String(rows[index]?.tag || "").trim() === "user_request") {
+        latestUserIndex = index;
+        break;
+      }
+    }
+    if (latestUserIndex < 0) break;
+    const priorQuery = String(rows[latestUserIndex]?.content || "").replace(/\s+/g, " ").trim();
+    if (priorQuery !== target) break;
+    cut = latestUserIndex;
+    rewound = true;
+  }
+  return rewound ? rows.slice(0, cut) : rows;
+}
+
 function dependencyState(step, outputsByStep) {
   return normalizedStrings(step?.depends_on).map((stepId) => {
     const output = outputsByStep.get(stepId);
-    const valid = validRouteOutput(output);
+    // Dependency identity must be computed from the same bounded replay
+    // representation that is persisted as an artifact.  Fresh runtime
+    // outputs can carry additional, non-replay metadata while reused outputs
+    // are already replay-shaped; hashing the raw objects made an unchanged
+    // upstream result appear different on the next run.
+    const canonicalReplay = replayOutput({
+      ...output,
+      id: output?.id || output?.step_id || stepId,
+      step_id: output?.step_id || output?.id || stepId
+    });
+    const valid = validRouteOutput(canonicalReplay);
     return {
       step_id: stepId,
-      adapter: output?.adapter || null,
+      adapter: canonicalReplay?.adapter || output?.adapter || null,
       output_digest: valid
-        ? output.world_graph_output_digest || outputDigest(output)
+        ? outputDigest(canonicalReplay)
         : worldGraphDigest({ invalid_dependency: stepId, observed_output: outputDigest(output) })
     };
   });
 }
 
-function effectPolicy({ query, agent, output = null }) {
+function queryRequestsFreshInformation(query, task = "") {
+  const value = `${String(query || "")} ${String(task || "")}`.replace(/\s+/g, " ").trim();
+  if (FRESHNESS_FALSE_SENSE.test(value) && !STRONG_FRESHNESS_QUERY.test(value)) return false;
+  return STRONG_FRESHNESS_QUERY.test(value)
+    || CONTEXTUAL_FRESHNESS_QUERY.test(value)
+    || MULTILINGUAL_VOLATILE_QUERY.test(value);
+}
+
+function effectPolicy({ query, task = "", evidenceRequirement = "", agent, output = null }) {
   const allowedTools = normalizedStrings(agent?.tools || output?.allowed_tools);
   const executions = Array.isArray(output?.tool_executions) ? output.tool_executions : [];
   const executedNames = executions.map((item) => String(item?.name || "")).filter(Boolean);
   const reasons = [];
   const agentIdentity = [agent?.id, agent?.title, ...(agent?.routing_cues || [])].join(" ").toLowerCase();
-  const volatileSubject = String(query || "").toLowerCase().match(/\b(weather|price|stock|score|news|current|latest|live|recent)\b/)?.[1];
+  const queryText = String(query || "");
+  const volatileSubject = queryText.toLowerCase().match(/\b(weather|price|stock|score|news|current|latest|live|recent)\b/)?.[1];
   const mutableToolAvailable = allowedTools.some((tool) => !REPLAY_SAFE_TOOL_AVAILABILITY.has(tool));
+  const evidenceClass = String(evidenceRequirement || "").trim().toLowerCase();
+  const explicitlyTimeSensitive = evidenceClass === "live_external"
+    || queryRequestsFreshInformation(queryText, task);
+  // A session controller marks uncertain external-state work explicitly. A
+  // mutable-tool route then fails closed without a second classifier/model
+  // call; stable or supplied-context work remains reusable.
+  const languageFreshnessUnknown = evidenceClass === "unknown" && mutableToolAvailable;
   if (
-    VOLATILE_QUERY.test(query)
+    (explicitlyTimeSensitive || languageFreshnessUnknown)
     && (
       mutableToolAvailable
       || allowedTools.some((tool) => VOLATILE_TOOLS.has(tool))
@@ -271,8 +321,8 @@ function effectPolicy({ query, agent, output = null }) {
   };
 }
 
-function replayPolicy({ query, agent, output = null, documents = [] }) {
-  const policy = effectPolicy({ query, agent, output });
+function replayPolicy({ query, task = "", evidenceRequirement = "", agent, output = null, documents = [] }) {
+  const policy = effectPolicy({ query, task, evidenceRequirement, agent, output });
   if (!sourceStateReplayable(agent, documents)) {
     policy.class = "volatile";
     policy.replayable = false;
@@ -290,7 +340,7 @@ function outputDigest(output = {}) {
     policy_violations: output.policy_violations || [],
     artifact_validation: output.artifact_validation || {},
     consumption_validation: output.consumption_validation || {},
-    source_validation: output.source_validation || { valid: true, violations: [] }
+    source_validation: output.source_validation || {}
   });
 }
 
@@ -324,7 +374,7 @@ function replayOutput(output = {}) {
     approved_sources: output.approved_sources || [],
     retrieved_context: output.retrieved_context || "",
     citations: output.citations || [],
-    source_validation: output.source_validation || { valid: true, violations: [] },
+    source_validation: output.source_validation || {},
     handoff_artifacts: output.handoff_artifacts || [],
     artifact_validation: output.artifact_validation || {},
     consumed_artifacts: output.consumed_artifacts || [],
@@ -357,22 +407,82 @@ function replayPayloadDigest(output = {}) {
   return worldGraphDigest(stable);
 }
 
+function normalizedRefusalText(value) {
+  return String(value || "")
+    .replaceAll("’", "'")
+    .replace(/^\s*(?:#{1,6}\s*)?(?:\*{1,2}|_{1,2})?(?:limitation|unable to complete|status|note)(?:\*{1,2}|_{1,2})?\s*[:：-]?\s*(?:\r?\n|$)/i, "")
+    .replace(/^\s*(?:[-*+]\s+|\d+[.)]\s+)/, "")
+    .replace(/^\s*(?:(?:unfortunately|regrettably|sorry|apologies|i'm sorry)\s*[,.:;-]?\s*)+/i, "")
+    .replace(/\bI'm\b/i, "I am")
+    .replace(/\bwe're\b/i, "we are")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+const ROUTE_REFUSAL_PATTERNS = [
+  /^no validated .{0,160} result was produced\b/i,
+  /^(?:i|we|this (?:agent|route|analysis|request)|the system)\s+(?:cannot|can't|could not|was unable to|is unable to|am unable to|are unable to)\s+(?:proceed|complete|provide|produce|answer|analy[sz]e|generate|continue|help|assist|comply)\b/i,
+  /^unable\s+to\s+(?:proceed|complete|provide|produce|answer|analy[sz]e|generate|continue)\b/i,
+  /^(?:i\s+)?(?:cannot|can't)\s+(?:assist|comply)\b/i,
+  /^(?:i|we)\s+(?:do not|don't)\s+have\s+enough\s+(?:information|details|context|data)\s+to\s+(?:proceed|complete|answer|analy[sz]e|continue)\b/i,
+  /^(?:i|we)\s+need\s+(?:more|additional)\s+(?:information|details|context|data)\b.{0,140}\bbefore\b.{0,80}\b(?:proceed|continue|begin|complete)\b/i,
+  /^(?:more|additional)\s+(?:information|details|context|data|project details)\s+(?:is|are)\s+(?:required|needed)\b.{0,120}\b(?:before|to)\b/i,
+  /^(?:this|the)\s+(?:task|analysis|request|work)\s+(?:cannot|can't|could not)\s+(?:be\s+)?(?:completed|provided|produced|generated|analy[sz]ed)\b/i,
+  /^(?:what|which)\b.{0,120}\b(?:project|scope|outcome|audience|market|timeframe)\b.{0,80}\?\s*$/i,
+  /^the requested .{0,180}\b(?:could not|cannot|was not)\s+(?:be\s+)?(?:completed|provided|produced|generated|analy[sz]ed)\b/i,
+  /^(?:there\s+(?:is|are)|we\s+have)\s+(?:insufficient|not enough)\s+(?:information|details|context|data)\b.{0,140}\b(?:to|for)\s+(?:proceed|complete|provide|produce|answer|analy[sz]e|generate|continue)\b/i,
+  /^(?:please|could you|can you|would you|kindly)\s+(?:provide|define|clarify|supply|share|specify)\b.{0,160}\b(?:scope|requirements?|target (?:users?|audience)|missing (?:details|information|data)|needed (?:details|information|data)|project details|input data)\b/i,
+  /^(?:n\/?a|unknown|unavailable|not available)\s*(?:[.:-]|$)/i,
+  /^no\s+(?:answer|result|output)\s+(?:is\s+)?available\b/i,
+  /^(?:ben|biz|bu\s+(?:istek|görev|analiz))\b.{0,100}\b(?:tamamlayamıyorum|tamamlanamıyor|sağlayamıyorum|devam\s+edemiyorum)\b/i,
+  /^(?:no\s+puedo|no\s+podemos|se\s+necesita\s+más\s+información)\b/i,
+  /^(?:je\s+ne\s+peux\s+pas|nous\s+ne\s+pouvons\s+pas|impossible\s+de)\b/i,
+  /^(?:ich\s+kann\b.{0,100}\bnicht|wir\s+können\b.{0,100}\bnicht|weitere\s+informationen\s+sind\s+erforderlich)\b/i,
+  /^(?:无法|不能|我无法|我们无法).{0,120}(?:完成|提供|继续|回答)/i
+];
+
+function refusalOnlyRouteAnswer(value) {
+  const answer = normalizedRefusalText(value);
+  for (const pattern of ROUTE_REFUSAL_PATTERNS) {
+    const match = answer.match(pattern);
+    if (!match) continue;
+    const remainder = answer.slice((match.index || 0) + match[0].length);
+    const contrast = remainder.match(/\b(?:but|however|instead|assuming|meanwhile|nevertheless|still|here (?:is|are)|I can|we can)\b([\s\S]+)$/i);
+    if (contrast && (contrast[1].match(/[\p{L}\p{M}][\p{L}\p{M}'-]*/gu) || []).length >= 6) return false;
+    const sentenceEnd = remainder.match(/[.!?](?:\s+|$)/);
+    if (!sentenceEnd) return true;
+    const tail = remainder.slice((sentenceEnd.index || 0) + sentenceEnd[0].length).trim();
+    if ((tail.match(/[\p{L}\p{M}][\p{L}\p{M}'-]*/gu) || []).length < 6) return true;
+    return ROUTE_REFUSAL_PATTERNS.some((candidate) => candidate.test(tail));
+  }
+  return false;
+}
+
 function validRouteOutput(output) {
+  const answer = String(output?.domain_answer || "").replace(/\s+/g, " ").trim();
   return Boolean(
     output
     && output.adapter
-    && output.domain_answer
+    && answer
+    && !refusalOnlyRouteAnswer(answer)
     && !(output.policy_violations || []).length
-    && output.artifact_validation?.valid !== false
-    && output.consumption_validation?.valid !== false
-    && output.source_validation?.valid !== false
+    && output.artifact_validation?.valid === true
+    && output.consumption_validation?.valid === true
+    && output.source_validation?.valid === true
   );
 }
 
 function inputEnvelope({ run, step, agent, documents, sharedMemory, options, outputsByStep, runtimeComponentProvenance = null }) {
   const query = normalizedQuery(run?.query);
   const sourceState = sourceStateForAgent(agent, documents);
-  const routeEffectPolicy = replayPolicy({ query, agent, documents });
+  const effectiveMemory = exactRepeatAntecedentMemory(query, sharedMemory);
+  const routeEffectPolicy = replayPolicy({
+    query,
+    task: step?.task,
+    evidenceRequirement: step?.evidence_requirement,
+    agent,
+    documents
+  });
   return {
     schema_version: WORLD_GRAPH_SCHEMA_VERSION,
     engine_revision: WORLD_GRAPH_ENGINE_REVISION,
@@ -381,9 +491,9 @@ function inputEnvelope({ run, step, agent, documents, sharedMemory, options, out
     adapter: String(step?.adapter || ""),
     agent_revision: agentRevision(agent || { id: step?.adapter || "" }),
     dependency_state: dependencyState(step, outputsByStep),
-    memory_digest: memoryState(agent, sharedMemory) === null
+    memory_digest: memoryState(agent, effectiveMemory) === null
       ? null
-      : worldGraphDigest(memoryState(agent, sharedMemory)),
+      : worldGraphDigest(memoryState(agent, effectiveMemory)),
     source_state_digest: worldGraphDigest(sourceState),
     route_options_digest: worldGraphDigest(routeOptionState(options)),
     runtime_component_digest: normalizedRuntimeComponentState(runtimeComponentProvenance)
@@ -469,13 +579,55 @@ function verifyWorldGraphEvent(event) {
 }
 
 function contestedArtifactIds(data) {
-  // Never promote an unsigned legacy/database-injected event into trusted
-  // audit truth during a read. Engine revision changes already invalidate old
-  // replay artifacts; any deliberate legacy migration belongs in an explicit,
-  // offline, scope-validating operation.
-  return new Set((data.worldGraphEvents || [])
-    .filter((event) => verifyWorldGraphEvent(event))
-    .flatMap((event) => Array.isArray(event.artifact_ids) ? event.artifact_ids : []));
+  const artifacts = (data.worldGraphArtifacts || []).filter((artifact) => (
+    verifyWorldGraphArtifact(artifact) && validRouteOutput(artifact.replay_output)
+  ));
+  const byId = new Map(artifacts.map((artifact) => [artifact.artifact_id, artifact]));
+  const contested = new Set();
+
+  const groupKey = (artifact) => worldGraphDigest({
+    workspace_id: artifact.workspace_id,
+    created_by: artifact.created_by,
+    session_id: artifact.session_id,
+    agent_workspace_id: artifact.agent_workspace_id,
+    adapter: artifact.adapter,
+    envelope_digest: artifact.envelope_digest
+  });
+
+  // Derive conflict truth from complete, integrity-valid route artifacts so
+  // event pruning cannot silently erase a real deterministic disagreement.
+  const groups = new Map();
+  for (const artifact of artifacts) {
+    const key = groupKey(artifact);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(artifact);
+  }
+  for (const group of groups.values()) {
+    if (new Set(group.map((artifact) => artifact.output_digest)).size < 2) continue;
+    for (const artifact of group) contested.add(artifact.artifact_id);
+  }
+
+  // Signed events remain auditable evidence, but every reference must still
+  // resolve to a valid artifact in the same exact tenant/envelope group with
+  // at least two distinct outputs. A legacy flag or poisoned event cannot by
+  // itself suppress a good result.
+  for (const event of data.worldGraphEvents || []) {
+    if (!verifyWorldGraphEvent(event) || !Array.isArray(event.artifact_ids)) continue;
+    const ids = [...new Set(event.artifact_ids.map((value) => String(value || "")).filter(Boolean))];
+    const referenced = ids.map((id) => byId.get(id));
+    if (ids.length < 2 || referenced.some((artifact) => !artifact)) continue;
+    const first = referenced[0];
+    const eventScope = scopeFor({ run: event, session: event });
+    if (
+      !referenced.every((artifact) => sameScope(artifact, eventScope))
+      || referenced.some((artifact) => artifact.adapter !== event.adapter)
+      || new Set(referenced.map(groupKey)).size !== 1
+      || new Set(referenced.map((artifact) => artifact.output_digest)).size < 2
+      || first.adapter !== event.adapter
+    ) continue;
+    for (const artifact of referenced) contested.add(artifact.artifact_id);
+  }
+  return contested;
 }
 
 function maxAgeFor(_options = {}) {
@@ -538,7 +690,7 @@ export function selectWorldGraphSeeds({
           mismatchReason ||= envelopeChangeReason(artifact.input_envelope, envelope);
           continue;
         }
-        if (artifact.contested === true || contested.has(artifact.artifact_id)) {
+        if (contested.has(artifact.artifact_id)) {
           reason = "stored_results_disagree";
           continue;
         }
@@ -634,7 +786,7 @@ export function selectWorldGraphSeedForStep({
         mismatchReason ||= envelopeChangeReason(artifact.input_envelope, envelope);
         continue;
       }
-      if (artifact.contested || contested.has(artifact.artifact_id)) { reason = "stored_results_disagree"; continue; }
+      if (contested.has(artifact.artifact_id)) { reason = "stored_results_disagree"; continue; }
       if (!artifactAgeValid(artifact, now, options)) { reason = "stored_result_expired"; continue; }
       if (!validRouteOutput(artifact.replay_output)) { reason = "stored_result_not_validated"; continue; }
       return {
@@ -724,6 +876,17 @@ export function recordWorldGraphRun({
       }
       continue;
     }
+    if (!validRouteOutput(replay)) {
+      if (executionMode === "reused") {
+        const error = new Error(`Reused WorldGraph output was not validated for step ${step.id}.`);
+        error.code = "world_graph_reuse_contract_invalid";
+        throw error;
+      }
+      // Failed-closed/partial worker results remain on the run for diagnosis,
+      // but they are not durable reusable knowledge and cannot create a
+      // deterministic contest against an earlier valid result.
+      continue;
+    }
     const envelope = inputEnvelope({
       run,
       session,
@@ -735,7 +898,14 @@ export function recordWorldGraphRun({
       outputsByStep: outputByStep,
       runtimeComponentProvenance: runtimeComponentState
     });
-    let actualEffect = replayPolicy({ query: run.query, agent, output, documents });
+    let actualEffect = replayPolicy({
+      query: run.query,
+      task: step?.task,
+      evidenceRequirement: step?.evidence_requirement,
+      agent,
+      output,
+      documents
+    });
     envelope.effect_policy = actualEffect;
     const outputHash = outputDigest(replay);
     const currentEnvelopeDigest = envelopeDigest(envelope);
@@ -749,7 +919,6 @@ export function recordWorldGraphRun({
         && output.world_graph_output_digest === candidate.output_digest
         && replayPayloadDigest(candidate.replay_output) === replayPayloadDigest(output)
         && worldGraphDigest(candidate.runtime_component_state || null) === worldGraphDigest(runtimeComponentState || null)
-        && candidate.contested !== true
         && !contestedArtifactIds(data).has(candidate.artifact_id)
         && candidate.effect_policy?.replayable === true
         && artifactAgeValid(candidate, Number.isFinite(recordTime) ? recordTime : Date.now(), options)
@@ -806,6 +975,7 @@ export function recordWorldGraphRun({
       && candidate.envelope_digest === artifact.envelope_digest
       && candidate.output_digest !== artifact.output_digest
       && verifyWorldGraphArtifact(candidate)
+      && validRouteOutput(candidate.replay_output)
     );
     if (conflicts.length && Number(options?.temperature || 0) === 0) {
       artifact.contested = true;
@@ -966,6 +1136,7 @@ export function publicWorldGraphSnapshot({ data, run, actor }) {
     ))
   );
   const verified = accessible.filter(verifyWorldGraphArtifact);
+  const validStored = verified.filter((artifact) => validRouteOutput(artifact.replay_output));
   const contested = contestedArtifactIds(data);
   const summary = run ? publicWorldGraphRun(run) : null;
   const decisions = new Map((summary?.decisions || []).map((item) => [item.step_id, item]));
@@ -998,9 +1169,9 @@ export function publicWorldGraphSnapshot({ data, run, actor }) {
       target: `agent_result:${step.id}`,
       kind: "supports"
     }))),
-    stored_results: verified.length,
-    contested_results: verified.filter((artifact) => artifact.contested || contested.has(artifact.artifact_id)).length,
-    effect_safe_results: verified.filter((artifact) => artifact.effect_policy?.replayable === true).length
+    stored_results: validStored.length,
+    contested_results: validStored.filter((artifact) => contested.has(artifact.artifact_id)).length,
+    effect_safe_results: validStored.filter((artifact) => artifact.effect_policy?.replayable === true).length
   };
 }
 
@@ -1265,7 +1436,7 @@ export function prepareWorldGraphReplay({
       addReplayExclusion(exclusionCounts, agentReasons, "stored_result_failed_integrity_check", adapter);
       continue;
     }
-    if (artifact.contested || contested.has(artifact.artifact_id)) {
+    if (contested.has(artifact.artifact_id)) {
       addReplayExclusion(exclusionCounts, agentReasons, "stored_results_disagree", adapter);
       continue;
     }
@@ -1302,7 +1473,12 @@ export function prepareWorldGraphReplay({
       addReplayExclusion(exclusionCounts, agentReasons, "source_changed_or_unverifiable", adapter);
       continue;
     }
-    const memory = memoryState(agent, sharedMemory);
+    // Exact repeats must be compared with the memory that preceded the first
+    // occurrence of the request. The session now contains the prior request,
+    // route outputs, and synthesis, but those are consequences of the result
+    // being considered and cannot invalidate that same result.
+    const effectiveMemory = exactRepeatAntecedentMemory(run?.query, sharedMemory);
+    const memory = memoryState(agent, effectiveMemory);
     const currentMemoryDigest = memory === null ? null : worldGraphDigest(memory);
     if (artifact.input_envelope.memory_digest !== currentMemoryDigest) {
       addReplayExclusion(exclusionCounts, agentReasons, "conversation_context_changed", adapter);
@@ -1338,10 +1514,6 @@ export function prepareWorldGraphReplay({
     candidates.push(candidate);
     eligibleAdapters.add(adapter);
   }
-  preparation.eligible_candidates = candidates.length;
-  if (!candidates.length) {
-    return { capsule: null, diagnostics: finalizeReplayPreparation(preparation, exclusionCounts, agentReasons, eligibleAdapters) };
-  }
   const issuedAt = new Date(now).toISOString();
   const capsule = {
     schema_version: WORLD_GRAPH_SCHEMA_VERSION,
@@ -1359,6 +1531,22 @@ export function prepareWorldGraphReplay({
     query_digest: queryDigest,
     candidates
   };
+  // Candidate-byte accounting alone omits the signed capsule's scope,
+  // timestamps, separators, and field names. Enforce the documented limit on
+  // the complete signed payload, removing the lowest-priority (latest appended)
+  // candidates until the exact transport bytes fit.
+  while (candidates.length && Buffer.byteLength(JSON.stringify(capsule), "utf8") > MAX_CAPSULE_BYTES) {
+    const removed = candidates.pop();
+    addReplayExclusion(exclusionCounts, agentReasons, "replay_payload_too_large", removed?.replay_output?.adapter);
+  }
+  eligibleAdapters.clear();
+  for (const candidate of candidates) {
+    eligibleAdapters.add(String(candidate?.replay_output?.adapter || candidate?.input_envelope?.adapter || ""));
+  }
+  preparation.eligible_candidates = candidates.length;
+  if (!candidates.length) {
+    return { capsule: null, diagnostics: finalizeReplayPreparation(preparation, exclusionCounts, agentReasons, eligibleAdapters) };
+  }
   // Transport the exact bytes that were signed. Re-serializing this object in
   // Python would otherwise change valid IEEE-754 spellings (for example
   // 0.000001 to 1e-06). No unsigned mirror fields are exposed on the wrapper,

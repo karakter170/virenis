@@ -280,7 +280,7 @@ describe.sequential("WorldGraph real-runtime bridge", () => {
     const repeatedCapsule = signedWorldGraphPayload(requests[1].world_graph);
     expect(repeatedCapsule).toMatchObject({
       schema_version: "virenis-world-graph-v1",
-      engine_revision: "world-graph-engine-v3",
+      engine_revision: "world-graph-engine-v5",
       scope: {
         target_run_id: repeated.run_id,
         workspace_id: "remote_workspace",

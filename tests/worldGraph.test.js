@@ -359,16 +359,26 @@ describe("WorldGraph validity and selective replay", () => {
     });
   });
 
-  it("wakes routes when a request-level refiner budget changes", () => {
+  it("keeps worker routes when only the final refiner budget changes", () => {
     const changed = replayFixture(fixture(), {
       options: { max_tokens: 1024, refiner_max_tokens: 2048, temperature: 0 }
     });
     expect(changed.actions).toEqual({
-      research_agent: "refreshed",
-      safety_agent: "refreshed",
-      writer_agent: "refreshed"
+      research_agent: "kept",
+      safety_agent: "kept",
+      writer_agent: "kept"
     });
-    expect(changed.reasons.research_agent).toBe("execution_settings_changed");
+    expect(changed.reasons.research_agent).toBe("inputs_and_evidence_unchanged");
+  });
+
+  it("fails closed for multilingual current-information requests", () => {
+    const base = fixture({
+      query: "Bugünkü hava durumunu söyle.",
+      agentPatches: { research_agent: { tools: ["web_search"], routing_cues: ["hava"] } }
+    });
+    const repeated = replayFixture(base);
+    expect(repeated.actions.research_agent).toBe("refreshed");
+    expect(repeated.reasons.research_agent).toBe("time_sensitive_request");
   });
 
   it("invalidates only agents that actually consume changed conversation memory", () => {
@@ -376,6 +386,118 @@ describe("WorldGraph validity and selective replay", () => {
     const memory = [{ tag: "audience", source: "user", content: "Teachers" }];
     const result = replayFixture(base, { sharedMemory: memory });
     expect(result.actions).toEqual({ research_agent: "refreshed", safety_agent: "kept", writer_agent: "kept" });
+  });
+
+  it("rewinds consequences of exact repeats before preparing a real-runtime replay capsule", () => {
+    const base = fixture({ agentPatches: { research_agent: { consumes: ["shared_memory"] } } });
+    const completedTurn = [
+      { tag: "user_request", source: "user", content: base.run.query },
+      { tag: "research_agent.final", source: "research_agent", content: "Prior research result." },
+      { tag: "safety_agent.final", source: "safety_agent", content: "Prior safety result." },
+      { tag: "writer_agent.final", source: "writer_agent", content: "Prior synthesis result." },
+      { tag: "base.synthesis", source: "model", content: "Prior final answer." }
+    ];
+    const prepared = prepareWorldGraphReplay({
+      data: base.data,
+      run: { ...base.run, run_id: "run_exact_repeat_target" },
+      session: base.session,
+      agents: base.agents,
+      documents: [],
+      sharedMemory: [...completedTurn, ...completedTurn],
+      options: { max_tokens: 1024, temperature: 0 },
+      signingKey: "a-runtime-key-long-enough-for-hmac",
+      now: Date.parse("2026-07-15T10:05:00.000Z")
+    });
+    expect(prepared.diagnostics).toMatchObject({
+      status: "ready",
+      eligible_candidates: 3,
+      primary_reason: "inputs_and_evidence_unchanged"
+    });
+    expect(signedCapsulePayload(prepared.capsule).candidates).toHaveLength(3);
+  });
+
+  it("binds each route task without unnecessarily waking unchanged siblings", () => {
+    const base = fixture();
+    const changedStep = { ...base.plan.steps[0], task: "Collect revised launch evidence." };
+    const selected = selectWorldGraphSeedForStep({
+      data: base.data,
+      run: { ...base.run, run_id: "run_changed_task" },
+      session: base.session,
+      step: changedStep,
+      agents: base.agents,
+      documents: [],
+      sharedMemory: [],
+      options: { max_tokens: 1024, temperature: 0 },
+      resolvedOutputs: [],
+      now: Date.parse("2026-07-15T10:05:00.000Z")
+    });
+    expect(selected.seed).toBeNull();
+    expect(selected.decision.reason).toBe("task_changed");
+    expect(replayFixture(base).actions.safety_agent).toBe("kept");
+  });
+
+  it("propagates changed evidence through a multi-hop diamond and keeps an independent branch", () => {
+    const agents = ["root", "left", "right", "join", "independent"].map((name) => agent(`${name}_agent`));
+    const plan = { steps: [
+      { id: "s1", adapter: "root_agent", task: "Produce the root evidence.", depends_on: [] },
+      { id: "s2", adapter: "left_agent", task: "Analyze the left branch.", depends_on: ["s1"] },
+      { id: "s3", adapter: "right_agent", task: "Analyze the right branch.", depends_on: ["s1"] },
+      { id: "s4", adapter: "join_agent", task: "Join both branches.", depends_on: ["s2", "s3"] },
+      { id: "s5", adapter: "independent_agent", task: "Produce an independent note.", depends_on: [] }
+    ] };
+    const run = {
+      run_id: "run_diamond_cold",
+      session_id: "session_diamond",
+      workspace_id: "workspace_one",
+      agent_workspace_id: "team_diamond",
+      created_by: "user_one",
+      query: "Analyze a diamond workflow.",
+      status: "completed",
+      plan
+    };
+    const session = {
+      session_id: run.session_id,
+      workspace_id: run.workspace_id,
+      agent_workspace_id: run.agent_workspace_id,
+      created_by: run.created_by
+    };
+    const data = { worldGraphArtifacts: [], worldGraphEvents: [] };
+    recordWorldGraphRun({
+      data,
+      run,
+      session,
+      plan,
+      outputs: plan.steps.map((step) => routeOutput(step)),
+      agents,
+      documents: [],
+      sharedMemory: [],
+      options: { max_tokens: 1024, temperature: 0 },
+      createdAt: "2026-07-15T10:00:01.000Z"
+    });
+
+    const changedAgents = agents.map((item) => item.id === "root_agent"
+      ? { ...item, capability: `${item.capability} Revised.` }
+      : item);
+    const resolved = [];
+    const actions = {};
+    const versions = { s1: "v2", s2: "v2", s3: "v2", s4: "v2" };
+    for (const step of plan.steps) {
+      const selected = selectWorldGraphSeedForStep({
+        data,
+        run: { ...run, run_id: "run_diamond_changed" },
+        session,
+        step,
+        agents: changedAgents,
+        documents: [],
+        sharedMemory: [],
+        options: { max_tokens: 1024, temperature: 0 },
+        resolvedOutputs: resolved,
+        now: Date.parse("2026-07-15T10:05:00.000Z")
+      });
+      actions[step.id] = selected.seed ? "kept" : "refreshed";
+      resolved.push(selected.seed || routeOutput(step, versions[step.id] || "v1"));
+    }
+    expect(actions).toEqual({ s1: "refreshed", s2: "refreshed", s3: "refreshed", s4: "refreshed", s5: "kept" });
   });
 
   it("uses content revisions rather than filenames for document validity", () => {
@@ -568,6 +690,92 @@ describe("WorldGraph validity and selective replay", () => {
     expect(replayFixture(base).reasons.research_agent).toBe("stored_results_disagree");
   });
 
+  it("does not store an invalid refresh or let it poison an earlier valid result", () => {
+    const base = fixture();
+    const run = { ...base.run, run_id: "run_invalid_refresh" };
+    const outputs = base.plan.steps.map((step) => routeOutput(
+      step,
+      step.id === "s1" ? "invalid_conflict" : "v1",
+      step.id === "s1" ? { source_validation: { valid: false, violations: ["missing_source"] } } : {}
+    ));
+    recordWorldGraphRun({
+      data: base.data,
+      run,
+      session: base.session,
+      plan: base.plan,
+      outputs,
+      agents: base.agents,
+      documents: [],
+      sharedMemory: [],
+      options: { max_tokens: 1024, temperature: 0 }
+    });
+    expect(base.data.worldGraphArtifacts.filter((artifact) => artifact.adapter === "research_agent")).toHaveLength(1);
+    expect(base.data.worldGraphEvents).toHaveLength(0);
+    expect(replayFixture(base).actions.research_agent).toBe("kept");
+  });
+
+  it("rejects every invalid route contract before durable WorldGraph storage", () => {
+    const invalidPatches = [
+      { policy_violations: ["worker_execution_failed"] },
+      { artifact_validation: { valid: false, errors: ["missing_produce"] } },
+      { consumption_validation: { valid: false, errors: ["missing_upstream"] } },
+      { source_validation: undefined },
+      { domain_answer: "I cannot proceed until the scope is defined." }
+    ];
+    for (const [index, invalidPatch] of invalidPatches.entries()) {
+      const base = fixture();
+      const run = { ...base.run, run_id: `run_invalid_contract_${index}` };
+      const outputs = base.plan.steps.map((step) => routeOutput(
+        step,
+        step.id === "s1" ? `invalid_${index}` : "v1",
+        step.id === "s1" ? invalidPatch : {}
+      ));
+      recordWorldGraphRun({
+        data: base.data,
+        run,
+        session: base.session,
+        plan: base.plan,
+        outputs,
+        agents: base.agents,
+        documents: [],
+        sharedMemory: [],
+        options: { max_tokens: 1024, temperature: 0 }
+      });
+      expect(base.data.worldGraphArtifacts.filter((artifact) => artifact.adapter === "research_agent")).toHaveLength(1);
+      expect(base.data.worldGraphEvents).toHaveLength(0);
+      expect(replayFixture(base).actions.research_agent).toBe("kept");
+    }
+  });
+
+  it("ignores legacy contest flags and signed events whose artifact set is no longer valid", () => {
+    const base = fixture();
+    const run = { ...base.run, run_id: "run_legacy_contest" };
+    const outputs = base.plan.steps.map((step) => routeOutput(step, step.id === "s1" ? "conflict" : "v1"));
+    recordWorldGraphRun({
+      data: base.data,
+      run,
+      session: base.session,
+      plan: base.plan,
+      outputs,
+      agents: base.agents,
+      documents: [],
+      sharedMemory: [],
+      options: { max_tokens: 1024, temperature: 0 }
+    });
+    const disputed = base.data.worldGraphArtifacts.filter((artifact) => artifact.adapter === "research_agent");
+    expect(disputed).toHaveLength(2);
+    // Preserve the signed event and standalone flags while making one event
+    // reference fail integrity/route validity, as can happen in legacy state.
+    disputed[1].replay_output.source_validation = { valid: false, violations: ["legacy_invalid"] };
+    const replay = replayFixture(base);
+    expect(replay.actions.research_agent).toBe("kept");
+    expect(publicWorldGraphSnapshot({
+      data: base.data,
+      run: base.run,
+      actor: { workspace_id: "workspace_one", user_id: "user_one" }
+    }).contested_results).toBe(0);
+  });
+
   it("never authenticates an unsigned cross-tenant contest event during reads", () => {
     const base = fixture();
     const target = base.data.worldGraphArtifacts[0];
@@ -635,6 +843,35 @@ describe("WorldGraph validity and selective replay", () => {
     const replay = replayFixture(base);
     expect(replay.actions).toEqual({ research_agent: "refreshed", safety_agent: "kept", writer_agent: "kept" });
     expect(replay.reasons.research_agent).toBe("tool_result_requires_fresh_execution");
+  });
+
+  it("always rechecks approval-bound and failed effectful tool attempts", () => {
+    for (const toolExecution of [
+      { id: "approval", name: "mcp_gmail_send", result: { ok: false, approval_required: true } },
+      { id: "failure", name: "mcp_shopify_update", result: { ok: false, available: false, error: "offline" } }
+    ]) {
+      const base = fixture();
+      base.data.worldGraphArtifacts = [];
+      const outputs = base.outputs.map((output, index) => index ? output : {
+        ...output,
+        tool_executions: [toolExecution]
+      });
+      recordWorldGraphRun({
+        data: base.data,
+        run: base.run,
+        session: base.session,
+        plan: base.plan,
+        outputs,
+        agents: base.agents,
+        documents: [],
+        sharedMemory: [],
+        options: { max_tokens: 1024, temperature: 0 },
+        createdAt: "2026-07-15T10:00:01.000Z"
+      });
+      const replay = replayFixture(base);
+      expect(replay.actions.research_agent).toBe("refreshed");
+      expect(base.data.worldGraphArtifacts.find((artifact) => artifact.adapter === "research_agent")?.effect_policy.replayable).toBe(false);
+    }
   });
 
   it("bounds per-owner storage without evicting another tenant", () => {
@@ -844,7 +1081,7 @@ describe("WorldGraph validity and selective replay", () => {
     const payload = signedCapsulePayload(capsule);
     expect(payload).toMatchObject({
       schema_version: "virenis-world-graph-v1",
-      engine_revision: "world-graph-engine-v3"
+      engine_revision: "world-graph-engine-v5"
     });
     expect(payload.scope).toMatchObject({ target_run_id: "run_target", workspace_id: "workspace_one", user_id: "user_one", session_id: "session_one", agent_workspace_id: "team_one" });
     expect(payload.candidates).toHaveLength(3);

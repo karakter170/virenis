@@ -109,6 +109,7 @@ describe.sequential("WorldGraph app integration", () => {
     expect(eventsOf(cold, "route.started").map((event) => event.adapter)).toEqual(EXPECTED_ADAPTERS);
     expect(eventsOf(cold, "route.reused")).toHaveLength(0);
     expect(executionModes(cold)).toEqual(Object.fromEntries(EXPECTED_ADAPTERS.map((id) => [id, "refreshed"])));
+    expect(cold.expert_outputs.every((output) => output.source_validation?.valid === true)).toBe(true);
 
     const repeated = await execute(session.session_id);
     expect(repeated.world_graph).toMatchObject({ kept: 3, refreshed: 0, total: 3 });
