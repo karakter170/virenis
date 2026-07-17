@@ -10,6 +10,7 @@ import {
   ConnectionsPanel,
   CustomMcpDialog,
   ChatMessage,
+  Composer,
   EmptyTeamWelcome,
   FormattedText,
   ProgressiveFormattedText,
@@ -41,6 +42,7 @@ import {
   mergeLiveRunEvent,
   progressiveRevealPlan,
   responseStyleFromBoundary,
+  runProgressGraph,
   runProgressSpecialists,
   storedGraphPositions,
   unavailableCollaboratorHandoffs,
@@ -107,7 +109,7 @@ describe("Agent Studio product surfaces", () => {
     expect(JSON.stringify(working)).not.toContain("internal_note");
   });
 
-  it("shows selected specialist names, assignments, dependencies, and live state", () => {
+  it("shows selected and active agents in a compact accessible dependency graph", () => {
     const run = {
       status: "running",
       plan: {
@@ -131,16 +133,48 @@ describe("Agent Studio product surfaces", () => {
       { name: "Renault Specialist", state: "ready", dependencies: [] },
       { name: "Business Idea Specialist", state: "working", dependencies: ["Renault Specialist"] }
     ]);
+    const graph = runProgressGraph(run, agents);
+    expect(graph).toMatchObject({
+      agentCount: 2,
+      activeAgentCount: 1,
+      finishedCount: 1
+    });
+    expect(graph.nodes.map((node) => ({ id: node.id, level: node.level, state: node.state }))).toEqual([
+      { id: "s1", level: 0, state: "ready" },
+      { id: "s2", level: 1, state: "working" }
+    ]);
+    expect(graph.edges).toEqual([expect.objectContaining({ from: "s1", to: "s2" })]);
 
     const markup = renderToStaticMarkup(createElement(RunProgress, { run, agents }));
-    expect(markup).toContain("2 teammates selected");
+    expect(markup).toContain("1 active · 2 selected");
     expect(markup).toContain("Renault Specialist");
     expect(markup).toContain("Business Idea Specialist");
-    expect(markup).toContain("Why selected:");
-    expect(markup).toContain("Receives work from Renault Specialist");
     expect(markup).toContain("Working");
-    expect(markup).toContain("private model reasoning is never displayed");
+    expect(markup).toContain("Done");
+    expect(markup).toContain("run-progress-dag");
+    expect(markup).toContain('role="img"');
+    expect(markup).toContain('marker-end="url(#run-progress-arrow-');
+    expect(markup).toContain("Working after Renault Specialist");
+    expect(markup).toContain("Private model reasoning is not displayed");
+    expect(markup).not.toContain("Why selected:");
+    expect(markup).not.toContain("Receives work from");
+    expect(markup).not.toContain("Review the Renault context");
+    expect(markup).not.toContain("Create the combined idea");
     expect(markup).not.toContain("hidden chain of thought");
+  });
+
+  it("keeps pre-plan Router progress minimal and screen-reader friendly", () => {
+    const markup = renderToStaticMarkup(createElement(RunProgress, {
+      run: { status: "planning", events: [{ type: "planner.started" }] },
+      agents: []
+    }));
+    expect(markup).toContain("Selecting agents");
+    expect(markup).toContain('role="status"');
+    expect(markup).toContain('aria-live="polite"');
+    expect(markup).not.toContain("Choosing the right teammates");
+    expect(markup).not.toContain("matching your request");
+    expect(markup).not.toContain("Request read");
+    expect(markup).not.toContain("Roles matched");
   });
 
   it("requires enough open team places for a proposed workflow", () => {
@@ -409,12 +443,15 @@ describe("Agent Studio product surfaces", () => {
       onDisputeOutcome: () => undefined,
       onCorrectOutcome: () => undefined
     }));
+    expect(markup).toContain("Specialist outputs");
     expect(markup).toContain("How your team built this answer");
     expect(markup).toContain("Router");
     expect(markup).toContain("Final answer");
     expect(markup).toContain("Specialist result");
     expect(markup).toContain("Opening evidence");
     expect(markup).toContain("Closing evidence");
+    expect(markup.indexOf("Specialist result")).toBeLessThan(markup.indexOf("How your team built this answer"));
+    expect(markup.indexOf("How your team built this answer")).toBeLessThan(markup.indexOf('class="usage-receipt"'));
   });
 
   it("keeps WorldGraph evidence inside Team and exposes Activity only to admins", () => {
@@ -462,10 +499,12 @@ describe("Agent Studio product surfaces", () => {
     expect(standardMarkup).toContain(">Results</button>");
     expect(standardMarkup).not.toContain(">What changed</button>");
     expect(standardMarkup).not.toContain(">Activity</button>");
+    expect(standardMarkup).toContain("Specialist outputs");
     expect(standardMarkup).toContain("How your team built this answer");
     expect(standardMarkup).toContain("WorldGraph record ready");
-    expect(standardMarkup).toContain("Specialist contributions");
     expect(standardMarkup).toContain('class="detail-section world-changes embedded" role="region"');
+    expect(standardMarkup.indexOf("Complete result.")).toBeLessThan(standardMarkup.indexOf("How your team built this answer"));
+    expect(standardMarkup.indexOf("How your team built this answer")).toBeLessThan(standardMarkup.indexOf("WorldGraph record ready"));
     expect(adminMarkup).toContain('class="view-switch four-up"');
     expect(adminMarkup).toContain(">Activity</button>");
     expect(adminMarkup).not.toContain(">What changed</button>");
@@ -1017,6 +1056,46 @@ describe("Agent Studio product surfaces", () => {
     expect(agentsForWorkspace(agents, null)).toEqual([]);
   });
 
+  it("combines team switching and per-chat specialist toggles beside the composer", () => {
+    const agents = [
+      { id: "first_writer", title: "First Writer", capability: "Drafts the current team's response", enabled: true, session_active: true },
+      { id: "second_researcher", title: "Second Researcher", capability: "Researches for another team", enabled: true, session_active: true }
+    ];
+    const firstWorkspace = { agent_workspace_id: "team_first", name: "Writing team", agent_ids: ["first_writer"] };
+    const secondWorkspace = { agent_workspace_id: "team_second", name: "Research team", agent_ids: ["second_researcher"] };
+    const markup = renderToStaticMarkup(createElement(Composer, {
+      value: "",
+      onChange: vi.fn(),
+      onSubmit: vi.fn(),
+      onAttachFile: vi.fn(),
+      chatDocuments: [],
+      onDeleteChatDocument: vi.fn(),
+      agents: agentsForWorkspace(agents, firstWorkspace),
+      allAgents: agents,
+      workspaces: [firstWorkspace, secondWorkspace],
+      activeWorkspace: firstWorkspace,
+      sessionId: "session_one",
+      canWrite: true,
+      focusRequest: 0,
+      onOpenAgents: vi.fn(),
+      onSelectWorkspace: vi.fn(),
+      onToggleAgent: vi.fn(),
+      togglingAgentId: ""
+    }));
+
+    expect(markup).toContain('class="composer-shell"');
+    expect(markup).toMatch(/<\/form><div class="composer-team-picker">/);
+    expect(markup).toContain('aria-haspopup="dialog"');
+    expect(markup).toContain('role="radiogroup"');
+    expect(markup).toContain('role="radio" aria-checked="true"');
+    expect(markup).toContain("Writing team");
+    expect(markup).toContain("Research team");
+    expect(markup).toContain("Drafts the current team&#x27;s response");
+    expect(markup).not.toContain("Researches for another team");
+    expect(markup).not.toContain("active-team-switcher");
+    expect(markup).not.toContain("agent-trigger");
+  });
+
   it("builds directed handoff/knowledge edges and bounded large-graph positions", () => {
     const agents = [
       { id: "source_agent", resources: [], consumes: [] },
@@ -1443,11 +1522,13 @@ describe("Agent Studio product surfaces", () => {
     expect(styles).toContain(".graph-node.world-fresh");
     expect(styles).toMatch(/\.details-sheet-body > \.view-switch button\s*\{[\s\S]*?min-height: 44px;/);
     expect(styles).toMatch(/\.answer-team-worldgraph\s*\{[\s\S]*?border-radius: 14px;/);
-    expect(styles).toMatch(/@media \(max-width: 640px\)\s*\{[\s\S]*?\.answer-team-contribution-heading\s*\{[\s\S]*?flex-direction: column;/);
+    expect(styles).toMatch(/\.answer-team-build\s*\{[\s\S]*?padding-top: 20px;[\s\S]*?border-top: 1px solid var\(--line\);/);
     expect(styles).not.toContain(".view-switch.five-up");
-    expect(styles).toMatch(/\.quick-agent-menu\s*\{[\s\S]*?max-height: min\(420px, calc\(100dvh - 180px\)\);/);
+    expect(styles).toMatch(/\.team-picker-popover\s*\{[\s\S]*?max-height: min\(520px, calc\(100dvh - 145px\)\);/);
+    expect(styles).toMatch(/\.composer-shell\s*\{[\s\S]*?grid-template-columns: minmax\(0, 820px\) 50px;/);
+    expect(styles).toContain(".team-picker-popover[hidden]");
     expect(appSource).toContain('aria-haspopup="dialog"');
-    expect(appSource).toContain('role="dialog" aria-modal="false"');
+    expect(appSource).toMatch(/role="dialog"\s+aria-modal="false"/);
     expect(appSource).toContain('event.key !== "Escape"');
   });
 });

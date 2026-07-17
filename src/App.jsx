@@ -563,12 +563,9 @@ function Workspace({ onHome, onSignedOut }) {
   const [workspaceDeleteTarget, setWorkspaceDeleteTarget] = useState(null);
   const [workflowWorkspacePrompt, setWorkflowWorkspacePrompt] = useState(null);
   const [teamNotice, setTeamNotice] = useState("");
-  const [teamSwitcherOpen, setTeamSwitcherOpen] = useState(false);
   const threadRef = useRef(null);
   const nearBottomRef = useRef(true);
   const eventSourceRef = useRef(null);
-  const teamSwitcherRef = useRef(null);
-  const teamMenuRef = useRef(null);
   const sendInFlightRef = useRef(false);
   const sendRetryRef = useRef(null);
   const progressivelyRenderedRunIdsRef = useRef(new Set());
@@ -599,47 +596,6 @@ function Workspace({ onHome, onSignedOut }) {
     const timer = window.setTimeout(() => setTeamNotice(""), 5200);
     return () => window.clearTimeout(timer);
   }, [teamNotice]);
-
-  useEffect(() => {
-    if (!teamSwitcherOpen) return undefined;
-    const focusTimer = window.requestAnimationFrame(() => {
-      const selected = teamMenuRef.current?.querySelector('[role="menuitemradio"][aria-checked="true"]');
-      const first = teamMenuRef.current?.querySelector('[role="menuitemradio"]');
-      (selected || first)?.focus();
-    });
-    const closeOutside = (event) => {
-      if (event.type === "keydown" && event.key === "Escape") {
-        setTeamSwitcherOpen(false);
-        teamSwitcherRef.current?.querySelector(".active-team-control")?.focus();
-        return;
-      }
-      if (event.type === "pointerdown" && !teamSwitcherRef.current?.contains(event.target)) setTeamSwitcherOpen(false);
-    };
-    document.addEventListener("pointerdown", closeOutside);
-    document.addEventListener("keydown", closeOutside);
-    return () => {
-      window.cancelAnimationFrame(focusTimer);
-      document.removeEventListener("pointerdown", closeOutside);
-      document.removeEventListener("keydown", closeOutside);
-    };
-  }, [teamSwitcherOpen]);
-
-  function handleTeamMenuKeyDown(event) {
-    if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
-    const items = [...(teamMenuRef.current?.querySelectorAll('[role="menuitemradio"], [role="menuitem"]') || [])]
-      .filter((item) => !item.disabled);
-    if (!items.length) return;
-    event.preventDefault();
-    const currentIndex = items.indexOf(document.activeElement);
-    const nextIndex = event.key === "Home"
-      ? 0
-      : event.key === "End"
-        ? items.length - 1
-        : event.key === "ArrowDown"
-          ? (currentIndex + 1 + items.length) % items.length
-          : (currentIndex - 1 + items.length) % items.length;
-    items[nextIndex].focus();
-  }
 
   useEffect(() => {
     const parameters = new URLSearchParams(window.location.search);
@@ -1672,44 +1628,6 @@ function Workspace({ onHome, onSignedOut }) {
         </section>
 
         <div className="composer-zone">
-          {!auth?.is_viewer && activeAgentWorkspace && (
-            <div className="active-team-switcher" ref={teamSwitcherRef}>
-              <button
-                type="button"
-                className="active-team-control"
-                aria-label={`Switch or manage ${activeAgentWorkspace.name || "active team"}`}
-                aria-expanded={teamSwitcherOpen}
-                onClick={() => setTeamSwitcherOpen((open) => !open)}
-              >
-                <span className="active-team-icon"><Layers3 size={14} /></span>
-                <span>
-                  <strong>{activeAgentWorkspace.name || "General team"}</strong>
-                  <small>{activeAgentWorkspaceAgents.filter((agent) => agent.enabled !== false && agent.session_active !== false).length} available for this chat</small>
-                </span>
-                <ChevronDown size={14} />
-              </button>
-              {teamSwitcherOpen && (
-                <div className="active-team-menu" ref={teamMenuRef} role="menu" aria-label="Choose the active team" onKeyDown={handleTeamMenuKeyDown}>
-                  <header><strong>Choose your team</strong><small>The chat and available specialists switch together.</small></header>
-                  <div>
-                    {agentWorkspaces.map((workspace) => {
-                      const memberCount = agentsForWorkspace(agents, workspace).filter((agent) => agent.enabled !== false).length;
-                      const selected = workspace.agent_workspace_id === activeAgentWorkspace.agent_workspace_id;
-                      return <button type="button" role="menuitemradio" aria-checked={selected} className={selected ? "selected" : ""} key={workspace.agent_workspace_id} onClick={() => {
-                        setTeamSwitcherOpen(false);
-                        if (!selected) switchAgentWorkspace(workspace.agent_workspace_id).catch((switchError) => setError(friendlyError(switchError)));
-                      }}><span><strong>{workspace.name}</strong><small>{memberCount} specialist{memberCount === 1 ? "" : "s"}</small></span>{selected && <Check size={14} />}</button>;
-                    })}
-                  </div>
-                  <button type="button" role="menuitem" className="manage-teams-link" onClick={() => {
-                    setTeamSwitcherOpen(false);
-                    setResourceView("agents");
-                    setResourcesOpen(true);
-                  }}><Settings2 size={14} />Manage teams and specialists</button>
-                </div>
-              )}
-            </div>
-          )}
           {teamNotice && (
             <div className="team-notice" role="status">
               <span><Check size={15} /></span>
@@ -1736,6 +1654,9 @@ function Workspace({ onHome, onSignedOut }) {
             chatDocuments={chatDocuments}
             onDeleteChatDocument={setDeleteDocumentTarget}
             agents={activeAgentWorkspaceAgents}
+            allAgents={agents}
+            workspaces={agentWorkspaces}
+            activeWorkspace={activeAgentWorkspace}
             sessionId={session?.session_id}
             canWrite={canWrite}
             focusRequest={focusComposer}
@@ -1743,6 +1664,9 @@ function Workspace({ onHome, onSignedOut }) {
               setResourceView("agents");
               setResourcesOpen(true);
             }}
+            onSelectWorkspace={(workspaceId) => switchAgentWorkspace(workspaceId).catch((workspaceError) => {
+              setError(friendlyError(workspaceError));
+            })}
             onToggleAgent={toggleAgentForSession}
             togglingAgentId={togglingAgentId}
           />
@@ -3055,15 +2979,18 @@ export function runProgressSpecialists(run, agents = []) {
   const stepById = new Map(steps.map((step) => [step.id, step]));
   return steps.map((step) => {
     const reused = events.some((event) => event.type === "route.reused" && event.step_id === step.id);
-    const completed = events.some((event) => event.type === "route.completed" && event.step_id === step.id);
+    const completed = events.some((event) => event.type === "route.completed" && event.step_id === step.id)
+      || ["synthesizing", "completed"].includes(run?.status);
     const started = events.some((event) => event.type === "route.started" && event.step_id === step.id);
     const state = reused ? "reused" : completed ? "ready" : started ? "working" : "queued";
+    const dependencyIds = (step.depends_on || []).filter((dependencyId) => stepById.has(dependencyId));
     return {
       id: step.id,
       adapter: step.adapter,
       name: formatAgentName(step.adapter, agents),
       task: agentFacingText(step.task, "Handle the relevant part of your request."),
-      dependencies: (step.depends_on || [])
+      dependency_ids: dependencyIds,
+      dependencies: dependencyIds
         .map((dependencyId) => stepById.get(dependencyId)?.adapter)
         .filter(Boolean)
         .map((adapter) => formatAgentName(adapter, agents)),
@@ -3072,66 +2999,133 @@ export function runProgressSpecialists(run, agents = []) {
   });
 }
 
+function runProgressStateLabel(state) {
+  if (state === "working") return "Working";
+  if (state === "ready") return "Done";
+  if (state === "reused") return "Reused";
+  return "Queued";
+}
+
+export function runProgressGraph(run, agents = []) {
+  const workItems = runProgressSpecialists(run, agents);
+  const byId = new Map(workItems.map((item) => [item.id, item]));
+  const levelById = new Map();
+
+  function levelFor(id, trail = new Set()) {
+    if (levelById.has(id)) return levelById.get(id);
+    if (trail.has(id)) return 0;
+    const item = byId.get(id);
+    if (!item) return 0;
+    const nextTrail = new Set(trail).add(id);
+    const dependencyLevels = item.dependency_ids
+      .filter((dependencyId) => dependencyId !== id)
+      .map((dependencyId) => levelFor(dependencyId, nextTrail));
+    const level = dependencyLevels.length ? Math.max(...dependencyLevels) + 1 : 0;
+    levelById.set(id, level);
+    return level;
+  }
+
+  const layeredItems = workItems.map((item) => ({ ...item, level: levelFor(item.id) }));
+  const layers = new Map();
+  for (const item of layeredItems) {
+    if (!layers.has(item.level)) layers.set(item.level, []);
+    layers.get(item.level).push(item);
+  }
+
+  const nodeWidth = 136;
+  const nodeHeight = 34;
+  const columnGap = 28;
+  const rowGap = 8;
+  const padding = 8;
+  const levelCount = Math.max(1, ...layeredItems.map((item) => item.level + 1));
+  const maxRows = Math.max(1, ...[...layers.values()].map((items) => items.length));
+  const width = padding * 2 + levelCount * nodeWidth + (levelCount - 1) * columnGap;
+  const height = padding * 2 + maxRows * nodeHeight + (maxRows - 1) * rowGap;
+  const nodes = [];
+  const positionedById = new Map();
+
+  for (const [level, layer] of [...layers.entries()].sort(([left], [right]) => left - right)) {
+    const layerHeight = layer.length * nodeHeight + Math.max(0, layer.length - 1) * rowGap;
+    const layerOffset = (height - layerHeight) / 2;
+    layer.forEach((item, row) => {
+      const node = {
+        ...item,
+        x: padding + level * (nodeWidth + columnGap),
+        y: layerOffset + row * (nodeHeight + rowGap),
+        width: nodeWidth,
+        height: nodeHeight,
+        state_label: runProgressStateLabel(item.state)
+      };
+      nodes.push(node);
+      positionedById.set(node.id, node);
+    });
+  }
+
+  const edges = nodes.flatMap((node) => node.dependency_ids.map((dependencyId) => {
+    const source = positionedById.get(dependencyId);
+    if (!source || source.id === node.id) return null;
+    const startX = source.x + source.width;
+    const startY = source.y + source.height / 2;
+    const endX = node.x;
+    const endY = node.y + node.height / 2;
+    const bend = Math.max(14, (endX - startX) / 2);
+    return {
+      from: source.id,
+      to: node.id,
+      path: `M ${startX} ${startY} C ${startX + bend} ${startY}, ${endX - bend} ${endY}, ${endX} ${endY}`
+    };
+  }).filter(Boolean));
+  const agentCount = new Set(nodes.map((node) => node.adapter)).size;
+  const activeAgentCount = new Set(nodes.filter((node) => node.state === "working").map((node) => node.adapter)).size;
+  const finishedCount = nodes.filter((node) => ["ready", "reused"].includes(node.state)).length;
+  const accessibleSummary = nodes.length
+    ? `Agent workflow. ${nodes.map((node) => `${node.name}: ${node.state_label}${node.dependencies.length ? ` after ${node.dependencies.join(", ")}` : ""}`).join(". ")}.`
+    : "No specialist handoff is currently selected.";
+  return { nodes, edges, width, height, agentCount, activeAgentCount, finishedCount, accessibleSummary };
+}
+
 export function RunProgress({ run, agents = [] }) {
-  const events = Array.isArray(run?.events) ? run.events : [];
-  const specialists = runProgressSpecialists(run, agents);
-  const plannerStarted = events.some((event) => ["run.started", "planner.started", "planner.completed"].includes(event.type));
-  const plannerCompleted = events.some((event) => event.type === "planner.completed") || Array.isArray(run?.plan?.steps);
+  const graph = runProgressGraph(run, agents);
+  const arrowId = `run-progress-arrow-${useId().replaceAll(":", "")}`;
   const synthesizing = run?.status === "synthesizing";
-  const workingCount = specialists.filter((item) => item.state === "working").length;
-  const finishedCount = specialists.filter((item) => ["ready", "reused"].includes(item.state)).length;
   const title = synthesizing
-    ? "Your team finished · composing the answer"
-    : plannerCompleted && specialists.length
-      ? `${specialists.length} ${specialists.length === 1 ? "teammate" : "teammates"} selected`
-      : plannerCompleted
-        ? "No specialist handoff is needed"
-        : "Choosing the right teammates";
-  const subtitle = synthesizing
-    ? "Combining the completed work into one clear response."
-    : specialists.length
-      ? `${finishedCount} ready${workingCount ? ` · ${workingCount} working now` : " · assignments prepared"}`
-      : plannerCompleted
-        ? "The main model can answer this request directly."
-        : "The Router is matching your request to the roles on this team.";
+    ? "Composing answer"
+    : graph.activeAgentCount
+      ? `${graph.activeAgentCount} active · ${graph.agentCount} selected`
+      : graph.agentCount
+        ? `${graph.agentCount} ${graph.agentCount === 1 ? "agent" : "agents"} selected`
+        : "Selecting agents";
   return (
-    <div className="run-progress" role="status" aria-live="polite" aria-atomic="false">
-      <div className="run-progress-heading">
+    <section className="run-progress" aria-label="Live Router progress">
+      <div className="run-progress-heading" role="status" aria-live="polite" aria-atomic="true">
         <span className="run-progress-mark" aria-hidden="true">
-          {synthesizing ? <Sparkles size={17} /> : <LoaderCircle className="spin" size={17} />}
+          {synthesizing ? <Sparkles size={14} /> : <LoaderCircle className="spin" size={14} />}
         </span>
-        <span><strong>{title}</strong><small>{subtitle}</small></span>
+        <span className="run-progress-router">Router</span>
+        <strong>{title}</strong>
+        {graph.nodes.length > 0 && <small>{graph.finishedCount}/{graph.nodes.length} done</small>}
       </div>
-      <div className="run-decision-trail" aria-label="Live Router decision progress">
-        <span className={plannerStarted ? "done" : "active"}><i>{plannerStarted ? <Check size={11} /> : "1"}</i>Request read</span>
-        <ChevronRight size={12} aria-hidden="true" />
-        <span className={plannerCompleted ? "done" : plannerStarted ? "active" : ""}><i>{plannerCompleted ? <Check size={11} /> : "2"}</i>Roles matched</span>
-        <ChevronRight size={12} aria-hidden="true" />
-        <span className={plannerCompleted ? "done" : ""}><i>{plannerCompleted ? <Check size={11} /> : "3"}</i>Handoffs ordered</span>
-      </div>
-      {specialists.length > 0 && (
-        <div className="run-specialist-list" aria-label="Selected teammates and assignments">
-          {specialists.map((specialist) => (
-            <div className={`run-specialist-row ${specialist.state}`} key={specialist.id}>
-              <span className="run-specialist-avatar" aria-hidden="true">{specialist.name.slice(0, 1)}</span>
-              <span className="run-specialist-copy">
-                <strong>{specialist.name}</strong>
-                <small><b>Why selected:</b> {specialist.task}</small>
-                {specialist.dependencies.length > 0 && <em>Receives work from {specialist.dependencies.join(", ")}</em>}
-              </span>
-              <span className="run-specialist-state">{specialist.state === "reused"
-                ? "Reused"
-                : specialist.state === "ready"
-                  ? "Ready"
-                  : specialist.state === "working"
-                    ? "Working"
-                    : "Queued"}</span>
-            </div>
-          ))}
+      {graph.nodes.length > 0 && (
+        <div className="run-progress-dag-scroll">
+          <svg className="run-progress-dag" width={graph.width} height={graph.height} viewBox={`0 0 ${graph.width} ${graph.height}`} role="img" aria-label={graph.accessibleSummary}>
+            <defs><marker id={arrowId} markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto"><path d="M 0 0 L 6 3 L 0 6 z" /></marker></defs>
+            <g className="run-progress-dag-edges" aria-hidden="true">
+              {graph.edges.map((edge) => <path d={edge.path} markerEnd={`url(#${arrowId})`} key={`${edge.from}:${edge.to}`} />)}
+            </g>
+              {graph.nodes.map((node) => (
+              <g className={`run-progress-dag-node ${node.state}`} transform={`translate(${node.x} ${node.y})`} key={node.id}>
+                <title>{`${node.name}: ${node.state_label}`}</title>
+                <rect width={node.width} height={node.height} rx="8" />
+                <circle cx="10" cy="11" r="3" />
+                <text className="run-progress-dag-name" x="18" y="14">{node.name.length > 18 ? `${node.name.slice(0, 17)}…` : node.name}</text>
+                <text className="run-progress-dag-state" x="18" y="27">{node.state_label}</text>
+              </g>
+            ))}
+          </svg>
         </div>
       )}
-      <small className="run-progress-safety">Live decision summary · private model reasoning is never displayed</small>
-    </div>
+      <span className="sr-only">This live view shows assignments, dependencies, and completion events only. Private model reasoning is not displayed.</span>
+    </section>
   );
 }
 
@@ -3201,18 +3195,22 @@ function mentionMatchScore(agent, query) {
   return 0;
 }
 
-function Composer({
+export function Composer({
   value,
   onChange,
   onSubmit,
   onAttachFile,
   chatDocuments,
   onDeleteChatDocument,
-  agents,
+  agents = [],
+  allAgents = agents,
+  workspaces = [],
+  activeWorkspace = null,
   sessionId,
   canWrite,
   focusRequest,
   onOpenAgents,
+  onSelectWorkspace,
   onToggleAgent,
   togglingAgentId
 }) {
@@ -3227,6 +3225,7 @@ function Composer({
   const [dismissedCommandValue, setDismissedCommandValue] = useState("");
   const quickAgents = availableSessionAgents(agents);
   const activeAgentCount = quickAgents.filter((agent) => agent.session_active !== false).length;
+  const activeWorkspaceName = activeWorkspace?.name || "Choose a team";
   const commandMatch = value.match(/^\/([a-z]*)$/i);
   const commandQuery = commandMatch?.[1]?.toLowerCase() || "";
   const commandSuggestions = commandMatch && dismissedCommandValue !== value ? [
@@ -3258,7 +3257,9 @@ function Composer({
   useEffect(() => {
     if (!agentMenuOpen) return undefined;
     const frame = window.requestAnimationFrame(() => {
-      agentMenuRef.current?.querySelector("button, input:not(:disabled), [tabindex='0']")?.focus();
+      const selectedWorkspace = agentMenuRef.current?.querySelector('[data-team-option][aria-checked="true"]:not(:disabled)');
+      const firstControl = agentMenuRef.current?.querySelector("button:not(:disabled), input:not(:disabled), [tabindex='0']");
+      (selectedWorkspace || firstControl)?.focus();
     });
     const closeOutside = (event) => {
       if (agentMenuRef.current?.contains(event.target) || agentMenuTriggerRef.current?.contains(event.target)) return;
@@ -3322,6 +3323,29 @@ function Composer({
     requestAnimationFrame(() => inputRef.current?.focus());
   }
 
+  function chooseWorkspace(workspaceId, selected) {
+    if (selected || !canWrite) return;
+    setAgentMenuOpen(false);
+    onSelectWorkspace?.(workspaceId);
+    requestAnimationFrame(() => agentMenuTriggerRef.current?.focus());
+  }
+
+  function onWorkspaceKeyDown(event) {
+    if (!["ArrowDown", "ArrowUp", "ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    const options = [...event.currentTarget.querySelectorAll('[data-team-option]:not(:disabled)')];
+    if (!options.length) return;
+    event.preventDefault();
+    const currentIndex = options.indexOf(document.activeElement);
+    const nextIndex = event.key === "Home"
+      ? 0
+      : event.key === "End"
+        ? options.length - 1
+        : ["ArrowDown", "ArrowRight"].includes(event.key)
+          ? (currentIndex + 1 + options.length) % options.length
+          : (currentIndex - 1 + options.length) % options.length;
+    options[nextIndex].focus();
+  }
+
   function onKeyDown(event) {
     if (mention && suggestions.length) {
       if (event.key === "ArrowDown") {
@@ -3374,7 +3398,8 @@ function Composer({
   }
 
   return (
-    <form className="composer" onSubmit={onSubmit}>
+    <div className="composer-shell">
+      <form className="composer" onSubmit={onSubmit}>
       {commandSuggestions.length > 0 && !mention && (
         <div className="command-menu" id={`${listId}-commands`} role="listbox" aria-label="Workflow commands">
           {commandSuggestions.map((item, index) => (
@@ -3453,44 +3478,6 @@ function Composer({
       >
         <WandSparkles size={18} />
       </IconButton>
-      <IconButton
-        ref={agentMenuTriggerRef}
-        label="Choose your team for this chat"
-        className={`composer-control agent-trigger ${agentMenuOpen ? "active" : ""}`}
-        onClick={() => setAgentMenuOpen((open) => !open)}
-        disabled={!sessionId}
-        aria-expanded={agentMenuOpen}
-        aria-haspopup="dialog"
-        aria-controls={teamPopupId}
-      >
-        <Network size={18} />
-        {activeAgentCount > 0 && <span className="composer-count" aria-hidden="true">{activeAgentCount}</span>}
-      </IconButton>
-      {agentMenuOpen && (
-        <div ref={agentMenuRef} id={teamPopupId} className="quick-agent-menu" role="dialog" aria-modal="false" aria-label="Your team for this chat" tabIndex="-1">
-          <div className="quick-menu-heading">
-            <span><strong>Your team for this chat</strong><small>Available teammates are called only when their role fits.</small></span>
-            <button type="button" onClick={() => { setAgentMenuOpen(false); onOpenAgents(); }}>Manage team</button>
-          </div>
-          <div className="quick-agent-list">
-            {quickAgents.map((agent) => (
-              <label key={agent.id}>
-                <span><strong>{formatAgentName(agent.id, agents)}</strong><small>{agentFacingText(agent.capability, "Specialist")}</small></span>
-                <span className="quick-agent-toggle">
-                  <small>{agent.session_active === false ? "Paused" : "Available"}</small>
-                  <input
-                    type="checkbox"
-                    checked={agent.session_active !== false}
-                    disabled={!canWrite || togglingAgentId === agent.id}
-                    onChange={(event) => onToggleAgent(agent, event.target.checked)}
-                  />
-                </span>
-              </label>
-            ))}
-            {quickAgents.length === 0 && <div className="quick-team-empty"><p>No specialists are on this team yet.</p><button type="button" onClick={() => { setAgentMenuOpen(false); onOpenAgents(); }}><Plus size={14} />Add your first specialist</button><small>Or use the wand beside the composer to build a workflow.</small></div>}
-          </div>
-        </div>
-      )}
       <label className="composer-input">
         <span className="sr-only">Message Virenis</span>
         <textarea
@@ -3524,7 +3511,94 @@ function Composer({
       >
         <ArrowUp size={19} />
       </IconButton>
-    </form>
+      </form>
+
+      <div className="composer-team-picker">
+        <button
+          ref={agentMenuTriggerRef}
+          type="button"
+          className={`composer-team-trigger ${agentMenuOpen ? "active" : ""}`}
+          aria-label={`${activeWorkspaceName}: ${activeAgentCount} specialist${activeAgentCount === 1 ? "" : "s"} available. Choose team and specialists.`}
+          aria-expanded={agentMenuOpen}
+          aria-haspopup="dialog"
+          aria-controls={teamPopupId}
+          disabled={!sessionId}
+          onClick={() => setAgentMenuOpen((open) => !open)}
+        >
+          <Network size={18} aria-hidden="true" />
+          <span className="composer-team-label" aria-hidden="true">Team</span>
+          {activeAgentCount > 0 && <span className="composer-team-count" aria-hidden="true">{activeAgentCount}</span>}
+        </button>
+
+        <div
+          ref={agentMenuRef}
+          id={teamPopupId}
+          className="team-picker-popover"
+          role="dialog"
+          aria-modal="false"
+          aria-label="Choose team and specialists for this chat"
+          tabIndex="-1"
+          hidden={!agentMenuOpen}
+        >
+          <header className="team-picker-heading">
+            <span><strong>{activeWorkspaceName}</strong><small>{activeAgentCount} of {quickAgents.length} specialists available for this chat</small></span>
+            <button type="button" onClick={() => { setAgentMenuOpen(false); onOpenAgents(); }}><Settings2 size={14} />Manage</button>
+          </header>
+
+          <section className="team-picker-workspaces" aria-labelledby={`${teamPopupId}-teams`}>
+            <div className="team-picker-section-heading">
+              <span><strong id={`${teamPopupId}-teams`}>Team</strong><small>Switching teams also changes the specialists available here.</small></span>
+            </div>
+            <div className="team-picker-workspace-list" role="radiogroup" aria-label="Active team" onKeyDown={onWorkspaceKeyDown}>
+              {workspaces.map((workspace) => {
+                const memberCount = availableSessionAgents(agentsForWorkspace(allAgents, workspace)).length;
+                const selected = workspace.agent_workspace_id === activeWorkspace?.agent_workspace_id;
+                return (
+                  <button
+                    type="button"
+                    role="radio"
+                    aria-checked={selected}
+                    className={`team-picker-workspace ${selected ? "selected" : ""}`}
+                    data-team-option="true"
+                    key={workspace.agent_workspace_id}
+                    disabled={!canWrite}
+                    onClick={() => chooseWorkspace(workspace.agent_workspace_id, selected)}
+                  >
+                    <span><strong>{workspace.name || "Untitled team"}</strong><small>{memberCount} specialist{memberCount === 1 ? "" : "s"}</small></span>
+                    <span className="team-picker-selection" aria-hidden="true">{selected ? <Check size={14} /> : null}</span>
+                  </button>
+                );
+              })}
+              {workspaces.length === 0 && <p className="team-picker-empty">No teams are available yet.</p>}
+            </div>
+          </section>
+
+          <section className="team-picker-specialists" aria-labelledby={`${teamPopupId}-specialists`}>
+            <div className="team-picker-section-heading">
+              <span><strong id={`${teamPopupId}-specialists`}>Specialists in this team</strong><small>Pause a specialist for this chat without changing the team.</small></span>
+            </div>
+            <div className="quick-agent-list">
+              {quickAgents.map((agent) => (
+                <label key={agent.id}>
+                  <span><strong>{formatAgentName(agent.id, agents)}</strong><small>{agentFacingText(agent.capability, "Specialist")}</small></span>
+                  <span className="quick-agent-toggle">
+                    <small>{agent.session_active === false ? "Paused" : "Available"}</small>
+                    <input
+                      type="checkbox"
+                      aria-label={`${agent.session_active === false ? "Make" : "Pause"} ${formatAgentName(agent.id, agents)} for this chat`}
+                      checked={agent.session_active !== false}
+                      disabled={!canWrite || togglingAgentId === agent.id}
+                      onChange={(event) => onToggleAgent(agent, event.target.checked)}
+                    />
+                  </span>
+                </label>
+              ))}
+              {quickAgents.length === 0 && <div className="quick-team-empty"><p>No specialists are on this team yet.</p><button type="button" onClick={() => { setAgentMenuOpen(false); onOpenAgents(); }}><Plus size={14} />Add your first specialist</button><small>Or use the wand beside the composer to build a workflow.</small></div>}
+            </div>
+          </section>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -6040,28 +6114,8 @@ export function RunDetailsSheet({
             {view === "agents" && (
               <section className="detail-section answer-team-view" aria-labelledby="used-agents-heading">
                 <div className="section-heading compact-heading">
-                  <div><h3 id="used-agents-heading">How your team built this answer</h3><p>See what was completed now, what was safely reused, and the result each specialist handed back.</p></div>
+                  <div><h3 id="used-agents-heading">Specialist outputs</h3><p>{run.expert_outputs?.length || 0} {(run.expert_outputs?.length || 0) === 1 ? "specialist" : "specialists"} contributed. Open a role to read its complete work.</p></div>
                 </div>
-                <div className="answer-team-worldgraph">
-                  <WorldGraphChanges
-                    run={run}
-                    agents={agents}
-                    canWrite={canWrite}
-                    onRefreshTracked={onRefreshTracked}
-                    onRunFresh={onRunFresh}
-                    embedded
-                  />
-                </div>
-                <div className="answer-team-contribution-heading">
-                  <strong>Specialist contributions</strong>
-                  <span>{run.expert_outputs?.length || 0} {(run.expert_outputs?.length || 0) === 1 ? "specialist" : "specialists"} contributed. Open a role to read its complete work.</span>
-                </div>
-                <UsageReceipt
-                  receipt={run.usage_receipt}
-                  agents={agents}
-                  expertOutputs={run.expert_outputs || []}
-                  includeFinalOutput
-                />
                 <div className="detail-list">
                   {(run.expert_outputs || []).map((route) => {
                     const selection = routeSelections.get(route.adapter);
@@ -6119,6 +6173,27 @@ export function RunDetailsSheet({
                   })}
                   {!run.expert_outputs?.length && <p className="muted-empty">No specialist details are available.</p>}
                 </div>
+                <section className="answer-team-build" aria-labelledby="team-build-heading">
+                  <div className="section-heading compact-heading">
+                    <div><h3 id="team-build-heading">How your team built this answer</h3><p>See what was completed now, what was safely reused, and how the Router combined the work.</p></div>
+                  </div>
+                  <div className="answer-team-worldgraph">
+                    <WorldGraphChanges
+                      run={run}
+                      agents={agents}
+                      canWrite={canWrite}
+                      onRefreshTracked={onRefreshTracked}
+                      onRunFresh={onRunFresh}
+                      embedded
+                    />
+                  </div>
+                  <UsageReceipt
+                    receipt={run.usage_receipt}
+                    agents={agents}
+                    expertOutputs={run.expert_outputs || []}
+                    includeFinalOutput
+                  />
+                </section>
               </section>
             )}
 
