@@ -3573,8 +3573,10 @@ summary:focus-visible,
 .market-card-open { min-width: 0; flex: 1; display: flex; flex-direction: column; border: 0; padding: 15px 15px 10px; color: inherit; background: transparent; text-align: left; }
 .market-card-open > header { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--text-faint); }
 .market-card-open:hover > header { color: var(--accent); }
+.market-card-labels { min-width: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 .market-type { width: fit-content; display: inline-flex; align-items: center; gap: 5px; border-radius: 11px; padding: 4px 7px; color: var(--accent); background: var(--accent-soft); font-size: 8px; font-weight: 750; letter-spacing: 0.06em; text-transform: uppercase; }
 .market-type.workspace { color: #6c5599; background: #f0ebfa; }
+.market-verified { width: fit-content; display: inline-flex; align-items: center; gap: 4px; border: 1px solid #bad7c8; border-radius: 11px; padding: 3px 7px; color: #286e4a; background: #f0faf5; font-size: 8px; font-weight: 750; letter-spacing: 0.03em; }
 .market-card-open h4 { margin: 12px 0 0; overflow: hidden; font-size: 14px; line-height: 1.3; text-overflow: ellipsis; white-space: nowrap; }
 .market-card-open > p { min-height: 46px; margin: 6px 0 0; display: -webkit-box; overflow: hidden; color: var(--text-soft); font-size: 10px; line-height: 1.5; -webkit-box-orient: vertical; -webkit-line-clamp: 3; }
 .market-card > footer { margin-top: auto; display: flex; align-items: center; justify-content: space-between; gap: 10px; border-top: 1px solid var(--line); padding: 10px 15px 12px; }
@@ -3692,6 +3694,7 @@ summary:focus-visible,
 .workspace-marketplace-handoffs h4 { margin: 0 0 8px; font-size: 11px; }
 .workspace-marketplace-handoffs > span { width: fit-content; display: flex; align-items: center; gap: 7px; margin-top: 5px; border-radius: 8px; padding: 6px 8px; color: var(--text-soft); background: var(--surface-subtle); font-size: 8px; }
 .workspace-marketplace-handoffs b { color: var(--text); font-weight: 650; }
+.workspace-marketplace-handoffs i { border-left: 1px solid var(--line-strong); padding-left: 7px; color: var(--text-faint); font-style: normal; }
 .workspace-marketplace-detail > .marketplace-sharing-boundary { margin-bottom: 22px; }
 .workspace-marketplace-detail > .marketplace-detail-actions { margin: auto calc(clamp(20px, 4vw, 42px) * -1) 0; }
 .workspace-agent-detail-back { width: fit-content; display: inline-flex; align-items: center; gap: 5px; margin-bottom: 18px; border: 0; padding: 0; color: var(--accent); background: transparent; font-size: 9px; font-weight: 700; }

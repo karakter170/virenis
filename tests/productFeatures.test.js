@@ -1691,13 +1691,27 @@ describe("Agent Studio product surfaces", () => {
       }
     };
     const marketplaceMarkup = renderToStaticMarkup(createElement(MarketplacePanel, {
-      items: [item],
+      items: [{
+        id: "aw_virenis_curated_engineering",
+        listing_id: "listing_curated_engineering",
+        item_type: "workspace",
+        title: "Engineering",
+        description: "A coordinated engineering team.",
+        publisher: { display_name: "Virenis" },
+        verified: true,
+        pinned: true,
+        rating_average: 0,
+        rating_count: 0
+      }, item],
       auth: { user_id: "bob", workspace_id: "workspace_b" }
     }));
     expect(marketplaceMarkup).toContain('<details class="marketplace-hero">');
-    expect(marketplaceMarkup).toContain("COMMUNITY LIBRARY");
+    expect(marketplaceMarkup).toContain("DISCOVER LIBRARY");
     expect(marketplaceMarkup).toContain("Shared agents and teams, ready to make your own.");
     expect(marketplaceMarkup).not.toContain("lucide-sparkles");
+    expect(marketplaceMarkup).toContain("Verified");
+    expect(marketplaceMarkup).toContain("lucide-shield-check");
+    expect(marketplaceMarkup).toContain("Published by Virenis");
     expect(marketplaceMarkup).toContain("Published by alice");
     expect(marketplaceMarkup).toContain("Rate");
     expect(marketplaceMarkup).not.toContain("Share your work");
@@ -1932,6 +1946,11 @@ describe("Agent Studio product surfaces", () => {
         consumes: ["user_request"],
         produces: ["first_draft"],
         routing_cues: ["write a draft"],
+        policies: {
+          response: { style: "careful", tones: ["clear", "professional"] },
+          memory: { mode: "conversation" },
+          knowledge: { requirements: ["user_provided_context", "upstream_specialist"] }
+        },
         exclusions: { private_knowledge: true }
       }
     };
@@ -1955,12 +1974,18 @@ describe("Agent Studio product surfaces", () => {
     const detailMarkup = renderToStaticMarkup(createElement(MarketplaceWorkspaceAgentDetails, {
       entry,
       workspaceTitle: "Editorial team",
-      publisher: "Alice"
+      publisher: "Alice",
+      verified: true
     }));
     expect(detailMarkup).toContain("Purpose and instructions");
     expect(detailMarkup).toContain("Use the supplied brief and identify missing context.");
     expect(detailMarkup).toContain("Web search");
     expect(detailMarkup).toContain("Google Drive · Read files");
+    expect(detailMarkup).toContain("VERIFIED TEAM SPECIALIST");
+    expect(detailMarkup).toContain("Careful · clear, professional");
+    expect(detailMarkup).toContain("Relevant context from this chat");
+    expect(detailMarkup).toContain("user provided context");
+    expect(detailMarkup).toContain("upstream specialist");
     expect(detailMarkup).toContain("first draft");
     expect(detailMarkup).toContain("Back to team");
     expect(detailMarkup).toContain("data-autofocus=\"true\"");

@@ -1,5 +1,7 @@
 # Agent workspaces
 
+First-party, copyable Discover teams and their execution proof are documented in [curated-discover-teams.md](./curated-discover-teams.md).
+
 Agent workspaces are per-user agent teams. They are intentionally separate from
 the identity tenant stored in `workspace_id`:
 

@@ -9,6 +9,7 @@ import { ensureGeneralAgentWorkspace, normalizeAgentWorkspaceCollections } from 
 import { normalizePublicMarketplaceRatings } from "./marketplaceRatingIdentity.js";
 import { normalizeMarketplacePublisherIdentities } from "./marketplacePublisherIdentity.js";
 import { validateProductionDatabaseTransport } from "./databaseTransport.js";
+import { ensureCuratedMarketplaceCatalog } from "./curatedMarketplace.js";
 
 const { Client, Pool } = pg;
 
@@ -74,8 +75,8 @@ function mergeSeedCatalog(agents, seedAgents) {
 
 function initialData(seedAgents) {
   const now = new Date().toISOString();
-  return {
-    version: 17,
+  return ensureCuratedMarketplaceCatalog({
+    version: 18,
     created_at: now,
     users: [],
     billingAccounts: [],
@@ -110,7 +111,7 @@ function initialData(seedAgents) {
     agents: clone(seedAgents),
     documents: [],
     validationRuns: []
-  };
+  });
 }
 
 export class JsonStore {
@@ -548,6 +549,7 @@ function normalizeData(value, seedAgents) {
     delete marketplace.version;
     delete marketplace.license;
   }
+  ensureCuratedMarketplaceCatalog(data);
   data.marketplaceRatings = normalizePublicMarketplaceRatings(data.marketplaceRatings, {
     subjects: Array.isArray(data.agents) ? data.agents : [],
     subjectIdField: "agent_id",

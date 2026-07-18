@@ -167,6 +167,7 @@ import {
   setAgentWorkspaceMembers,
   updateAgentWorkspace
 } from "./agentWorkspaces.js";
+import { curatedMarketplacePresentation } from "./curatedMarketplace.js";
 
 const VALIDATION_SUITES = new Set(["manifest", "parallel_scheduler", "document_rag", "mock_smoke", "live_smoke"]);
 
@@ -2559,7 +2560,9 @@ export async function createApp({
         .map((workspace) => agentWorkspaceMarketplaceSummary(data, workspace, req))
         .filter((item) => !q || `${item.title} ${item.description} ${item.publisher_display_name || ""}`.toLowerCase().includes(q));
       const items = [...agentItems, ...workspaceItems]
-        .sort((left, right) => right.rating_average - left.rating_average
+        .sort((left, right) => Number(right.pinned === true) - Number(left.pinned === true)
+          || (left.pin_rank ?? Number.MAX_SAFE_INTEGER) - (right.pin_rank ?? Number.MAX_SAFE_INTEGER)
+          || right.rating_average - left.rating_average
           || right.rating_count - left.rating_count
           || String(right.published_at || "").localeCompare(String(left.published_at || "")));
       res.json({ items, total: items.length });
@@ -8927,7 +8930,10 @@ function marketplaceItemSummary(data, agent, req) {
     can_copy: !isViewer(req),
     can_manage: canManage,
     is_self_published: selfPublished,
-    is_owner: canManage
+    is_owner: canManage,
+    verified: false,
+    pinned: false,
+    pin_rank: null
   };
 }
 
@@ -9012,7 +9018,11 @@ function publishedAgentWorkspaceSnapshot(data, workspace) {
     }),
     edges: (Array.isArray(stored.edges) ? stored.edges : []).slice(0, 120).flatMap((edge) => (
       edge?.from && edge?.to && edge.from !== edge.to
-        ? [{ from: String(edge.from).slice(0, 120), to: String(edge.to).slice(0, 120), label: "handoff" }]
+        ? [{
+            from: String(edge.from).slice(0, 120),
+            to: String(edge.to).slice(0, 120),
+            label: String(edge.label || "handoff").replaceAll("\0", "").trim().slice(0, 120) || "handoff"
+          }]
         : []
     )),
     exclusions: { private_knowledge: true, mcp_credentials_and_bindings: true }
@@ -9051,6 +9061,7 @@ function agentWorkspaceMarketplaceSummary(data, workspace, req) {
   const myRating = ratings.find((rating) => (
     rating.created_by === req.auth?.user_id
   ));
+  const curatedPresentation = curatedMarketplacePresentation(workspace);
   return {
     id: workspace.agent_workspace_id,
     listing_id: listingId,
@@ -9073,7 +9084,10 @@ function agentWorkspaceMarketplaceSummary(data, workspace, req) {
     can_copy: !isViewer(req),
     can_manage: agentWorkspaceMarketplaceCanManage(workspace, req),
     is_self_published: agentWorkspaceMarketplaceIsSelfPublished(workspace, req),
-    is_owner: agentWorkspaceMarketplaceCanManage(workspace, req)
+    is_owner: agentWorkspaceMarketplaceCanManage(workspace, req),
+    verified: curatedPresentation?.verified === true,
+    pinned: curatedPresentation?.pinned === true,
+    pin_rank: curatedPresentation?.pin_rank ?? null
   };
 }
 

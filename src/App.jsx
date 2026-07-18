@@ -6050,7 +6050,7 @@ export function MarketplacePanel({ items, auth, onOpen = () => undefined, onRate
       <details className="marketplace-hero">
         <summary>
           <span className="marketplace-hero-copy">
-            <small className="marketplace-hero-eyebrow">COMMUNITY LIBRARY</small>
+            <small className="marketplace-hero-eyebrow">DISCOVER LIBRARY</small>
             <span className="marketplace-hero-title" id="marketplace-heading" role="heading" aria-level="3">Shared agents and teams, ready to make your own.</span>
           </span>
           <span className="marketplace-hero-toggle" aria-hidden="true"><ChevronDown size={16} /></span>
@@ -6064,10 +6064,10 @@ export function MarketplacePanel({ items, auth, onOpen = () => undefined, onRate
         {filtered.map((item) => (
           <article className="market-card" key={item.listing_id || item.id}>
             <button type="button" className="market-card-open" onClick={() => onOpen(item)} aria-label={`View ${agentFacingText(item.title, "community specialist")}`}>
-              <header><span className={`market-type ${item.item_type}`}>
+              <header><span className="market-card-labels"><span className={`market-type ${item.item_type}`}>
                 {item.item_type === "workspace" ? <Network size={13} /> : <Bot size={13} />}
                 {item.item_type === "workspace" ? "team" : "specialist"}
-              </span><ChevronRight size={15} /></header>
+              </span>{item.verified && <span className="market-verified"><ShieldCheck size={12} />Verified</span>}</span><ChevronRight size={15} /></header>
               <h4>{agentFacingText(item.title, "Community specialist")}</h4>
               <p>{agentFacingText(item.description || item.capability)}</p>
               <small className="market-author">Published by {item.publisher?.display_name || item.publisher_display_name || item.publisher?.id || item.publisher_id || item.published_by || "Community publisher"}</small>
@@ -6154,6 +6154,7 @@ export function MarketplaceWorkspaceAgentDetails({
   entry,
   workspaceTitle,
   publisher,
+  verified = false,
   onBack = () => undefined
 }) {
   const agent = entry?.agent || {};
@@ -6165,6 +6166,13 @@ export function MarketplaceWorkspaceAgentDetails({
   const cues = Array.isArray(agent.routing_cues) ? agent.routing_cues : [];
   const connectorRequirements = Array.isArray(agent.connector_requirements) ? agent.connector_requirements : [];
   const exclusions = agent.exclusions || {};
+  const responsePolicy = agent.policies?.response || {};
+  const memoryMode = agent.policies?.memory?.mode === "conversation" ? "conversation" : "none";
+  const knowledgeRequirements = Array.isArray(agent.policies?.knowledge?.requirements)
+    ? agent.policies.knowledge.requirements
+    : [];
+  const responseStyle = String(responsePolicy.style || "direct");
+  const responseSummary = `${responseStyle.charAt(0).toUpperCase()}${responseStyle.slice(1)}${Array.isArray(responsePolicy.tones) && responsePolicy.tones.length ? ` · ${responsePolicy.tones.join(", ")}` : ""}`;
   const connectionTools = connectorRequirements.flatMap((requirement, requirementIndex) => (
     (Array.isArray(requirement?.tools) ? requirement.tools : []).map((tool, toolIndex) => ({
       key: `${requirementIndex}:${toolIndex}:${tool?.name || "tool"}`,
@@ -6178,7 +6186,7 @@ export function MarketplaceWorkspaceAgentDetails({
           <button type="button" className="workspace-agent-detail-back" data-autofocus onClick={onBack}><ArrowLeft size={14} />Back to team</button>
           <section className="builder-panel marketplace-detail-intro">
             <div className="builder-heading">
-              <span>TEAM SPECIALIST</span>
+              <span>{verified ? "VERIFIED TEAM SPECIALIST" : "TEAM SPECIALIST"}</span>
               <h3>{description}</h3>
               <p>Part of <strong>{agentFacingText(workspaceTitle, "Shared team")}</strong> · Published by <strong>{publisher}</strong>.</p>
             </div>
@@ -6197,6 +6205,9 @@ export function MarketplaceWorkspaceAgentDetails({
             <dl className="marketplace-spec-list compact">
               <div><dt>Abilities</dt><dd>{tools.length ? tools.map((value) => <span className="marketplace-spec-chip" key={value}>{workflowToolLabel(value)}</span>) : "No tools required"}</dd></div>
               <div><dt>Connections</dt><dd>{connectionTools.length ? connectionTools.map((tool) => <span className="marketplace-spec-chip" key={tool.key}>{tool.label}</span>) : "No external connection required"}</dd></div>
+              <div><dt>Response</dt><dd>{responseSummary}</dd></div>
+              <div><dt>Memory</dt><dd>{memoryMode === "conversation" ? "Relevant context from this chat" : "Current request only"}</dd></div>
+              <div><dt>Knowledge</dt><dd>{knowledgeRequirements.length ? knowledgeRequirements.map((value) => <span className="marketplace-spec-chip" key={value}>{contractFieldLabel(value)}</span>) : "User-provided context"}</dd></div>
               <div><dt>Receives</dt><dd>{consumes.length ? consumes.map((value) => <span className="marketplace-spec-chip" key={value}>{contractFieldLabel(value)}</span>) : "Your request"}</dd></div>
               <div><dt>Hands back</dt><dd>{produces.length ? produces.map((value) => <span className="marketplace-spec-chip" key={value}>{contractFieldLabel(value)}</span>) : "Working answer"}</dd></div>
               <div><dt>Best used for</dt><dd>{cues.length ? cues.join(", ") : "Requests matching its name and purpose"}</dd></div>
@@ -6218,6 +6229,8 @@ export function MarketplaceWorkspaceAgentDetails({
           <dl>
             <div><dt>Team</dt><dd>{agentFacingText(workspaceTitle, "Shared team")}</dd></div>
             <div><dt>Publisher</dt><dd>{publisher}</dd></div>
+            <div><dt>Memory</dt><dd>{memoryMode === "conversation" ? "This chat" : "Current request"}</dd></div>
+            <div><dt>Knowledge</dt><dd>{knowledgeRequirements.length || "User context"}</dd></div>
             <div><dt>Tools</dt><dd>{tools.length || "None"}</dd></div>
             <div><dt>Connections</dt><dd>{connectorRequirements.length || "None"}</dd></div>
             <div><dt>Outputs</dt><dd>{produces.length || "Default"}</dd></div>
@@ -6339,6 +6352,13 @@ export function MarketplaceAgentDialog({
   const produces = agent.produces || [];
   const cues = agent.routing_cues || [];
   const connectorRequirements = agent.connector_requirements || [];
+  const responsePolicy = agent.policies?.response || {};
+  const memoryMode = agent.policies?.memory?.mode === "conversation" ? "conversation" : "none";
+  const knowledgeRequirements = Array.isArray(agent.policies?.knowledge?.requirements)
+    ? agent.policies.knowledge.requirements
+    : [];
+  const responseStyle = String(responsePolicy.style || "direct");
+  const responseSummary = `${responseStyle.charAt(0).toUpperCase()}${responseStyle.slice(1)}${Array.isArray(responsePolicy.tones) && responsePolicy.tones.length ? ` · ${responsePolicy.tones.join(", ")}` : ""}`;
   const targetWorkspace = agentWorkspaces.find((workspace) => workspace.agent_workspace_id === targetWorkspaceId);
   const targetWorkspaceFull = Boolean(
     targetWorkspace
@@ -6367,6 +6387,7 @@ export function MarketplaceAgentDialog({
               entry={selectedWorkspaceAgent}
               workspaceTitle={detail.title}
               publisher={publisher}
+              verified={detail.verified === true}
               onBack={() => setSelectedWorkspaceAgent(null)}
             />
           </div>
@@ -6387,7 +6408,7 @@ export function MarketplaceAgentDialog({
           <MarketplaceDetailFailure message={detailError} loading={loading} onRetry={() => setDetailAttempt((value) => value + 1)} />
           {loading && <div className="marketplace-detail-loading"><LoaderCircle className="spin" size={18} />Loading team details</div>}
           <section className="builder-panel marketplace-detail-intro">
-            <div className="builder-heading"><span>SHARED TEAM</span><h3>{detail.description || sharedWorkspace.description}</h3><p>{workspaceAgents.length} coordinated specialist{workspaceAgents.length === 1 ? "" : "s"} · Published by <strong>{publisher}</strong>.</p></div>
+            <div className="builder-heading"><span>{detail.verified ? "VERIFIED TEAM" : "SHARED TEAM"}</span><h3>{detail.description || sharedWorkspace.description}</h3><p>{workspaceAgents.length} coordinated specialist{workspaceAgents.length === 1 ? "" : "s"} · Published by <strong>{publisher}</strong>.</p></div>
           </section>
           <div className="workspace-marketplace-agents">
             {workspaceAgents.map((entry, index) => (
@@ -6410,7 +6431,7 @@ export function MarketplaceAgentDialog({
               {workspaceEdges.map((edge, index) => {
                 const from = workspaceAgents.find((entry) => entry.source_agent_id === edge.from)?.agent?.title || edge.from;
                 const to = workspaceAgents.find((entry) => entry.source_agent_id === edge.to)?.agent?.title || edge.to;
-                return <span key={`${edge.from}:${edge.to}:${index}`}><b>{from}</b><ArrowRight size={14} /><b>{to}</b></span>;
+                return <span key={`${edge.from}:${edge.to}:${index}`}><b>{from}</b><ArrowRight size={14} /><b>{to}</b>{edge.label && edge.label !== "handoff" && <i>{edge.label}</i>}</span>;
               })}
             </section>
           )}
@@ -6464,6 +6485,9 @@ export function MarketplaceAgentDialog({
               <dl className="marketplace-spec-list compact">
                 <div><dt>Abilities</dt><dd>{tools.length ? tools.map((value) => <span className="marketplace-spec-chip" key={value}>{workflowToolLabel(value)}</span>) : "No external abilities required"}</dd></div>
                 <div><dt>Connections</dt><dd>{connectorRequirements.length ? connectorRequirements.flatMap((requirement) => requirement.tools.map((tool) => <span className="marketplace-spec-chip" key={`${requirement.connection_name}:${tool.name}`}>{requirement.connection_name} · {tool.title || tool.name}</span>)) : "No external connection required"}</dd></div>
+                <div><dt>Response</dt><dd>{responseSummary}</dd></div>
+                <div><dt>Memory</dt><dd>{memoryMode === "conversation" ? "Relevant context from this chat" : "Current request only"}</dd></div>
+                <div><dt>Knowledge</dt><dd>{knowledgeRequirements.length ? knowledgeRequirements.map((value) => <span className="marketplace-spec-chip" key={value}>{contractFieldLabel(value)}</span>) : "User-provided context"}</dd></div>
                 <div><dt>Receives</dt><dd>{consumes.length ? consumes.map((value) => <span className="marketplace-spec-chip" key={value}>{contractFieldLabel(value)}</span>) : "Your request"}</dd></div>
                 <div><dt>Hands back</dt><dd>{produces.length ? produces.map((value) => <span className="marketplace-spec-chip" key={value}>{contractFieldLabel(value)}</span>) : "Working answer"}</dd></div>
                 <div><dt>Best used for</dt><dd>{cues.length ? cues.join(", ") : "Requests matching its name and purpose"}</dd></div>
