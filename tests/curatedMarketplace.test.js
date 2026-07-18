@@ -10,6 +10,7 @@ import {
   CURATED_MARKETPLACE_TEAM_IDS,
   curatedMarketplaceTeams
 } from "../server/curatedMarketplace.js";
+import { configuredPlanGaps, planRoutes } from "../server/tcarEngine.js";
 
 const TOKENS = {
   curated_alice: {
@@ -135,6 +136,41 @@ describe("Virenis curated Marketplace teams", () => {
           expect(agent.policies.knowledge.requirements).toContain("upstream_specialist");
         }
       }
+    }
+  });
+
+  it("compiles every curated and copied-team shape as a complete handoff graph at route caps three and four", () => {
+    for (const team of curatedMarketplaceTeams) {
+      const convergingAgent = team.agents[2];
+      const leadAgent = team.agents[3];
+      const bounded = planRoutes({
+        query: `Ask @${convergingAgent.id} to continue the earlier conclusion.`,
+        agents: team.agents,
+        maxRoutingAdapters: 3
+      });
+      expect(bounded.steps.map((step) => step.adapter), team.name).toHaveLength(3);
+      expect(bounded.steps.map((step) => step.adapter), team.name).toContain(convergingAgent.id);
+      expect(configuredPlanGaps(bounded.steps, team.agents), team.name).toEqual([]);
+      expect(bounded.steps.filter((step) => step.adapter !== convergingAgent.id).every((step) => (
+        step.task.includes("authorized conversation memory")
+        && !step.task.includes("Prepare the upstream work")
+      )), team.name).toBe(true);
+
+      const complete = planRoutes({
+        query: `Ask @${leadAgent.id} to continue the earlier conclusion.`,
+        agents: team.agents,
+        maxRoutingAdapters: 4
+      });
+      expect(new Set(complete.steps.map((step) => step.adapter)), team.name).toEqual(
+        new Set(team.agents.map((agent) => agent.id))
+      );
+      expect(configuredPlanGaps(complete.steps, team.agents), team.name).toEqual([]);
+
+      expect(() => planRoutes({
+        query: `Ask @${leadAgent.id} to continue the earlier conclusion.`,
+        agents: team.agents,
+        maxRoutingAdapters: 3
+      }), team.name).toThrow(/complete configured handoff graph/i);
     }
   });
 

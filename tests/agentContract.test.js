@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 
-import { buildParallelBatches, planRoutes, resolveAgentContext } from "../server/tcarEngine.js";
+import {
+  assertRuntimePlan,
+  buildParallelBatches,
+  configuredPlanGaps,
+  planRoutes,
+  resolveAgentContext
+} from "../server/tcarEngine.js";
 
 
 function artifact({ name, value, producer, stepId, contentType = "application/json" }) {
@@ -235,7 +241,7 @@ describe("canonical Agent Studio execution contract", () => {
     });
   });
 
-  it("never lets configured dependencies displace an approved workflow specialist", () => {
+  it("never executes an approved workflow specialist without its configured dependency closure", () => {
     const agents = [
       {
         id: "first_upstream",
@@ -270,15 +276,156 @@ describe("canonical Agent Studio execution contract", () => {
       }
     ];
 
-    const plan = planRoutes({
+    expect(() => planRoutes({
       query: "Complete the approved workflow.",
       agents,
       requiredAgentIds: ["approved_destination"],
       maxRoutingAdapters: 1
-    });
+    })).toThrow(/complete configured handoff graph/i);
 
-    expect(plan.steps.map((step) => step.adapter)).toEqual(["approved_destination"]);
-    expect(plan.steps[0].depends_on).toEqual([]);
-    expect(plan.routing.mode).toBe("approved_workflow");
+    const complete = planRoutes({
+      query: "Complete the approved workflow.",
+      agents,
+      requiredAgentIds: ["approved_destination"],
+      maxRoutingAdapters: 3
+    });
+    expect(new Set(complete.steps.map((step) => step.adapter))).toEqual(new Set([
+      "first_upstream",
+      "second_upstream",
+      "approved_destination"
+    ]));
+    expect(configuredPlanGaps(complete.steps, agents)).toEqual([]);
+    expect(complete.routing.mode).toBe("approved_workflow");
+    expect(complete.steps.filter((step) => step.adapter !== "approved_destination").every((step) => (
+      step.task.includes("authorized conversation memory")
+      && !step.task.includes("Prepare the upstream work")
+    ))).toBe(true);
+  });
+
+  it("promotes a resource helper when it is also requested as a specialist", () => {
+    const agents = [
+      {
+        id: "knowledge_helper",
+        title: "Knowledge helper",
+        capability: "Retrieve approved knowledge.",
+        consumes: ["user_request"],
+        produces: ["retrieved_context"],
+        resources: [],
+        enabled: true
+      },
+      {
+        id: "answer_writer",
+        title: "Answer writer",
+        capability: "Write from approved knowledge.",
+        consumes: ["user_request", "document_context"],
+        produces: ["final_answer"],
+        resources: ["agent:knowledge_helper"],
+        enabled: true
+      }
+    ];
+
+    const supportOnly = planRoutes({
+      query: "Ask @answer_writer.",
+      agents,
+      maxRoutingAdapters: 1
+    });
+    expect(supportOnly.steps.find((step) => step.adapter === "knowledge_helper")?.resource_support).toBe(true);
+    expect(configuredPlanGaps(supportOnly.steps, agents)).toEqual([]);
+
+    expect(() => planRoutes({
+      query: "Ask @answer_writer and @knowledge_helper.",
+      agents,
+      maxRoutingAdapters: 1
+    })).toThrow(/complete configured handoff graph/i);
+
+    const promoted = planRoutes({
+      query: "Ask @answer_writer and @knowledge_helper.",
+      agents,
+      maxRoutingAdapters: 2
+    });
+    const helper = promoted.steps.find((step) => step.adapter === "knowledge_helper");
+    expect(helper.resource_support).toBeUndefined();
+    expect(helper.task).toContain("explicitly requested @knowledge_helper");
+    expect(promoted.routing.explicit_adapters).toEqual(expect.arrayContaining([
+      "answer_writer",
+      "knowledge_helper"
+    ]));
+    expect(configuredPlanGaps(promoted.steps, agents)).toEqual([]);
+  });
+
+  it("bounds cap-exempt resource support independently of the specialist limit", () => {
+    const agents = [
+      ...["resource_one", "resource_two"].map((id) => ({
+        id,
+        title: id,
+        capability: "Retrieve approved knowledge.",
+        consumes: ["user_request"],
+        produces: ["retrieved_context"],
+        resources: [],
+        enabled: true
+      })),
+      {
+        id: "resource_consumer",
+        title: "Resource consumer",
+        capability: "Use both resources.",
+        consumes: ["user_request"],
+        produces: ["final_answer"],
+        resources: ["agent:resource_one", "agent:resource_two"],
+        enabled: true
+      }
+    ];
+
+    expect(() => planRoutes({
+      query: "Ask @resource_consumer.",
+      agents,
+      maxRoutingAdapters: 1,
+      maxResourceSupportAdapters: 1
+    })).toThrow(/complete configured handoff graph/i);
+
+    const complete = planRoutes({
+      query: "Ask @resource_consumer.",
+      agents,
+      maxRoutingAdapters: 1,
+      maxResourceSupportAdapters: 2
+    });
+    expect(complete.steps.filter((step) => step.resource_support === true)).toHaveLength(2);
+    expect(configuredPlanGaps(complete.steps, agents)).toEqual([]);
+  });
+
+  it("validates remote resource support without letting explicit specialists bypass the cap", () => {
+    const agents = [
+      { id: "knowledge", resources: [], consumes: ["user_request"] },
+      { id: "writer", resources: ["agent:knowledge"], consumes: ["user_request"] }
+    ];
+    const plan = {
+      steps: [
+        { id: "s1", adapter: "knowledge", task: "Retrieve knowledge.", depends_on: [] },
+        { id: "s2", adapter: "writer", task: "Write the answer.", depends_on: ["s1"] }
+      ],
+      routing: {
+        selected: [
+          { adapter: "knowledge", source: "configured_handoff" },
+          { adapter: "writer", source: "explicit" }
+        ]
+      }
+    };
+    expect(assertRuntimePlan(plan, {
+      allowedAdapters: ["knowledge", "writer"],
+      maxSteps: 1,
+      maxResourceSupportSteps: 1,
+      agents
+    }).steps).toHaveLength(2);
+
+    expect(() => assertRuntimePlan({
+      ...plan,
+      routing: {
+        selected: plan.routing.selected.map((selection) => ({ ...selection, source: "explicit" }))
+      }
+    }, {
+      allowedAdapters: ["knowledge", "writer"],
+      maxSteps: 1,
+      maxResourceSupportSteps: 1,
+      agents
+    })).toThrow(/specialist route limit/i);
   });
 });

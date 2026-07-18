@@ -47,6 +47,11 @@ const STRUCTURED_CONTEXT_ARTIFACTS = new Set([
   "metric_definitions",
   "calculation_trace"
 ]);
+const CONFIGURED_HANDOFF_TASK = [
+  "Apply this specialist's declared capability to the current user request.",
+  "When the request refers to earlier work, resolve it from authorized conversation memory.",
+  "Return the domain contribution and declared outputs needed by the configured downstream handoff; do not narrate workflow preparation."
+].join(" ");
 
 export function validateUserMessage(content) {
   if (typeof content !== "string" || content.trim().length === 0) {
@@ -76,6 +81,43 @@ function producedContractSupportsContext(produces = [], consumes = []) {
   return false;
 }
 
+export function configuredAgentDependencies(agent = {}) {
+  return [...new Set([
+    ...(agent.resources || [])
+      .map((value) => String(value || "").match(/^agent:([a-z0-9_-]+)$/i)?.[1]),
+    ...(agent.consumes || [])
+      .map((value) => String(value || "").match(/^agent:([a-z0-9_-]+):output$/i)?.[1])
+  ].filter(Boolean))];
+}
+
+function configuredResourceDependencies(agent = {}) {
+  return [...new Set((agent.resources || [])
+    .map((value) => String(value || "").match(/^agent:([a-z0-9_-]+)$/i)?.[1])
+    .filter(Boolean))];
+}
+
+function configuredHandoffDependencies(agent = {}) {
+  return [...new Set((agent.consumes || [])
+    .map((value) => String(value || "").match(/^agent:([a-z0-9_-]+):output$/i)?.[1])
+    .filter(Boolean))];
+}
+
+export function configuredPlanGaps(steps = [], agents = []) {
+  const agentById = new Map(agents.map((agent) => [agent.id, agent]));
+  const adapterByStepId = new Map(steps.map((step) => [step.id, step.adapter]));
+  const selected = new Set(steps.map((step) => step.adapter));
+  const gaps = [];
+  for (const step of steps) {
+    const actual = new Set((step.depends_on || []).map((stepId) => adapterByStepId.get(stepId)).filter(Boolean));
+    for (const dependencyId of configuredAgentDependencies(agentById.get(step.adapter))) {
+      if (dependencyId !== step.adapter && selected.has(dependencyId) && actual.has(dependencyId)) continue;
+      const token = `${dependencyId}->${step.adapter}`;
+      if (!gaps.includes(token)) gaps.push(token);
+    }
+  }
+  return gaps;
+}
+
 function agentOwnsSemanticContext(agent = {}) {
   const retrieval = agent?.retrieval;
   return Boolean(
@@ -98,15 +140,24 @@ function producedContractSupportsInferredEdge(sourceAgent = {}, destinationAgent
   return producedContractSupportsContext(produces, consumes);
 }
 
-export function planRoutes({ query, agents, documents = [], agentRankings = {}, maxRoutingAdapters = 12, requiredAgentIds = [] }) {
+export function planRoutes({
+  query,
+  agents,
+  documents = [],
+  agentRankings = {},
+  maxRoutingAdapters = 12,
+  maxResourceSupportAdapters = 8,
+  requiredAgentIds = []
+}) {
   const enabled = agents.filter((agent) => agent.enabled !== false && agent.runtime_sync_pending !== true);
   const hasAgent = (id) => enabled.some((agent) => agent.id === id);
   const lower = query.toLowerCase();
   const steps = [];
   const idByAdapter = new Map();
   const selections = new Map();
-  const activeAdds = new Set();
   const specialistLimit = Math.max(1, Number(maxRoutingAdapters) || 12);
+  const resourceSupportLimit = Math.max(0, Math.min(Number(maxResourceSupportAdapters) || 0, 24));
+  const enabledById = new Map(enabled.map((agent) => [agent.id, agent]));
 
   const contains = (...terms) => terms.some((term) => lower.includes(term));
   const wouldCreateCycle = (dependencyId, destinationId) => {
@@ -140,6 +191,16 @@ export function planRoutes({ query, agents, documents = [], agentRankings = {}, 
       const existing = steps.find((step) => step.adapter === adapter);
       const dependencies = safeDependencyIds(existing.id, dependencyAdapters);
       existing.depends_on = [...new Set([...(existing.depends_on || []), ...dependencies])].filter((id) => id !== existing.id);
+      // A knowledge helper can later become an explicitly requested or hard
+      // handoff specialist. Promote it instead of leaving it cap-exempt with
+      // the generic support task and missing selection provenance.
+      if (existing.resource_support === true && !resourceSupport) {
+        delete existing.resource_support;
+        existing.task = task;
+      } else if (selection) {
+        existing.task = task;
+      }
+      if (selection) selections.set(adapter, selection);
       return idByAdapter.get(adapter);
     }
     if (adapter !== "writing_synthesis_lora" && !resourceSupport
@@ -156,39 +217,88 @@ export function planRoutes({ query, agents, documents = [], agentRankings = {}, 
     return id;
   };
 
+  const configuredDependencies = (agent = {}) => configuredAgentDependencies(agent);
+
+  const dependencyClosure = (rootAdapter) => {
+    const ordered = [];
+    const visited = new Set();
+    const visiting = new Set();
+    const missing = [];
+    const resourceDependencies = new Set();
+    const handoffDependencies = new Set();
+    let cycle = false;
+    const walk = (adapter) => {
+      if (visited.has(adapter)) return;
+      if (visiting.has(adapter)) {
+        cycle = true;
+        return;
+      }
+      const agent = enabledById.get(adapter);
+      if (!agent) {
+        missing.push(adapter);
+        return;
+      }
+      visiting.add(adapter);
+      for (const dependencyId of configuredResourceDependencies(agent)) resourceDependencies.add(dependencyId);
+      for (const dependencyId of configuredHandoffDependencies(agent)) handoffDependencies.add(dependencyId);
+      for (const dependencyId of configuredDependencies(agent)) {
+        if (dependencyId === adapter) {
+          cycle = true;
+          continue;
+        }
+        if (!enabledById.has(dependencyId)) missing.push(dependencyId);
+        else walk(dependencyId);
+      }
+      visiting.delete(adapter);
+      visited.add(adapter);
+      ordered.push(adapter);
+    };
+    walk(rootAdapter);
+    return {
+      ordered,
+      missing: [...new Set(missing)],
+      cycle,
+      resourceSupport: new Set(
+        [...resourceDependencies].filter((dependencyId) => (
+          dependencyId !== rootAdapter && !handoffDependencies.has(dependencyId)
+        ))
+      )
+    };
+  };
+
   const add = (adapter, task, dependencyAdapters = [], selection = null) => {
-    const agent = enabled.find((candidate) => candidate.id === adapter);
-    if (!agent || activeAdds.has(adapter)) return idByAdapter.get(adapter);
-    activeAdds.add(adapter);
-    const resourceAgents = (agent?.resources || [])
-      .map((value) => String(value || "").match(/^agent:([a-z0-9_-]+)$/i)?.[1])
-      .filter((resourceAgentId) => resourceAgentId && resourceAgentId !== adapter && hasAgent(resourceAgentId));
-    for (const resourceAgentId of resourceAgents) {
-      addStep(
-        resourceAgentId,
-        `Retrieve the approved knowledge attached to ${agent?.title || adapter} and return only relevant cited evidence.`,
-        [],
-        null,
-        true
+    const closure = dependencyClosure(adapter);
+    if (closure.cycle || closure.missing.length) return undefined;
+    const additions = closure.ordered.filter((candidate) => !idByAdapter.has(candidate));
+    const promotions = closure.ordered.filter((candidate) => {
+      const existing = steps.find((step) => step.adapter === candidate);
+      return existing?.resource_support === true && !closure.resourceSupport.has(candidate);
+    });
+    const occupied = steps.filter((step) => (
+      step.adapter !== "writing_synthesis_lora" && step.resource_support !== true
+    )).length;
+    const countedAdditions = additions.filter((candidate) => (
+      candidate !== "writing_synthesis_lora" && !closure.resourceSupport.has(candidate)
+    )).length;
+    if (occupied + countedAdditions + promotions.length > specialistLimit) return undefined;
+    const occupiedResourceSupport = steps.filter((step) => step.resource_support === true).length;
+    const resourceAdditions = additions.filter((candidate) => closure.resourceSupport.has(candidate)).length;
+    if (occupiedResourceSupport - promotions.length + resourceAdditions > resourceSupportLimit) return undefined;
+
+    for (const currentAdapter of closure.ordered) {
+      const currentAgent = enabledById.get(currentAdapter);
+      const isRoot = currentAdapter === adapter;
+      const configured = configuredDependencies(currentAgent);
+      const result = addStep(
+        currentAdapter,
+        isRoot ? task : CONFIGURED_HANDOFF_TASK,
+        isRoot ? [...new Set([...configured, ...dependencyAdapters])] : configured,
+        isRoot ? selection : null,
+        closure.resourceSupport.has(currentAdapter)
       );
+      if (!result) return undefined;
     }
-    const handoffAgents = (agent?.consumes || [])
-      .map((value) => String(value || "").match(/^agent:([a-z0-9_-]+):output$/i)?.[1])
-      .filter((handoffAgentId) => handoffAgentId && handoffAgentId !== adapter && hasAgent(handoffAgentId));
-    for (const handoffAgentId of handoffAgents) {
-      add(
-        handoffAgentId,
-        `Prepare the upstream work required by ${agent?.title || adapter}.`
-      );
-    }
-    const result = addStep(
-      adapter,
-      task,
-      [...new Set([...resourceAgents, ...handoffAgents, ...dependencyAdapters])],
-      selection
-    );
-    activeAdds.delete(adapter);
-    return result;
+    return idByAdapter.get(adapter);
   };
 
   const approvedWorkflowAgents = [...new Set(
@@ -204,26 +314,28 @@ export function planRoutes({ query, agents, documents = [], agentRankings = {}, 
     }
     for (const agentId of approvedWorkflowAgents) {
       const agent = enabled.find((candidate) => candidate.id === agentId);
-      addStep(agentId, `Complete the approved workflow assignment for ${agent?.title || "this specialist"}.`, [], {
+      const added = add(agentId, `Complete the approved workflow assignment for ${agent?.title || "this specialist"}.`, [], {
         adapter: agentId,
         source: "approved_workflow",
         confidence: 1,
         reality_rank: rankingScore(agentRankings[agentId]),
         reason: "Selected by the workflow the user approved."
       });
-    }
-    const approvedSet = new Set(approvedWorkflowAgents);
-    for (const step of steps) {
-      const agent = enabled.find((candidate) => candidate.id === step.adapter);
-      const configuredDependencies = [
-        ...(agent?.consumes || []).map((value) => String(value || "").match(/^agent:([a-z0-9_-]+):output$/i)?.[1]),
-        ...(agent?.resources || []).map((value) => String(value || "").match(/^agent:([a-z0-9_-]+)$/i)?.[1])
-      ].filter((adapter) => adapter && adapter !== step.adapter && approvedSet.has(adapter));
-      step.depends_on = safeDependencyIds(step.id, [...new Set(configuredDependencies)]);
+      if (!added) {
+        const error = new Error("The approved workflow cannot fit its complete configured handoff graph within the current specialist limit and active team.");
+        error.code = "workflow_dependency_closure_unavailable";
+        throw error;
+      }
     }
     const plannedAdapters = new Set(steps.map((step) => step.adapter));
     if (approvedWorkflowAgents.some((adapter) => !plannedAdapters.has(adapter))) {
       const error = new Error("The approved workflow could not be compiled without dropping a requested specialist.");
+      error.code = "workflow_plan_incomplete";
+      throw error;
+    }
+    const dependencyGaps = configuredPlanGaps(steps, enabled);
+    if (dependencyGaps.length) {
+      const error = new Error(`The approved workflow is missing configured handoffs: ${dependencyGaps.join(", ")}.`);
       error.code = "workflow_plan_incomplete";
       throw error;
     }
@@ -246,13 +358,18 @@ export function planRoutes({ query, agents, documents = [], agentRankings = {}, 
 
   for (const agent of resolveExplicitAgentMentions(query, enabled)) {
     if (agent.id === "writing_synthesis_lora") continue;
-    add(agent.id, `Execute the explicitly requested @${agent.id} agent within its declared capability and boundary.`, [], {
+    const explicitStep = add(agent.id, `Execute the explicitly requested @${agent.id} agent within its declared capability and boundary.`, [], {
       adapter: agent.id,
       source: "explicit",
       confidence: 1,
       reality_rank: rankingScore(agentRankings[agent.id]),
       reason: "Explicit authorized agent reference."
     });
+    if (!explicitStep) {
+      const error = new Error(`@${agent.id} cannot fit its complete configured handoff graph within the current specialist limit and active team.`);
+      error.code = "explicit_agent_dependency_closure_unavailable";
+      throw error;
+    }
   }
 
   const matchingDocuments = documents.filter((doc) => {
@@ -362,6 +479,13 @@ export function planRoutes({ query, agents, documents = [], agentRankings = {}, 
   }
 
   add("writing_synthesis_lora", "Synthesize one concise final answer while preserving source and safety boundaries.", steps.map((step) => step.adapter));
+
+  const dependencyGaps = configuredPlanGaps(steps, enabled);
+  if (dependencyGaps.length) {
+    const error = new Error(`The route is missing configured handoffs: ${dependencyGaps.join(", ")}.`);
+    error.code = "plan_missing_configured_dependency";
+    throw error;
+  }
 
   return {
     steps,
@@ -1117,6 +1241,10 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
       ]
     });
     const routeLimit = Number(options.max_routing_adapters) || Number(process.env.TCAR_MAX_ROUTING_ADAPTERS || 12);
+    const resourceSupportLimit = Math.max(
+      0,
+      Math.min(Number(process.env.TCAR_MAX_RESOURCE_SUPPORT_ADAPTERS || 8), 24)
+    );
     const parallelWorkers = Math.max(
       1,
       Math.min(Number(options.parallel_workers) || Number(process.env.TCAR_PARALLEL_WORKERS || 2), 32)
@@ -1160,7 +1288,9 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
         const earlyPlan = enrichRuntimeRoutingTrace(
           assertRuntimePlan(normalizeRuntimePlan(safeStreamPlan), {
             allowedAdapters: scoped.allowedAdapters,
-            maxSteps: routeLimit
+            maxSteps: routeLimit,
+            maxResourceSupportSteps: resourceSupportLimit,
+            agents: scoped.agents
           }),
           agentRankings,
           scoped.agents
@@ -1186,7 +1316,9 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
     const plan = enrichRuntimeRoutingTrace(
       assertRuntimePlan(normalizeRuntimePlan(result.plan), {
         allowedAdapters: scoped.allowedAdapters,
-        maxSteps: routeLimit
+        maxSteps: routeLimit,
+        maxResourceSupportSteps: resourceSupportLimit,
+        agents: scoped.agents
       }),
       agentRankings,
       scoped.agents
@@ -1662,7 +1794,12 @@ function canonicalRuntimeContractValue(value) {
   );
 }
 
-function assertRuntimePlan(plan, { allowedAdapters = [], maxSteps = 12 } = {}) {
+export function assertRuntimePlan(plan, {
+  allowedAdapters = [],
+  maxSteps = 12,
+  maxResourceSupportSteps = 0,
+  agents = []
+} = {}) {
   const fail = (detail) => {
     const error = new Error(`model_invalid_response: ${detail}`);
     error.code = "model_invalid_response";
@@ -1670,7 +1807,11 @@ function assertRuntimePlan(plan, { allowedAdapters = [], maxSteps = 12 } = {}) {
   };
   const rawSteps = Array.isArray(plan?.steps) ? plan.steps : [];
   const routeLimit = Math.max(1, Math.min(Number(maxSteps) || 12, 64));
-  if (rawSteps.length > routeLimit) fail(`runtime plan exceeds the ${routeLimit}-step route limit`);
+  const resourceSupportLimit = Math.max(0, Math.min(Number(maxResourceSupportSteps) || 0, 24));
+  const absoluteStepLimit = routeLimit + resourceSupportLimit;
+  if (rawSteps.length > absoluteStepLimit) {
+    fail(`runtime plan exceeds the ${absoluteStepLimit}-step combined route limit`);
+  }
   const allowed = new Set((allowedAdapters || []).map(String));
   const normalizedSteps = rawSteps.map((step) => {
     if (!step || typeof step !== "object" || Array.isArray(step)) fail("runtime plan contains a malformed step");
@@ -1686,7 +1827,7 @@ function assertRuntimePlan(plan, { allowedAdapters = [], maxSteps = 12 } = {}) {
     if (!Array.isArray(step.depends_on || [])) fail(`runtime dependencies are malformed for step ${id}`);
     const dependsOn = (step.depends_on || []).map((dependency) => String(dependency || ""));
     if (
-      dependsOn.length > routeLimit
+      dependsOn.length > absoluteStepLimit
       || new Set(dependsOn).size !== dependsOn.length
       || dependsOn.some((dependency) => !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,119}$/.test(dependency))
     ) fail(`runtime dependencies are invalid for step ${id}`);
@@ -1714,6 +1855,38 @@ function assertRuntimePlan(plan, { allowedAdapters = [], maxSteps = 12 } = {}) {
   ].filter(Boolean).map(String);
   if (routedAdapters.some((adapter) => !allowed.has(adapter))) {
     fail("runtime routing trace contains an unauthorized agent");
+  }
+  const agentById = new Map((agents || []).map((agent) => [String(agent?.id || ""), agent]));
+  const selectedAgents = normalizedSteps
+    .map((step) => agentById.get(step.adapter))
+    .filter(Boolean);
+  const selectionSource = new Map(
+    (plan?.routing?.selected || [])
+      .filter((selection) => selection?.adapter)
+      .map((selection) => [String(selection.adapter), String(selection.source || "")])
+  );
+  const resourceDependencies = new Set(
+    selectedAgents.flatMap((agent) => configuredResourceDependencies(agent))
+  );
+  const hardHandoffDependencies = new Set(
+    selectedAgents.flatMap((agent) => configuredHandoffDependencies(agent))
+  );
+  const resourceSupportAdapters = new Set(
+    normalizedSteps
+      .map((step) => step.adapter)
+      .filter((adapter) => {
+        const source = selectionSource.get(adapter);
+        return agentById.has(adapter)
+          && resourceDependencies.has(adapter)
+          && !hardHandoffDependencies.has(adapter)
+          && ["configured_handoff", "configured_resource"].includes(source);
+      })
+  );
+  if (resourceSupportAdapters.size > resourceSupportLimit) {
+    fail(`runtime plan exceeds the ${resourceSupportLimit}-resource support limit`);
+  }
+  if (normalizedSteps.length - resourceSupportAdapters.size > routeLimit) {
+    fail(`runtime plan exceeds the ${routeLimit}-specialist route limit`);
   }
   return {
     ...plan,
