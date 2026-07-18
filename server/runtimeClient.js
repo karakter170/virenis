@@ -1330,6 +1330,8 @@ export function composeRuntimeWorkflow({
   candidates = [],
   connections = [],
   conversation_context = [],
+  composition_dependencies = [],
+  source_observations = [],
   execution_context = {}
 }) {
   return runtimeRequest("/workflow/compose", {
@@ -1341,6 +1343,8 @@ export function composeRuntimeWorkflow({
       candidates,
       connections,
       conversation_context,
+      composition_dependencies,
+      source_observations,
       execution_context
     },
     timeoutMs: Number(process.env.TCAR_RUNTIME_WORKFLOW_TIMEOUT_MS || process.env.TCAR_RUNTIME_CHAT_TIMEOUT_MS || DEFAULT_TIMEOUT_MS)
@@ -1371,54 +1375,223 @@ export function continueRuntimeConversation({
   });
 }
 
-export function registerRuntimeAgent(agent) {
-  return runtimeRequest("/agents", {
+export async function registerRuntimeAgent(agent) {
+  const body = runtimeAgentLifecycleBody(agent, [
+    "id",
+    "title",
+    "capability",
+    "boundary",
+    "consumes",
+    "produces",
+    "routing_cues",
+    "resources",
+    "tools",
+    "tool_contracts",
+    "sources",
+    "policies",
+    "workflow_profile",
+    "stage",
+    "source_text",
+    "overwrite",
+    "registration_id",
+    "audit_context"
+  ]);
+  const result = await runtimeRequest("/agents", {
     method: "POST",
-    body: selectFields(agent, [
-      "id",
-      "title",
-      "capability",
-      "boundary",
-      "consumes",
-      "produces",
-      "routing_cues",
-      "resources",
-      "tools",
-      "tool_contracts",
-      "sources",
-      "policies",
-      "stage",
-      "source_text",
-      "overwrite",
-      "registration_id",
-      "audit_context"
-    ]),
+    body,
     timeoutMs: Number(process.env.TCAR_RUNTIME_ADMIN_TIMEOUT_MS || 180000)
   });
+  return restoreRuntimeWorkflowProfile(result, body.workflow_profile, body.policies);
 }
 
-export function updateRuntimeAgent(agentId, patch) {
-  return runtimeRequest(`/agents/${encodeURIComponent(agentId)}`, {
+export async function updateRuntimeAgent(agentId, patch) {
+  const body = runtimeAgentLifecycleBody(patch, [
+    "title",
+    "capability",
+    "boundary",
+    "consumes",
+    "produces",
+    "routing_cues",
+    "resources",
+    "tools",
+    "tool_contracts",
+    "sources",
+    "policies",
+    "workflow_profile",
+    "stage",
+    "enabled",
+    "source_text",
+    "audit_context"
+  ]);
+  const result = await runtimeRequest(`/agents/${encodeURIComponent(agentId)}`, {
     method: "PATCH",
-    body: selectFields(patch, [
-      "title",
-      "capability",
-      "boundary",
-      "consumes",
-      "produces",
-      "routing_cues",
-      "resources",
-      "tools",
-      "tool_contracts",
-      "sources",
-      "policies",
-      "stage",
-      "enabled",
-      "source_text",
-      "audit_context"
-    ]),
+    body,
     timeoutMs: Number(process.env.TCAR_RUNTIME_ADMIN_TIMEOUT_MS || 180000)
   });
+  return restoreRuntimeWorkflowProfile(result, body.workflow_profile, body.policies);
+}
+
+const RUNTIME_FLAT_POLICY_KEYS = [
+  "activation_policy",
+  "write_policy",
+  "source_policy",
+  "tool_policy",
+  "citation_policy",
+  "escalation_policy"
+];
+const RUNTIME_WORKFLOW_RESPONSE_STYLES = new Set(["direct", "thorough", "careful"]);
+const RUNTIME_WORKFLOW_TONES = new Set([
+  "calm", "clear", "concise", "direct", "diplomatic", "educational", "empathetic",
+  "formal", "friendly", "neutral", "objective", "patient", "persuasive", "practical",
+  "professional", "reassuring", "supportive", "technical"
+]);
+const RUNTIME_WORKFLOW_KNOWLEDGE = new Set([
+  "attached_documents", "connected_app", "current_web", "organization_knowledge",
+  "repository", "structured_data", "upstream_specialist", "user_provided_context"
+]);
+
+function runtimeAgentLifecycleBody(value, allowedFields) {
+  const body = selectFields(value, allowedFields);
+  const workflowProfile = runtimeWorkflowProfile(value);
+  if (workflowProfile) body.workflow_profile = workflowProfile;
+  if (body.policies !== undefined) body.policies = runtimeFlatPolicies(body.policies);
+  return body;
+}
+
+function restoreRuntimeWorkflowProfile(result, workflowProfile, flatPolicies) {
+  if (!workflowProfile || !result?.agent || typeof result.agent !== "object") return result;
+  // The Runtime stores flat enforcement policies and structured workflow
+  // metadata separately.  The web tier's workflow contract compares the
+  // structured profile it submitted; project that profile back into the
+  // response so a just-created agent is not mistaken for a changed agent and
+  // redundantly PATCHed during the same activation.
+  return {
+    ...result,
+    agent: {
+      ...result.agent,
+      workflow_profile: workflowProfile,
+      policies: {
+        ...runtimeFlatPolicies(flatPolicies),
+        response: {
+          style: workflowProfile.response.style,
+          tones: [...workflowProfile.response.tones]
+        },
+        memory: { mode: workflowProfile.memory.mode },
+        knowledge: {
+          requirements: [...workflowProfile.knowledge.requirements]
+        },
+        composition: {
+          reusable_role: workflowProfile.composition.reusable_role !== false,
+          source_content_persisted: false,
+          ...(workflowProfile.composition.unknown_category === "route_to_general_review"
+            ? { unknown_category: "route_to_general_review" }
+            : {})
+        }
+      }
+    }
+  };
+}
+
+function runtimeFlatPolicies(value) {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  return Object.fromEntries(RUNTIME_FLAT_POLICY_KEYS
+    .filter((key) => typeof source[key] === "string" && source[key].trim())
+    .map((key) => [key, source[key].replaceAll("\0", "").trim().slice(0, 6000)]));
+}
+
+function runtimeWorkflowProfile(value) {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const explicit = objectValue(source.workflow_profile);
+  const policies = objectValue(source.policies);
+  const explicitResponse = objectValue(explicit.response);
+  const policyResponse = objectValue(policies.response);
+  const explicitMemory = objectValue(explicit.memory);
+  const policyMemory = objectValue(policies.memory);
+  const explicitKnowledge = objectValue(explicit.knowledge);
+  const policyKnowledge = objectValue(policies.knowledge);
+  const explicitComposition = objectValue(explicit.composition);
+  const policyComposition = objectValue(policies.composition);
+  const hasProfile = Object.keys(explicit).length > 0
+    || typeof source.configuration_version === "string"
+    || typeof source.response_style === "string"
+    || Array.isArray(source.tones)
+    || Object.keys(objectValue(source.memory)).length > 0
+    || Object.keys(objectValue(source.knowledge)).length > 0
+    || ["response", "memory", "knowledge", "composition"].some((key) => (
+      policies[key] && typeof policies[key] === "object" && !Array.isArray(policies[key])
+    ));
+  if (!hasProfile) return null;
+
+  const configuredVersion = boundedRuntimeProfileText(
+    explicit.configuration_version || source.configuration_version,
+    80
+  );
+  const configurationVersion = /^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,79}$/.test(configuredVersion)
+    ? configuredVersion
+    : "virenis-workflow-agent-config-v3";
+  const requestedStyle = boundedRuntimeProfileText(
+    explicitResponse.style || source.response_style || policyResponse.style,
+    20
+  ).toLowerCase();
+  const style = RUNTIME_WORKFLOW_RESPONSE_STYLES.has(requestedStyle) ? requestedStyle : "direct";
+  const tones = boundedRuntimeProfileList(
+    explicitResponse.tones || source.tones || policyResponse.tones,
+    3,
+    40,
+    RUNTIME_WORKFLOW_TONES
+  );
+  const sourceMemory = objectValue(source.memory);
+  const requestedMemory = boundedRuntimeProfileText(
+    explicitMemory.mode || sourceMemory.mode || policyMemory.mode,
+    20
+  ).toLowerCase();
+  const sourceKnowledge = objectValue(source.knowledge);
+  const requirements = boundedRuntimeProfileList(
+    explicitKnowledge.requirements || sourceKnowledge.requirements || policyKnowledge.requirements,
+    8,
+    80,
+    RUNTIME_WORKFLOW_KNOWLEDGE
+  );
+  const resources = boundedRuntimeProfileList(
+    explicitKnowledge.resources || sourceKnowledge.resources,
+    8,
+    180
+  );
+  const unknownCategory = boundedRuntimeProfileText(
+    explicitComposition.unknown_category || policyComposition.unknown_category,
+    60
+  );
+  return {
+    configuration_version: configurationVersion,
+    response: { style, tones: tones.length ? tones : ["clear"] },
+    memory: { mode: requestedMemory === "conversation" ? "conversation" : "none" },
+    knowledge: {
+      requirements: requirements.length ? requirements : ["user_provided_context"],
+      resources
+    },
+    composition: {
+      reusable_role: (explicitComposition.reusable_role ?? policyComposition.reusable_role) !== false,
+      source_content_persisted: false,
+      ...(unknownCategory === "route_to_general_review" ? { unknown_category: unknownCategory } : {})
+    }
+  };
+}
+
+function objectValue(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
+function boundedRuntimeProfileList(value, maxItems, maxChars, allowed = null) {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value
+    .filter((item) => typeof item === "string")
+    .map((item) => boundedRuntimeProfileText(item, maxChars))
+    .filter((item) => item && (!allowed || allowed.has(item))))]
+    .slice(0, maxItems);
+}
+
+function boundedRuntimeProfileText(value, maxChars) {
+  return String(value ?? "").replaceAll("\0", "").trim().slice(0, maxChars);
 }
 
 function selectFields(value, allowedFields) {

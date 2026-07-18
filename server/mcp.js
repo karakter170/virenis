@@ -24,6 +24,7 @@ import {
 import { readConfiguredSecret } from "./secretConfig.js";
 import { makeId, nowIso } from "./store.js";
 import { ensureMcpApprovalCheckpoint } from "./workflows.js";
+import { workflowDiscoveryToolIsSafe } from "./workflowSourceDiscovery.js";
 
 export const MCP_PROTOCOL_VERSION = "2025-11-25";
 const MAX_RPC_BYTES = 2 * 1024 * 1024;
@@ -1569,6 +1570,130 @@ export function isMcpToolAlias(name) {
   return MCP_ALIAS_RE.test(String(name || ""));
 }
 
+/**
+ * Execute one design-time source read without inventing a temporary agent or
+ * weakening the normal agent-bound MCP gateway. The caller supplies a
+ * server-issued, exact grant; this function independently rechecks ownership,
+ * workflow/run scope, connection identity, read risk, schema pin, and argument
+ * digest immediately before transport execution.
+ */
+export async function executeWorkflowSourceDiscoveryRead({
+  store,
+  key,
+  actor,
+  execution_context: rawContext,
+  grant
+}) {
+  if (!store) throw mcpError(503, "Workflow source discovery requires the application store.", "mcp_workflow_store_missing");
+  const context = normalizeGatewayContext(rawContext);
+  if (context.workspace_id !== actor?.workspace_id || context.user_id !== actor?.user_id) {
+    throw mcpError(403, "Workflow source discovery is outside this identity.", "mcp_workflow_actor_forbidden");
+  }
+  if (!grant || typeof grant !== "object" || Array.isArray(grant)) {
+    throw mcpError(400, "Workflow source discovery grant is missing.", "mcp_workflow_grant_missing");
+  }
+  const workflowId = String(grant.workflow_id || "").trim();
+  const requestId = String(grant.request_id || "").trim();
+  const providerId = String(grant.provider_id || "").trim().toLowerCase();
+  const connectionId = String(grant.connection_id || "").trim();
+  const toolName = String(grant.tool_name || "").trim();
+  const schemaDigest = String(grant.schema_digest || "").trim();
+  const argumentsValue = grant.arguments;
+  if (!requestId || !providerId || !connectionId || !toolName || !schemaDigest) {
+    throw mcpError(400, "Workflow source discovery grant is incomplete.", "mcp_workflow_grant_invalid");
+  }
+  if (!argumentsValue || typeof argumentsValue !== "object" || Array.isArray(argumentsValue)) {
+    throw mcpError(400, "Workflow source discovery arguments must be an object.", "mcp_arguments_invalid");
+  }
+  if (Buffer.byteLength(JSON.stringify(argumentsValue)) > MAX_ARGUMENT_BYTES) {
+    throw mcpError(413, "Workflow source discovery arguments are too large.", "mcp_arguments_too_large");
+  }
+  const argumentsDigest = digest(argumentsValue);
+  if (!safeDigestEqual(argumentsDigest, grant.arguments_digest)) {
+    throw mcpError(409, "Workflow source discovery arguments changed after review.", "mcp_workflow_grant_stale");
+  }
+
+  const snapshot = store.read();
+  const runMatches = (snapshot.runs || []).filter((run) => (
+    run.run_id === context.run_id
+    && run.session_id === context.session_id
+    && run.workspace_id === context.workspace_id
+    && run.created_by === context.user_id
+    && run.kind === "workflow_composition"
+  ));
+  if (runMatches.length !== 1) {
+    throw mcpError(runMatches.length ? 409 : 404, "Workflow composition run is unavailable.", "mcp_workflow_run_unavailable");
+  }
+  if (workflowId) {
+    const matches = (snapshot.workflows || []).filter((workflow) => (
+      workflow.workflow_id === workflowId
+      && workflow.session_id === context.session_id
+      && workflow.workspace_id === context.workspace_id
+      && workflow.created_by === context.user_id
+    ));
+    if (matches.length !== 1) {
+      throw mcpError(matches.length ? 409 : 404, "Workflow source discovery scope is unavailable.", "mcp_workflow_scope_unavailable");
+    }
+    const request = (matches[0].source_discovery?.requests || []).find((item) => item.request_id === requestId);
+    if (!request || request.provider_id !== providerId || request.connection_id !== connectionId) {
+      throw mcpError(409, "Workflow source discovery grant no longer matches the saved request.", "mcp_workflow_grant_stale");
+    }
+    if (matches[0].status === "declined") {
+      throw mcpError(409, "Workflow source discovery was cancelled.", "mcp_workflow_cancelled");
+    }
+  }
+
+  const connections = (snapshot.mcpConnections || []).filter((connection) => (
+    connection.connection_id === connectionId
+    && connection.workspace_id === context.workspace_id
+    && (connection.visibility !== "private" || connection.created_by === context.user_id)
+  ));
+  if (connections.length !== 1) {
+    throw mcpError(connections.length ? 409 : 404, "Workflow source connection is unavailable.", "mcp_workflow_connection_unavailable");
+  }
+  const connection = connections[0];
+  if (connection.status !== "ready" || !workflowConnectionMatchesProvider(connection, providerId)) {
+    throw mcpError(409, "Workflow source connection must be reselected or reconnected.", "mcp_workflow_connection_unavailable");
+  }
+  const tool = (connection.tools || []).find((item) => item.name === toolName);
+  if (!tool) throw mcpError(409, "Workflow source tool is no longer available.", "mcp_tool_missing");
+  if (!workflowDiscoveryToolIsSafe(tool)) {
+    throw mcpError(403, "Workflow source discovery permits only trusted read-only tools.", "mcp_workflow_read_required");
+  }
+  validatePinnedSchema({ schema_digest: schemaDigest }, tool);
+
+  const startedAt = nowIso();
+  const servicePrincipal = { id: "workflow_source_discovery" };
+  try {
+    const result = await callMcpTool(connection, tool, argumentsValue, { key, store });
+    await appendMcpAudit(store, {
+      context,
+      agent: servicePrincipal,
+      connection,
+      tool,
+      alias: `workflow:${workflowId || context.run_id}:${requestId}`,
+      status: "workflow_source_read_completed",
+      argumentsValue,
+      result,
+      startedAt
+    });
+    return { connection, tool, result };
+  } catch (error) {
+    await appendMcpAudit(store, {
+      context,
+      agent: servicePrincipal,
+      connection,
+      tool,
+      alias: `workflow:${workflowId || context.run_id}:${requestId}`,
+      status: "workflow_source_read_failed",
+      argumentsValue,
+      result: { code: error?.code || "mcp_call_failed" },
+      startedAt
+    });
+    throw error;
+  }
+}
+
 export function marketplaceMcpRequirements(agent) {
   return (agent.mcp_bindings || []).map((binding) => {
     const template = MCP_TEMPLATES.find((item) => item.id === binding.template_id);
@@ -1908,6 +2033,17 @@ function validatePinnedSchema(boundTool, tool) {
   if (!expected.length || expected.length !== actual.length || !crypto.timingSafeEqual(expected, actual)) {
     throw mcpError(409, "MCP tool schema changed; review and rebind it before use.", "mcp_schema_changed");
   }
+}
+
+function workflowConnectionMatchesProvider(connection, providerId) {
+  const normalize = (value) => String(value || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+  const provider = normalize(providerId);
+  const values = [connection.provider_id, connection.template_id, connection.name].map(normalize);
+  if (values.includes(provider)) return true;
+  if (connection.connection_mode !== "custom") return false;
+  const providerTokens = provider.split("_").filter((token) => token.length >= 3);
+  const nameTokens = new Set(normalize(connection.name).split("_").filter(Boolean));
+  return providerTokens.length > 0 && providerTokens.every((token) => nameTokens.has(token));
 }
 
 function assertAgentExecutionScope(agent, context) {

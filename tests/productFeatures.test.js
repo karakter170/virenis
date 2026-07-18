@@ -31,6 +31,7 @@ import {
   WorldGraphChanges,
   WorkflowDraftCard,
   agentPayloadFromForm,
+  createAgentForm,
   approvalActivityPresentation,
   agentsForWorkspace,
   availableSessionAgents,
@@ -61,7 +62,8 @@ import {
   worldGraphPlainReason,
   worldGraphUniqueWakeSpecialists,
   workflowRunRequest,
-  workflowRequirementConnections
+  workflowRequirementConnections,
+  workflowStatusNeedsPolling
 } from "../src/App.jsx";
 import LandingPage from "../src/LandingPage.jsx";
 
@@ -325,7 +327,52 @@ describe("Agent Studio product surfaces", () => {
       source_text: "The approved packaging color is amber."
     });
     expect(payload.boundary).toContain("Prioritize verified evidence");
+    expect(payload.policies).toMatchObject({
+      response: { style: "careful", tones: ["clear"] },
+      memory: { mode: "conversation" },
+      knowledge: {
+        requirements: expect.arrayContaining(["attached_documents", "structured_data", "upstream_specialist"])
+      },
+      composition: { reusable_role: true, source_content_persisted: false }
+    });
     expect(payload).not.toHaveProperty("sources");
+  });
+
+  it("round-trips an Auto-Composer profile through the standard Agent Studio controls", () => {
+    const form = createAgentForm({
+      id: "workflow_support",
+      title: "Customer Support Agent",
+      capability: "Classifies recurring support needs.",
+      boundary: "Compiler-authored comprehensive workflow boundary.",
+      routing_cues: ["customer support"],
+      consumes: ["user_request", "shared_memory", "upstream_route_outputs"],
+      produces: ["support_result"],
+      tools: ["web_search"],
+      mcp_bindings: [],
+      resources: [],
+      sources: [],
+      workflow_origin: { workflow_id: "workflow_profile", node_id: "support" },
+      policies: {
+        response: { style: "careful", tones: ["empathetic", "calm"] },
+        memory: { mode: "conversation" },
+        knowledge: { requirements: ["current_web", "upstream_specialist"] },
+        composition: { reusable_role: true, source_content_persisted: false }
+      }
+    });
+    expect(form).toMatchObject({
+      response_style: "careful",
+      boundary: "",
+      policies: {
+        response: { tones: ["empathetic", "calm"] },
+        memory: { mode: "conversation" }
+      }
+    });
+    const payload = agentPayloadFromForm(form);
+    expect(payload.policies).toMatchObject({
+      response: { style: "careful", tones: ["empathetic", "calm"] },
+      memory: { mode: "conversation" },
+      knowledge: { requirements: expect.arrayContaining(["current_web", "upstream_specialist"]) }
+    });
   });
 
   it("layers response preference onto custom guardrails without destroying either", () => {
@@ -865,6 +912,174 @@ describe("Agent Studio product surfaces", () => {
     }));
     expect(approvedMarkup).toContain("Use Personal Gmail");
     expect(approvedMarkup).toContain("Reconnect Old Gmail");
+  });
+
+  it("keeps source-first inspection separate from final team confirmation", () => {
+    const sourceDraft = {
+      workflow_id: "workflow_source_ui",
+      mode: "workflow",
+      title: "Inbox-informed support team",
+      status: "awaiting_confirmation",
+      nodes: [
+        { id: "trigger", type: "trigger", title: "Requested workflow", source: "system", status: "ready" },
+        { id: "inspect_gmail", type: "tool", title: "Secret source placeholder", source: "system", status: "ready" }
+      ],
+      edges: [{ source: "trigger", target: "inspect_gmail" }],
+      source_discovery: {
+        required: true,
+        status: "awaiting_connection",
+        raw_source_content: "PRIVATE CUSTOMER COMPLAINT BODY",
+        requests: [{
+          request_id: "source_gmail_1",
+          provider_id: "gmail",
+          name: "Gmail",
+          status: "awaiting_connection",
+          read_only: true,
+          raw_result: "PRIVATE MESSAGE RESULT"
+        }]
+      },
+      connection_requirements: [{
+        provider_id: "gmail",
+        name: "Gmail",
+        reason: "Read a bounded source sample before designing the team.",
+        connection_mode: "managed",
+        status: "missing"
+      }],
+      permissions: ["Read a bounded Gmail sample."],
+      safety: ["Do not create specialists until the source check is complete."]
+    };
+    const initialMarkup = renderToStaticMarkup(createElement(WorkflowDraftCard, { workflow: sourceDraft }));
+
+    expect(initialMarkup).toContain("AUTO COMPOSE · READ-ONLY SOURCE CHECK");
+    expect(initialMarkup).toContain("Source check · review required");
+    expect(initialMarkup).toContain("Read-only source inspection · 0 of 1 source inspected");
+    expect(initialMarkup).toContain("Account not connected · Read only");
+    expect(initialMarkup).toContain("Connect account");
+    expect(initialMarkup).toContain("No specialists created yet");
+    expect(initialMarkup).toContain("Confirm source check first");
+    expect(initialMarkup).toContain("Inspect read-only sources");
+    expect(initialMarkup).not.toContain("Proposed workflow handoff graph");
+    expect(initialMarkup).not.toContain("Secret source placeholder");
+    expect(initialMarkup).not.toContain("PRIVATE CUSTOMER COMPLAINT BODY");
+    expect(initialMarkup).not.toContain("PRIVATE MESSAGE RESULT");
+
+    const multiSourceMarkup = renderToStaticMarkup(createElement(WorkflowDraftCard, {
+      workflow: {
+        ...sourceDraft,
+        source_discovery: {
+          ...sourceDraft.source_discovery,
+          requests: ["Gmail", "Google Drive", "Slack", "Jira"].map((name, index) => ({
+            request_id: `source_multi_${index}`,
+            provider_id: name.toLowerCase().replaceAll(" ", "_"),
+            name,
+            status: "awaiting_connection",
+            read_only: true
+          }))
+        }
+      }
+    }));
+    expect(multiSourceMarkup).toContain("0 of 4 sources inspected");
+    expect(multiSourceMarkup).toContain("Gmail");
+    expect(multiSourceMarkup).toContain("Google Drive");
+    expect(multiSourceMarkup).toContain("Slack");
+    expect(multiSourceMarkup).toContain("Jira");
+
+    const inspectingMarkup = renderToStaticMarkup(createElement(WorkflowDraftCard, {
+      workflow: {
+        ...sourceDraft,
+        status: "source_discovering",
+        approved_at: "2026-07-18T10:00:00.000Z",
+        source_discovery: {
+          ...sourceDraft.source_discovery,
+          status: "discovering",
+          requests: [{
+            ...sourceDraft.source_discovery.requests[0],
+            status: "ready",
+            connection_id: "gmail_support"
+          }]
+        },
+        connection_requirements: [{
+          ...sourceDraft.connection_requirements[0],
+          status: "connected",
+          connection_id: "gmail_support"
+        }]
+      },
+      connections: [{
+        connection_id: "gmail_support",
+        provider_id: "gmail",
+        name: "Support inbox",
+        status: "ready"
+      }]
+    }));
+    expect(inspectingMarkup).toContain("Inspecting sources");
+    expect(inspectingMarkup).toContain("Inspecting 1 approved source");
+    expect(inspectingMarkup).toContain("Support inbox · Read only");
+    expect(inspectingMarkup).toContain("Inspecting a bounded read-only sample");
+    expect(inspectingMarkup).toContain("No specialists are being created yet");
+
+    const finalMarkup = renderToStaticMarkup(createElement(WorkflowDraftCard, {
+      workflow: {
+        ...sourceDraft,
+        title: "Source-informed support workflow",
+        source_discovery: {
+          required: true,
+          status: "completed",
+          completed_at: "2026-07-18T10:01:00.000Z",
+          requests: [{
+            request_id: "source_gmail_1",
+            provider_id: "gmail",
+            name: "Gmail",
+            status: "completed",
+            connection_id: "gmail_support",
+            result_digest: "a".repeat(64)
+          }]
+        },
+        nodes: [
+          { id: "trigger", type: "trigger", title: "New support request", source: "system", status: "ready" },
+          { id: "triage", type: "agent", title: "Support Triage", source: "generated", status: "ready" }
+        ],
+        edges: [{ source: "trigger", target: "triage" }],
+        connection_requirements: [{
+          ...sourceDraft.connection_requirements[0],
+          status: "connected",
+          connection_id: "gmail_support"
+        }]
+      },
+      connections: [{
+        connection_id: "gmail_support",
+        provider_id: "gmail",
+        name: "Support inbox",
+        status: "ready"
+      }]
+    }));
+    expect(finalMarkup).toContain("AUTO COMPOSE · SOURCE-INFORMED PROPOSED WORKFLOW");
+    expect(finalMarkup).toContain("1 of 1 source inspected");
+    expect(finalMarkup).toContain("Source check complete");
+    expect(finalMarkup).toContain("Proposed workflow handoff graph");
+    expect(finalMarkup).toContain("Support Triage");
+    expect(finalMarkup).toContain("Create this workflow");
+
+    const failedMarkup = renderToStaticMarkup(createElement(WorkflowDraftCard, {
+      workflow: {
+        ...sourceDraft,
+        status: "activation_failed",
+        approved_at: "2026-07-18T10:00:00.000Z",
+        error: "The source could not be inspected safely.",
+        source_discovery: {
+          ...sourceDraft.source_discovery,
+          status: "failed",
+          error: "Retry or review the connection."
+        }
+      }
+    }));
+    expect(failedMarkup).toContain("Inspection failed");
+    expect(failedMarkup).toContain("Retry source inspection");
+    expect(failedMarkup).toContain("The source could not be inspected safely.");
+    expect(failedMarkup).not.toContain("Retry setup");
+
+    expect(workflowStatusNeedsPolling("source_discovering")).toBe(true);
+    expect(workflowStatusNeedsPolling("activating")).toBe(true);
+    expect(workflowStatusNeedsPolling("awaiting_confirmation")).toBe(false);
   });
 
   it("offers only compatible ready accounts for a workflow connection requirement", () => {

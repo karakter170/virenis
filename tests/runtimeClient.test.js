@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import http from "node:http";
 import net from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
@@ -60,6 +61,21 @@ describe("TCAR runtime HTTP transport", () => {
       workspace_id: "workspace_contract",
       user_id: "alice"
     };
+    const compositionDependencies = [{
+      request_id: "source_gmail_1",
+      provider_id: "gmail",
+      connection_id: "mcp_gmail",
+      read_only: true,
+      required_before_agent_design: true
+    }];
+    const observationContent = "{\"categories\":[\"returns\"]}";
+    const sourceObservations = [{
+      request_id: "source_gmail_1",
+      provider_id: "gmail",
+      trust: "external_untrusted_data",
+      content: observationContent,
+      content_digest: crypto.createHash("sha256").update(observationContent).digest("hex")
+    }];
     await expect(composeRuntimeWorkflow({
       command: "workflow",
       mode: "workflow",
@@ -67,6 +83,8 @@ describe("TCAR runtime HTTP transport", () => {
       candidates: [{ candidate_id: "workspace:support" }],
       connections: [],
       conversation_context: [{ tag: "context", content: "Keep it concise." }],
+      composition_dependencies: compositionDependencies,
+      source_observations: sourceObservations,
       execution_context: executionContext
     })).resolves.toEqual({ title: "Composed", nodes: [] });
     await expect(continueRuntimeConversation({
@@ -88,6 +106,8 @@ describe("TCAR runtime HTTP transport", () => {
           candidates: [{ candidate_id: "workspace:support" }],
           connections: [],
           conversation_context: [{ tag: "context", content: "Keep it concise." }],
+          composition_dependencies: compositionDependencies,
+          source_observations: sourceObservations,
           execution_context: executionContext
         }
       },
@@ -379,13 +399,25 @@ describe("TCAR runtime HTTP transport", () => {
   it("sends only fields accepted by the live agent lifecycle contract", async () => {
     const requests = [];
     const runtime = await startHttpServer(async (request, response) => {
-      requests.push({ method: request.method, path: request.url, body: await readRequest(request) });
+      const body = await readRequest(request);
+      requests.push({ method: request.method, path: request.url, body });
       response.writeHead(200, { "Content-Type": "application/json" });
-      response.end(JSON.stringify({ ok: true }));
+      response.end(JSON.stringify({
+        ok: true,
+        ...(["POST", "PATCH"].includes(request.method) ? {
+          agent: {
+            ...body,
+            policies: {
+              activation_policy: "Runtime-owned activation policy.",
+              source_policy: body.policies?.source_policy
+            }
+          }
+        } : {})
+      }));
     });
     configureRuntime(runtime.url);
 
-    await registerRuntimeAgent({
+    const registered = await registerRuntimeAgent({
       id: "textile_agent",
       title: "Textile Agent",
       capability: "Analyzes textile operations.",
@@ -396,7 +428,14 @@ describe("TCAR runtime HTTP transport", () => {
       resources: [],
       tools: ["web_search"],
       sources: [],
-      policies: { source_policy: "Use approved current sources." },
+      configuration_version: "virenis-workflow-agent-config-v3",
+      policies: {
+        source_policy: "Use approved current sources.",
+        response: { style: "careful", tones: ["professional", "objective", "unsafe-tone"] },
+        memory: { mode: "conversation" },
+        knowledge: { requirements: ["current_web", "unknown_requirement"] },
+        composition: { reusable_role: true, source_content_persisted: true }
+      },
       stage: 20,
       registration_id: "registration_contract_test",
       audit_context: { user_id: "alice" },
@@ -406,13 +445,33 @@ describe("TCAR runtime HTTP transport", () => {
       workspace_id: "workspace_a",
       ready: true
     });
-    await updateRuntimeAgent("textile_agent", {
+    const updated = await updateRuntimeAgent("textile_agent", {
       title: "Textile Specialist",
       enabled: true,
-      policies: { source_policy: "Use evidence." },
+      policies: {
+        source_policy: "Use evidence.",
+        response: { style: "thorough", tones: ["clear"] },
+        memory: { mode: "none" },
+        knowledge: { requirements: ["user_provided_context"] }
+      },
       audit_context: { user_id: "alice" },
       item_type: "agent",
       license: "private"
+    });
+
+    expect(registered.agent.policies).toEqual({
+      source_policy: "Use approved current sources.",
+      response: { style: "careful", tones: ["professional", "objective"] },
+      memory: { mode: "conversation" },
+      knowledge: { requirements: ["current_web"] },
+      composition: { reusable_role: true, source_content_persisted: false }
+    });
+    expect(updated.agent.policies).toEqual({
+      source_policy: "Use evidence.",
+      response: { style: "thorough", tones: ["clear"] },
+      memory: { mode: "none" },
+      knowledge: { requirements: ["user_provided_context"] },
+      composition: { reusable_role: true, source_content_persisted: false }
     });
 
     expect(requests).toEqual([
@@ -431,6 +490,13 @@ describe("TCAR runtime HTTP transport", () => {
           tools: ["web_search"],
           sources: [],
           policies: { source_policy: "Use approved current sources." },
+          workflow_profile: {
+            configuration_version: "virenis-workflow-agent-config-v3",
+            response: { style: "careful", tones: ["professional", "objective"] },
+            memory: { mode: "conversation" },
+            knowledge: { requirements: ["current_web"], resources: [] },
+            composition: { reusable_role: true, source_content_persisted: false }
+          },
           stage: 20,
           registration_id: "registration_contract_test",
           audit_context: { user_id: "alice" }
@@ -442,6 +508,13 @@ describe("TCAR runtime HTTP transport", () => {
         body: {
           title: "Textile Specialist",
           policies: { source_policy: "Use evidence." },
+          workflow_profile: {
+            configuration_version: "virenis-workflow-agent-config-v3",
+            response: { style: "thorough", tones: ["clear"] },
+            memory: { mode: "none" },
+            knowledge: { requirements: ["user_provided_context"], resources: [] },
+            composition: { reusable_role: true, source_content_persisted: false }
+          },
           enabled: true,
           audit_context: { user_id: "alice" }
         }

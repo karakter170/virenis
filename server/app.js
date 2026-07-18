@@ -111,6 +111,7 @@ import {
   processWorkflowCompositionRun,
   publicConversationCheckpoint,
   publicWorkflow,
+  recomposeWorkflowAfterSourceDiscovery,
   recoverInterruptedWorkflowActivations,
   recoverStaleContinuationReservations,
   refreshConnectionRequirements,
@@ -128,6 +129,7 @@ import {
   disconnectMcpConnectionDurably,
   ensureMcpCredentialKey,
   executeMcpGatewayCall,
+  executeWorkflowSourceDiscoveryRead,
   isMcpToolAlias,
   marketplaceMcpRequirements,
   publicMcpApproval,
@@ -141,6 +143,7 @@ import {
   revokePendingMcpOAuthState,
   resolveAgentMcpBindings
 } from "./mcp.js";
+import { workflowDiscoveryToolIsSafe } from "./workflowSourceDiscovery.js";
 import {
   clerkFrontendApiOrigin,
   clerkIdentityEnabled,
@@ -288,6 +291,7 @@ export async function createApp({
   autoRun = true,
   chatProcessor = processChatRun,
   workflowComposer = null,
+  workflowSourceDiscoverer = null,
   conversationContinuator = null,
   validationProcessor = processValidationRun,
   clerkAdapter = null,
@@ -484,6 +488,11 @@ export async function createApp({
     : async ({ tool_name, decision }) => ({
         content: defaultToolContinuation({ tool_title: tool_name, tool_name }, decision)
       }));
+  const discoverWorkflowSource = workflowSourceDiscoverer || ((input) => executeWorkflowSourceDiscoveryRead({
+    store,
+    key: mcpCredentialKey,
+    ...input
+  }));
   const workflowActivationInflight = new Map();
   const marketplaceCopyInflight = new Map();
   const runtimeAdoptionInflight = new Map();
@@ -503,6 +512,8 @@ export async function createApp({
       workflowId,
       actor,
       mcpCredentialKey,
+      compose: composeWorkflow,
+      discoverSource: discoverWorkflowSource,
       ownerMutation
     }).finally(() => ownerMutation.release());
     workflowActivationInflight.set(workflowId, task);
@@ -566,7 +577,8 @@ export async function createApp({
             store,
             bus,
             run_id: runId,
-            compose: composeWorkflow
+            compose: composeWorkflow,
+            discoverSource: discoverWorkflowSource
           });
         } else {
           await chatProcessor({ store, bus, run_id: runId, options: claim.options });
@@ -4238,6 +4250,16 @@ export async function composeRuntimeWorkflowWithFallback(input) {
   try {
     return await composeRuntimeWorkflow(input);
   } catch (error) {
+    // Once private source observations have informed composition, silently
+    // replacing the controller with a generic fallback would misrepresent the
+    // result as source-aware. Fail closed so the UI can offer an honest retry
+    // without creating any specialists.
+    if (
+      (Array.isArray(input?.source_observations) && input.source_observations.length > 0)
+      || (Array.isArray(input?.composition_dependencies) && input.composition_dependencies.length > 0)
+    ) {
+      throw error;
+    }
     const status = Number(error?.status || 0);
     const recoverable = !status || status === 408 || status === 429 || status >= 500;
     if (!recoverable) throw error;
@@ -7580,7 +7602,22 @@ async function reconcileWorkflowRegistrationAnchors({
   };
 }
 
-async function activateWorkflowDraft({ store, workflowId, actor, ownerMutation = null }) {
+async function activateWorkflowDraft({
+  store,
+  workflowId,
+  actor,
+  compose,
+  discoverSource,
+  ownerMutation = null
+}) {
+  const sourceComposition = await recomposeWorkflowAfterSourceDiscovery({
+    store,
+    workflowId,
+    actor,
+    compose,
+    discoverSource
+  });
+  if (sourceComposition.handled) return sourceComposition.workflow;
   const registrationRecovery = await reconcileWorkflowRegistrationAnchors({
     store,
     workflowId,
@@ -7744,6 +7781,7 @@ async function activateWorkflowDraft({ store, workflowId, actor, ownerMutation =
           req: { auth: actor },
           sourceAgent,
           requestedId,
+          agentConfiguration: node,
           ownerMutation,
           workflowCommit: {
             workflow,
@@ -7793,9 +7831,10 @@ async function activateWorkflowDraft({ store, workflowId, actor, ownerMutation =
       const agent = nodeAgents.get(node.id);
       if (!agent) throwStatus(409, `Workflow agent setup is incomplete: ${node.title}.`);
       if (!workflowAgentMutable(agent, actor)) continue;
+      const configuredAgent = applyWorkflowNodeAgentConfiguration(agent, node);
       const upstreamNodeIds = nearestUpstreamAgentNodes(workflow, node.id);
       const consumes = [...new Set([
-        ...(agent.consumes || ["user_request"]),
+        ...(configuredAgent.consumes || ["user_request"]),
         ...upstreamNodeIds.map((nodeId) => `agent:${nodeAgents.get(nodeId)?.id}:output`).filter((value) => !value.includes("undefined"))
       ])];
       const providerIds = inferredNodeProviders(workflow, node.id);
@@ -7818,16 +7857,24 @@ async function activateWorkflowDraft({ store, workflowId, actor, ownerMutation =
       }
       const resolvedBindings = rawBindings.length
         ? resolveAgentMcpBindings(rawBindings, currentSnapshot, actor) || []
-        : agent.mcp_bindings || [];
+        : configuredAgent.mcp_bindings || [];
       const patched = applyAgentMcpBindings({
-        ...agent,
+        ...configuredAgent,
         consumes,
-        tools: [...new Set([...(agent.tools || []), ...(node.tools || [])])]
+        tools: [...new Set([...(configuredAgent.tools || []), ...(node.tools || [])])]
       }, resolvedBindings);
       const runtimePatch = {
+        title: patched.title,
+        capability: patched.capability,
+        boundary: patched.boundary,
         consumes: patched.consumes,
+        produces: patched.produces,
+        routing_cues: patched.routing_cues,
+        resources: patched.resources,
         tools: patched.tools,
         tool_contracts: patched.tool_contracts,
+        policies: patched.policies,
+        stage: patched.stage,
         audit_context: {
           user_id: actor.user_id,
           workspace_id: actor.workspace_id,
@@ -7851,9 +7898,17 @@ async function activateWorkflowDraft({ store, workflowId, actor, ownerMutation =
           throwStatus(409, `Workflow agent ownership changed during activation: ${node.title}.`);
         }
         stored.consumes = patched.consumes;
+        stored.title = patched.title;
+        stored.capability = patched.capability;
+        stored.boundary = patched.boundary;
+        stored.produces = patched.produces;
+        stored.routing_cues = patched.routing_cues;
+        stored.resources = patched.resources;
         stored.tools = patched.tools;
         stored.tool_contracts = patched.tool_contracts;
         stored.mcp_bindings = patched.mcp_bindings;
+        stored.policies = patched.policies;
+        stored.stage = patched.stage;
         stored.connector_requirements_pending = [];
         stored.last_edited_by = actor.user_id;
         stored.last_edited_at = nowIso();
@@ -8072,6 +8127,7 @@ function workflowNodeRequiresScopedCopy(workflow, node, source) {
   // A chat-scoped document agent already is an isolated resource owned by this
   // conversation. Copying it would discard its retrieval index.
   if (source.document && source.scope === "chat" && source.session_id === workflow.session_id) return false;
+  if (node.new_specialist_required === true) return true;
   if (source.workflow_origin?.workflow_id && source.workflow_origin.workflow_id !== workflow.workflow_id) return true;
   if (nearestUpstreamAgentNodes(workflow, node.id).length > 0) return true;
   if (inferredNodeProviders(workflow, node.id).length > 0) return true;
@@ -8086,16 +8142,51 @@ function workflowNodeRequiresScopedCopy(workflow, node, source) {
 
 function workflowAgentExecutionContractChanged(agent, patched) {
   return JSON.stringify({
+    title: agent.title,
+    capability: agent.capability,
+    boundary: agent.boundary,
     consumes: agent.consumes || [],
+    produces: agent.produces || [],
+    routing_cues: agent.routing_cues || [],
+    resources: agent.resources || [],
     tools: agent.tools || [],
     tool_contracts: agent.tool_contracts || {},
-    mcp_bindings: agent.mcp_bindings || []
+    mcp_bindings: agent.mcp_bindings || [],
+    policies: agent.policies || {},
+    stage: Number(agent.stage || 50)
   }) !== JSON.stringify({
+    title: patched.title,
+    capability: patched.capability,
+    boundary: patched.boundary,
     consumes: patched.consumes || [],
+    produces: patched.produces || [],
+    routing_cues: patched.routing_cues || [],
+    resources: patched.resources || [],
     tools: patched.tools || [],
     tool_contracts: patched.tool_contracts || {},
-    mcp_bindings: patched.mcp_bindings || []
+    mcp_bindings: patched.mcp_bindings || [],
+    policies: patched.policies || {},
+    stage: Number(patched.stage || 50)
   });
+}
+
+function applyWorkflowNodeAgentConfiguration(agent, node) {
+  const config = node.agent_config || node.generated_agent || {};
+  return {
+    ...agent,
+    title: String(node.title || config.title || agent.title || agent.id).trim().slice(0, 160),
+    capability: String(node.capability || config.capability || agent.capability || node.task || "").trim().slice(0, 1200),
+    boundary: String(config.boundary || agent.boundary || workflowGeneratedBoundary(node.title)).trim().slice(0, 2400),
+    consumes: [...new Set(config.consumes || agent.consumes || ["user_request"])].slice(0, 20),
+    produces: [...new Set(config.produces || node.produces || agent.produces || ["domain_outputs"])].slice(0, 20),
+    routing_cues: [...new Set(config.routing_cues || agent.routing_cues || [node.title])].slice(0, 20),
+    resources: [...new Set(config.resources || agent.resources || [])].slice(0, 20),
+    tools: [...new Set(config.tools || node.tools || agent.tools || [])].slice(0, 30),
+    policies: config.policies && typeof config.policies === "object"
+      ? structuredClone(config.policies)
+      : structuredClone(agent.policies || {}),
+    stage: Math.max(1, Math.min(99, Math.round(Number(config.stage ?? agent.stage ?? 50))))
+  };
 }
 
 function sourceRequiresKnowledgeBridge(source) {
@@ -8181,7 +8272,10 @@ async function createWorkflowGeneratedAgent({
     }
     throwStatus(409, `Generated agent id is already in use: ${agentId}.`);
   }
-  const spec = node.generated_agent || workflowGeneratedSpec(workflow, node);
+  // `agent_config` is the normalized execution contract. `generated_agent`
+  // remains a compatibility projection (and may carry only an id hint in
+  // recovery records), so it must not replace a richer compiled profile.
+  const spec = node.agent_config || node.generated_agent || workflowGeneratedSpec(workflow, node);
   const agent = normalizeAgentPayload({
     id: agentId,
     title: spec.title || node.title,
@@ -8191,8 +8285,16 @@ async function createWorkflowGeneratedAgent({
     produces: spec.produces || node.produces || ["domain_outputs"],
     routing_cues: spec.routing_cues || [node.title],
     resources: spec.resources || [],
-    tools: spec.tools || node.tools || []
+    tools: spec.tools || node.tools || [],
+    policies: spec.policies || {},
+    stage: spec.stage || 50
   });
+  if (spec.tool_contracts && typeof spec.tool_contracts === "object") {
+    agent.tool_contracts = structuredClone(spec.tool_contracts);
+  }
+  if (Array.isArray(spec.mcp_bindings)) {
+    agent.mcp_bindings = structuredClone(spec.mcp_bindings);
+  }
   Object.assign(agent, {
     workspace_id: actor.workspace_id,
     visibility: "private",
@@ -8371,15 +8473,30 @@ async function createWorkflowGeneratedAgent({
 }
 
 function workflowGeneratedSpec(workflow, node, source = null) {
+  const config = node.generated_agent || node.agent_config || {};
+  const sourceResources = source && sourceRequiresKnowledgeBridge(source) ? [`agent:${source.id}`] : [];
   return {
+    configuration_version: config.configuration_version || "virenis-workflow-agent-config-v3",
     title: node.title,
     capability: node.capability || source?.capability || node.task,
-    boundary: workflowGeneratedBoundary(node.title),
-    consumes: ["user_request"],
-    produces: node.produces?.length ? node.produces : [`${node.id}_output`],
-    routing_cues: [...new Set([node.title, ...(source?.routing_cues || []), workflow.title])].slice(0, 20),
-    resources: source && sourceRequiresKnowledgeBridge(source) ? [`agent:${source.id}`] : [],
-    tools: [...new Set(node.tools || [])]
+    boundary: config.boundary || source?.boundary || workflowGeneratedBoundary(node.title),
+    consumes: [...new Set(config.consumes || source?.consumes || ["user_request"])].slice(0, 20),
+    produces: [...new Set(config.produces || node.produces || source?.produces || [`${node.id}_output`])].slice(0, 20),
+    routing_cues: [...new Set([
+      ...(config.routing_cues || []),
+      node.title,
+      ...(source?.routing_cues || []),
+      workflow.title
+    ])].slice(0, 20),
+    resources: [...new Set([...(config.resources || []), ...sourceResources])].slice(0, 20),
+    tools: [...new Set(config.tools || node.tools || [])].slice(0, 30),
+    policies: structuredClone(config.policies || source?.policies || {}),
+    stage: Math.max(1, Math.min(99, Math.round(Number(config.stage ?? source?.stage ?? 50)))),
+    ...(source?.mcp_bindings?.length ? {
+      mcp_bindings: structuredClone(source.mcp_bindings),
+      tool_contracts: structuredClone(source.tool_contracts || {}),
+      tools: [...new Set([...(config.tools || node.tools || []), ...(source.tools || [])])].slice(0, 30)
+    } : {})
   };
 }
 
@@ -8456,9 +8573,7 @@ function nearestUpstreamAgentNodes(workflow, targetId) {
 }
 
 function workflowNodeAllowsWriteTools(node) {
-  if (node?.side_effect === true) return true;
-  return /\b(draft|create|update|modify|delete|remove|send|publish|post|submit|cancel|purchase|buy|charge|refund)\b/i
-    .test(String(node?.task || ""));
+  return node?.write_tools_allowed === true;
 }
 
 function selectWorkflowTools(tools, keywords, { allowWrite = false } = {}) {
@@ -8467,7 +8582,7 @@ function selectWorkflowTools(tools, keywords, { allowWrite = false } = {}) {
     const text = `${tool.name} ${tool.title || ""} ${tool.description || ""}`.toLowerCase();
     const score = normalizedKeywords.reduce((total, keyword) => total + (text.includes(keyword) ? 1 : 0), 0);
     return { tool, score };
-  }).filter((item) => item.score > 0 && (allowWrite || item.tool.risk === "read"))
+  }).filter((item) => item.score > 0 && (allowWrite || workflowDiscoveryToolIsSafe(item.tool)))
     .sort((left, right) => (
       Number(left.tool.risk !== "read") - Number(right.tool.risk !== "read")
       || right.score - left.score
@@ -9391,6 +9506,7 @@ async function copyMarketplaceAgentToWorkspace({
   req,
   sourceAgent,
   requestedId,
+  agentConfiguration = null,
   targetAgentWorkspaceId = null,
   idempotency = null,
   ownerMutation = null,
@@ -9412,7 +9528,7 @@ async function copyMarketplaceAgentToWorkspace({
   const listingId = marketplaceListingId(sourceAgent);
   const sourcePublisher = publicPublisher(store.read(), sourceAgent.marketplace);
   const agentId = marketplaceCopyAgentId(store.read(), sourceAgent, requestedId);
-  const copied = normalizeAgentPayload({
+  const copiedBase = normalizeAgentPayload({
     id: agentId,
     title: snapshot.title,
     capability: snapshot.capability,
@@ -9426,6 +9542,12 @@ async function copyMarketplaceAgentToWorkspace({
     policies: snapshot.policies,
     stage: snapshot.stage
   });
+  // Workflow activation registers the final compiled role in one Runtime
+  // request. This avoids a transient Marketplace profile followed by a
+  // second PATCH and makes crash recovery deterministic.
+  const copied = agentConfiguration
+    ? applyWorkflowNodeAgentConfiguration(copiedBase, agentConfiguration)
+    : copiedBase;
   Object.assign(copied, {
     workspace_id: requestWorkspaceId(req),
     visibility: "private",

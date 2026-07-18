@@ -86,7 +86,7 @@ async function runMessage(sessionId, content, options = {}, headers = {}) {
   throw new Error(`Run ${queued.body.run_id} did not finish.`);
 }
 
-function futureIso(delayMs = 80) {
+function futureIso(delayMs = 500) {
   return new Date(Date.now() + delayMs).toISOString();
 }
 

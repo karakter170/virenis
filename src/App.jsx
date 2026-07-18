@@ -772,19 +772,31 @@ function Workspace({ onHome, onSignedOut }) {
     }
   }, [messages, activeRun?.status, loading]);
 
-  const activatingWorkflowSignature = workflows
-    .filter((workflow) => workflow.status === "activating")
-    .map((workflow) => workflow.workflow_id)
+  const progressingWorkflowSignature = workflows
+    .filter((workflow) => workflowStatusNeedsPolling(workflow.status))
+    .map((workflow) => `${workflow.status}:${encodeURIComponent(workflow.workflow_id)}`)
     .sort()
-    .join(":");
+    .join("|");
   const workflowPollingIssueSignature = workflowPollingIssue
     ? `${workflowPollingIssue.sessionId || ""}:${(workflowPollingIssue.workflowIds || []).join(":")}`
     : "";
 
   useEffect(() => {
-    if (!activatingWorkflowSignature || !session?.session_id) return undefined;
+    if (!progressingWorkflowSignature || !session?.session_id) return undefined;
     const originSessionId = session.session_id;
-    const workflowIds = activatingWorkflowSignature.split(":").filter(Boolean);
+    const progressingWorkflows = progressingWorkflowSignature.split("|").map((entry) => {
+      const separator = entry.indexOf(":");
+      return {
+        status: entry.slice(0, separator),
+        workflowId: decodeURIComponent(entry.slice(separator + 1))
+      };
+    });
+    const workflowIds = progressingWorkflows.map((item) => item.workflowId);
+    const sourceDiscoveryIds = new Set(
+      progressingWorkflows
+        .filter((item) => item.status === "source_discovering")
+        .map((item) => item.workflowId)
+    );
     if (
       workflowPollingIssue?.sessionId === originSessionId
       && workflowIds.some((workflowId) => workflowPollingIssue.workflowIds?.includes(workflowId))
@@ -832,7 +844,7 @@ function Workspace({ onHome, onSignedOut }) {
         setWorkflows((items) => items.map((workflow) => updates.get(workflow.workflow_id) || workflow));
       }
       const remaining = workflowIds.filter((workflowId, index) => (
-        results[index].status === "rejected" || results[index].value?.status === "activating"
+        results[index].status === "rejected" || workflowStatusNeedsPolling(results[index].value?.status)
       ));
       if (!remaining.length) {
         setWorkflowPollingIssue(null);
@@ -846,10 +858,16 @@ function Workspace({ onHome, onSignedOut }) {
         return;
       }
       if (Date.now() >= deadlineAt) {
+        const sourceInspectionPending = remaining.some((workflowId) => (
+          sourceDiscoveryIds.has(workflowId)
+          || results[workflowIds.indexOf(workflowId)]?.value?.status === "source_discovering"
+        ));
         setWorkflowPollingIssue({
           sessionId: originSessionId,
           workflowIds: remaining,
-          message: "Team setup is taking longer than expected. Automatic checks paused so the page will not keep making requests."
+          message: sourceInspectionPending
+            ? "Read-only source inspection is taking longer than expected. Automatic checks paused so the page will not keep making requests."
+            : "Team setup is taking longer than expected. Automatic checks paused so the page will not keep making requests."
         });
         return;
       }
@@ -864,7 +882,7 @@ function Workspace({ onHome, onSignedOut }) {
       window.clearTimeout(timer);
       document.removeEventListener("visibilitychange", onVisibilityChange);
     };
-  }, [activatingWorkflowSignature, session?.session_id, workflowPollRetry, workflowPollingIssueSignature]);
+  }, [progressingWorkflowSignature, session?.session_id, workflowPollRetry, workflowPollingIssueSignature]);
 
   async function bootstrap() {
     if (bootstrapInFlightRef.current) return;
@@ -1695,7 +1713,7 @@ function Workspace({ onHome, onSignedOut }) {
     let deadlineAt = Date.now() + WORKFLOW_POLL_DEADLINE_MS;
     const originSessionId = current?.session_id || session?.session_id || "";
     while (
-      current?.status === "activating"
+      workflowStatusNeedsPolling(current?.status)
       && Date.now() < deadlineAt
       && (!originSessionId || desiredSessionIdRef.current === originSessionId)
     ) {
@@ -1715,7 +1733,7 @@ function Workspace({ onHome, onSignedOut }) {
       attempt += 1;
       current = await api.get(`/api/workflows/${encodeURIComponent(current.workflow_id)}`);
     }
-    if (current?.status === "activating" && shouldRefreshOriginSession(
+    if (workflowStatusNeedsPolling(current?.status) && shouldRefreshOriginSession(
       originSessionId,
       displayedSessionIdRef.current,
       desiredSessionIdRef.current
@@ -1723,7 +1741,9 @@ function Workspace({ onHome, onSignedOut }) {
       setWorkflowPollingIssue({
         sessionId: originSessionId,
         workflowIds: [current.workflow_id],
-        message: "Team setup is taking longer than expected. Automatic checks paused so the page will not keep making requests."
+        message: current.status === "source_discovering"
+          ? "Read-only source inspection is taking longer than expected. Automatic checks paused so the page will not keep making requests."
+          : "Team setup is taking longer than expected. Automatic checks paused so the page will not keep making requests."
       });
     }
     return current;
@@ -3317,35 +3337,53 @@ export function WorkflowDraftCard({
   onRun = () => undefined,
   onGraph = () => undefined
 }) {
+  const sourceDiscovery = workflow.source_discovery?.required ? workflow.source_discovery : null;
+  const sourcePhase = Boolean(sourceDiscovery && sourceDiscovery.status !== "completed");
+  const sourceInformed = sourceDiscovery?.status === "completed";
   const missingConnections = (workflow.connection_requirements || []).filter((item) => item.status !== "connected");
   const agentNodes = (workflow.nodes || []).filter((node) => node.type === "agent");
-  const status = workflowStatusCopy(workflow.status);
+  const status = workflowStatusCopy(workflow.status, { sourcePhase });
+  const headerKind = sourcePhase
+    ? "READ-ONLY SOURCE CHECK"
+    : `${sourceInformed ? "SOURCE-INFORMED " : ""}${workflow.mode === "agent_team" ? "PROPOSED TEAM" : "PROPOSED WORKFLOW"}`;
+  const displayedError = workflow.error || (sourceDiscovery?.status === "failed" ? sourceDiscovery.error : "");
   return (
-    <section className={`workflow-draft-card status-${workflow.status}`} aria-label={`${workflow.title} workflow proposal`}>
+    <section className={`workflow-draft-card status-${workflow.status}`} aria-label={`${workflow.title} ${sourcePhase ? "source inspection" : "workflow proposal"}`}>
       <header className="workflow-card-head">
-        <div className="workflow-card-copy"><small>AUTO COMPOSE · {workflow.mode === "agent_team" ? "PROPOSED TEAM" : "PROPOSED WORKFLOW"}</small><strong>{workflow.title}</strong></div>
-        <i className={status.tone}>{(busy || workflow.status === "activating") && <LoaderCircle className="spin" size={13} aria-hidden="true" />}{status.label}</i>
+        <div className="workflow-card-copy"><small>AUTO COMPOSE · {headerKind}</small><strong>{workflow.title}</strong></div>
+        <i className={status.tone}>{(busy || workflowStatusNeedsPolling(workflow.status)) && <LoaderCircle className="spin" size={13} aria-hidden="true" />}{status.label}</i>
       </header>
 
-      <WorkflowMiniGraph nodes={workflow.nodes || []} edges={workflow.edges || []} />
+      {sourceDiscovery && (
+        <WorkflowSourceInspection
+          discovery={sourceDiscovery}
+          requirements={workflow.connection_requirements || []}
+          connections={connections}
+          sourcePhase={sourcePhase}
+        />
+      )}
 
-      <div className="workflow-agent-sources" aria-label="Selected specialists">
-        {agentNodes.map((node) => (
-          <div key={node.id}>
-            <span className={`workflow-source-dot ${node.source}`} />
-            <span>
-              <strong>{node.title}</strong>
-              <small>{workflowSourceLabel(node)}</small>
-              {(node.tools || []).length > 0 && <small>Tools: {node.tools.map(workflowToolLabel).join(" · ")}</small>}
-            </span>
-            {node.status === "blocked_connection" && <i>Needs connection</i>}
-          </div>
-        ))}
-      </div>
+      {!sourcePhase && <WorkflowMiniGraph nodes={workflow.nodes || []} edges={workflow.edges || []} />}
 
-      {(workflow.connection_requirements || []).length > 0 && (
+      {!sourcePhase && agentNodes.length > 0 && (
+        <div className="workflow-agent-sources" aria-label="Selected specialists">
+          {agentNodes.map((node) => (
+            <div key={node.id}>
+              <span className={`workflow-source-dot ${node.source}`} />
+              <span>
+                <strong>{node.title}</strong>
+                <small>{workflowSourceLabel(node)}</small>
+                {(node.tools || []).length > 0 && <small>Tools: {node.tools.map(workflowToolLabel).join(" · ")}</small>}
+              </span>
+              {node.status === "blocked_connection" && <i>Needs connection</i>}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {(workflow.connection_requirements || []).length > 0 && (!sourcePhase || missingConnections.length > 0) && (
         <div className="workflow-connections" aria-label="Required connections">
-          <strong>Connections</strong>
+          <strong>{sourcePhase ? "Account access" : "Connections"}</strong>
           {(workflow.connection_requirements || []).map((requirement) => {
             const matchingConnections = workflowRequirementConnectionCandidates(requirement, connections);
             const readyConnections = matchingConnections.filter((connection) => connection.status === "ready").slice(0, 4);
@@ -3360,7 +3398,7 @@ export function WorkflowDraftCard({
                 {requirement.status === "connected"
                   ? <em className="connected"><Check size={12} />Connected</em>
                   : !connectionSetupEnabled
-                    ? <em className="pending">{workflow.status === "declined" ? "Draft closed" : "Create the team first"}</em>
+                    ? <em className="pending">{workflow.status === "declined" ? "Draft closed" : sourcePhase ? "Confirm source check first" : "Create the team first"}</em>
                   : <span className="workflow-connection-actions">
                     {readyConnections.map((connection) => (
                       <button
@@ -3393,9 +3431,9 @@ export function WorkflowDraftCard({
       )}
 
       <details className="workflow-review-details">
-        <summary>Review permissions and safety</summary>
+        <summary>{sourcePhase ? "Review read-only boundaries" : "Review permissions and safety"}</summary>
         <div>
-          <section><strong>Permissions</strong><ul>{(workflow.permissions || []).map((item) => <li key={item}>{item}</li>)}</ul></section>
+          <section><strong>{sourcePhase ? "Read access" : "Permissions"}</strong><ul>{(workflow.permissions || []).map((item) => <li key={item}>{item}</li>)}</ul></section>
           <section><strong>Safeguards</strong><ul>{(workflow.safety || []).map((item) => <li key={item}>{item}</li>)}</ul></section>
         </div>
       </details>
@@ -3403,26 +3441,62 @@ export function WorkflowDraftCard({
       <footer className="workflow-card-actions">
         {workflow.status === "awaiting_confirmation" && <>
           <button type="button" className="text-button ghost" disabled={!canWrite || busy} onClick={() => onDecision(workflow, "deny")}>Not now</button>
-          <button type="button" className="text-button primary" disabled={!canWrite || busy} onClick={() => onDecision(workflow, "approve")}>{busy ? <LoaderCircle className="spin" size={14} /> : <Check size={14} />}{workflow.mode === "agent_team" ? "Create this team" : "Create this workflow"}</button>
+          <button type="button" className="text-button primary" disabled={!canWrite || busy} onClick={() => onDecision(workflow, "approve")}>{busy ? <LoaderCircle className="spin" size={14} /> : sourcePhase ? <FileSearch size={14} /> : <Check size={14} />}{sourcePhase ? sourceDiscovery?.status === "failed" ? "Retry source inspection" : "Inspect read-only sources" : workflow.mode === "agent_team" ? "Create this team" : "Create this workflow"}</button>
         </>}
         {workflow.status === "awaiting_connections" && <>
-          <button type="button" className="text-button ghost" disabled={!canWrite || busy} onClick={() => onDecision(workflow, "deny")}>Cancel setup</button>
-          <span>{missingConnections.length ? `Waiting for ${missingConnections.map((item) => item.name).join(" and ")}` : "Connections ready"}</span>
+          <button type="button" className="text-button ghost" disabled={!canWrite || busy} onClick={() => onDecision(workflow, "deny")}>{sourcePhase ? "Cancel source check" : "Cancel setup"}</button>
+          <span>{sourcePhase ? missingConnections.length ? `Connect ${missingConnections.map((item) => item.name).join(" and ")} to inspect it. No specialists have been created.` : "Accounts ready for read-only inspection" : missingConnections.length ? `Waiting for ${missingConnections.map((item) => item.name).join(" and ")}` : "Connections ready"}</span>
         </>}
-        {workflow.status === "ready_to_activate" && <button type="button" className="text-button primary" disabled={!canWrite || busy} onClick={() => onResume(workflow)}>{busy ? <LoaderCircle className="spin" size={14} /> : <Check size={14} />}Complete team setup</button>}
+        {workflow.status === "ready_to_activate" && <button type="button" className="text-button primary" disabled={!canWrite || busy} onClick={() => onResume(workflow)}>{busy ? <LoaderCircle className="spin" size={14} /> : sourcePhase ? <FileSearch size={14} /> : <Check size={14} />}{sourcePhase ? "Inspect sources" : "Complete team setup"}</button>}
         {workflow.status === "activation_failed" && <>
-          <button type="button" className="text-button ghost" disabled={!canWrite || busy} onClick={() => onDecision(workflow, "deny")}>Cancel setup</button>
-          <button type="button" className="text-button primary" disabled={!canWrite || busy} onClick={() => onResume(workflow)}><RefreshCw size={14} />Retry setup</button>
+          <button type="button" className="text-button ghost" disabled={!canWrite || busy} onClick={() => onDecision(workflow, "deny")}>{sourcePhase ? "Cancel source check" : "Cancel setup"}</button>
+          <button type="button" className="text-button primary" disabled={!canWrite || busy} onClick={() => onResume(workflow)}><RefreshCw size={14} />{sourcePhase ? "Retry source inspection" : "Retry setup"}</button>
         </>}
         {workflow.status === "active" && <>
           <button type="button" className="text-button ghost" onClick={() => onGraph(workflow)}><Network size={14} />View team map</button>
           <button type="button" className="text-button primary" disabled={!canWrite || busy} onClick={() => onRun(workflow)}><ArrowRight size={14} />Start workflow</button>
         </>}
         {workflow.status === "activating" && <span><LoaderCircle className="spin" size={14} />Adding your specialists and connecting their work…</span>}
-        {workflow.status === "declined" && <span>Nothing was created. Your connected accounts were unchanged.</span>}
+        {workflow.status === "source_discovering" && <span><LoaderCircle className="spin" size={14} />Inspecting a bounded read-only sample. No specialists are being created yet.</span>}
+        {workflow.status === "declined" && <span>{sourcePhase ? "Source inspection was closed. No specialists were created, and your connected accounts were unchanged." : "Nothing was created. Your connected accounts were unchanged."}</span>}
       </footer>
-      {workflow.error && <div className="workflow-card-error" role="alert"><AlertCircle size={14} />{workflow.error}</div>}
+      {displayedError && <div className="workflow-card-error" role="alert"><AlertCircle size={14} />{displayedError}</div>}
     </section>
+  );
+}
+
+export function WorkflowSourceInspection({ discovery, requirements = [], connections = [], sourcePhase = true }) {
+  const requests = Array.isArray(discovery?.requests) ? discovery.requests.slice(0, 16) : [];
+  const completed = requests.filter((request) => request.status === "completed").length;
+  const total = requests.length;
+  const progress = discovery?.status === "completed"
+    ? `${completed} of ${total} ${total === 1 ? "source" : "sources"} inspected`
+    : discovery?.status === "discovering"
+      ? `Inspecting ${total} approved ${total === 1 ? "source" : "sources"}`
+      : discovery?.status === "failed"
+        ? "Inspection needs attention"
+        : `${completed} of ${total} ${total === 1 ? "source" : "sources"} inspected`;
+  return (
+    <div className="workflow-connections workflow-source-inspection" aria-label="Read-only source inspection">
+      <strong>Read-only source inspection · {progress}</strong>
+      {requests.map((request) => {
+        const requirement = requirements.find((item) => item.provider_id === request.provider_id);
+        const connectionId = request.connection_id || requirement?.connection_id;
+        const connection = connections.find((item) => item.connection_id === connectionId);
+        const account = connection?.name || (connectionId ? "Selected account" : "Account not connected");
+        const state = workflowSourceRequestState(request, discovery.status);
+        return (
+          <div key={request.request_id || request.provider_id}>
+            <span><FileSearch size={14} /><i><b>{request.name || "Connected source"}</b><small>{account} · Read only</small></i></span>
+            <em className={state.complete ? "connected" : "pending"}>{state.icon === "loading" ? <LoaderCircle className="spin" size={12} /> : state.icon === "complete" ? <Check size={12} /> : state.icon === "error" ? <AlertCircle size={12} /> : <Clock3 size={12} />}{state.label}</em>
+          </div>
+        );
+      })}
+      <div>
+        <span><ShieldCheck size={14} /><i><b>{sourcePhase ? "No specialists created yet" : "Source check complete"}</b><small>{sourcePhase ? "Only the approved bounded reads run before team design." : "The team proposal is ready; retrieved source content is not displayed here."}</small></i></span>
+        <em className={sourcePhase ? "pending" : "connected"}>{sourcePhase ? "Inspection first" : "Ready to review"}</em>
+      </div>
+    </div>
   );
 }
 
@@ -3574,14 +3648,27 @@ function workflowToolLabel(tool) {
   return labels[tool] || String(tool || "").replaceAll("_", " ");
 }
 
-function workflowStatusCopy(status) {
+export function workflowStatusNeedsPolling(status) {
+  return status === "activating" || status === "source_discovering";
+}
+
+function workflowSourceRequestState(request, discoveryStatus) {
+  if (request?.status === "completed") return { label: "Checked", complete: true, icon: "complete" };
+  if (discoveryStatus === "failed" || request?.status === "failed") return { label: "Retry needed", complete: false, icon: "error" };
+  if (discoveryStatus === "discovering" || request?.status === "discovering") return { label: "Inspecting", complete: false, icon: "loading" };
+  if (request?.status === "awaiting_connection") return { label: "Connect account", complete: false, icon: "waiting" };
+  return { label: "Ready to inspect", complete: false, icon: "waiting" };
+}
+
+function workflowStatusCopy(status, { sourcePhase = false } = {}) {
   if (status === "active") return { label: "Ready", tone: "success" };
   if (status === "declined") return { label: "Closed", tone: "muted" };
-  if (status === "awaiting_connections") return { label: "Connection needed", tone: "warning" };
-  if (status === "activation_failed") return { label: "Needs attention", tone: "warning" };
+  if (status === "awaiting_connections") return { label: sourcePhase ? "Source account needed" : "Connection needed", tone: "warning" };
+  if (status === "activation_failed") return { label: sourcePhase ? "Inspection failed" : "Needs attention", tone: "warning" };
+  if (status === "source_discovering") return { label: "Inspecting sources", tone: "working" };
   if (status === "activating") return { label: "Creating", tone: "working" };
-  if (status === "ready_to_activate") return { label: "Ready to finish", tone: "working" };
-  return { label: "Draft · review required", tone: "draft" };
+  if (status === "ready_to_activate") return { label: sourcePhase ? "Ready to inspect" : "Ready to finish", tone: "working" };
+  return { label: sourcePhase ? "Source check · review required" : "Draft · review required", tone: "draft" };
 }
 
 export function FormattedText({ text }) {
@@ -7574,24 +7661,61 @@ export function agentPayloadFromForm(form, { isAdmin = false, hasDocumentResourc
       ? `${responseStyle.boundary}\n\nAdditional role-specific guardrails:\n${customBoundary}`
       : responseStyle.boundary
     : customBoundary || RESPONSE_STYLES[0].boundary;
+  const consumes = [...new Set([
+    "user_request",
+    ...(form.consumes || []),
+    ...(hasDocumentResources ? ["document_context"] : [])
+  ])];
+  const tools = [...new Set([
+    ...(form.tools || []),
+    ...(hasDocumentResources ? ["document_search", "document_read"] : [])
+  ])];
+  const knowledgeRequirements = new Set(
+    (form.policies?.knowledge?.requirements || []).filter((item) => item === "organization_knowledge")
+  );
+  if (hasDocumentResources || tools.some((tool) => ["document_search", "document_read"].includes(tool))) knowledgeRequirements.add("attached_documents");
+  if (tools.includes("web_search")) knowledgeRequirements.add("current_web");
+  if (tools.includes("data_table") || consumes.includes("table_context")) knowledgeRequirements.add("structured_data");
+  if (tools.includes("repo_inspector")) knowledgeRequirements.add("repository");
+  if ((form.mcp_bindings || []).some((binding) => binding.tool_names?.length)) knowledgeRequirements.add("connected_app");
+  if (consumes.includes("upstream_route_outputs") || consumes.some((item) => /^agent:.+:output$/.test(item))) knowledgeRequirements.add("upstream_specialist");
+  if (!knowledgeRequirements.size) knowledgeRequirements.add("user_provided_context");
   return {
     item_type: form.item_type,
     title: form.title.trim(),
     capability: form.capability.trim(),
     boundary: combinedBoundary,
     routing_cues: form.routing_cues || `${form.title}, ${form.capability}`,
-    consumes: [...new Set([
-      "user_request",
-      ...(form.consumes || []),
-      ...(hasDocumentResources ? ["document_context"] : [])
-    ])],
+    consumes,
     produces: form.produces?.length ? [...form.produces] : ["domain_outputs"],
-    tools: [...new Set([
-      ...(form.tools || []),
-      ...(hasDocumentResources ? ["document_search", "document_read"] : [])
-    ])],
+    tools,
     mcp_bindings: form.mcp_bindings || [],
     resources: form.resources || [],
+    policies: {
+      ...(form.policies || {}),
+      response: {
+        ...(form.policies?.response || {}),
+        style: responseStyle?.id || "direct",
+        tones: Array.isArray(form.policies?.response?.tones) && form.policies.response.tones.length
+          ? [...form.policies.response.tones]
+          : ["clear"]
+      },
+      memory: {
+        ...(form.policies?.memory || {}),
+        mode: consumes.some((item) => ["shared_memory", "conversation_context"].includes(item))
+          ? "conversation"
+          : "none"
+      },
+      knowledge: {
+        ...(form.policies?.knowledge || {}),
+        requirements: [...knowledgeRequirements]
+      },
+      composition: {
+        ...(form.policies?.composition || {}),
+        reusable_role: form.policies?.composition?.reusable_role !== false,
+        source_content_persisted: false
+      }
+    },
     source_text: form.source_text || "",
     ...(isAdmin ? { sources: form.sources } : {})
   };
@@ -7613,15 +7737,16 @@ export function responseStyleFromBoundary(boundary) {
   return { response_style: "custom", boundary: value };
 }
 
-function createAgentForm(agent) {
+export function createAgentForm(agent) {
   if (agent) {
     const responseConfiguration = responseStyleFromBoundary(agent.boundary);
+    const policyStyle = RESPONSE_STYLES.find((style) => style.id === agent.policies?.response?.style)?.id;
     return {
       id: agent.id,
       title: agentFacingText(agent.title),
       capability: agentFacingText(agent.capability),
-      boundary: responseConfiguration.boundary,
-      response_style: responseConfiguration.response_style,
+      boundary: agent.workflow_origin && policyStyle ? "" : responseConfiguration.boundary,
+      response_style: policyStyle || responseConfiguration.response_style,
       routing_cues: (agent.routing_cues || []).join(", "),
       consumes: agent.consumes?.length ? [...agent.consumes] : ["user_request"],
       produces: agent.produces?.length ? [...agent.produces] : ["domain_outputs"],
@@ -7633,6 +7758,7 @@ function createAgentForm(agent) {
       resources: [...(agent.resources || [])],
       sources: (agent.sources || []).join(", "),
       source_text: "",
+      policies: agent.policies && typeof agent.policies === "object" ? agent.policies : {},
       item_type: "agent"
     };
   }
@@ -7651,6 +7777,7 @@ function createAgentForm(agent) {
     resources: [],
     sources: "",
     source_text: "",
+    policies: {},
     item_type: "agent"
   };
 }

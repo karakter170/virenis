@@ -1472,11 +1472,18 @@ describe("runtime and catalog", () => {
     expect(item).toMatchObject({
       item_type: "agent",
       description: "A patient-safe clinical rewriting agent.",
-      published_by: "user_local",
-      publisher: { user_id: "user_local" },
+      published_by: expect.stringMatching(/^publisher_[a-f0-9]{32}$/),
+      publisher: {
+        id: expect.stringMatching(/^publisher_[a-f0-9]{32}$/),
+        user_id: expect.stringMatching(/^publisher_[a-f0-9]{32}$/),
+        display_name: expect.any(String),
+        status: "active"
+      },
       rating_count: 0,
       rating_average: 0
     });
+    expect(item.publisher.id).toBe(item.published_by);
+    expect(JSON.stringify(item)).not.toContain("user_local");
     expect(item.listing_id).toMatch(/^listing_/);
     for (const retiredField of ["achievements", "proofs", "version", "license", "reviews"]) {
       expect(item).not.toHaveProperty(retiredField);
@@ -1675,7 +1682,15 @@ describe("runtime and catalog", () => {
         .set("Authorization", "Bearer market_alice")
         .send({ description: "A reusable agent for producing clear research briefs." })
         .expect(201);
-      expect(publication.body.publisher).toEqual({ user_id: "alice" });
+      expect(publication.body.publisher).toMatchObject({
+        id: expect.stringMatching(/^publisher_[a-f0-9]{32}$/),
+        user_id: expect.stringMatching(/^publisher_[a-f0-9]{32}$/),
+        display_name: expect.any(String),
+        status: "active"
+      });
+      expect(publication.body.publisher.id).toBe(publication.body.publisher.user_id);
+      expect(JSON.stringify(publication.body.publisher)).not.toContain("alice");
+      const publicPublisherId = publication.body.publisher.id;
       expect(publication.body).toMatchObject({
         can_manage: true,
         is_self_published: true,
@@ -1719,7 +1734,7 @@ describe("runtime and catalog", () => {
         .set("Authorization", "Bearer market_bob")
         .expect(200);
       expect(bobListing.body).toMatchObject({
-        published_by: "alice",
+        published_by: publicPublisherId,
         workspace_copy: null,
         can_copy: true,
         can_manage: false,
@@ -1765,10 +1780,12 @@ describe("runtime and catalog", () => {
           marketplace_origin: {
             listing_id: publication.body.listing_id,
             source_agent_id: "alice_shared_research_agent",
-            publisher_user_id: "alice"
+            publisher_id: publicPublisherId,
+            publisher_display_name: expect.any(String)
           }
         }
       });
+      expect(copied.body.agent.marketplace_origin).not.toHaveProperty("publisher_user_id");
       expect(copied.body.duplicate).toBe(false);
       expect(copied.body.agent).not.toHaveProperty("marketplace_copy_idempotency");
       const copiedAgentId = copied.body.agent.id;
@@ -2077,11 +2094,13 @@ describe("runtime and catalog", () => {
       .expect(200);
     expect(listing.body).toMatchObject({
       description: "Legacy description",
-      published_by: "legacy_publisher",
+      published_by: expect.stringMatching(/^publisher_[a-f0-9]{32}$/),
       rating_average: 4,
       rating_count: 1,
       my_rating: { score: 4 }
     });
+    expect(listing.body.published_by).toBe(stored.agent.marketplace.publisher_id);
+    expect(JSON.stringify(listing.body)).not.toContain("legacy_publisher");
     expect(JSON.stringify(listing.body)).not.toContain("This text must not survive migration.");
   });
 

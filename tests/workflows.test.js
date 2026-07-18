@@ -911,7 +911,10 @@ describe("explicit workflow Auto-Composer", () => {
     await waitForRun(queued.body.run_id);
     const loaded = await getSession(session.session_id);
     const agents = loaded.body.workflows[0].nodes.filter((node) => node.type === "agent");
-    expect(agents[0]).toMatchObject({ source: "marketplace", listing_id: "listing_ceramic42", publisher: "publisher" });
+    // Marketplace nodes expose only a public publisher identity. This legacy
+    // fixture has no public publisher id, so the private owner id must not
+    // escape through workflow projections.
+    expect(agents[0]).toMatchObject({ source: "marketplace", listing_id: "listing_ceramic42", publisher: null });
     expect(agents[1]).toMatchObject({ source: "generated" });
     expect(agents[1].generated_agent.boundary).toContain("untrusted data");
   });
