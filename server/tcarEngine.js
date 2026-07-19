@@ -40,6 +40,10 @@ const DOCUMENT_CONTEXT_ARTIFACTS = new Set([
   "evidence_summary"
 ]);
 const CHAT_RUN_SINGLE_FLIGHTS = new Map();
+const RUNTIME_PLAN_CONTRACT_VERSIONS = [
+  "tcar-runtime-plan-contract-v5",
+  "tcar-runtime-plan-contract-v4"
+];
 const STRUCTURED_CONTEXT_ARTIFACTS = new Set([
   "table_context",
   "structured_data",
@@ -1317,6 +1321,7 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
     );
     let streamedSafePlanDigest = null;
     let streamedExactPlanDigest = null;
+    let streamedExactPlanContractVersion = null;
     let plannerCompletedPersisted = false;
     const streamed = await executeRuntimeChatStream({
       query,
@@ -1345,7 +1350,11 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
             .map(([agentId, ranking]) => [agentId, ranking.routing_score])
         )
       },
-      onPlannerCompleted: async (safeStreamPlan, exactContractDigest) => {
+      onPlannerCompleted: async (
+        safeStreamPlan,
+        exactContractDigest,
+        exactPlanContractVersion
+      ) => {
         if (plannerCompletedPersisted) {
           const error = new Error("Runtime streamed planner.completed more than once.");
           error.code = "runtime_stream_invalid";
@@ -1364,6 +1373,7 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
         const earlyParallel = buildParallelBatches(earlyPlan.steps, parallelWorkers);
         streamedSafePlanDigest = runtimePlanSafeProjectionDigest(earlyPlan);
         streamedExactPlanDigest = exactContractDigest;
+        streamedExactPlanContractVersion = exactPlanContractVersion;
         await updateRun(
           store,
           bus,
@@ -1378,6 +1388,7 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
     if (result.ok === false) {
       throw new Error(result.error || "TCAR runtime returned an unsuccessful response.");
     }
+    const rawTerminalPlan = result.plan;
 
     const plan = enrichRuntimeRoutingTrace(
       assertRuntimePlan(normalizeRuntimePlan(result.plan), {
@@ -1401,7 +1412,11 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
     }
     if (
       streamedExactPlanDigest
-      && runtimePlanExactContractDigest(plan) !== streamedExactPlanDigest
+      && !runtimePlanContractDigestMatches(
+        rawTerminalPlan,
+        streamedExactPlanDigest,
+        streamedExactPlanContractVersion
+      )
     ) {
       const error = new Error("Runtime terminal plan did not match its exact execution contract digest.");
       error.code = "runtime_stream_plan_mismatch";
@@ -1925,24 +1940,54 @@ function stripRuntimePlanTaskControls(value) {
   }).join("");
 }
 
-export function runtimePlanExactContractDigest(plan) {
+export function runtimePlanExactContractDigest(
+  plan,
+  schemaVersion = RUNTIME_PLAN_CONTRACT_VERSIONS[0]
+) {
+  if (!RUNTIME_PLAN_CONTRACT_VERSIONS.includes(schemaVersion)) {
+    throw new Error("Unsupported Runtime plan contract version.");
+  }
   const rawRouting = plan?.routing || {};
   const rawOrchestrator = rawRouting?.orchestrator || {};
   const rawOutcome = rawOrchestrator?.outcome_contract || {};
   const clarificationQuestion = String(rawOrchestrator.clarification_question || "");
-  const material = {
-    schema_version: "tcar-runtime-plan-contract-v5",
-    steps: (Array.isArray(plan?.steps) ? plan.steps : []).map((step) => ({
-      id: String(step.id || ""),
-      adapter: String(step.adapter || ""),
-      depends_on: (Array.isArray(step.depends_on) ? step.depends_on : []).map(String),
-      evidence_requirement: String(step.evidence_requirement || ""),
-      expected_outputs: (Array.isArray(step.expected_outputs) ? step.expected_outputs : []).map(String),
-      fulfills: (Array.isArray(step.fulfills) ? step.fulfills : []).map(String),
-      task_sha256: crypto.createHash("sha256")
-        .update(String(step.task || ""), "utf8")
-        .digest("hex")
+  const commonOutcomeContract = {
+    contract_version: String(rawOutcome.contract_version || ""),
+    compiler_authority: String(rawOutcome.compiler_authority || ""),
+    status: String(rawOutcome.status || ""),
+    route_admission_contract_version: String(rawOutcome.route_admission_contract_version || ""),
+    deliverables: (Array.isArray(rawOutcome.deliverables) ? rawOutcome.deliverables : []).map((row) => ({
+      id: String(row?.id || ""),
+      title_sha256: crypto.createHash("sha256").update(String(row?.title || ""), "utf8").digest("hex"),
+      description_sha256: crypto.createHash("sha256").update(String(row?.description || ""), "utf8").digest("hex"),
+      required: row?.required !== false,
+      evidence_requirement: String(row?.evidence_requirement || ""),
+      required_outputs: (Array.isArray(row?.required_outputs) ? row.required_outputs : []).map(String),
+      controller_can_synthesize: row?.controller_can_synthesize === true,
+      assigned_to_session_controller: row?.assigned_to_session_controller === true
     })),
+    steps: runtimeRouteAdmissionDigestProjection(rawOutcome.steps)
+  };
+  const steps = (Array.isArray(plan?.steps) ? plan.steps : []).map((step) => ({
+    id: String(step.id || ""),
+    adapter: String(step.adapter || ""),
+    depends_on: (Array.isArray(step.depends_on) ? step.depends_on : []).map(String),
+    evidence_requirement: String(step.evidence_requirement || ""),
+    expected_outputs: (Array.isArray(step.expected_outputs) ? step.expected_outputs : []).map(String),
+    fulfills: (Array.isArray(step.fulfills) ? step.fulfills : []).map(String),
+    task_sha256: crypto.createHash("sha256")
+      .update(String(step.task || ""), "utf8")
+      .digest("hex")
+  }));
+  const material = schemaVersion === "tcar-runtime-plan-contract-v4"
+    ? {
+      schema_version: schemaVersion,
+      steps,
+      outcome_contract: commonOutcomeContract
+    }
+    : {
+    schema_version: schemaVersion,
+    steps,
     orchestrator: {
       contract_version: String(rawOrchestrator.contract_version || ""),
       decision: String(rawOrchestrator.decision || ""),
@@ -1954,21 +1999,7 @@ export function runtimePlanExactContractDigest(plan) {
       fallback: String(rawRouting.fallback || "")
     },
     outcome_contract: {
-      contract_version: String(rawOutcome.contract_version || ""),
-      compiler_authority: String(rawOutcome.compiler_authority || ""),
-      status: String(rawOutcome.status || ""),
-      route_admission_contract_version: String(rawOutcome.route_admission_contract_version || ""),
-      deliverables: (Array.isArray(rawOutcome.deliverables) ? rawOutcome.deliverables : []).map((row) => ({
-        id: String(row?.id || ""),
-        title_sha256: crypto.createHash("sha256").update(String(row?.title || ""), "utf8").digest("hex"),
-        description_sha256: crypto.createHash("sha256").update(String(row?.description || ""), "utf8").digest("hex"),
-        required: row?.required !== false,
-        evidence_requirement: String(row?.evidence_requirement || ""),
-        required_outputs: (Array.isArray(row?.required_outputs) ? row.required_outputs : []).map(String),
-        controller_can_synthesize: row?.controller_can_synthesize === true,
-        assigned_to_session_controller: row?.assigned_to_session_controller === true
-      })),
-      steps: runtimeRouteAdmissionDigestProjection(rawOutcome.steps),
+      ...commonOutcomeContract,
       coverage: (Array.isArray(rawOutcome.coverage) ? rawOutcome.coverage : [])
         .filter((row) => row && typeof row === "object" && !Array.isArray(row))
         .map((row) => ({
@@ -1982,6 +2013,15 @@ export function runtimePlanExactContractDigest(plan) {
   };
   const canonical = JSON.stringify(canonicalRuntimeContractValue(material));
   return `sha256:${crypto.createHash("sha256").update(canonical, "utf8").digest("hex")}`;
+}
+
+function runtimePlanContractDigestMatches(plan, digest, selectedVersion = null) {
+  const versions = selectedVersion
+    ? [selectedVersion]
+    : RUNTIME_PLAN_CONTRACT_VERSIONS;
+  return versions.some((version) => (
+    runtimePlanExactContractDigest(plan, version) === digest
+  ));
 }
 
 function runtimeRouteAdmissionDigestProjection(value) {

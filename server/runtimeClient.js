@@ -11,10 +11,15 @@ const DEFAULT_CONNECT_TIMEOUT_MS = 10000;
 const DEFAULT_BODY_IDLE_TIMEOUT_MS = 60000;
 const LEGACY_STREAM_BODY_IDLE_TIMEOUT_MS = 300000;
 const DEFAULT_TERMINAL_RECOVERY_MS = 90000;
+const TERMINAL_RECOVERY_CLAIM_GRACE_MS = 3000;
 const MAX_TERMINAL_RECOVERY_MS = 300000;
 const DEFAULT_MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
 const RUNTIME_STREAM_CONTENT_TYPE = "application/x-ndjson";
 const RUNTIME_STREAM_PROTOCOL = "heartbeat-v1";
+const RUNTIME_PLAN_CONTRACT_VERSIONS = [
+  "tcar-runtime-plan-contract-v5",
+  "tcar-runtime-plan-contract-v4"
+];
 // Runtime can heartbeat every five seconds for the full 30-minute hard request
 // limit (360 records). Keep a finite margin for scheduling jitter/config
 // changes while retaining a strict parser bound.
@@ -551,7 +556,8 @@ async function runtimeStreamRequest(path, {
     Accept: RUNTIME_STREAM_CONTENT_TYPE,
     "Content-Type": "application/json",
     "Content-Length": String(encodedBody.length),
-    "X-TCAR-Stream-Protocol": RUNTIME_STREAM_PROTOCOL
+    "X-TCAR-Stream-Protocol": RUNTIME_STREAM_PROTOCOL,
+    "X-TCAR-Plan-Contract-Versions": RUNTIME_PLAN_CONTRACT_VERSIONS.join(",")
   };
   const configuredRuntimeApiKey = runtimeApiKey();
   if (configuredRuntimeApiKey) headers["X-TCAR-API-Key"] = configuredRuntimeApiKey;
@@ -735,6 +741,7 @@ async function consumeRuntimeStreamResponse({
 }) {
   const contentType = responseContentType(headers);
   const heartbeatsNegotiated = validateRuntimeStreamProtocol(headers);
+  const selectedPlanContractVersion = validateRuntimePlanContractVersion(headers);
   if (status < 200 || status >= 300) {
     const responseBody = await readBoundedStreamBody(body, maxResponseBytes);
     const payload = parseJsonObject(responseBody.toString("utf8")) || {};
@@ -763,7 +770,8 @@ async function consumeRuntimeStreamResponse({
     expectedRunId,
     maxResponseBytes,
     onPlannerCompleted,
-    heartbeatsNegotiated
+    heartbeatsNegotiated,
+    selectedPlanContractVersion
   });
   if (body) {
     for await (const chunk of body) {
@@ -777,7 +785,8 @@ function createRuntimeNdjsonParser({
   expectedRunId,
   maxResponseBytes,
   onPlannerCompleted,
-  heartbeatsNegotiated
+  heartbeatsNegotiated,
+  selectedPlanContractVersion
 }) {
   const decoder = new TextDecoder("utf-8", { fatal: true });
   let buffered = "";
@@ -834,14 +843,42 @@ function createRuntimeNdjsonParser({
       if (lineBytes > MAX_RUNTIME_STREAM_PLAN_EVENT_BYTES) {
         throw invalidRuntimeStream("the planner event exceeded its size limit");
       }
-      assertExactObjectKeys(event.data, ["contract_digest", "plan"], "planner event data");
+      const plannerKeys = Object.keys(event.data).sort();
+      const legacyPlannerKeys = ["contract_digest", "plan"];
+      const versionedPlannerKeys = ["contract_digest", "contract_version", "plan"];
+      const plannerShapeMatches = (expected) => (
+        plannerKeys.length === expected.length
+        && plannerKeys.every((key, index) => key === expected[index])
+      );
+      if (!plannerShapeMatches(legacyPlannerKeys) && !plannerShapeMatches(versionedPlannerKeys)) {
+        throw invalidRuntimeStream("planner event data contained unsupported fields");
+      }
       const contractDigest = String(event.data.contract_digest || "");
       if (!/^sha256:[a-f0-9]{64}$/.test(contractDigest)) {
         throw invalidRuntimeStream("the planner contract digest was malformed");
       }
+      const eventPlanContractVersion = event.data.contract_version === undefined
+        ? null
+        : String(event.data.contract_version || "");
+      if (
+        eventPlanContractVersion
+        && !RUNTIME_PLAN_CONTRACT_VERSIONS.includes(eventPlanContractVersion)
+      ) {
+        throw invalidRuntimeStream("the planner selected an unsupported plan contract");
+      }
+      if (
+        selectedPlanContractVersion
+        && eventPlanContractVersion !== selectedPlanContractVersion
+      ) {
+        throw invalidRuntimeStream("the planner contract did not match the negotiated response");
+      }
       streamedPlan = validateStreamPlan(event.data.plan);
       if (typeof onPlannerCompleted === "function") {
-        await onPlannerCompleted(streamedPlan, contractDigest);
+        await onPlannerCompleted(
+          streamedPlan,
+          contractDigest,
+          eventPlanContractVersion || selectedPlanContractVersion || null
+        );
       }
       return;
     }
@@ -887,9 +924,27 @@ function createRuntimeNdjsonParser({
       try {
         buffered += decoder.decode();
       } catch {
+        if (!terminal && (streamedPlan || heartbeatCount > 0)) {
+          throw incompleteRuntimeStream();
+        }
         throw invalidRuntimeStream("the response ended with invalid UTF-8");
       }
-      if (buffered) await consumeLine(buffered);
+      if (buffered) {
+        const trailingLine = buffered.endsWith("\r") ? buffered.slice(0, -1) : buffered;
+        // A non-newline-terminated fragment that is not even a JSON object is
+        // the characteristic shape of a transport cutoff in the middle of the
+        // terminal record. Recover only after a fully validated prefix; a
+        // complete malformed record or any post-terminal data still fails the
+        // strict protocol checks below.
+        if (
+          !terminal
+          && (streamedPlan || heartbeatCount > 0)
+          && !parseJsonObject(trailingLine)
+        ) {
+          throw incompleteRuntimeStream();
+        }
+        await consumeLine(buffered);
+      }
       // A well-formed prefix with no terminal record is a delivery failure,
       // not a protocol violation. This permits an authenticated, idempotent
       // terminal lookup without accepting any partial answer.
@@ -902,7 +957,12 @@ function createRuntimeNdjsonParser({
         error.component = terminal.error.component;
         throw error;
       }
-      return { result: terminal.result, streamedPlan, legacy: false };
+      return {
+        result: terminal.result,
+        streamedPlan,
+        planContractVersion: selectedPlanContractVersion || null,
+        legacy: false
+      };
     }
   };
 }
@@ -1000,6 +1060,18 @@ function validateRuntimeStreamProtocol(headers) {
     throw invalidRuntimeStream("the response selected an unsupported stream protocol");
   }
   return true;
+}
+
+function validateRuntimePlanContractVersion(headers) {
+  const value = headers?.["x-tcar-plan-contract-version"]
+    ?? headers?.["X-TCAR-Plan-Contract-Version"]
+    ?? "";
+  const version = String(Array.isArray(value) ? value[0] : value).trim();
+  if (!version) return null;
+  if (!RUNTIME_PLAN_CONTRACT_VERSIONS.includes(version)) {
+    throw invalidRuntimeStream("the response selected an unsupported plan contract");
+  }
+  return version;
 }
 
 function projectedRuntimeError(payload, status) {
@@ -1374,6 +1446,7 @@ async function recoverRuntimeChatResult(body, { originalError, requestTimeoutMs 
   );
   const budgetMs = Math.min(configuredBudgetMs, Math.max(1, Number(requestTimeoutMs) || DEFAULT_TIMEOUT_MS));
   const deadline = Date.now() + budgetMs;
+  const claimGraceDeadline = Math.min(deadline, Date.now() + TERMINAL_RECOVERY_CLAIM_GRACE_MS);
   let delayMs = 250;
 
   while (Date.now() < deadline) {
@@ -1386,6 +1459,15 @@ async function recoverRuntimeChatResult(body, { originalError, requestTimeoutMs 
         timeoutMs: Math.min(5000, remainingMs)
       });
     } catch (recoveryError) {
+      if (
+        String(recoveryError?.code || "") === "execution_recovery_not_found"
+        && Date.now() < claimGraceDeadline
+      ) {
+        const waitMs = Math.min(delayMs, Math.max(0, claimGraceDeadline - Date.now()));
+        if (waitMs > 0) await new Promise((resolve) => setTimeout(resolve, waitMs));
+        delayMs = Math.min(delayMs * 2, 2000);
+        continue;
+      }
       // Recovery is additive and must never turn a transport interruption into
       // a second inference call. If it is unavailable, preserve the original
       // failure and its diagnostic identity.

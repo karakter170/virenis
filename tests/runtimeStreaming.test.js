@@ -18,6 +18,8 @@ const TOKEN = "runtime_stream_owner_token_0123456789";
 const ADMIN_TOKEN = "runtime_stream_admin_token_0123456789";
 const AUTH = `Bearer ${TOKEN}`;
 const RUN_ID = "run_stream_parser_1";
+const PLAN_CONTRACT_V5 = "tcar-runtime-plan-contract-v5";
+const PLAN_CONTRACT_V4 = "tcar-runtime-plan-contract-v4";
 const BLOCKED_CLARIFICATION_V5_DIGEST =
   "sha256:7f27214b6ea68cfc343ccd9b72a96e9aeae3f8f7b56a827455e1870e6bf7d8a5";
 const ENV_KEYS = [
@@ -317,6 +319,59 @@ describe.sequential("Runtime early-plan stream", () => {
     }
   });
 
+  it.each([PLAN_CONTRACT_V5, PLAN_CONTRACT_V4])(
+    "negotiates and preserves the explicitly selected %s plan contract",
+    async (contractVersion) => {
+      const otherVersion = contractVersion === PLAN_CONTRACT_V5
+        ? PLAN_CONTRACT_V4
+        : PLAN_CONTRACT_V5;
+      const selectedDigest = runtimePlanExactContractDigest(safePlan, contractVersion);
+      expect(selectedDigest).not.toBe(runtimePlanExactContractDigest(safePlan, otherVersion));
+
+      let advertisedVersions = "";
+      let plannerCallback = null;
+      restoreFetch = setRuntimeFetchForTests(async (_url, options = {}) => {
+        advertisedVersions = options.headers["X-TCAR-Plan-Contract-Versions"];
+        return new Response([
+          `${JSON.stringify(event("planner.completed", 1, {
+            plan: safePlan,
+            contract_digest: selectedDigest,
+            contract_version: contractVersion
+          }))}\n`,
+          `${JSON.stringify(event("run.completed", 2, {
+            result: { ok: true, plan: safePlan, finalAnswer: "Ready." }
+          }))}\n`
+        ].join(""), {
+          headers: {
+            "Content-Type": "application/x-ndjson",
+            "X-TCAR-Stream-Protocol": "heartbeat-v1",
+            "X-TCAR-Plan-Contract-Version": contractVersion
+          }
+        });
+      });
+
+      const streamed = await executeRuntimeChatStream({
+        query: "Prepare a note.",
+        executionContext: { run_id: RUN_ID },
+        onPlannerCompleted: async (plan, digest, version) => {
+          plannerCallback = { plan, digest, version };
+        }
+      });
+
+      expect(advertisedVersions).toBe(`${PLAN_CONTRACT_V5},${PLAN_CONTRACT_V4}`);
+      expect(plannerCallback).toEqual({
+        plan: safePlan,
+        digest: selectedDigest,
+        version: contractVersion
+      });
+      expect(streamed).toMatchObject({
+        legacy: false,
+        planContractVersion: contractVersion,
+        result: { ok: true, finalAnswer: "Ready." }
+      });
+    }
+  );
+
   it("persists a guarded blocked clarification instead of relabeling it as an invalid model response", async () => {
     const question = blockedClarificationPlan.routing.orchestrator.clarification_question;
     const runtimeUrl = await startRuntimeServer((incoming, response) => {
@@ -412,6 +467,104 @@ describe.sequential("Runtime early-plan stream", () => {
       tag: "session.clarification",
       source: "session_controller",
       content: question
+    });
+  });
+
+  it("checks the exact terminal digest against the raw plan before normalization", async () => {
+    const rawPlan = structuredClone(blockedClarificationPlan);
+    const rawDescription = `Assess feasibility. ${"x".repeat(620)}`;
+    rawPlan.routing.orchestrator.outcome_contract.deliverables[0].description = rawDescription;
+    const normalizedEquivalent = structuredClone(rawPlan);
+    normalizedEquivalent.routing.orchestrator.outcome_contract.deliverables[0].description =
+      rawDescription.slice(0, 600);
+    const rawDigest = runtimePlanExactContractDigest(rawPlan, PLAN_CONTRACT_V5);
+    expect(runtimePlanExactContractDigest(normalizedEquivalent, PLAN_CONTRACT_V5)).not.toBe(rawDigest);
+    const question = rawPlan.routing.orchestrator.clarification_question;
+
+    const runtimeUrl = await startRuntimeServer((incoming, response) => {
+      let requestText = "";
+      incoming.setEncoding("utf8");
+      incoming.on("data", (chunk) => { requestText += chunk; });
+      incoming.once("end", () => {
+        const requestBody = JSON.parse(requestText);
+        const runId = requestBody.execution_context.run_id;
+        response.writeHead(200, {
+          "Content-Type": "application/x-ndjson",
+          "X-TCAR-Stream-Protocol": "heartbeat-v1",
+          "X-TCAR-Plan-Contract-Version": PLAN_CONTRACT_V5
+        });
+        response.write(`${JSON.stringify(event("planner.completed", 1, {
+          plan: { steps: [] },
+          contract_digest: rawDigest,
+          contract_version: PLAN_CONTRACT_V5
+        }, runId))}\n`);
+        response.end(`${JSON.stringify(event("run.completed", 2, {
+          result: {
+            ok: true,
+            mode: "session_clarification",
+            baseModel: "qwen-stream-test",
+            manifestRevision: "1".repeat(64),
+            componentProvenance: {
+              revision_authority: "runtime",
+              manifest_revision: "1".repeat(64),
+              base_model_id: "qwen-stream-test",
+              base_model_content_digest: "2".repeat(64),
+              session_model_id: "qwen-stream-test",
+              session_model_content_digest: "2".repeat(64),
+              session_contract_version: "session-orchestrator-v3",
+              executor_code_digest: "3".repeat(64),
+              agents: []
+            },
+            executionProvenance: {
+              execution_id: runId,
+              receipt_id: `receipt_${runId}`,
+              record_hash: "9".repeat(64),
+              schema_version: 1,
+              created_at: "2026-07-17T11:00:00.000Z"
+            },
+            plan: rawPlan,
+            parallel: { workers: 1, batches: [], maxBatchWidth: 0, parallelizable: false },
+            expertOutputs: [],
+            finalAnswer: question,
+            fallbackFinalAnswer: question,
+            tokenAccounting: {
+              schema_version: "router-token-accounting-v1",
+              provider_reported: true,
+              complete: true,
+              call_count: 1,
+              calls: [],
+              totals: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+              missing_usage: []
+            }
+          }
+        }, runId))}\n`);
+      });
+    });
+    process.env.TCAR_RUNTIME_API_URL = runtimeUrl;
+    app = await createApp({
+      dbPath: path.join(tmpDir, "raw-terminal-plan-app.json"),
+      uploadRoot: path.join(tmpDir, "raw-terminal-plan-uploads")
+    });
+    const session = await request(app)
+      .post("/api/chat/sessions")
+      .set("Authorization", AUTH)
+      .send({ title: "Raw terminal plan" })
+      .expect(201);
+    const queued = await request(app)
+      .post(`/api/chat/sessions/${session.body.session_id}/messages`)
+      .set("Authorization", AUTH)
+      .send({ content: "Check whether the requested feasibility review can proceed." })
+      .expect(202);
+    expect((await app.locals.drainBackgroundTasks({ timeoutMs: 3000 })).ok).toBe(true);
+
+    const run = await request(app)
+      .get(`/api/chat/runs/${queued.body.run_id}`)
+      .set("Authorization", AUTH)
+      .expect(200);
+    expect(run.body).toMatchObject({
+      status: "completed",
+      error: null,
+      final_answer: question
     });
   });
 
@@ -759,6 +912,84 @@ describe.sequential("Runtime early-plan stream", () => {
     });
     expect(streamCalls).toBe(1);
     expect(recoveryCalls).toBe(2);
+    expect(plannerCallbacks).toBe(1);
+  });
+
+  it("recovers after the terminal NDJSON record is truncated mid-record", async () => {
+    const runId = "run_mid_record_recovery";
+    const recoveredResult = {
+      ok: true,
+      plan: safePlan,
+      finalAnswer: "Recovered from a truncated terminal record."
+    };
+    const requestedPaths = [];
+    let plannerCallbacks = 0;
+    restoreFetch = setRuntimeFetchForTests(async (url) => {
+      const pathname = new URL(url).pathname;
+      requestedPaths.push(pathname);
+      if (pathname === "/chat/execute/stream") {
+        const plannerRecord = `${JSON.stringify(event("planner.completed", 1, {
+          plan: safePlan,
+          contract_digest: contractDigest(safePlan)
+        }, runId))}\n`;
+        const truncatedTerminal = JSON.stringify(event("run.completed", 2, {
+          result: recoveredResult
+        }, runId)).slice(0, -24);
+        return new Response(`${plannerRecord}${truncatedTerminal}`, {
+          headers: {
+            "Content-Type": "application/x-ndjson",
+            "X-TCAR-Stream-Protocol": "heartbeat-v1"
+          }
+        });
+      }
+      expect(pathname).toBe("/chat/recover");
+      return new Response(JSON.stringify({ status: "completed", result: recoveredResult }), {
+        headers: { "Content-Type": "application/json" }
+      });
+    });
+
+    await expect(executeRuntimeChatStream({
+      query: "Prepare a note.",
+      executionContext: { run_id: runId },
+      onPlannerCompleted: async () => { plannerCallbacks += 1; }
+    })).resolves.toMatchObject({
+      legacy: false,
+      recovered: true,
+      result: recoveredResult
+    });
+    expect(requestedPaths).toEqual(["/chat/execute/stream", "/chat/recover"]);
+    expect(plannerCallbacks).toBe(1);
+  });
+
+  it("rejects a complete malformed terminal record without attempting recovery", async () => {
+    const runId = "run_complete_malformed_record";
+    const requestedPaths = [];
+    let plannerCallbacks = 0;
+    restoreFetch = setRuntimeFetchForTests(async (url) => {
+      const pathname = new URL(url).pathname;
+      requestedPaths.push(pathname);
+      expect(pathname).toBe("/chat/execute/stream");
+      const plannerRecord = `${JSON.stringify(event("planner.completed", 1, {
+        plan: safePlan,
+        contract_digest: contractDigest(safePlan)
+      }, runId))}\n`;
+      return new Response(`${plannerRecord}{"type":"run.completed",not-json}\n`, {
+        headers: {
+          "Content-Type": "application/x-ndjson",
+          "X-TCAR-Stream-Protocol": "heartbeat-v1"
+        }
+      });
+    });
+
+    await expect(executeRuntimeChatStream({
+      query: "Prepare a note.",
+      executionContext: { run_id: runId },
+      onPlannerCompleted: async () => { plannerCallbacks += 1; }
+    })).rejects.toMatchObject({
+      code: "runtime_stream_invalid",
+      status: 502
+    });
+    expect(requestedPaths).toEqual(["/chat/execute/stream"]);
     expect(plannerCallbacks).toBe(1);
   });
 
