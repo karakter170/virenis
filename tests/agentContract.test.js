@@ -524,6 +524,7 @@ describe("canonical Agent Studio execution contract", () => {
     }];
     const outcomeContract = {
       contract_version: "session-outcome-v1",
+      route_admission_contract_version: "session-route-admission-v1",
       compiler_authority: "runtime",
       status: "covered",
       deliverables: [{
@@ -535,6 +536,26 @@ describe("canonical Agent Studio execution contract", () => {
         required_outputs: ["report"],
         controller_can_synthesize: false,
         assigned_to_session_controller: false
+      }],
+      steps: [{
+        step_id: "s1",
+        route_admission_valid: true,
+        route_dependency_closure_valid: true,
+        route_admission: {
+          contract_version: "session-route-admission-v1",
+          valid: true,
+          route_role: "outcome_owner",
+          obligation_source: "compiled_deliverables",
+          deliverable_ids: ["d1"],
+          expected_outputs: ["report"],
+          downstream_bindings: [],
+          strict_constraints_checked: [
+            "activation_policy", "boundary", "write_policy", "tool_policy",
+            "source_policy", "escalation_policy"
+          ],
+          violations: [],
+          obligation: "Produce the report."
+        }
       }]
     };
     const plan = {
@@ -548,8 +569,11 @@ describe("canonical Agent Studio execution contract", () => {
         fulfills: ["d1"]
       }],
       routing: {
+        mode: "session",
         orchestrator: {
           contract_version: "session-orchestrator-v3",
+          decision: "delegate",
+          final_synthesis_required: true,
           outcome_contract: outcomeContract
         }
       }
@@ -564,6 +588,7 @@ describe("canonical Agent Studio execution contract", () => {
     expect(() => assertRuntimePlan({
       ...plan,
       routing: {
+        ...plan.routing,
         orchestrator: {
           ...plan.routing.orchestrator,
           outcome_contract: { ...outcomeContract, status: "blocked" }
@@ -578,6 +603,7 @@ describe("canonical Agent Studio execution contract", () => {
     expect(() => assertRuntimePlan({
       ...plan,
       routing: {
+        ...plan.routing,
         orchestrator: {
           ...plan.routing.orchestrator,
           outcome_contract: {
@@ -608,6 +634,206 @@ describe("canonical Agent Studio execution contract", () => {
       maxSteps: 1,
       agents
     })).toThrow(/omits a compiled step contract/i);
+
+    expect(() => assertRuntimePlan({
+      ...plan,
+      routing: {
+        ...plan.routing,
+        orchestrator: {
+          ...plan.routing.orchestrator,
+          outcome_contract: {
+            ...outcomeContract,
+            route_admission_contract_version: ""
+          }
+        }
+      }
+    }, {
+      allowedAdapters: ["writer"],
+      maxSteps: 1,
+      agents
+    })).toThrow(/missing its route admission contract/i);
+  });
+
+  it("accepts only the safe zero-route states for direct answers and clarifications", () => {
+    const blockedOutcome = {
+      contract_version: "session-outcome-v1",
+      route_admission_contract_version: "session-route-admission-v1",
+      compiler_authority: "runtime",
+      status: "blocked",
+      deliverables: [{
+        id: "d1",
+        title: "Feasibility review",
+        description: "Revisit the ideas from several perspectives and assess feasibility.",
+        required: true,
+        evidence_requirement: "none",
+        required_outputs: [],
+        controller_can_synthesize: true,
+        assigned_to_session_controller: false
+      }],
+      steps: [{
+        step_id: "s1",
+        route_admission_valid: false,
+        route_dependency_closure_valid: false,
+        route_admission: {
+          contract_version: "session-route-admission-v1",
+          valid: false,
+          route_role: "prerequisite",
+          obligation_source: "typed_downstream_bindings",
+          deliverable_ids: [],
+          expected_outputs: ["idea_pool"],
+          downstream_bindings: [],
+          strict_constraints_checked: [
+            "activation_policy", "boundary", "write_policy", "tool_policy",
+            "source_policy", "escalation_policy"
+          ],
+          violations: ["agent_domain_incompatible:ideas:d1"],
+          obligation: "Rejected diagnostic route; do not execute."
+        }
+      }],
+      coverage: [{
+        deliverable_id: "d1",
+        covered: true,
+        fulfilling_steps: [],
+        controller_synthesis: true
+      }],
+      violations: ["inferred_deliverable_semantically_unowned:d1"]
+    };
+    const blockedClarification = {
+      steps: [],
+      routing: {
+        mode: "session",
+        selected: [],
+        orchestrator: {
+          contract_version: "session-orchestrator-v3",
+          decision: "clarify",
+          clarification_question: "Please enable a compatible capability or adjust the deliverable.",
+          final_synthesis_required: false,
+          outcome_contract: blockedOutcome
+        }
+      }
+    };
+    const validate = (plan) => assertRuntimePlan(plan, {
+      allowedAdapters: [],
+      maxSteps: 12,
+      agents: []
+    });
+
+    expect(validate(blockedClarification).steps).toEqual([]);
+    expect(validate({
+      steps: [],
+      routing: {
+        mode: "session",
+        selected: [],
+        orchestrator: {
+          contract_version: "session-orchestrator-v3",
+          decision: "clarify",
+          clarification_question: "Which active specialist did you mean?",
+          final_synthesis_required: false,
+          outcome_contract: {
+            ...blockedOutcome,
+            status: "not_applicable",
+            route_admission_contract_version: "",
+            deliverables: [],
+            steps: [],
+            coverage: [],
+            violations: []
+          }
+        }
+      }
+    }).steps).toEqual([]);
+    expect(validate({
+      steps: [],
+      routing: {
+        mode: "session",
+        selected: [],
+        orchestrator: {
+          contract_version: "session-orchestrator-v3",
+          decision: "direct",
+          clarification_question: "",
+          final_synthesis_required: true,
+          outcome_contract: {
+            ...blockedOutcome,
+            status: "not_applicable",
+            route_admission_contract_version: "",
+            deliverables: [],
+            steps: [],
+            coverage: [],
+            violations: []
+          }
+        }
+      }
+    }).steps).toEqual([]);
+
+    expect(() => validate({
+      ...blockedClarification,
+      routing: {
+        ...blockedClarification.routing,
+        orchestrator: {
+          ...blockedClarification.routing.orchestrator,
+          decision: "direct",
+          final_synthesis_required: true
+        }
+      }
+    })).toThrow(/direct outcome contract has an invalid execution state/i);
+    expect(() => validate({
+      ...blockedClarification,
+      routing: {
+        ...blockedClarification.routing,
+        orchestrator: {
+          ...blockedClarification.routing.orchestrator,
+          clarification_question: ""
+        }
+      }
+    })).toThrow(/clarification decision contains no question/i);
+    expect(() => validate({
+      ...blockedClarification,
+      routing: {
+        ...blockedClarification.routing,
+        orchestrator: {
+          ...blockedClarification.routing.orchestrator,
+          outcome_contract: { ...blockedOutcome, violations: [] }
+        }
+      }
+    })).toThrow(/lacks compiler diagnostics/i);
+    expect(() => validate({
+      ...blockedClarification,
+      routing: {
+        ...blockedClarification.routing,
+        selected: [{ adapter: "writer", source: "session_controller" }]
+      }
+    })).toThrow(/unauthorized agent/i);
+
+    expect(() => validate({
+      ...blockedClarification,
+      routing: {
+        ...blockedClarification.routing,
+        orchestrator: {
+          ...blockedClarification.routing.orchestrator,
+          contract_version: "session-orchestrator-v99"
+        }
+      }
+    })).toThrow(/unsupported orchestrator contract/i);
+
+    const { outcome_contract: _ignoredOutcome, ...orchestratorWithoutOutcome } = blockedClarification.routing.orchestrator;
+    expect(() => validate({
+      ...blockedClarification,
+      routing: {
+        ...blockedClarification.routing,
+        orchestrator: orchestratorWithoutOutcome
+      }
+    })).toThrow(/missing its outcome contract/i);
+
+    const normalizedUnknownStatus = {
+      ...blockedClarification,
+      routing: normalizeRuntimeRouting({
+        ...blockedClarification.routing,
+        orchestrator: {
+          ...blockedClarification.routing.orchestrator,
+          outcome_contract: { ...blockedOutcome, status: "future_status" }
+        }
+      })
+    };
+    expect(() => validate(normalizedUnknownStatus)).toThrow(/clarification outcome contract has an invalid execution state/i);
   });
 
   it("treats compiler-marked route admission as an exact execution gate", () => {
@@ -657,8 +883,11 @@ describe("canonical Agent Studio execution contract", () => {
     const plan = {
       steps,
       routing: {
+        mode: "session",
         orchestrator: {
           contract_version: "session-orchestrator-v3",
+          decision: "delegate",
+          final_synthesis_required: true,
           outcome_contract: {
             contract_version: "session-outcome-v1", compiler_authority: "runtime", status: "covered",
             route_admission_contract_version: "session-route-admission-v1",
@@ -708,6 +937,7 @@ describe("canonical Agent Studio execution contract", () => {
       expect(() => validate({
         ...plan,
         routing: {
+          ...plan.routing,
           orchestrator: {
             ...plan.routing.orchestrator,
             outcome_contract: {

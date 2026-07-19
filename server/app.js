@@ -6553,6 +6553,11 @@ function publicRunFailureDetails(code = null) {
       retryable: true,
       action: "retry"
     },
+    runtime_contract_invalid: {
+      message: "The model runtime returned an incompatible execution contract. Contact support with the run id.",
+      retryable: false,
+      action: "contact_support"
+    },
     model_configuration_error: {
       message: "The selected model connection needs administrator attention. Try another model or contact support with the run id.",
       retryable: false,

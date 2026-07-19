@@ -1499,6 +1499,21 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
       (output.policy_violations || []).map((violation) => ({ step_id: output.id, adapter: output.adapter, violation }))
     );
     const finalAnswer = sanitizeRuntimeFinalAnswer(result);
+    if (!finalAnswer) {
+      const error = new Error("model_invalid_response: runtime returned an empty public answer");
+      error.code = "model_invalid_response";
+      throw error;
+    }
+    const orchestratorDecision = String(plan?.routing?.orchestrator?.decision || "");
+    if (orchestratorDecision === "clarify") {
+      const clarificationQuestion = String(plan.routing.orchestrator.clarification_question || "").trim();
+      if (result.mode !== "session_clarification" || finalAnswer !== clarificationQuestion) {
+        const error = new Error("runtime_contract_invalid: clarification result changed its compiled question");
+        error.code = "runtime_contract_invalid";
+        error.retryable = false;
+        throw error;
+      }
+    }
     const assistantMessageId = makeId("msg");
     const completedAt = nowIso();
     const elapsedSec = Number(((Date.now() - started) / 1000).toFixed(3));
@@ -1580,10 +1595,15 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
       if (session) {
         session.updated_at = completedAt;
         session.last_message_at = completedAt;
+        const clarificationTurn = orchestratorDecision === "clarify";
         session.shared_memory = nextSharedMemory(session.shared_memory, [
           { tag: "user_request", source: "user", content: query },
           ...routeOutputSharedMemoryEntries(outputs),
-          { tag: "base.synthesis", source: result.baseModel || BASE_MODEL, content: finalAnswer }
+          {
+            tag: clarificationTurn ? "session.clarification" : "base.synthesis",
+            source: clarificationTurn ? "session_controller" : result.baseModel || BASE_MODEL,
+            content: finalAnswer
+          }
         ]);
       }
       run.events.push({ type: "final.completed", message_id: assistantMessageId, elapsed_sec: elapsedSec, at: completedAt });
@@ -1721,6 +1741,14 @@ function classifyRunFailure(error, fallbackCode = "run_failed") {
       action: "retry"
     };
   }
+  if (matches("runtime_contract_invalid")) {
+    return {
+      code: "runtime_contract_invalid",
+      message: "The model runtime returned an incompatible execution contract. Contact support with the run id.",
+      retryable: false,
+      action: "contact_support"
+    };
+  }
   if (
     [502, 503].includes(status)
     || matches(
@@ -1777,8 +1805,9 @@ function assertRuntimeRouteCoverage(plan, value) {
   const expected = new Map(steps.map((step) => [String(step.id || ""), step]));
   const seen = new Set();
   const fail = (detail) => {
-    const error = new Error(`model_invalid_response: ${detail}`);
-    error.code = "model_invalid_response";
+    const error = new Error(`runtime_contract_invalid: ${detail}`);
+    error.code = "runtime_contract_invalid";
+    error.retryable = false;
     throw error;
   };
   if (outputs.length !== steps.length) {
@@ -1841,10 +1870,13 @@ function stripRuntimePlanTaskControls(value) {
   }).join("");
 }
 
-function runtimePlanExactContractDigest(plan) {
-  const rawOutcome = plan?.routing?.orchestrator?.outcome_contract || {};
+export function runtimePlanExactContractDigest(plan) {
+  const rawRouting = plan?.routing || {};
+  const rawOrchestrator = rawRouting?.orchestrator || {};
+  const rawOutcome = rawOrchestrator?.outcome_contract || {};
+  const clarificationQuestion = String(rawOrchestrator.clarification_question || "");
   const material = {
-    schema_version: "tcar-runtime-plan-contract-v4",
+    schema_version: "tcar-runtime-plan-contract-v5",
     steps: (Array.isArray(plan?.steps) ? plan.steps : []).map((step) => ({
       id: String(step.id || ""),
       adapter: String(step.adapter || ""),
@@ -1856,6 +1888,16 @@ function runtimePlanExactContractDigest(plan) {
         .update(String(step.task || ""), "utf8")
         .digest("hex")
     })),
+    orchestrator: {
+      contract_version: String(rawOrchestrator.contract_version || ""),
+      decision: String(rawOrchestrator.decision || ""),
+      clarification_question_sha256: crypto.createHash("sha256")
+        .update(clarificationQuestion, "utf8")
+        .digest("hex"),
+      final_synthesis_required: rawOrchestrator.final_synthesis_required === true,
+      fallback_used: String(rawOrchestrator.fallback_used || ""),
+      fallback: String(rawRouting.fallback || "")
+    },
     outcome_contract: {
       contract_version: String(rawOutcome.contract_version || ""),
       compiler_authority: String(rawOutcome.compiler_authority || ""),
@@ -1871,7 +1913,16 @@ function runtimePlanExactContractDigest(plan) {
         controller_can_synthesize: row?.controller_can_synthesize === true,
         assigned_to_session_controller: row?.assigned_to_session_controller === true
       })),
-      steps: runtimeRouteAdmissionDigestProjection(rawOutcome.steps)
+      steps: runtimeRouteAdmissionDigestProjection(rawOutcome.steps),
+      coverage: (Array.isArray(rawOutcome.coverage) ? rawOutcome.coverage : [])
+        .filter((row) => row && typeof row === "object" && !Array.isArray(row))
+        .map((row) => ({
+          deliverable_id: String(row.deliverable_id || ""),
+          covered: row.covered === true,
+          fulfilling_steps: (Array.isArray(row.fulfilling_steps) ? row.fulfilling_steps : []).map(String),
+          controller_synthesis: row.controller_synthesis === true
+        })),
+      violations: (Array.isArray(rawOutcome.violations) ? rawOutcome.violations : []).map(String)
     }
   };
   const canonical = JSON.stringify(canonicalRuntimeContractValue(material));
@@ -1929,8 +1980,9 @@ export function assertRuntimePlan(plan, {
   agents = []
 } = {}) {
   const fail = (detail) => {
-    const error = new Error(`model_invalid_response: ${detail}`);
-    error.code = "model_invalid_response";
+    const error = new Error(`runtime_contract_invalid: ${detail}`);
+    error.code = "runtime_contract_invalid";
+    error.retryable = false;
     throw error;
   };
   const rawSteps = Array.isArray(plan?.steps) ? plan.steps : [];
@@ -2012,15 +2064,75 @@ export function assertRuntimePlan(plan, {
   if (routedAdapters.some((adapter) => !allowed.has(adapter))) {
     fail("runtime routing trace contains an unauthorized agent");
   }
-  const outcomeContract = plan?.routing?.orchestrator?.outcome_contract;
+  const orchestrator = plan?.routing?.orchestrator || null;
+  const outcomeContract = orchestrator?.outcome_contract;
+  const strictStepContracts = orchestrator?.contract_version === "session-orchestrator-v3";
+  if (orchestrator) {
+    const supportedVersions = new Set([
+      "session-orchestrator-v1",
+      "session-orchestrator-v2",
+      "session-orchestrator-v3"
+    ]);
+    const decision = String(orchestrator.decision || "");
+    if (!supportedVersions.has(String(orchestrator.contract_version || ""))) {
+      fail("runtime plan has an unsupported orchestrator contract");
+    }
+    if (String(plan?.routing?.mode || "") !== "session") {
+      fail("runtime orchestrator is attached to a non-session plan");
+    }
+    if (!["direct", "delegate", "clarify"].includes(decision)) {
+      fail("runtime plan has an invalid orchestrator decision");
+    }
+    if ((normalizedSteps.length > 0) !== (decision === "delegate")) {
+      fail("runtime orchestrator decision does not match its executable routes");
+    }
+    if (decision === "clarify" && !String(orchestrator.clarification_question || "").trim()) {
+      fail("runtime clarification decision contains no question");
+    }
+    if (
+      strictStepContracts
+      && orchestrator.final_synthesis_required !== (decision !== "clarify")
+    ) {
+      fail("runtime orchestrator has an invalid synthesis state");
+    }
+    if (strictStepContracts && !outcomeContract) {
+      fail("runtime v3 plan is missing its outcome contract");
+    }
+  }
   if (outcomeContract) {
+    const decision = String(orchestrator.decision || "");
+    const clarificationQuestion = String(orchestrator.clarification_question || "").trim();
+    const blockedClarification = strictStepContracts
+      && decision === "clarify"
+      && normalizedSteps.length === 0
+      && outcomeContract.status === "blocked";
     if (outcomeContract.compiler_authority !== "runtime") {
       fail("runtime outcome contract lacks compiler authority");
     }
     if (outcomeContract.contract_version !== "session-outcome-v1") {
       fail("runtime outcome contract has an unsupported version");
     }
-    if (
+    if (strictStepContracts) {
+      if (decision === "delegate") {
+        if (normalizedSteps.length === 0 || outcomeContract.status !== "covered") {
+          fail("runtime delegated outcome contract is not executable");
+        }
+      } else if (decision === "direct") {
+        if (normalizedSteps.length !== 0 || outcomeContract.status !== "not_applicable") {
+          fail("runtime direct outcome contract has an invalid execution state");
+        }
+      } else if (decision === "clarify") {
+        if (
+          normalizedSteps.length !== 0
+          || !["blocked", "not_applicable"].includes(outcomeContract.status)
+          || !clarificationQuestion
+        ) {
+          fail("runtime clarification outcome contract has an invalid execution state");
+        }
+      } else {
+        fail("runtime outcome contract has an invalid orchestrator decision");
+      }
+    } else if (
       (normalizedSteps.length > 0 && outcomeContract.status !== "covered")
       || (normalizedSteps.length === 0 && !["covered", "not_applicable"].includes(outcomeContract.status))
     ) {
@@ -2045,13 +2157,29 @@ export function assertRuntimePlan(plan, {
     ) {
       fail("runtime outcome contract contains invalid or duplicate deliverables");
     }
+    if (blockedClarification) {
+      if (deliverableRows.length === 0 || !Array.isArray(outcomeContract.violations) || outcomeContract.violations.length === 0) {
+        fail("runtime blocked clarification lacks compiler diagnostics");
+      }
+      if ((plan?.routing?.selected || []).length > 0) {
+        fail("runtime blocked clarification exposes an executable selection");
+      }
+      const coverageRows = Array.isArray(outcomeContract.coverage) ? outcomeContract.coverage : [];
+      const coverageIds = coverageRows.map((item) => String(item?.deliverable_id || ""));
+      if (
+        coverageRows.length !== deliverableRows.length
+        || new Set(coverageIds).size !== coverageIds.length
+        || coverageIds.some((id) => !deliverableIds.has(id))
+      ) {
+        fail("runtime blocked clarification has inconsistent outcome coverage");
+      }
+    }
     if (deliverableRows.some((item) => (
       item.evidence_requirement === "live_external"
       && (item.controller_can_synthesize === true || item.assigned_to_session_controller === true)
     ))) {
       fail("runtime outcome contract delegates live evidence to synthesis");
     }
-    const strictStepContracts = plan?.routing?.orchestrator?.contract_version === "session-orchestrator-v3";
     if (strictStepContracts && normalizedSteps.some((step) => (
       !Object.prototype.hasOwnProperty.call(step, "expected_outputs")
       || !Object.prototype.hasOwnProperty.call(step, "fulfills")
@@ -2063,7 +2191,14 @@ export function assertRuntimePlan(plan, {
     if (routeAdmissionVersion && routeAdmissionVersion !== "session-route-admission-v1") {
       fail("runtime outcome contract has an unsupported route admission contract");
     }
-    if (strictStepContracts && routeAdmissionVersion === "session-route-admission-v1") {
+    if (
+      strictStepContracts
+      && ["covered", "blocked"].includes(outcomeContract.status)
+      && routeAdmissionVersion !== "session-route-admission-v1"
+    ) {
+      fail("runtime v3 outcome contract is missing its route admission contract");
+    }
+    if (strictStepContracts && !blockedClarification && routeAdmissionVersion === "session-route-admission-v1") {
       const proofRows = Array.isArray(outcomeContract.steps) ? outcomeContract.steps : [];
       const executableById = new Map(normalizedSteps.map((step) => [step.id, step]));
       const proofById = new Map();
@@ -2157,33 +2292,35 @@ export function assertRuntimePlan(plan, {
         }
       }
     }
-    const assigned = new Set();
-    const assignedOutputs = new Map(deliverableRows.map((item) => [item.id, new Set()]));
-    for (const step of normalizedSteps) {
-      for (const deliverableId of step.fulfills || []) {
-        if (!deliverableIds.has(deliverableId)) {
-          fail(`runtime step ${step.id} references an unknown deliverable`);
-        }
-        assigned.add(deliverableId);
-        for (const outputName of step.expected_outputs || []) {
-          assignedOutputs.get(deliverableId).add(outputName);
+    if (!blockedClarification) {
+      const assigned = new Set();
+      const assignedOutputs = new Map(deliverableRows.map((item) => [item.id, new Set()]));
+      for (const step of normalizedSteps) {
+        for (const deliverableId of step.fulfills || []) {
+          if (!deliverableIds.has(deliverableId)) {
+            fail(`runtime step ${step.id} references an unknown deliverable`);
+          }
+          assigned.add(deliverableId);
+          for (const outputName of step.expected_outputs || []) {
+            assignedOutputs.get(deliverableId).add(outputName);
+          }
         }
       }
-    }
-    for (const deliverable of deliverableRows) {
-      if (
-        deliverable.required !== false
-        && !assigned.has(deliverable.id)
-        && deliverable.controller_can_synthesize !== true
-        && deliverable.assigned_to_session_controller !== true
-      ) {
-        fail(`runtime outcome contract leaves required deliverable ${deliverable.id} uncovered`);
-      }
-      if (
-        deliverable.required_outputs.some((name) => !assignedOutputs.get(deliverable.id)?.has(name))
-        && deliverable.assigned_to_session_controller !== true
-      ) {
-        fail(`runtime outcome contract lacks a producer for ${deliverable.id}`);
+      for (const deliverable of deliverableRows) {
+        if (
+          deliverable.required !== false
+          && !assigned.has(deliverable.id)
+          && deliverable.controller_can_synthesize !== true
+          && deliverable.assigned_to_session_controller !== true
+        ) {
+          fail(`runtime outcome contract leaves required deliverable ${deliverable.id} uncovered`);
+        }
+        if (
+          deliverable.required_outputs.some((name) => !assignedOutputs.get(deliverable.id)?.has(name))
+          && deliverable.assigned_to_session_controller !== true
+        ) {
+          fail(`runtime outcome contract lacks a producer for ${deliverable.id}`);
+        }
       }
     }
   }
@@ -2408,7 +2545,9 @@ function normalizeRuntimeOutcomeContract(raw) {
   return {
     contract_version: boundedText(raw.contract_version, 120),
     compiler_authority: raw.compiler_authority === "runtime" ? "runtime" : "",
-    status: ["covered", "blocked", "not_applicable"].includes(raw.status) ? raw.status : "blocked",
+    // Preserve an invalid sentinel so a malformed/future status cannot be
+    // silently converted into the now-valid blocked-clarification state.
+    status: ["covered", "blocked", "not_applicable"].includes(raw.status) ? raw.status : "invalid",
     route_admission_contract_version: boundedText(raw.route_admission_contract_version, 120),
     deliverables,
     steps: normalizeRuntimeRouteAdmissionSteps(raw.steps),

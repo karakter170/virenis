@@ -8,6 +8,7 @@ import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { createApp } from "../server/app.js";
+import { runtimePlanExactContractDigest } from "../server/tcarEngine.js";
 import {
   executeRuntimeChatStream,
   setRuntimeFetchForTests
@@ -17,6 +18,8 @@ const TOKEN = "runtime_stream_owner_token_0123456789";
 const ADMIN_TOKEN = "runtime_stream_admin_token_0123456789";
 const AUTH = `Bearer ${TOKEN}`;
 const RUN_ID = "run_stream_parser_1";
+const BLOCKED_CLARIFICATION_V5_DIGEST =
+  "sha256:7f27214b6ea68cfc343ccd9b72a96e9aeae3f8f7b56a827455e1870e6bf7d8a5";
 const ENV_KEYS = [
   "APP_API_TOKENS_JSON",
   "APP_IDENTITY_PROVIDER",
@@ -37,6 +40,67 @@ const safePlan = {
     task: "Prepare the concise note.",
     depends_on: []
   }]
+};
+
+const blockedClarificationPlan = {
+  steps: [],
+  routing: {
+    mode: "session",
+    fallback: "clarification",
+    orchestrator: {
+      contract_version: "session-orchestrator-v3",
+      decision: "clarify",
+      clarification_question: "Enable a feasibility-capable agent or adjust the requested review.",
+      final_synthesis_required: false,
+      fallback_used: "outcome_contract_blocked",
+      outcome_contract: {
+        contract_version: "session-outcome-v1",
+        compiler_authority: "runtime",
+        status: "blocked",
+        route_admission_contract_version: "session-route-admission-v1",
+        deliverables: [{
+          id: "d1",
+          title: "Feasibility review",
+          description: "Assess feasibility from multiple perspectives.",
+          required: true,
+          evidence_requirement: "none",
+          required_outputs: ["feasibility_assessment"],
+          controller_can_synthesize: false,
+          assigned_to_session_controller: false
+        }],
+        steps: [{
+          step_id: "s1",
+          route_admission_valid: false,
+          route_dependency_closure_valid: false,
+          route_admission: {
+            contract_version: "session-route-admission-v1",
+            valid: false,
+            route_role: "outcome_owner",
+            obligation_source: "compiled_deliverables",
+            deliverable_ids: ["d1"],
+            expected_outputs: ["feasibility_assessment"],
+            downstream_bindings: [],
+            strict_constraints_checked: [
+              "activation_policy", "boundary", "write_policy",
+              "tool_policy", "source_policy", "escalation_policy"
+            ],
+            violations: ["unsupported_expected_output:ideas"],
+            obligation: "Assess feasibility without crossing the agent boundary."
+          }
+        }],
+        coverage: [{
+          deliverable_id: "d1",
+          covered: false,
+          fulfilling_steps: [],
+          controller_synthesis: false
+        }],
+        violations: [
+          "unsupported_expected_output:ideas",
+          "required_deliverable_uncovered:d1"
+        ]
+      }
+    }
+  }
 };
 
 let app;
@@ -68,9 +132,44 @@ function ndjsonResponse(records) {
 }
 
 function contractDigest(plan) {
-  const outcomeContract = plan?.routing?.orchestrator?.outcome_contract || {};
+  const routing = plan?.routing || {};
+  const orchestrator = routing?.orchestrator || {};
+  const outcomeContract = orchestrator?.outcome_contract || {};
+  const routeAdmissionSteps = (Array.isArray(outcomeContract.steps) ? outcomeContract.steps : [])
+    .filter((row) => row && typeof row === "object" && !Array.isArray(row))
+    .map((row) => {
+      const admission = row.route_admission && typeof row.route_admission === "object" && !Array.isArray(row.route_admission)
+        ? row.route_admission
+        : {};
+      return {
+        step_id: String(row.step_id || ""),
+        route_admission_valid: row.route_admission_valid === true,
+        route_dependency_closure_valid: row.route_dependency_closure_valid === true,
+        route_admission: {
+          contract_version: String(admission.contract_version || ""),
+          valid: admission.valid === true,
+          route_role: String(admission.route_role || ""),
+          obligation_source: String(admission.obligation_source || ""),
+          deliverable_ids: (Array.isArray(admission.deliverable_ids) ? admission.deliverable_ids : []).map(String),
+          expected_outputs: (Array.isArray(admission.expected_outputs) ? admission.expected_outputs : []).map(String),
+          downstream_bindings: (Array.isArray(admission.downstream_bindings) ? admission.downstream_bindings : [])
+            .filter((binding) => binding && typeof binding === "object" && !Array.isArray(binding))
+            .map((binding) => ({
+              consumer_step_id: String(binding.consumer_step_id || ""),
+              consumer_adapter: String(binding.consumer_adapter || ""),
+              input: String(binding.input || ""),
+              output: String(binding.output || "")
+            })),
+          strict_constraints_checked: (Array.isArray(admission.strict_constraints_checked) ? admission.strict_constraints_checked : []).map(String),
+          violations: (Array.isArray(admission.violations) ? admission.violations : []).map(String),
+          obligation_sha256: crypto.createHash("sha256")
+            .update(String(admission.obligation || ""), "utf8")
+            .digest("hex")
+        }
+      };
+    });
   const material = {
-    schema_version: "tcar-runtime-plan-contract-v4",
+    schema_version: "tcar-runtime-plan-contract-v5",
     steps: plan.steps.map((step) => ({
       id: String(step.id || ""),
       adapter: String(step.adapter || ""),
@@ -80,6 +179,16 @@ function contractDigest(plan) {
       fulfills: (step.fulfills || []).map(String),
       task_sha256: crypto.createHash("sha256").update(String(step.task || ""), "utf8").digest("hex")
     })),
+    orchestrator: {
+      contract_version: String(orchestrator.contract_version || ""),
+      decision: String(orchestrator.decision || ""),
+      clarification_question_sha256: crypto.createHash("sha256")
+        .update(String(orchestrator.clarification_question || ""), "utf8")
+        .digest("hex"),
+      final_synthesis_required: orchestrator.final_synthesis_required === true,
+      fallback_used: String(orchestrator.fallback_used || ""),
+      fallback: String(routing.fallback || "")
+    },
     outcome_contract: {
       contract_version: String(outcomeContract.contract_version || ""),
       compiler_authority: String(outcomeContract.compiler_authority || ""),
@@ -99,7 +208,16 @@ function contractDigest(plan) {
         controller_can_synthesize: deliverable?.controller_can_synthesize === true,
         assigned_to_session_controller: deliverable?.assigned_to_session_controller === true
       })),
-      steps: []
+      steps: routeAdmissionSteps,
+      coverage: (Array.isArray(outcomeContract.coverage) ? outcomeContract.coverage : [])
+        .filter((row) => row && typeof row === "object" && !Array.isArray(row))
+        .map((row) => ({
+          deliverable_id: String(row.deliverable_id || ""),
+          covered: row.covered === true,
+          fulfilling_steps: (Array.isArray(row.fulfilling_steps) ? row.fulfilling_steps : []).map(String),
+          controller_synthesis: row.controller_synthesis === true
+        })),
+      violations: (Array.isArray(outcomeContract.violations) ? outcomeContract.violations : []).map(String)
     }
   };
   const canonical = (value) => {
@@ -173,6 +291,129 @@ afterEach(async () => {
 });
 
 describe.sequential("Runtime early-plan stream", () => {
+  it("binds hidden blocked-clarification state in the v5 exact contract", () => {
+    const baseline = runtimePlanExactContractDigest(blockedClarificationPlan);
+    expect(baseline).toBe(contractDigest(blockedClarificationPlan));
+    expect(baseline).toBe(BLOCKED_CLARIFICATION_V5_DIGEST);
+
+    const mutations = [
+      (plan) => { plan.routing.orchestrator.contract_version = "session-orchestrator-v2"; },
+      (plan) => { plan.routing.orchestrator.decision = "direct"; },
+      (plan) => { plan.routing.orchestrator.clarification_question = "Enable a different specialist."; },
+      (plan) => { plan.routing.orchestrator.final_synthesis_required = true; },
+      (plan) => { plan.routing.orchestrator.fallback_used = "clarification"; },
+      (plan) => { plan.routing.fallback = "session_model"; },
+      (plan) => { plan.routing.orchestrator.outcome_contract.coverage[0].covered = true; },
+      (plan) => {
+        plan.routing.orchestrator.outcome_contract.violations = ["required_deliverable_uncovered:d1"];
+      }
+    ];
+    for (const mutate of mutations) {
+      const changed = structuredClone(blockedClarificationPlan);
+      mutate(changed);
+      expect(changed.steps).toEqual(blockedClarificationPlan.steps);
+      expect(runtimePlanExactContractDigest(changed)).not.toBe(baseline);
+    }
+  });
+
+  it("persists a guarded blocked clarification instead of relabeling it as an invalid model response", async () => {
+    const question = blockedClarificationPlan.routing.orchestrator.clarification_question;
+    const runtimeUrl = await startRuntimeServer((incoming, response) => {
+      let requestText = "";
+      incoming.setEncoding("utf8");
+      incoming.on("data", (chunk) => { requestText += chunk; });
+      incoming.once("end", () => {
+        const requestBody = JSON.parse(requestText);
+        const runId = requestBody.execution_context.run_id;
+        response.writeHead(200, {
+          "Content-Type": "application/x-ndjson",
+          "X-TCAR-Stream-Protocol": "heartbeat-v1"
+        });
+        response.write(`${JSON.stringify(event("planner.completed", 1, {
+          plan: { steps: [] },
+          contract_digest: runtimePlanExactContractDigest(blockedClarificationPlan)
+        }, runId))}\n`);
+        response.end(`${JSON.stringify(event("run.completed", 2, {
+          result: {
+            ok: true,
+            mode: "session_clarification",
+            baseModel: "qwen-stream-test",
+            manifestRevision: "1".repeat(64),
+            componentProvenance: {
+              revision_authority: "runtime",
+              manifest_revision: "1".repeat(64),
+              base_model_id: "qwen-stream-test",
+              base_model_content_digest: "2".repeat(64),
+              session_model_id: "qwen-stream-test",
+              session_model_content_digest: "2".repeat(64),
+              session_contract_version: "session-orchestrator-v3",
+              executor_code_digest: "3".repeat(64),
+              agents: []
+            },
+            executionProvenance: {
+              execution_id: runId,
+              receipt_id: `receipt_${runId}`,
+              record_hash: "9".repeat(64),
+              schema_version: 1,
+              created_at: "2026-07-17T11:00:00.000Z"
+            },
+            plan: blockedClarificationPlan,
+            parallel: { workers: 1, batches: [], maxBatchWidth: 0, parallelizable: false },
+            expertOutputs: [],
+            finalAnswer: question,
+            fallbackFinalAnswer: question,
+            tokenAccounting: {
+              schema_version: "router-token-accounting-v1",
+              provider_reported: true,
+              complete: true,
+              call_count: 1,
+              calls: [],
+              totals: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+              missing_usage: []
+            }
+          }
+        }, runId))}\n`);
+      });
+    });
+    process.env.TCAR_RUNTIME_API_URL = runtimeUrl;
+    app = await createApp({
+      dbPath: path.join(tmpDir, "blocked-clarification-app.json"),
+      uploadRoot: path.join(tmpDir, "blocked-clarification-uploads")
+    });
+    const session = await request(app)
+      .post("/api/chat/sessions")
+      .set("Authorization", AUTH)
+      .send({ title: "Feasibility follow-up" })
+      .expect(201);
+    const queued = await request(app)
+      .post(`/api/chat/sessions/${session.body.session_id}/messages`)
+      .set("Authorization", AUTH)
+      .send({ content: "Then brainstorm again and check feasibility from different perspectives." })
+      .expect(202);
+    expect((await app.locals.drainBackgroundTasks({ timeoutMs: 3000 })).ok).toBe(true);
+
+    const run = await request(app)
+      .get(`/api/chat/runs/${queued.body.run_id}`)
+      .set("Authorization", AUTH)
+      .expect(200);
+    expect(run.body).toMatchObject({
+      status: "completed",
+      final_answer: question,
+      expert_outputs: [],
+      plan: { steps: [] }
+    });
+    expect(run.body.error).toBeNull();
+    expect(run.body.events.filter((item) => item.type === "planner.completed")).toHaveLength(1);
+    const storedSession = app.locals.store.read((data) =>
+      data.sessions.find((item) => item.session_id === session.body.session_id)
+    );
+    expect(storedSession.shared_memory.at(-1)).toMatchObject({
+      tag: "session.clarification",
+      source: "session_controller",
+      content: question
+    });
+  });
+
   it("rejects unsafe or duplicate planner records without applying them twice", async () => {
     let callbackCount = 0;
     const unsafe = structuredClone(safePlan);
