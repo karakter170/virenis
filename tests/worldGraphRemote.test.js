@@ -89,10 +89,19 @@ beforeEach(async () => {
       citations: [],
       policy_violations: [],
       artifact_validation: { valid: true },
+      outcome_validation: {
+        contract_version: "session-step-outcome-v1",
+        expected_outputs: [],
+        produced_expected_outputs: [],
+        missing_expected_outputs: [],
+        fulfills: [],
+        valid: true
+      },
       consumption_validation: { valid: true },
       source_validation: { valid: true, violations: [] },
       allowed_tools: Array.isArray(runtimeAgent.tools) ? runtimeAgent.tools : [],
       tool_executions: [],
+      output_contract: "terminal_domain_answer",
       execution_mode: reused ? "reused" : "executed",
       reused_from_artifact_id: candidate?.artifact_id || null,
       reused_from_run_id: candidate?.origin_run_id || null,
@@ -279,8 +288,8 @@ describe.sequential("WorldGraph real-runtime bridge", () => {
     const repeated = (await send(session.body.session_id)).body;
     const repeatedCapsule = signedWorldGraphPayload(requests[1].world_graph);
     expect(repeatedCapsule).toMatchObject({
-      schema_version: "virenis-world-graph-v1",
-      engine_revision: "world-graph-engine-v5",
+      schema_version: "virenis-world-graph-v2",
+      engine_revision: "world-graph-engine-v7",
       scope: {
         target_run_id: repeated.run_id,
         workspace_id: "remote_workspace",

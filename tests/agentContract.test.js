@@ -4,7 +4,10 @@ import {
   assertRuntimePlan,
   buildParallelBatches,
   configuredPlanGaps,
+  normalizeRuntimeRouting,
   planRoutes,
+  routeOutputCanEnterSharedMemory,
+  routeOutputSharedMemoryEntries,
   resolveAgentContext
 } from "../server/tcarEngine.js";
 
@@ -23,6 +26,88 @@ function artifact({ name, value, producer, stepId, contentType = "application/js
     verified: true
   };
 }
+
+function validRouteMemoryOutput(patch = {}) {
+  return {
+    id: "s1",
+    adapter: "research_agent",
+    domain_answer: "A validated contribution.",
+    policy_violations: [],
+    source_validation: { valid: true },
+    consumption_validation: { valid: true },
+    artifact_validation: { valid: true },
+    outcome_validation: { valid: true },
+    model_calls: [{ finish_reason: "stop" }],
+    ...patch
+  };
+}
+
+
+describe("route output shared-memory boundary", () => {
+  it("retains only explicitly validated, complete domain answers", () => {
+    const valid = validRouteMemoryOutput();
+    const invalid = validRouteMemoryOutput({
+      adapter: "invalid_agent",
+      source_validation: { valid: false },
+      domain_answer: "This must not influence a later turn."
+    });
+
+    expect(routeOutputCanEnterSharedMemory(valid)).toBe(true);
+    expect(routeOutputSharedMemoryEntries([invalid, valid])).toEqual([{
+      tag: "research_agent.final",
+      source: "research_agent",
+      content: "A validated contribution."
+    }]);
+  });
+
+  it.each([
+    ["source validation", { source_validation: { valid: false } }],
+    ["missing source validation", { source_validation: undefined }],
+    ["consumption validation", { consumption_validation: { valid: false } }],
+    ["missing consumption validation", { consumption_validation: null }],
+    ["artifact validation", { artifact_validation: { valid: false } }],
+    ["missing artifact validation", { artifact_validation: [] }],
+    ["outcome validation", { outcome_validation: { valid: false } }],
+    ["malformed outcome validation", { outcome_validation: null }],
+    ["policy validation", { policy_violations: ["missing_expected_output:report"] }]
+  ])("rejects an output that fails %s", (_label, patch) => {
+    expect(routeOutputCanEnterSharedMemory(validRouteMemoryOutput(patch))).toBe(false);
+  });
+
+  it.each([
+    "length",
+    "max_tokens",
+    "max_output_tokens",
+    "incomplete",
+    "token_limit",
+    "content_filter",
+    "safety",
+    "recitation",
+    "blocked",
+    "prohibited_content"
+  ])("rejects a model result with terminal finish reason %s", (finishReason) => {
+    expect(routeOutputCanEnterSharedMemory(validRouteMemoryOutput({
+      model_calls: [{ finish_reason: finishReason }]
+    }))).toBe(false);
+  });
+
+  it("rejects an empty domain answer instead of falling back to raw protocol text", () => {
+    expect(routeOutputCanEnterSharedMemory(validRouteMemoryOutput({
+      domain_answer: "  ",
+      text: "DOMAIN_ANSWER: Unvalidated fallback text."
+    }))).toBe(false);
+    expect(routeOutputSharedMemoryEntries([validRouteMemoryOutput({
+      domain_answer: "",
+      text: "DOMAIN_ANSWER: Unvalidated fallback text."
+    })])).toEqual([]);
+  });
+
+  it("accepts a legacy validated output with no declared outcome contract", () => {
+    const output = validRouteMemoryOutput();
+    delete output.outcome_validation;
+    expect(routeOutputCanEnterSharedMemory(output)).toBe(true);
+  });
+});
 
 
 describe("canonical Agent Studio execution contract", () => {
@@ -427,5 +512,211 @@ describe("canonical Agent Studio execution contract", () => {
       maxResourceSupportSteps: 1,
       agents
     })).toThrow(/specialist route limit/i);
+  });
+
+  it("accepts only runtime-authoritative v3 outcome contracts with executable output coverage", () => {
+    const agents = [{
+      id: "writer",
+      title: "Writer",
+      consumes: ["user_request"],
+      produces: ["report", "appendix"],
+      resources: []
+    }];
+    const outcomeContract = {
+      contract_version: "session-outcome-v1",
+      compiler_authority: "runtime",
+      status: "covered",
+      deliverables: [{
+        id: "d1",
+        title: "Report",
+        description: "Answer the request.",
+        required: true,
+        evidence_requirement: "none",
+        required_outputs: ["report"],
+        controller_can_synthesize: false,
+        assigned_to_session_controller: false
+      }]
+    };
+    const plan = {
+      steps: [{
+        id: "s1",
+        adapter: "writer",
+        task: "Write the report.",
+        depends_on: [],
+        evidence_requirement: "none",
+        expected_outputs: ["report"],
+        fulfills: ["d1"]
+      }],
+      routing: {
+        orchestrator: {
+          contract_version: "session-orchestrator-v3",
+          outcome_contract: outcomeContract
+        }
+      }
+    };
+
+    expect(assertRuntimePlan(plan, {
+      allowedAdapters: ["writer"],
+      maxSteps: 1,
+      agents
+    }).steps[0].expected_outputs).toEqual(["report"]);
+
+    expect(() => assertRuntimePlan({
+      ...plan,
+      routing: {
+        orchestrator: {
+          ...plan.routing.orchestrator,
+          outcome_contract: { ...outcomeContract, status: "blocked" }
+        }
+      }
+    }, {
+      allowedAdapters: ["writer"],
+      maxSteps: 1,
+      agents
+    })).toThrow(/not executable/i);
+
+    expect(() => assertRuntimePlan({
+      ...plan,
+      routing: {
+        orchestrator: {
+          ...plan.routing.orchestrator,
+          outcome_contract: {
+            ...outcomeContract,
+            deliverables: [{
+              ...outcomeContract.deliverables[0],
+              required_outputs: ["appendix"]
+            }]
+          }
+        }
+      }
+    }, {
+      allowedAdapters: ["writer"],
+      maxSteps: 1,
+      agents
+    })).toThrow(/lacks a producer/i);
+
+    expect(() => assertRuntimePlan({
+      ...plan,
+      steps: [{
+        id: "s1",
+        adapter: "writer",
+        task: "Write the report.",
+        depends_on: []
+      }]
+    }, {
+      allowedAdapters: ["writer"],
+      maxSteps: 1,
+      agents
+    })).toThrow(/omits a compiled step contract/i);
+  });
+
+  it("treats compiler-marked route admission as an exact execution gate", () => {
+    const agents = [
+      { id: "researcher", produces: ["evidence"], consumes: ["user_request"], resources: [] },
+      { id: "writer", produces: ["report"], consumes: ["evidence"], resources: [] }
+    ];
+    const strictChecks = [
+      "activation_policy", "boundary", "write_policy", "tool_policy",
+      "source_policy", "escalation_policy"
+    ];
+    const steps = [
+      {
+        id: "s1", adapter: "researcher", task: "Produce evidence.", depends_on: [],
+        evidence_requirement: "none", expected_outputs: ["evidence"], fulfills: []
+      },
+      {
+        id: "s2", adapter: "writer", task: "Write the report.", depends_on: ["s1"],
+        evidence_requirement: "none", expected_outputs: ["report"], fulfills: ["d1"]
+      }
+    ];
+    const proofRows = [
+      {
+        step_id: "s1", route_admission_valid: true, route_dependency_closure_valid: true,
+        route_admission: {
+          contract_version: "session-route-admission-v1", valid: true,
+          route_role: "prerequisite", obligation_source: "typed_downstream_bindings",
+          deliverable_ids: [], expected_outputs: ["evidence"],
+          downstream_bindings: [{
+            consumer_step_id: "s2", consumer_adapter: "writer",
+            input: "evidence", output: "evidence"
+          }],
+          strict_constraints_checked: strictChecks, violations: [],
+          obligation: "Produce evidence for the writer."
+        }
+      },
+      {
+        step_id: "s2", route_admission_valid: true, route_dependency_closure_valid: true,
+        route_admission: {
+          contract_version: "session-route-admission-v1", valid: true,
+          route_role: "outcome_owner", obligation_source: "compiled_deliverables",
+          deliverable_ids: ["d1"], expected_outputs: ["report"], downstream_bindings: [],
+          strict_constraints_checked: strictChecks, violations: [], obligation: ""
+        }
+      }
+    ];
+    const plan = {
+      steps,
+      routing: {
+        orchestrator: {
+          contract_version: "session-orchestrator-v3",
+          outcome_contract: {
+            contract_version: "session-outcome-v1", compiler_authority: "runtime", status: "covered",
+            route_admission_contract_version: "session-route-admission-v1",
+            deliverables: [{
+              id: "d1", title: "Report", description: "Write the report.", required: true,
+              evidence_requirement: "none", required_outputs: ["report"],
+              controller_can_synthesize: false, assigned_to_session_controller: false
+            }],
+            steps: proofRows
+          }
+        }
+      }
+    };
+    const validate = (candidate) => assertRuntimePlan(candidate, {
+      allowedAdapters: agents.map((agent) => agent.id), maxSteps: 2, agents
+    });
+
+    expect(validate(plan).steps).toHaveLength(2);
+    const normalized = {
+      ...plan,
+      routing: normalizeRuntimeRouting(plan.routing)
+    };
+    expect(
+      normalized.routing.orchestrator.outcome_contract.steps[0].route_admission
+    ).toMatchObject({
+      contract_version: "session-route-admission-v1",
+      valid: true,
+      route_role: "prerequisite",
+      expected_outputs: ["evidence"]
+    });
+    expect(validate(normalized).steps).toHaveLength(2);
+    for (const badProofRows of [
+      proofRows.slice(1),
+      proofRows.map((row) => row.step_id === "s1"
+        ? { ...row, route_admission_valid: false }
+        : row),
+      proofRows.map((row) => row.step_id === "s1"
+        ? { ...row, route_admission: { ...row.route_admission, expected_outputs: ["other"] } }
+        : row),
+      proofRows.map((row) => row.step_id === "s1"
+        ? { ...row, route_admission: { ...row.route_admission, strict_constraints_checked: ["boundary"] } }
+        : row),
+      proofRows.map((row) => row.step_id === "s1"
+        ? { ...row, route_admission: { ...row.route_admission, route_role: "outcome_owner" } }
+        : row)
+    ]) {
+      expect(() => validate({
+        ...plan,
+        routing: {
+          orchestrator: {
+            ...plan.routing.orchestrator,
+            outcome_contract: {
+              ...plan.routing.orchestrator.outcome_contract,
+              steps: badProofRows
+            }
+          }
+        }
+      })).toThrow(/route admission/i);
+    }
   });
 });

@@ -11,7 +11,9 @@ import {
   prepareWorldGraphReplay,
   recordWorldGraphRun,
   selectWorldGraphSeedForStep,
-  worldGraphReplayCandidateIds
+  worldGraphReplayCandidateIds,
+  worldGraphRouteOutcomeContract,
+  worldGraphRouteOutputMatchesOutcomeContract
 } from "./worldGraph.js";
 
 const MAX_MESSAGE_CHARS = 12000;
@@ -812,6 +814,71 @@ function nextSharedMemory(existing, additions) {
   return normalizeSharedMemory([...(Array.isArray(existing) ? existing : []), ...additions]);
 }
 
+const NON_REUSABLE_ROUTE_FINISH_REASONS = new Set([
+  "length",
+  "max_tokens",
+  "max_output_tokens",
+  "incomplete",
+  "token_limit",
+  "content_filter",
+  "content-filter",
+  "safety",
+  "recitation",
+  "blocked",
+  "block",
+  "prohibited_content"
+]);
+
+/**
+ * Decide whether one route result is safe to carry into a later turn.
+ *
+ * Shared memory is a trust boundary: persisted route text can influence every
+ * future agent that accepts conversation context.  Keep this predicate aligned
+ * with the runtime's route-validity contract and fail closed whenever a core
+ * validation envelope is absent or malformed.  Outcome validation is optional
+ * only for legacy/simulator outputs that do not declare an outcome contract;
+ * once supplied, it must explicitly pass.
+ */
+export function routeOutputCanEnterSharedMemory(output) {
+  if (!output || typeof output !== "object" || Array.isArray(output)) return false;
+
+  const policyViolations = output.policy_violations;
+  if (Array.isArray(policyViolations) ? policyViolations.length > 0 : Boolean(policyViolations)) {
+    return false;
+  }
+
+  for (const key of ["source_validation", "consumption_validation", "artifact_validation"]) {
+    const validation = output[key];
+    if (!validation || typeof validation !== "object" || Array.isArray(validation) || validation.valid !== true) {
+      return false;
+    }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(output, "outcome_validation")) {
+    const validation = output.outcome_validation;
+    if (!validation || typeof validation !== "object" || Array.isArray(validation) || validation.valid !== true) {
+      return false;
+    }
+  }
+
+  const modelCalls = Array.isArray(output.model_calls) ? output.model_calls : [];
+  const lastModelCall = modelCalls.length > 0 ? modelCalls[modelCalls.length - 1] : null;
+  const finishReason = String(lastModelCall?.finish_reason || output.finish_reason || "").trim().toLowerCase();
+  if (NON_REUSABLE_ROUTE_FINISH_REASONS.has(finishReason)) return false;
+
+  return typeof output.domain_answer === "string" && output.domain_answer.trim().length > 0;
+}
+
+export function routeOutputSharedMemoryEntries(outputs) {
+  return (Array.isArray(outputs) ? outputs : [])
+    .filter(routeOutputCanEnterSharedMemory)
+    .map((output) => ({
+      tag: `${output.adapter}.final`,
+      source: output.adapter,
+      content: output.domain_answer
+    }));
+}
+
 export async function processChatRun({ store, bus, run_id, options = {} }) {
   if (options.run_fresh === true || Number(options.temperature || 0) !== 0) {
     return executeChatRun({ store, bus, run_id, options });
@@ -945,6 +1012,7 @@ async function processLocalChatRun({ store, bus, run_id, options = {} }) {
           data: snapshot,
           run: snapshot.run,
           session: snapshot.session,
+          plan,
           step,
           agents: scoped.agents,
           documents: scoped.documents,
@@ -966,6 +1034,7 @@ async function processLocalChatRun({ store, bus, run_id, options = {} }) {
         const result = replay.seed || {
           ...buildRouteOutput({
             step,
+            plan,
             query,
             agents: scoped.agents,
             documents: scoped.documents,
@@ -1014,6 +1083,7 @@ async function processLocalChatRun({ store, bus, run_id, options = {} }) {
             handoffs: result.handoffs,
             handoff_artifacts: result.handoff_artifacts,
             artifact_validation: result.artifact_validation,
+            outcome_validation: result.outcome_validation,
             consumed_artifacts: result.consumed_artifacts,
             consumption_validation: result.consumption_validation,
             source_validation: result.source_validation,
@@ -1099,11 +1169,7 @@ async function processLocalChatRun({ store, bus, run_id, options = {} }) {
         session.last_message_at = completedAt;
         session.shared_memory = nextSharedMemory(session.shared_memory, [
           { tag: "user_request", source: "user", content: query },
-          ...routeOutputs.map((output) => ({
-            tag: `${output.adapter}.final`,
-            source: output.adapter,
-            content: output.domain_answer
-          })),
+          ...routeOutputSharedMemoryEntries(routeOutputs),
           { tag: "base.synthesis", source: BASE_MODEL, content: finalAnswer }
         ]);
       }
@@ -1490,6 +1556,9 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
         mode: result.mode,
         plannerMode: result.plannerMode,
         sessionController: normalizeArtifactValue(result.sessionController || null),
+        planOutcomeValidation: normalizeArtifactValue(result.planOutcomeValidation || null),
+        routeFailureSummary: normalizeArtifactValue(result.routeFailureSummary || []),
+        outcomeRecovery: normalizeArtifactValue(result.refinerOutput?.outcome_recovery || null),
         vllmBaseUrl: result.vllmBaseUrl,
         baseModel: result.baseModel,
         apiElapsedSec: result.apiElapsedSec,
@@ -1513,11 +1582,7 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
         session.last_message_at = completedAt;
         session.shared_memory = nextSharedMemory(session.shared_memory, [
           { tag: "user_request", source: "user", content: query },
-          ...outputs.map((output) => ({
-            tag: `${output.adapter}.final`,
-            source: output.adapter,
-            content: output.domain_answer || output.text || ""
-          })),
+          ...routeOutputSharedMemoryEntries(outputs),
           { tag: "base.synthesis", source: result.baseModel || BASE_MODEL, content: finalAnswer }
         ]);
       }
@@ -1734,6 +1799,12 @@ function assertRuntimeRouteCoverage(plan, value) {
     if (String(output.adapter || "") !== String(step.adapter || "")) {
       fail(`runtime route output adapter does not match planned step ${stepId}`);
     }
+    if (
+      plan?.routing?.orchestrator?.contract_version === "session-orchestrator-v3"
+      && !worldGraphRouteOutputMatchesOutcomeContract(output, plan, step)
+    ) {
+      fail(`runtime route output does not prove the compiled outcome contract for step ${stepId}`);
+    }
     seen.add(stepId);
   }
   if (seen.size !== expected.size) fail("runtime omitted a planned route output");
@@ -1771,19 +1842,76 @@ function stripRuntimePlanTaskControls(value) {
 }
 
 function runtimePlanExactContractDigest(plan) {
+  const rawOutcome = plan?.routing?.orchestrator?.outcome_contract || {};
   const material = {
-    schema_version: "tcar-runtime-plan-contract-v1",
+    schema_version: "tcar-runtime-plan-contract-v4",
     steps: (Array.isArray(plan?.steps) ? plan.steps : []).map((step) => ({
       id: String(step.id || ""),
       adapter: String(step.adapter || ""),
       depends_on: (Array.isArray(step.depends_on) ? step.depends_on : []).map(String),
+      evidence_requirement: String(step.evidence_requirement || ""),
+      expected_outputs: (Array.isArray(step.expected_outputs) ? step.expected_outputs : []).map(String),
+      fulfills: (Array.isArray(step.fulfills) ? step.fulfills : []).map(String),
       task_sha256: crypto.createHash("sha256")
         .update(String(step.task || ""), "utf8")
         .digest("hex")
-    }))
+    })),
+    outcome_contract: {
+      contract_version: String(rawOutcome.contract_version || ""),
+      compiler_authority: String(rawOutcome.compiler_authority || ""),
+      status: String(rawOutcome.status || ""),
+      route_admission_contract_version: String(rawOutcome.route_admission_contract_version || ""),
+      deliverables: (Array.isArray(rawOutcome.deliverables) ? rawOutcome.deliverables : []).map((row) => ({
+        id: String(row?.id || ""),
+        title_sha256: crypto.createHash("sha256").update(String(row?.title || ""), "utf8").digest("hex"),
+        description_sha256: crypto.createHash("sha256").update(String(row?.description || ""), "utf8").digest("hex"),
+        required: row?.required !== false,
+        evidence_requirement: String(row?.evidence_requirement || ""),
+        required_outputs: (Array.isArray(row?.required_outputs) ? row.required_outputs : []).map(String),
+        controller_can_synthesize: row?.controller_can_synthesize === true,
+        assigned_to_session_controller: row?.assigned_to_session_controller === true
+      })),
+      steps: runtimeRouteAdmissionDigestProjection(rawOutcome.steps)
+    }
   };
   const canonical = JSON.stringify(canonicalRuntimeContractValue(material));
   return `sha256:${crypto.createHash("sha256").update(canonical, "utf8").digest("hex")}`;
+}
+
+function runtimeRouteAdmissionDigestProjection(value) {
+  return (Array.isArray(value) ? value : [])
+    .filter((row) => row && typeof row === "object" && !Array.isArray(row))
+    .map((row) => {
+      const admission = row.route_admission && typeof row.route_admission === "object" && !Array.isArray(row.route_admission)
+        ? row.route_admission
+        : {};
+      return {
+        step_id: String(row.step_id || ""),
+        route_admission_valid: row.route_admission_valid === true,
+        route_dependency_closure_valid: row.route_dependency_closure_valid === true,
+        route_admission: {
+          contract_version: String(admission.contract_version || ""),
+          valid: admission.valid === true,
+          route_role: String(admission.route_role || ""),
+          obligation_source: String(admission.obligation_source || ""),
+          deliverable_ids: (Array.isArray(admission.deliverable_ids) ? admission.deliverable_ids : []).map(String),
+          expected_outputs: (Array.isArray(admission.expected_outputs) ? admission.expected_outputs : []).map(String),
+          downstream_bindings: (Array.isArray(admission.downstream_bindings) ? admission.downstream_bindings : [])
+            .filter((binding) => binding && typeof binding === "object" && !Array.isArray(binding))
+            .map((binding) => ({
+              consumer_step_id: String(binding.consumer_step_id || ""),
+              consumer_adapter: String(binding.consumer_adapter || ""),
+              input: String(binding.input || ""),
+              output: String(binding.output || "")
+            })),
+          strict_constraints_checked: (Array.isArray(admission.strict_constraints_checked) ? admission.strict_constraints_checked : []).map(String),
+          violations: (Array.isArray(admission.violations) ? admission.violations : []).map(String),
+          obligation_sha256: crypto.createHash("sha256")
+            .update(String(admission.obligation || ""), "utf8")
+            .digest("hex")
+        }
+      };
+    });
 }
 
 function canonicalRuntimeContractValue(value) {
@@ -1813,6 +1941,20 @@ export function assertRuntimePlan(plan, {
     fail(`runtime plan exceeds the ${absoluteStepLimit}-step combined route limit`);
   }
   const allowed = new Set((allowedAdapters || []).map(String));
+  const agentById = new Map((agents || []).map((agent) => [String(agent?.id || ""), agent]));
+  const contractIdentifiers = (value, field, maximum = 32) => {
+    if (!Array.isArray(value) || value.length > maximum) fail(`runtime ${field} is malformed`);
+    const rows = [];
+    for (const raw of value) {
+      if (typeof raw !== "string") fail(`runtime ${field} contains a non-string identifier`);
+      const normalized = raw.trim();
+      if (!/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$/.test(normalized)) {
+        fail(`runtime ${field} contains an invalid identifier`);
+      }
+      if (!rows.includes(normalized)) rows.push(normalized);
+    }
+    return rows;
+  };
   const normalizedSteps = rawSteps.map((step) => {
     if (!step || typeof step !== "object" || Array.isArray(step)) fail("runtime plan contains a malformed step");
     const id = String(step.id || "");
@@ -1835,12 +1977,26 @@ export function assertRuntimePlan(plan, {
       evidenceRequirement
       && !["live_external", "supplied_context", "none", "unknown"].includes(evidenceRequirement)
     ) fail(`runtime plan contains an invalid evidence requirement for step ${id}`);
+    const expectedOutputs = step.expected_outputs === undefined
+      ? null
+      : contractIdentifiers(step.expected_outputs, `expected outputs for step ${id}`);
+    const fulfills = step.fulfills === undefined
+      ? null
+      : contractIdentifiers(step.fulfills, `deliverable assignments for step ${id}`, 24);
+    if (expectedOutputs) {
+      const declared = new Set((agentById.get(adapter)?.produces || []).map((value) => String(value || "").trim()));
+      if (expectedOutputs.some((name) => !declared.has(name))) {
+        fail(`runtime step ${id} expects an output not declared by ${adapter}`);
+      }
+    }
     return {
       id,
       adapter,
       task,
       depends_on: dependsOn,
-      ...(evidenceRequirement ? { evidence_requirement: evidenceRequirement } : {})
+      ...(evidenceRequirement ? { evidence_requirement: evidenceRequirement } : {}),
+      ...(expectedOutputs ? { expected_outputs: expectedOutputs } : {}),
+      ...(fulfills ? { fulfills } : {})
     };
   });
   try {
@@ -1856,7 +2012,181 @@ export function assertRuntimePlan(plan, {
   if (routedAdapters.some((adapter) => !allowed.has(adapter))) {
     fail("runtime routing trace contains an unauthorized agent");
   }
-  const agentById = new Map((agents || []).map((agent) => [String(agent?.id || ""), agent]));
+  const outcomeContract = plan?.routing?.orchestrator?.outcome_contract;
+  if (outcomeContract) {
+    if (outcomeContract.compiler_authority !== "runtime") {
+      fail("runtime outcome contract lacks compiler authority");
+    }
+    if (outcomeContract.contract_version !== "session-outcome-v1") {
+      fail("runtime outcome contract has an unsupported version");
+    }
+    if (
+      (normalizedSteps.length > 0 && outcomeContract.status !== "covered")
+      || (normalizedSteps.length === 0 && !["covered", "not_applicable"].includes(outcomeContract.status))
+    ) {
+      fail("runtime outcome contract is not executable");
+    }
+    const deliverables = Array.isArray(outcomeContract.deliverables) ? outcomeContract.deliverables : [];
+    if (normalizedSteps.length > 0 && deliverables.length === 0) {
+      fail("runtime delegated outcome contract has no deliverables");
+    }
+    const deliverableRows = deliverables.map((item) => ({
+      ...item,
+      id: String(item?.id || ""),
+      required_outputs: contractIdentifiers(
+        item?.required_outputs || [],
+        `required outputs for deliverable ${String(item?.id || "missing")}`
+      )
+    }));
+    const deliverableIds = new Set(deliverableRows.map((item) => item.id).filter(Boolean));
+    if (
+      deliverableIds.size !== deliverableRows.length
+      || [...deliverableIds].some((id) => !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,119}$/.test(id))
+    ) {
+      fail("runtime outcome contract contains invalid or duplicate deliverables");
+    }
+    if (deliverableRows.some((item) => (
+      item.evidence_requirement === "live_external"
+      && (item.controller_can_synthesize === true || item.assigned_to_session_controller === true)
+    ))) {
+      fail("runtime outcome contract delegates live evidence to synthesis");
+    }
+    const strictStepContracts = plan?.routing?.orchestrator?.contract_version === "session-orchestrator-v3";
+    if (strictStepContracts && normalizedSteps.some((step) => (
+      !Object.prototype.hasOwnProperty.call(step, "expected_outputs")
+      || !Object.prototype.hasOwnProperty.call(step, "fulfills")
+      || step.expected_outputs.length === 0
+    ))) {
+      fail("runtime v3 plan omits a compiled step contract");
+    }
+    const routeAdmissionVersion = String(outcomeContract.route_admission_contract_version || "");
+    if (routeAdmissionVersion && routeAdmissionVersion !== "session-route-admission-v1") {
+      fail("runtime outcome contract has an unsupported route admission contract");
+    }
+    if (strictStepContracts && routeAdmissionVersion === "session-route-admission-v1") {
+      const proofRows = Array.isArray(outcomeContract.steps) ? outcomeContract.steps : [];
+      const executableById = new Map(normalizedSteps.map((step) => [step.id, step]));
+      const proofById = new Map();
+      for (const proof of proofRows) {
+        const stepId = String(proof?.step_id || "");
+        if (!executableById.has(stepId) || proofById.has(stepId)) {
+          fail("runtime route admission proof has invalid step identity coverage");
+        }
+        proofById.set(stepId, proof);
+      }
+      if (proofRows.length !== normalizedSteps.length || proofById.size !== normalizedSteps.length) {
+        fail("runtime route admission proof does not cover every executable step");
+      }
+      const requiredChecks = new Set([
+        "activation_policy", "boundary", "write_policy", "tool_policy",
+        "source_policy", "escalation_policy"
+      ]);
+      for (const step of normalizedSteps) {
+        const proof = proofById.get(step.id);
+        const admission = proof?.route_admission;
+        if (
+          !admission
+          || typeof admission !== "object"
+          || Array.isArray(admission)
+          || admission.contract_version !== "session-route-admission-v1"
+          || admission.valid !== true
+          || proof.route_admission_valid !== true
+          || proof.route_dependency_closure_valid !== true
+          || (Array.isArray(admission.violations) && admission.violations.length > 0)
+        ) {
+          fail(`runtime step ${step.id} lacks a valid route admission proof`);
+        }
+        const proofOutputs = contractIdentifiers(
+          admission.expected_outputs,
+          `route admission expected outputs for step ${step.id}`
+        );
+        const proofDeliverables = contractIdentifiers(
+          admission.deliverable_ids,
+          `route admission deliverables for step ${step.id}`,
+          24
+        );
+        if (
+          JSON.stringify([...proofOutputs].sort()) !== JSON.stringify([...(step.expected_outputs || [])].sort())
+          || JSON.stringify([...proofDeliverables].sort()) !== JSON.stringify([...(step.fulfills || [])].sort())
+        ) {
+          fail(`runtime step ${step.id} route admission contract changed`);
+        }
+        const checked = new Set(contractIdentifiers(
+          admission.strict_constraints_checked,
+          `route admission constraints for step ${step.id}`,
+          24
+        ));
+        if ([...requiredChecks].some((name) => !checked.has(name))) {
+          fail(`runtime step ${step.id} route admission omits a strict constraint`);
+        }
+        const downstream = normalizedSteps.filter((candidate) => candidate.depends_on.includes(step.id));
+        const expectedRole = step.fulfills.length
+          ? (downstream.length ? "outcome_owner_and_prerequisite" : "outcome_owner")
+          : "prerequisite";
+        const expectedObligationSource = expectedRole === "outcome_owner"
+          ? "compiled_deliverables"
+          : expectedRole === "prerequisite"
+            ? "typed_downstream_bindings"
+            : "compiled_deliverables_and_typed_downstream_bindings";
+        if (
+          admission.route_role !== expectedRole
+          || admission.obligation_source !== expectedObligationSource
+        ) {
+          fail(`runtime step ${step.id} route admission role is inconsistent with the DAG`);
+        }
+        const seenBindings = new Set();
+        for (const binding of Array.isArray(admission.downstream_bindings) ? admission.downstream_bindings : []) {
+          const consumerId = String(binding?.consumer_step_id || "");
+          const consumer = executableById.get(consumerId);
+          const identity = JSON.stringify([
+            consumerId,
+            String(binding?.consumer_adapter || ""),
+            String(binding?.input || ""),
+            String(binding?.output || "")
+          ]);
+          if (
+            seenBindings.has(identity)
+            || !consumer
+            || !consumer.depends_on.includes(step.id)
+            || String(binding?.consumer_adapter || "") !== consumer.adapter
+            || !proofOutputs.includes(String(binding?.output || ""))
+          ) {
+            fail(`runtime step ${step.id} route admission contains an invalid binding`);
+          }
+          seenBindings.add(identity);
+        }
+      }
+    }
+    const assigned = new Set();
+    const assignedOutputs = new Map(deliverableRows.map((item) => [item.id, new Set()]));
+    for (const step of normalizedSteps) {
+      for (const deliverableId of step.fulfills || []) {
+        if (!deliverableIds.has(deliverableId)) {
+          fail(`runtime step ${step.id} references an unknown deliverable`);
+        }
+        assigned.add(deliverableId);
+        for (const outputName of step.expected_outputs || []) {
+          assignedOutputs.get(deliverableId).add(outputName);
+        }
+      }
+    }
+    for (const deliverable of deliverableRows) {
+      if (
+        deliverable.required !== false
+        && !assigned.has(deliverable.id)
+        && deliverable.controller_can_synthesize !== true
+        && deliverable.assigned_to_session_controller !== true
+      ) {
+        fail(`runtime outcome contract leaves required deliverable ${deliverable.id} uncovered`);
+      }
+      if (
+        deliverable.required_outputs.some((name) => !assignedOutputs.get(deliverable.id)?.has(name))
+        && deliverable.assigned_to_session_controller !== true
+      ) {
+        fail(`runtime outcome contract lacks a producer for ${deliverable.id}`);
+      }
+    }
+  }
   const selectedAgents = normalizedSteps
     .map((step) => agentById.get(step.adapter))
     .filter(Boolean);
@@ -1914,6 +2244,7 @@ export function normalizeRuntimeRouting(routing) {
     }).filter((selection) => selection.adapter)
     : [];
   const rawOrchestrator = routing.orchestrator;
+  const outcomeContract = normalizeRuntimeOutcomeContract(rawOrchestrator?.outcome_contract);
   const orchestrator = rawOrchestrator && typeof rawOrchestrator === "object" && !Array.isArray(rawOrchestrator)
     ? {
       contract_version: boundedText(rawOrchestrator.contract_version, 120),
@@ -1935,7 +2266,8 @@ export function normalizeRuntimeRouting(routing) {
       rejected_adapters: boundedStringList(rawOrchestrator.rejected_adapters, 24, 240),
       fallback_used: boundedText(rawOrchestrator.fallback_used, 120),
       planning_call_performed: rawOrchestrator.planning_call_performed === true,
-      final_synthesis_required: rawOrchestrator.final_synthesis_required === true
+      final_synthesis_required: rawOrchestrator.final_synthesis_required === true,
+      ...(outcomeContract ? { outcome_contract: outcomeContract } : {})
     }
     : null;
   return {
@@ -1962,6 +2294,135 @@ export function normalizeRuntimeRouting(routing) {
     reason: boundedText(routing.reason, 1000),
     fallback: boundedText(routing.fallback, 240),
     orchestrator
+  };
+}
+
+function normalizeRuntimeRouteAdmissionSteps(value) {
+  if (!Array.isArray(value)) return [];
+  const identifierPattern = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$/;
+  const stringList = (items, maximum, maxChars) => {
+    if (items == null) return { rows: [], valid: true };
+    if (!Array.isArray(items) || items.length > maximum || items.some((item) => typeof item !== "string")) {
+      return { rows: [], valid: false };
+    }
+    const rows = [];
+    let valid = true;
+    for (const item of items) {
+      const normalized = boundedText(item, maxChars);
+      if (!identifierPattern.test(normalized)) valid = false;
+      if (normalized && !rows.includes(normalized)) rows.push(normalized);
+    }
+    return { rows, valid };
+  };
+  return value.slice(0, 64).map((rawStep) => {
+    if (!rawStep || typeof rawStep !== "object" || Array.isArray(rawStep)) {
+      return {
+        step_id: "",
+        route_admission_valid: false,
+        route_dependency_closure_valid: false
+      };
+    }
+    const rawAdmission = rawStep.route_admission;
+    if (!rawAdmission || typeof rawAdmission !== "object" || Array.isArray(rawAdmission)) {
+      return {
+        step_id: boundedText(rawStep.step_id, 120),
+        route_admission_valid: false,
+        route_dependency_closure_valid: false
+      };
+    }
+    const deliverables = stringList(rawAdmission.deliverable_ids, 24, 120);
+    const outputs = stringList(rawAdmission.expected_outputs, 32, 120);
+    const constraints = stringList(rawAdmission.strict_constraints_checked, 24, 120);
+    const violations = stringList(rawAdmission.violations, 64, 120);
+    const rawBindings = rawAdmission.downstream_bindings == null ? [] : rawAdmission.downstream_bindings;
+    let bindingsValid = Array.isArray(rawBindings) && rawBindings.length <= 64;
+    const downstreamBindings = (Array.isArray(rawBindings) ? rawBindings : []).slice(0, 64).flatMap((binding) => {
+      if (!binding || typeof binding !== "object" || Array.isArray(binding)) {
+        bindingsValid = false;
+        return [];
+      }
+      const normalized = {
+        consumer_step_id: boundedText(binding.consumer_step_id, 120),
+        consumer_adapter: boundedText(binding.consumer_adapter, 120),
+        input: boundedText(binding.input, 120),
+        output: boundedText(binding.output, 120)
+      };
+      if (Object.values(normalized).some((item) => !identifierPattern.test(item))) bindingsValid = false;
+      return [normalized];
+    });
+    const shapeValid = deliverables.valid && outputs.valid && constraints.valid && violations.valid && bindingsValid;
+    return {
+      step_id: boundedText(rawStep.step_id, 120),
+      route_admission_valid: rawStep.route_admission_valid === true && shapeValid,
+      route_dependency_closure_valid: rawStep.route_dependency_closure_valid === true,
+      route_admission: {
+        contract_version: boundedText(rawAdmission.contract_version, 120),
+        valid: rawAdmission.valid === true && shapeValid,
+        route_role: boundedText(rawAdmission.route_role, 80),
+        obligation_source: boundedText(rawAdmission.obligation_source, 120),
+        deliverable_ids: deliverables.rows,
+        expected_outputs: outputs.rows,
+        downstream_bindings: downstreamBindings,
+        strict_constraints_checked: constraints.rows,
+        violations: violations.rows,
+        obligation: boundedText(rawAdmission.obligation, 1200)
+      }
+    };
+  });
+}
+
+function normalizeRuntimeOutcomeContract(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const evidenceModes = new Set(["live_external", "supplied_context", "none", "unknown"]);
+  const deliverables = Array.isArray(raw.deliverables)
+    ? raw.deliverables.slice(0, 24).flatMap((item) => {
+      if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+      const id = boundedText(item.id, 120);
+      if (!/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,119}$/.test(id)) return [];
+      const evidence = String(item.evidence_requirement || "unknown").trim().toLowerCase();
+      return [{
+        id,
+        title: boundedText(item.title || id, 160),
+        description: boundedText(item.description, 600),
+        required: item.required !== false,
+        evidence_requirement: evidenceModes.has(evidence) ? evidence : "unknown",
+        required_outputs: boundedStringList(item.required_outputs, 32, 160),
+        controller_can_synthesize: item.controller_can_synthesize === true,
+        assigned_to_session_controller: item.assigned_to_session_controller === true
+      }];
+    })
+    : [];
+  const coverage = Array.isArray(raw.coverage)
+    ? raw.coverage.slice(0, 24).flatMap((item) => {
+      if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+      const deliverableId = boundedText(item.deliverable_id, 120);
+      if (!deliverableId) return [];
+      return [{
+        deliverable_id: deliverableId,
+        covered: item.covered === true,
+        fulfilling_steps: boundedStringList(item.fulfilling_steps, 64, 120),
+        controller_synthesis: item.controller_synthesis === true
+      }];
+    })
+    : [];
+  return {
+    contract_version: boundedText(raw.contract_version, 120),
+    compiler_authority: raw.compiler_authority === "runtime" ? "runtime" : "",
+    status: ["covered", "blocked", "not_applicable"].includes(raw.status) ? raw.status : "blocked",
+    route_admission_contract_version: boundedText(raw.route_admission_contract_version, 120),
+    deliverables,
+    steps: normalizeRuntimeRouteAdmissionSteps(raw.steps),
+    coverage,
+    violations: boundedStringList(raw.violations, 64, 200),
+    inferred_deliverables: raw.inferred_deliverables === true,
+    inferred_fulfills: Array.isArray(raw.inferred_fulfills)
+      ? raw.inferred_fulfills.slice(0, 64).flatMap((item) => {
+        if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+        const deliverableId = boundedText(item.deliverable_id, 120);
+        const stepId = boundedText(item.step_id, 120);
+        return deliverableId && stepId ? [{ deliverable_id: deliverableId, step_id: stepId }] : [];
+      })
+      : []
   };
 }
 
@@ -2032,6 +2493,7 @@ function runtimeOutputToRunStep({ run_id, output, parallel, step = null }) {
     handoffs: reused ? "" : typeof output.handoffs === "string" ? output.handoffs : sections.handoffs,
     handoff_artifacts: normalizeHandoffArtifacts(output.handoff_artifacts || output.handoffs, output),
     artifact_validation: normalizeArtifactValue(output.artifact_validation || {}),
+    outcome_validation: normalizeArtifactValue(output.outcome_validation || {}),
     consumed_artifacts: normalizeArtifactValue(output.consumed_artifacts || []),
     consumption_validation: normalizeArtifactValue(output.consumption_validation || {}),
     source_validation: normalizeArtifactValue(output.source_validation || {}),
@@ -2196,7 +2658,9 @@ function stableCitationId(value) {
 }
 
 function boundedText(value, maxChars) {
-  return String(value || "").replaceAll("\0", "").trim().slice(0, maxChars);
+  return Array.from(String(value || "").replaceAll("\0", "").trim())
+    .slice(0, maxChars)
+    .join("");
 }
 
 function normalizeHandoffArtifacts(value, output) {
@@ -2458,7 +2922,7 @@ export function resolveAgentContext({ agent = {}, step = {}, upstream = [], shar
   };
 }
 
-function buildRouteOutput({ step, query, agents, documents, upstream = [], sharedMemory = [] }) {
+function buildRouteOutput({ step, plan, query, agents, documents, upstream = [], sharedMemory = [] }) {
   const agent = agents.find((item) => item.id === step.adapter);
   const citations = gatherCitations({ step, agent, query, documents });
   const retrievedContext = citations
@@ -2497,6 +2961,9 @@ function buildRouteOutput({ step, query, agents, documents, upstream = [], share
     sanitized.violations.push(...missingContext.map((name) => `invalid_upstream_contract:${name}`));
   }
   const sections = parseRouteSections(sanitized.text);
+  const routeOutcomeContract = worldGraphRouteOutcomeContract(plan || { steps: [step] }, step);
+  const producedNames = new Set(handoffArtifacts.map((artifact) => artifact.name));
+  const expectedOutputs = routeOutcomeContract.expected_outputs;
 
   return {
     step_id: step.id,
@@ -2515,6 +2982,14 @@ function buildRouteOutput({ step, query, agents, documents, upstream = [], share
       warnings: [],
       valid: context.validation.valid
     },
+    outcome_validation: {
+      contract_version: "session-step-outcome-v1",
+      expected_outputs: expectedOutputs,
+      produced_expected_outputs: expectedOutputs.filter((name) => producedNames.has(name)),
+      missing_expected_outputs: expectedOutputs.filter((name) => !producedNames.has(name)),
+      fulfills: routeOutcomeContract.fulfills,
+      valid: context.validation.valid && expectedOutputs.every((name) => producedNames.has(name))
+    },
     consumed_artifacts: context.consumed_artifacts,
     consumption_validation: context.validation,
     used_memory: context.used_memory.map(({ tag, source }) => ({ tag, source })),
@@ -2530,6 +3005,7 @@ function buildRouteOutput({ step, query, agents, documents, upstream = [], share
       violations: [],
       approved_source_count: citations.length
     },
+    output_contract: routeOutcomeContract.execution_output_contract,
     raw_text: sanitized.text
   };
 }

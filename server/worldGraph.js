@@ -4,8 +4,9 @@ import { agentRevision, normalizeSha256Digest } from "./outcomes.js";
 import { runtimeApiKey } from "./runtimeClient.js";
 import { makeId, nowIso } from "./store.js";
 
-export const WORLD_GRAPH_SCHEMA_VERSION = "virenis-world-graph-v1";
-export const WORLD_GRAPH_ENGINE_REVISION = "world-graph-engine-v5";
+export const WORLD_GRAPH_SCHEMA_VERSION = "virenis-world-graph-v2";
+export const WORLD_GRAPH_ENGINE_REVISION = "world-graph-engine-v7";
+export const WORLD_GRAPH_ROUTE_OUTCOME_CONTRACT_VERSION = "world-graph-route-outcome-v2";
 
 const WORLD_GRAPH_DIGEST_DOMAIN = "worldgraph-digest-v2\n";
 const WORLD_GRAPH_CAPSULE_ENCODING = "json-utf8-exact-v1";
@@ -120,7 +121,167 @@ function normalizedTask(value) {
 }
 
 function boundedText(value, maximum = 4000) {
-  return String(value || "").replaceAll("\0", "").trim().slice(0, maximum);
+  return Array.from(String(value || "").replaceAll("\0", "").trim())
+    .slice(0, maximum)
+    .join("");
+}
+
+function routeContractText(value, maximum) {
+  // JavaScript's White_Space property omits U+001C..U+001F, while Python's
+  // `\s` includes them. Include both sets so the split deployment hashes the
+  // same admitted contract text.
+  const normalized = String(value || "")
+    .replaceAll("\0", "")
+    .replace(/[\p{White_Space}\u001c-\u001f]+/gu, " ")
+    .trim();
+  return Array.from(normalized).slice(0, maximum).join("");
+}
+
+function routeContractIds(value) {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value
+    .filter((item) => typeof item === "string")
+    .map((item) => routeContractText(item, 160))
+    .filter(Boolean))]
+    .sort(utf8KeyCompare);
+}
+
+function routeAdmissionContract(outcome, stepId) {
+  const declaredContractVersion = routeContractText(
+    outcome?.route_admission_contract_version,
+    120
+  );
+  const diagnostics = Array.isArray(outcome?.steps)
+    ? outcome.steps.filter((row) => row && typeof row === "object" && !Array.isArray(row))
+    : [];
+  const diagnostic = diagnostics.find((row) => routeContractText(row.step_id, 120) === stepId);
+  const admission = diagnostic?.route_admission;
+  // Old runtime-covered plans may execute during the compatibility window,
+  // but without a compiler-declared route proof they are not safe replay
+  // identities. WorldGraph therefore fails closed independently of the
+  // executor's backward-compatibility policy.
+  const required = Boolean(
+    declaredContractVersion
+    || diagnostics.length > 0
+    || (
+      routeContractText(outcome?.compiler_authority, 40) === "runtime"
+      && routeContractText(outcome?.status, 40) === "covered"
+    )
+  );
+  if (!admission || typeof admission !== "object" || Array.isArray(admission)) {
+    return {
+      required,
+      present: false,
+      declared_contract_version: declaredContractVersion
+    };
+  }
+  const downstreamBindings = (Array.isArray(admission.downstream_bindings) ? admission.downstream_bindings : [])
+    .filter((row) => row && typeof row === "object" && !Array.isArray(row))
+    .map((row) => ({
+      consumer_step_id: routeContractText(row.consumer_step_id, 120),
+      consumer_adapter: routeContractText(row.consumer_adapter, 300),
+      input: routeContractText(row.input, 160),
+      output: routeContractText(row.output, 120)
+    }))
+    .sort((left, right) => utf8KeyCompare(worldGraphCanonicalJson(left), worldGraphCanonicalJson(right)));
+  return {
+    required,
+    present: true,
+    declared_contract_version: declaredContractVersion,
+    contract_version: routeContractText(admission.contract_version, 120),
+    valid: admission.valid === true && diagnostic?.route_admission_valid === true,
+    dependency_closure_valid: diagnostic?.route_dependency_closure_valid === true,
+    route_role: routeContractText(admission.route_role, 80),
+    obligation_source: routeContractText(admission.obligation_source, 120),
+    deliverable_ids: routeContractIds(admission.deliverable_ids),
+    expected_outputs: routeContractIds(admission.expected_outputs),
+    downstream_bindings: downstreamBindings,
+    strict_constraints_checked: routeContractIds(admission.strict_constraints_checked),
+    violations: routeContractIds(admission.violations),
+    obligation: routeContractText(admission.obligation, 1200)
+  };
+}
+
+function routeAdmissionAllowsReplay(routeContract) {
+  const admission = routeContract?.route_admission;
+  if (!admission?.required) return true;
+  return Boolean(
+    routeContract?.route_admission_contract_version === "session-route-admission-v1"
+    && admission.present
+    && admission.declared_contract_version === "session-route-admission-v1"
+    && admission.contract_version === "session-route-admission-v1"
+    && admission.valid
+    && admission.dependency_closure_valid
+    && admission.violations.length === 0
+  );
+}
+
+export function worldGraphRouteOutcomeContract(plan, step) {
+  const steps = Array.isArray(plan?.steps) ? plan.steps.filter((item) => item && typeof item === "object") : [step];
+  const stepId = routeContractText(step?.id, 120);
+  const terminal = !steps.some((candidate) => (
+    String(candidate?.id || "") !== stepId
+    && routeContractIds(candidate?.depends_on).includes(stepId)
+  ));
+  const outcome = plan?.routing?.orchestrator?.outcome_contract;
+  const safeOutcome = outcome && typeof outcome === "object" && !Array.isArray(outcome) ? outcome : {};
+  const fulfills = routeContractIds(step?.fulfills);
+  const assigned = new Set(fulfills);
+  const deliverables = (Array.isArray(safeOutcome.deliverables) ? safeOutcome.deliverables : [])
+    .filter((row) => row && typeof row === "object" && assigned.has(routeContractText(row.id, 120)))
+    .map((row) => {
+      const id = routeContractText(row.id, 120);
+      return {
+        id,
+        title: routeContractText(row.title || id, 160),
+        description: routeContractText(row.description, 600),
+        required: row.required !== false,
+        evidence_requirement: routeContractText(row.evidence_requirement || "unknown", 40),
+        required_outputs: routeContractIds(row.required_outputs),
+        controller_can_synthesize: row.controller_can_synthesize === true,
+        assigned_to_session_controller: row.assigned_to_session_controller === true
+      };
+    })
+    .sort((left, right) => utf8KeyCompare(left.id, right.id));
+  return {
+    contract_version: WORLD_GRAPH_ROUTE_OUTCOME_CONTRACT_VERSION,
+    step_id: stepId,
+    adapter: routeContractText(step?.adapter, 300),
+    evidence_requirement: routeContractText(step?.evidence_requirement, 40),
+    compiler_authority: routeContractText(safeOutcome.compiler_authority, 40),
+    outcome_contract_version: routeContractText(safeOutcome.contract_version, 120),
+    outcome_status: routeContractText(safeOutcome.status, 40),
+    route_admission_contract_version: routeContractText(
+      safeOutcome.route_admission_contract_version,
+      120
+    ),
+    expected_outputs: routeContractIds(step?.expected_outputs),
+    fulfills,
+    execution_output_contract: terminal ? "terminal_domain_answer" : "full_handoff",
+    deliverables,
+    route_admission: routeAdmissionContract(safeOutcome, stepId)
+  };
+}
+
+export function worldGraphRouteOutputMatchesOutcomeContract(output, plan, step) {
+  if (!output || typeof output !== "object" || Array.isArray(output)) return false;
+  const contract = worldGraphRouteOutcomeContract(plan, step);
+  if (!routeAdmissionAllowsReplay(contract)) return false;
+  const validation = output.outcome_validation;
+  if (!validation || typeof validation !== "object" || Array.isArray(validation) || validation.valid !== true) return false;
+  if (boundedText(validation.contract_version, 120) !== "session-step-outcome-v1") return false;
+  if (worldGraphDigest(routeContractIds(validation.expected_outputs)) !== worldGraphDigest(contract.expected_outputs)) return false;
+  if (worldGraphDigest(routeContractIds(validation.produced_expected_outputs)) !== worldGraphDigest(contract.expected_outputs)) return false;
+  if (routeContractIds(validation.missing_expected_outputs).length) return false;
+  if (worldGraphDigest(routeContractIds(validation.fulfills)) !== worldGraphDigest(contract.fulfills)) return false;
+  if (boundedText(output.output_contract, 120) !== contract.execution_output_contract) return false;
+  const producedArtifacts = routeContractIds(
+    (Array.isArray(output.handoff_artifacts) ? output.handoff_artifacts : [])
+      .filter((item) => item && typeof item === "object" && item.verified !== false)
+      .map((item) => item.name)
+  );
+  return contract.expected_outputs.length === 0
+    || worldGraphDigest(producedArtifacts) === worldGraphDigest(contract.expected_outputs);
 }
 
 function scopeFor({ run, session }) {
@@ -223,13 +384,16 @@ function memoryState(agent, sharedMemory) {
   return (Array.isArray(sharedMemory) ? sharedMemory : []).map((entry) => ({
     tag: boundedText(entry?.tag || "memory", 120),
     source: boundedText(entry?.source || "application", 120),
-    content: boundedText(entry?.content, 2000)
+    // The caller has already normalized and bounded shared memory. Hash that
+    // exact admitted projection; an extra 2,000-character cut can conceal a
+    // meaningful suffix change when deployments allow larger memory entries.
+    content: String(entry?.content || "")
   }));
 }
 
 function exactRepeatAntecedentMemory(query, sharedMemory) {
   const rows = Array.isArray(sharedMemory) ? sharedMemory : [];
-  const target = String(query || "").replace(/\s+/g, " ").trim();
+  const target = String(query || "").replaceAll("\0", "").trim();
   let cut = rows.length;
   let rewound = false;
   while (cut > 0) {
@@ -241,7 +405,7 @@ function exactRepeatAntecedentMemory(query, sharedMemory) {
       }
     }
     if (latestUserIndex < 0) break;
-    const priorQuery = String(rows[latestUserIndex]?.content || "").replace(/\s+/g, " ").trim();
+    const priorQuery = String(rows[latestUserIndex]?.content || "").replaceAll("\0", "").trim();
     if (priorQuery !== target) break;
     cut = latestUserIndex;
     rewound = true;
@@ -345,8 +509,10 @@ function outputDigest(output = {}) {
     citations: output.citations || [],
     policy_violations: output.policy_violations || [],
     artifact_validation: output.artifact_validation || {},
+    outcome_validation: output.outcome_validation || {},
     consumption_validation: output.consumption_validation || {},
-    source_validation: output.source_validation || {}
+    source_validation: output.source_validation || {},
+    output_contract: output.output_contract || ""
   });
 }
 
@@ -383,6 +549,7 @@ function replayOutput(output = {}) {
     source_validation: output.source_validation || {},
     handoff_artifacts: output.handoff_artifacts || [],
     artifact_validation: output.artifact_validation || {},
+    outcome_validation: output.outcome_validation || {},
     consumed_artifacts: output.consumed_artifacts || [],
     consumption_validation: output.consumption_validation || {},
     text: output.domain_answer ? `DOMAIN_ANSWER:\n${output.domain_answer}` : "",
@@ -473,12 +640,14 @@ function validRouteOutput(output) {
     && !refusalOnlyRouteAnswer(answer)
     && !(output.policy_violations || []).length
     && output.artifact_validation?.valid === true
+    && output.outcome_validation?.valid === true
+    && !(output.outcome_validation?.missing_expected_outputs || []).length
     && output.consumption_validation?.valid === true
     && output.source_validation?.valid === true
   );
 }
 
-function inputEnvelope({ run, step, agent, documents, sharedMemory, options, outputsByStep, runtimeComponentProvenance = null }) {
+function inputEnvelope({ run, plan, step, agent, documents, sharedMemory, options, outputsByStep, runtimeComponentProvenance = null }) {
   const query = normalizedQuery(run?.query);
   const sourceState = sourceStateForAgent(agent, documents);
   const effectiveMemory = exactRepeatAntecedentMemory(query, sharedMemory);
@@ -489,11 +658,14 @@ function inputEnvelope({ run, step, agent, documents, sharedMemory, options, out
     agent,
     documents
   });
+  const routeOutcomeContract = worldGraphRouteOutcomeContract(plan || run?.plan || { steps: [step] }, step);
   return {
     schema_version: WORLD_GRAPH_SCHEMA_VERSION,
     engine_revision: WORLD_GRAPH_ENGINE_REVISION,
     query_digest: worldGraphDigest(query),
     task_digest: worldGraphDigest(normalizedTask(step?.task)),
+    route_outcome_contract: routeOutcomeContract,
+    route_outcome_contract_digest: worldGraphDigest(routeOutcomeContract),
     adapter: String(step?.adapter || ""),
     agent_revision: agentRevision(agent || { id: step?.adapter || "" }),
     dependency_state: dependencyState(step, outputsByStep),
@@ -518,6 +690,7 @@ function envelopeChangeReason(previous, current) {
   if (previous.query_digest !== current.query_digest) return "request_changed";
   if (previous.agent_revision !== current.agent_revision) return "agent_changed";
   if (previous.task_digest !== current.task_digest) return "task_changed";
+  if (previous.route_outcome_contract_digest !== current.route_outcome_contract_digest) return "outcome_contract_changed";
   if (previous.source_state_digest !== current.source_state_digest) return "source_changed_or_unverifiable";
   if (previous.memory_digest !== current.memory_digest) return "conversation_context_changed";
   if (previous.route_options_digest !== current.route_options_digest) return "execution_settings_changed";
@@ -679,7 +852,7 @@ export function selectWorldGraphSeeds({
   for (const step of plan?.steps || []) {
     const agent = agentsById.get(step.adapter) || { id: step.adapter };
     const envelope = inputEnvelope({
-      run, session, step, agent, documents, sharedMemory, options, outputsByStep, runtimeComponentProvenance
+      run, session, plan, step, agent, documents, sharedMemory, options, outputsByStep, runtimeComponentProvenance
     });
     const digest = envelopeDigest(envelope);
     let chosen = null;
@@ -704,7 +877,7 @@ export function selectWorldGraphSeeds({
           reason = "stored_result_expired";
           continue;
         }
-        if (!validRouteOutput(artifact.replay_output)) {
+        if (!validRouteOutput(artifact.replay_output) || !worldGraphRouteOutputMatchesOutcomeContract(artifact.replay_output, plan, step)) {
           reason = "stored_result_not_validated";
           continue;
         }
@@ -762,6 +935,7 @@ export function selectWorldGraphSeedForStep({
   data,
   run,
   session,
+  plan = run?.plan,
   step,
   agents,
   documents,
@@ -776,7 +950,7 @@ export function selectWorldGraphSeedForStep({
   const agent = (agents || []).find((item) => item.id === step.adapter) || { id: step.adapter };
   const outputsByStep = new Map((resolvedOutputs || []).map((output) => [output.step_id || output.id, output]));
   const envelope = inputEnvelope({
-    run, session, step, agent, documents, sharedMemory, options, outputsByStep, runtimeComponentProvenance
+    run, session, plan, step, agent, documents, sharedMemory, options, outputsByStep, runtimeComponentProvenance
   });
   const digest = envelopeDigest(envelope);
   const contested = contestedArtifactIds(data);
@@ -795,6 +969,10 @@ export function selectWorldGraphSeedForStep({
       if (contested.has(artifact.artifact_id)) { reason = "stored_results_disagree"; continue; }
       if (!artifactAgeValid(artifact, now, options)) { reason = "stored_result_expired"; continue; }
       if (!validRouteOutput(artifact.replay_output)) { reason = "stored_result_not_validated"; continue; }
+      if (!worldGraphRouteOutputMatchesOutcomeContract(artifact.replay_output, plan, step)) {
+        reason = "stored_result_outcome_mismatch";
+        continue;
+      }
       return {
         seed: {
           ...structuredClone(artifact.replay_output),
@@ -882,7 +1060,7 @@ export function recordWorldGraphRun({
       }
       continue;
     }
-    if (!validRouteOutput(replay)) {
+    if (!validRouteOutput(replay) || !worldGraphRouteOutputMatchesOutcomeContract(replay, plan, step)) {
       if (executionMode === "reused") {
         const error = new Error(`Reused output was not validated for step ${step.id}.`);
         error.code = "world_graph_reuse_contract_invalid";
@@ -895,6 +1073,7 @@ export function recordWorldGraphRun({
     }
     const envelope = inputEnvelope({
       run,
+      plan,
       session,
       step,
       agent,
@@ -1291,6 +1470,8 @@ export function worldGraphReasonText(code, action = "") {
     agent_changed: "The specialist's instructions or knowledge changed.",
     agent_team_changed: "The active team changed since this answer ran.",
     task_changed: "This specialist received a different task.",
+    outcome_contract_changed: "The required output or handoff contract changed.",
+    stored_result_outcome_mismatch: "The earlier result did not prove the required output contract.",
     upstream_result_changed: "Work this specialist relies on changed.",
     dependencies_changed: "The handoff into this specialist changed.",
     source_changed_or_unverifiable: "A source changed or could no longer be verified.",

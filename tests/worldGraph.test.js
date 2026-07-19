@@ -9,7 +9,8 @@ import {
   recordWorldGraphRun,
   selectWorldGraphSeedForStep,
   verifyWorldGraphArtifact,
-  worldGraphReplayCapsule
+  worldGraphReplayCapsule,
+  worldGraphRouteOutcomeContract
 } from "../server/worldGraph.js";
 
 function signedCapsulePayload(wrapper) {
@@ -37,8 +38,9 @@ function agent(id, patch = {}) {
   };
 }
 
-function routeOutput(step, version = "v1", patch = {}) {
+function routeOutput(step, version = "v1", patch = {}, plan = { steps: [step] }) {
   const value = `${step.adapter}:${version}`;
+  const routeContract = worldGraphRouteOutcomeContract(plan, step);
   const artifact = {
     artifact_id: `handoff_${step.id}_${version}`,
     schema_version: "tcar-handoff-artifact-v1",
@@ -64,6 +66,14 @@ function routeOutput(step, version = "v1", patch = {}) {
     citations: [],
     policy_violations: [],
     artifact_validation: { valid: true, produced: [artifact.name], declared_produces: [artifact.name] },
+    outcome_validation: {
+      contract_version: "session-step-outcome-v1",
+      expected_outputs: routeContract.expected_outputs,
+      produced_expected_outputs: routeContract.expected_outputs,
+      missing_expected_outputs: [],
+      fulfills: routeContract.fulfills,
+      valid: true
+    },
     consumption_validation: { valid: true, resolved_contract_inputs: [] },
     source_validation: { valid: true, violations: [] },
     used_memory: [],
@@ -71,8 +81,111 @@ function routeOutput(step, version = "v1", patch = {}) {
     tool_executions: [],
     approved_sources: [],
     boundary_check: "Validated.",
+    output_contract: routeContract.execution_output_contract,
     execution_mode: "refreshed",
     ...patch
+  };
+}
+
+function admissionBoundPlan({
+  prerequisiteAdmissionPatch = {},
+  prerequisiteDiagnosticPatch = {},
+  includePrerequisiteAdmission = true
+} = {}) {
+  const steps = [
+    {
+      id: "s1",
+      adapter: "research_agent",
+      task: "Collect the typed evidence packet.",
+      depends_on: [],
+      evidence_requirement: "none",
+      expected_outputs: ["research_agent_result"],
+      fulfills: []
+    },
+    {
+      id: "s2",
+      adapter: "writer_agent",
+      task: "Write the answer from the validated evidence packet.",
+      depends_on: ["s1"],
+      evidence_requirement: "none",
+      expected_outputs: ["writer_agent_result"],
+      fulfills: ["d1"]
+    }
+  ];
+  const checked = [
+    "activation_policy", "boundary", "escalation_policy",
+    "source_policy", "tool_policy", "write_policy"
+  ];
+  const prerequisiteAdmission = {
+    contract_version: "session-route-admission-v1",
+    valid: true,
+    route_role: "prerequisite",
+    obligation_source: "typed_downstream_bindings",
+    deliverable_ids: [],
+    expected_outputs: ["research_agent_result"],
+    downstream_bindings: [{
+      consumer_step_id: "s2",
+      consumer_adapter: "writer_agent",
+      input: "agent:research_agent:output",
+      output: "research_agent_result"
+    }],
+    strict_constraints_checked: checked,
+    violations: [],
+    obligation: "Collect the typed evidence packet and produce research agent result.",
+    ...prerequisiteAdmissionPatch
+  };
+  const prerequisiteDiagnostic = {
+    step_id: "s1",
+    route_admission_valid: prerequisiteAdmission.valid === true,
+    route_dependency_closure_valid: true,
+    ...(includePrerequisiteAdmission ? { route_admission: prerequisiteAdmission } : {}),
+    ...prerequisiteDiagnosticPatch
+  };
+  return {
+    steps,
+    routing: {
+      mode: "session",
+      orchestrator: {
+        contract_version: "session-orchestrator-v3",
+        decision: "delegate",
+        outcome_contract: {
+          contract_version: "session-outcome-v1",
+          route_admission_contract_version: "session-route-admission-v1",
+          compiler_authority: "runtime",
+          status: "covered",
+          deliverables: [{
+            id: "d1",
+            title: "Requested answer",
+            description: "Write the requested answer from validated evidence.",
+            required: true,
+            evidence_requirement: "none",
+            required_outputs: ["writer_agent_result"],
+            controller_can_synthesize: false,
+            assigned_to_session_controller: false
+          }],
+          steps: [
+            prerequisiteDiagnostic,
+            {
+              step_id: "s2",
+              route_admission_valid: true,
+              route_dependency_closure_valid: prerequisiteDiagnostic.route_admission_valid === true,
+              route_admission: {
+                contract_version: "session-route-admission-v1",
+                valid: true,
+                route_role: "outcome_owner",
+                obligation_source: "compiled_deliverables",
+                deliverable_ids: ["d1"],
+                expected_outputs: ["writer_agent_result"],
+                downstream_bindings: [],
+                strict_constraints_checked: checked,
+                violations: [],
+                obligation: ""
+              }
+            }
+          ]
+        }
+      }
+    }
   };
 }
 
@@ -117,7 +230,7 @@ function fixture({
     shared_memory: []
   };
   const data = { worldGraphArtifacts: [], worldGraphEvents: [] };
-  const outputs = resolvedPlan.steps.map((step) => routeOutput(step));
+  const outputs = resolvedPlan.steps.map((step) => routeOutput(step, "v1", {}, resolvedPlan));
   recordWorldGraphRun({
     data,
     run,
@@ -171,7 +284,7 @@ function replayFixture(base, {
     });
     actions.push([step.adapter, decision.seed ? "kept" : "refreshed"]);
     reasons[step.adapter] = decision.decision.reason;
-    resolved.push(decision.seed || routeOutput(step, outputVersions[step.adapter] || "v1"));
+    resolved.push(decision.seed || routeOutput(step, outputVersions[step.adapter] || "v1", {}, base.plan));
   }
   return { actions: Object.fromEntries(actions), reasons, outputs: resolved };
 }
@@ -521,7 +634,7 @@ describe("WorldGraph validity and selective replay", () => {
       run,
       session,
       plan,
-      outputs: plan.steps.map((step) => routeOutput(step)),
+      outputs: plan.steps.map((step) => routeOutput(step, "v1", {}, plan)),
       agents,
       documents: [],
       sharedMemory: [],
@@ -549,7 +662,7 @@ describe("WorldGraph validity and selective replay", () => {
         now: Date.parse("2026-07-15T10:05:00.000Z")
       });
       actions[step.id] = selected.seed ? "kept" : "refreshed";
-      resolved.push(selected.seed || routeOutput(step, versions[step.id] || "v1"));
+      resolved.push(selected.seed || routeOutput(step, versions[step.id] || "v1", {}, plan));
     }
     expect(actions).toEqual({ s1: "refreshed", s2: "refreshed", s3: "refreshed", s4: "refreshed", s5: "kept" });
   });
@@ -689,7 +802,7 @@ describe("WorldGraph validity and selective replay", () => {
       created_by: run.created_by
     };
     const data = { worldGraphArtifacts: [], worldGraphEvents: [] };
-    const outputs = plan.steps.map((step) => routeOutput(step));
+    const outputs = plan.steps.map((step) => routeOutput(step, "v1", {}, plan));
     recordWorldGraphRun({
       data,
       run,
@@ -721,7 +834,7 @@ describe("WorldGraph validity and selective replay", () => {
         now: Date.parse("2026-07-15T10:05:00.000Z")
       });
       if (!selection.seed) refreshed.push(step.adapter);
-      resolved.push(selection.seed || routeOutput(step, step.adapter === "document_agent_5" ? "v2" : "v1"));
+      resolved.push(selection.seed || routeOutput(step, step.adapter === "document_agent_5" ? "v2" : "v1", {}, plan));
     }
     expect(refreshed).toEqual(["document_agent_5", "writer_agent"]);
     expect(resolved.filter((output) => output.execution_mode === "reused")).toHaveLength(9);
@@ -730,7 +843,7 @@ describe("WorldGraph validity and selective replay", () => {
   it("marks deterministic disagreement as contested and refuses both results", () => {
     const base = fixture();
     const run = { ...base.run, run_id: "run_fresh" };
-    const outputs = base.plan.steps.map((step) => routeOutput(step, step.id === "s1" ? "conflict" : "v1"));
+    const outputs = base.plan.steps.map((step) => routeOutput(step, step.id === "s1" ? "conflict" : "v1", {}, base.plan));
     recordWorldGraphRun({ data: base.data, run, session: base.session, plan: base.plan, outputs, agents: base.agents, documents: [], sharedMemory: [], options: { max_tokens: 1024, temperature: 0 } });
     expect(publicWorldGraphSnapshot({
       data: base.data,
@@ -750,7 +863,8 @@ describe("WorldGraph validity and selective replay", () => {
     const outputs = base.plan.steps.map((step) => routeOutput(
       step,
       step.id === "s1" ? "invalid_conflict" : "v1",
-      step.id === "s1" ? { source_validation: { valid: false, violations: ["missing_source"] } } : {}
+      step.id === "s1" ? { source_validation: { valid: false, violations: ["missing_source"] } } : {},
+      base.plan
     ));
     recordWorldGraphRun({
       data: base.data,
@@ -768,6 +882,115 @@ describe("WorldGraph validity and selective replay", () => {
     expect(replayFixture(base).actions.research_agent).toBe("kept");
   });
 
+  it("replays a covered prerequisite only with its current route-admission proof", () => {
+    const plan = admissionBoundPlan();
+    const base = fixture({ plan });
+    expect(base.data.worldGraphArtifacts).toHaveLength(2);
+    const prerequisite = base.data.worldGraphArtifacts.find(
+      (artifact) => artifact.adapter === "research_agent"
+    );
+    expect(prerequisite.input_envelope.route_outcome_contract.route_admission).toMatchObject({
+      required: true,
+      present: true,
+      contract_version: "session-route-admission-v1",
+      valid: true,
+      dependency_closure_valid: true,
+      route_role: "prerequisite",
+      expected_outputs: ["research_agent_result"]
+    });
+    expect(replayFixture(base).actions).toEqual({
+      research_agent: "kept",
+      writer_agent: "kept"
+    });
+  });
+
+  it("invalidates replay when the compiler-owned route-admission proof changes", () => {
+    const base = fixture({ plan: admissionBoundPlan() });
+    const currentPlan = admissionBoundPlan({
+      prerequisiteAdmissionPatch: {
+        strict_constraints_checked: [
+          "activation_policy", "boundary", "escalation_policy", "privacy_policy",
+          "source_policy", "tool_policy", "write_policy"
+        ]
+      }
+    });
+    const run = {
+      ...base.run,
+      run_id: "run_admission_changed",
+      plan: currentPlan
+    };
+    const selection = selectWorldGraphSeedForStep({
+      data: base.data,
+      run,
+      session: base.session,
+      plan: currentPlan,
+      step: currentPlan.steps[0],
+      agents: base.agents,
+      documents: [],
+      sharedMemory: [],
+      options: base.options,
+      resolvedOutputs: [],
+      now: Date.parse("2026-07-15T10:05:00.000Z")
+    });
+    expect(selection.seed).toBeNull();
+    expect(selection.decision.reason).toBe("outcome_contract_changed");
+  });
+
+  it("never records or replays a route whose required admission is invalid or missing", () => {
+    for (const plan of [
+      admissionBoundPlan({
+        prerequisiteAdmissionPatch: {
+          valid: false,
+          violations: ["activation_policy_unsatisfied:research_agent"]
+        },
+        prerequisiteDiagnosticPatch: {
+          route_admission_valid: false,
+          route_dependency_closure_valid: false
+        }
+      }),
+      admissionBoundPlan({
+        includePrerequisiteAdmission: false,
+        prerequisiteDiagnosticPatch: {
+          route_admission_valid: false,
+          route_dependency_closure_valid: false
+        }
+      })
+    ]) {
+      const base = fixture({ plan });
+      expect(base.data.worldGraphArtifacts).toHaveLength(0);
+      const selection = selectWorldGraphSeedForStep({
+        data: base.data,
+        run: { ...base.run, run_id: "run_invalid_admission_repeat", plan },
+        session: base.session,
+        plan,
+        step: plan.steps[0],
+        agents: base.agents,
+        documents: [],
+        sharedMemory: [],
+        options: base.options,
+        resolvedOutputs: [],
+        now: Date.parse("2026-07-15T10:05:00.000Z")
+      });
+      expect(selection.seed).toBeNull();
+      expect(selection.decision.reason).toBe("no_matching_result");
+    }
+  });
+
+  it("executes legacy covered plans without making them reusable in engine v7", () => {
+    const plan = admissionBoundPlan();
+    delete plan.routing.orchestrator.outcome_contract.route_admission_contract_version;
+    const base = fixture({ plan });
+    expect(base.data.worldGraphArtifacts).toHaveLength(0);
+    expect(worldGraphRouteOutcomeContract(plan, plan.steps[0])).toMatchObject({
+      route_admission_contract_version: "",
+      route_admission: {
+        required: true,
+        present: true,
+        declared_contract_version: ""
+      }
+    });
+  });
+
   it("rejects every invalid route contract before durable WorldGraph storage", () => {
     const invalidPatches = [
       { policy_violations: ["worker_execution_failed"] },
@@ -782,7 +1005,8 @@ describe("WorldGraph validity and selective replay", () => {
       const outputs = base.plan.steps.map((step) => routeOutput(
         step,
         step.id === "s1" ? `invalid_${index}` : "v1",
-        step.id === "s1" ? invalidPatch : {}
+        step.id === "s1" ? invalidPatch : {},
+        base.plan
       ));
       recordWorldGraphRun({
         data: base.data,
@@ -804,7 +1028,7 @@ describe("WorldGraph validity and selective replay", () => {
   it("ignores legacy contest flags and signed events whose artifact set is no longer valid", () => {
     const base = fixture();
     const run = { ...base.run, run_id: "run_legacy_contest" };
-    const outputs = base.plan.steps.map((step) => routeOutput(step, step.id === "s1" ? "conflict" : "v1"));
+    const outputs = base.plan.steps.map((step) => routeOutput(step, step.id === "s1" ? "conflict" : "v1", {}, base.plan));
     recordWorldGraphRun({
       data: base.data,
       run,
@@ -836,7 +1060,7 @@ describe("WorldGraph validity and selective replay", () => {
     const originalHash = target.record_hash;
     base.data.worldGraphEvents.push({
       event_id: "forged_legacy_event",
-      schema_version: "virenis-world-graph-v1",
+      schema_version: "virenis-world-graph-v2",
       event_type: "result.contested",
       workspace_id: "workspace_attacker",
       created_by: "user_attacker",
@@ -1003,7 +1227,7 @@ describe("WorldGraph validity and selective replay", () => {
     const plan = { steps: [{ id: "s1", adapter: "research_agent", task: "Create the bounded result.", depends_on: [] }] };
     const base = fixture({ plan });
     base.data.worldGraphArtifacts = [];
-    const oversized = routeOutput(plan.steps[0], "v1", { domain_answer: "x".repeat(140 * 1024) });
+    const oversized = routeOutput(plan.steps[0], "v1", { domain_answer: "x".repeat(140 * 1024) }, plan);
     recordWorldGraphRun({
       data: base.data,
       run: base.run,
@@ -1134,8 +1358,8 @@ describe("WorldGraph validity and selective replay", () => {
     });
     const payload = signedCapsulePayload(capsule);
     expect(payload).toMatchObject({
-      schema_version: "virenis-world-graph-v1",
-      engine_revision: "world-graph-engine-v5"
+      schema_version: "virenis-world-graph-v2",
+      engine_revision: "world-graph-engine-v7"
     });
     expect(payload.scope).toMatchObject({ target_run_id: "run_target", workspace_id: "workspace_one", user_id: "user_one", session_id: "session_one", agent_workspace_id: "team_one" });
     expect(payload.candidates).toHaveLength(3);

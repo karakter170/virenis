@@ -68,14 +68,39 @@ function ndjsonResponse(records) {
 }
 
 function contractDigest(plan) {
+  const outcomeContract = plan?.routing?.orchestrator?.outcome_contract || {};
   const material = {
-    schema_version: "tcar-runtime-plan-contract-v1",
+    schema_version: "tcar-runtime-plan-contract-v4",
     steps: plan.steps.map((step) => ({
       id: String(step.id || ""),
       adapter: String(step.adapter || ""),
       depends_on: (step.depends_on || []).map(String),
+      evidence_requirement: String(step.evidence_requirement || ""),
+      expected_outputs: (step.expected_outputs || []).map(String),
+      fulfills: (step.fulfills || []).map(String),
       task_sha256: crypto.createHash("sha256").update(String(step.task || ""), "utf8").digest("hex")
-    }))
+    })),
+    outcome_contract: {
+      contract_version: String(outcomeContract.contract_version || ""),
+      compiler_authority: String(outcomeContract.compiler_authority || ""),
+      status: String(outcomeContract.status || ""),
+      route_admission_contract_version: String(outcomeContract.route_admission_contract_version || ""),
+      deliverables: (outcomeContract.deliverables || []).map((deliverable) => ({
+        id: String(deliverable?.id || ""),
+        title_sha256: crypto.createHash("sha256")
+          .update(String(deliverable?.title || ""), "utf8")
+          .digest("hex"),
+        description_sha256: crypto.createHash("sha256")
+          .update(String(deliverable?.description || ""), "utf8")
+          .digest("hex"),
+        required: deliverable?.required !== false,
+        evidence_requirement: String(deliverable?.evidence_requirement || ""),
+        required_outputs: (Array.isArray(deliverable?.required_outputs) ? deliverable.required_outputs : []).map(String),
+        controller_can_synthesize: deliverable?.controller_can_synthesize === true,
+        assigned_to_session_controller: deliverable?.assigned_to_session_controller === true
+      })),
+      steps: []
+    }
   };
   const canonical = (value) => {
     if (Array.isArray(value)) return value.map(canonical);

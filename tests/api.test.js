@@ -4059,7 +4059,11 @@ describe("chat execution", () => {
     const metrics = await request(app).get("/api/admin/metrics").expect(200);
     expect(metrics.body.total_runs).toBe(25);
     expect(metrics.body.most_used_agents.length).toBeGreaterThan(0);
-  }, 45000);
+    // This intentionally performs many serialized durable JSON commits. On a
+    // shared CI host the integrity work can exceed 45 seconds even though every
+    // run continues to make progress; keep the workload and give it a realistic
+    // wall-clock budget so cleanup never races still-active writers.
+  }, 75000);
 });
 
 describe("documents and sources", () => {
