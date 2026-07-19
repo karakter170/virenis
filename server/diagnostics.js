@@ -23,6 +23,8 @@ export function normalizeDiagnosticError(error, {
   const resolvedStatus = finiteStatus(error?.status ?? status);
   const providerStatus = finiteStatus(error?.providerStatus ?? error?.provider_status);
   const providerRequestId = correlationId(error?.requestId ?? error?.provider_request_id);
+  const component = diagnosticComponent(error?.component ?? error?.diagnostic?.component);
+  const recoveryCode = diagnosticComponent(error?.recoveryCode ?? error?.recovery_code);
   const errorType = errorTypeName(error);
   const stackShape = stackFrames(error?.stack);
   const fingerprint = crypto.createHash("sha256")
@@ -30,6 +32,8 @@ export function normalizeDiagnosticError(error, {
       code,
       status: resolvedStatus,
       provider_status: providerStatus,
+      component,
+      recovery_code: recoveryCode,
       error_type: errorType,
       stack_frames: stackShape
     }), "utf8")
@@ -40,6 +44,8 @@ export function normalizeDiagnosticError(error, {
     retryable: error?.retryable === true,
     provider_status: providerStatus,
     provider_request_id: providerRequestId,
+    component,
+    recovery_code: recoveryCode,
     error_type: errorType,
     fingerprint: `sha256:${fingerprint}`
   });
@@ -74,7 +80,8 @@ export function projectRuntimeFailure(payload, status) {
     status: finiteStatus(status),
     retryable: object.retryable === true,
     provider_status: finiteStatus(object.provider_status),
-    provider_request_id: correlationId(object.request_id ?? object.provider_request_id)
+    provider_request_id: correlationId(object.request_id ?? object.provider_request_id),
+    component: diagnosticComponent(object.component)
   });
 }
 
@@ -119,6 +126,11 @@ export function diagnosticCode(value, fallback = "internal_error") {
 export function correlationId(value) {
   const candidate = String(value || "").trim();
   return CORRELATION_ID_RE.test(candidate) ? candidate : null;
+}
+
+function diagnosticComponent(value) {
+  const candidate = String(value || "").trim().toLowerCase();
+  return DIAGNOSTIC_CODE_RE.test(candidate) ? candidate : null;
 }
 
 function diagnosticEvent(value) {

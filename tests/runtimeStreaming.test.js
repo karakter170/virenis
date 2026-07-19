@@ -30,6 +30,7 @@ const ENV_KEYS = [
   "TCAR_RUNTIME_CHAT_TIMEOUT_MS",
   "TCAR_RUNTIME_CONNECT_TIMEOUT_MS",
   "TCAR_RUNTIME_HEADER_TIMEOUT_MS",
+  "TCAR_RUNTIME_TERMINAL_RECOVERY_MS",
   "WEB_STORE_DRIVER"
 ];
 
@@ -581,6 +582,14 @@ describe.sequential("Runtime early-plan stream", () => {
 
   it("reports a stalled real HTTP event stream as a transport-idle timeout", async () => {
     const runtimeUrl = await startRuntimeServer((incoming, response) => {
+      if (incoming.url === "/chat/recover") {
+        incoming.resume();
+        incoming.once("end", () => {
+          response.writeHead(404, { "Content-Type": "application/json" });
+          response.end(JSON.stringify({ detail: { code: "execution_recovery_not_found", retryable: true } }));
+        });
+        return;
+      }
       expect(incoming.headers["x-tcar-stream-protocol"]).toBe("heartbeat-v1");
       incoming.resume();
       incoming.once("end", () => {
@@ -610,6 +619,14 @@ describe.sequential("Runtime early-plan stream", () => {
 
   it("persists a stalled stream as a public connection interruption with private transport diagnostics", async () => {
     const runtimeUrl = await startRuntimeServer((incoming, response) => {
+      if (incoming.url === "/chat/recover") {
+        incoming.resume();
+        incoming.once("end", () => {
+          response.writeHead(404, { "Content-Type": "application/json" });
+          response.end(JSON.stringify({ detail: { code: "execution_recovery_not_found", retryable: true } }));
+        });
+        return;
+      }
       let requestText = "";
       incoming.setEncoding("utf8");
       incoming.on("data", (chunk) => { requestText += chunk; });
@@ -655,7 +672,7 @@ describe.sequential("Runtime early-plan stream", () => {
     expect(userRun.body.status).toBe("failed");
     expect(userRun.body.error).toEqual({
       code: "model_connection_interrupted",
-      message: "The connection to the model runtime stopped receiving progress. Your message is still available—try again.",
+      message: "The connection to the model runtime was interrupted. Your message is still available—try again.",
       retryable: true,
       action: "retry"
     });
@@ -673,6 +690,76 @@ describe.sequential("Runtime early-plan stream", () => {
       status: 504,
       retryable: true
     });
+  });
+
+  it("recovers an already-completed answer after the terminal stream connection breaks", async () => {
+    let streamCalls = 0;
+    let recoveryCalls = 0;
+    let plannerCallbacks = 0;
+    const recoveredResult = {
+      ok: true,
+      plan: safePlan,
+      finalAnswer: "Recovered without another inference call."
+    };
+    const runtimeUrl = await startRuntimeServer((incoming, response) => {
+      let requestText = "";
+      incoming.setEncoding("utf8");
+      incoming.on("data", (chunk) => { requestText += chunk; });
+      incoming.once("end", () => {
+        const requestBody = JSON.parse(requestText);
+        if (incoming.url === "/chat/execute/stream") {
+          streamCalls += 1;
+          const runId = requestBody.execution_context.run_id;
+          response.writeHead(200, {
+            "Content-Type": "application/x-ndjson",
+            "X-TCAR-Stream-Protocol": "heartbeat-v1"
+          });
+          response.write(`${JSON.stringify(event("planner.completed", 1, {
+            plan: safePlan,
+            contract_digest: contractDigest(safePlan)
+          }, runId))}\n`, () => {
+            // Simulate a proxy dropping only the terminal delivery after the
+            // Runtime has already committed the result. Let the validated
+            // planner record reach the client first.
+            setTimeout(() => response.socket.destroy(), 10);
+          });
+          return;
+        }
+        if (incoming.url === "/chat/recover") {
+          recoveryCalls += 1;
+          expect(requestBody.execution_context.run_id).toBe("run_terminal_recovery");
+          if (recoveryCalls === 1) {
+            response.writeHead(202, { "Content-Type": "application/json" });
+            response.end(JSON.stringify({ status: "pending", retry_after_ms: 100 }));
+          } else {
+            response.writeHead(200, { "Content-Type": "application/json" });
+            response.end(JSON.stringify({ status: "completed", result: recoveredResult }));
+          }
+          return;
+        }
+        response.writeHead(404, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ detail: { code: "not_found", retryable: false } }));
+      });
+    });
+    process.env.TCAR_RUNTIME_API_URL = runtimeUrl;
+    process.env.TCAR_RUNTIME_CONNECT_TIMEOUT_MS = "100";
+    process.env.TCAR_RUNTIME_HEADER_TIMEOUT_MS = "100";
+    process.env.TCAR_RUNTIME_BODY_IDLE_TIMEOUT_MS = "100";
+    process.env.TCAR_RUNTIME_CHAT_TIMEOUT_MS = "2000";
+    process.env.TCAR_RUNTIME_TERMINAL_RECOVERY_MS = "1000";
+
+    await expect(executeRuntimeChatStream({
+      query: "Prepare a note.",
+      executionContext: { run_id: "run_terminal_recovery" },
+      onPlannerCompleted: async () => { plannerCallbacks += 1; }
+    })).resolves.toMatchObject({
+      legacy: false,
+      recovered: true,
+      result: recoveredResult
+    });
+    expect(streamCalls).toBe(1);
+    expect(recoveryCalls).toBe(2);
+    expect(plannerCallbacks).toBe(1);
   });
 
   it("uses a rollout-safe idle budget when an older Runtime does not negotiate heartbeats", async () => {

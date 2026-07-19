@@ -6511,7 +6511,11 @@ function publicRunFailureMessage(code = null) {
 }
 
 function publicRunFailureCode(code = null) {
-  return code === "runtime_stream_idle_timeout"
+  return [
+    "runtime_stream_idle_timeout",
+    "runtime_connection_reset",
+    "runtime_response_incomplete"
+  ].includes(code)
     ? "model_connection_interrupted"
     : code;
 }
@@ -6529,7 +6533,7 @@ function publicRunFailureDetails(code = null) {
       action: "retry"
     },
     model_connection_interrupted: {
-      message: "The connection to the model runtime stopped receiving progress. Your message is still available—try again.",
+      message: "The connection to the model runtime was interrupted. Your message is still available—try again.",
       retryable: true,
       action: "retry"
     },
@@ -6560,6 +6564,41 @@ function publicRunFailureDetails(code = null) {
     },
     model_configuration_error: {
       message: "The selected model connection needs administrator attention. Try another model or contact support with the run id.",
+      retryable: false,
+      action: "contact_support"
+    },
+    model_request_rejected: {
+      message: "The selected model rejected the generated request. Adjust the request or contact support with the run id.",
+      retryable: false,
+      action: "contact_support"
+    },
+    runtime_protocol_error: {
+      message: "The model runtime returned an incompatible response. Contact support with the run id.",
+      retryable: false,
+      action: "contact_support"
+    },
+    runtime_response_too_large: {
+      message: "The generated response exceeded the runtime delivery limit. Lower the output limit, then retry.",
+      retryable: false,
+      action: "reduce_context"
+    },
+    runtime_service_unavailable: {
+      message: "The model runtime is temporarily unreachable. Try again shortly.",
+      retryable: true,
+      action: "retry_later"
+    },
+    runtime_timeout: {
+      message: "The model runtime took too long to complete the request. Your message is still available—try again.",
+      retryable: true,
+      action: "retry"
+    },
+    runtime_configuration_error: {
+      message: "The model runtime connection needs administrator attention. Contact support with the run id.",
+      retryable: false,
+      action: "contact_support"
+    },
+    runtime_service_error: {
+      message: "The model runtime could not complete the request. Contact support with the run id.",
       retryable: false,
       action: "contact_support"
     }

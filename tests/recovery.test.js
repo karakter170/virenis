@@ -149,7 +149,7 @@ describe("durable background recovery", () => {
       .expect(200);
     expect(response.body.error).toEqual({
       code: "model_connection_interrupted",
-      message: "The connection to the model runtime stopped receiving progress. Your message is still available—try again.",
+      message: "The connection to the model runtime was interrupted. Your message is still available—try again.",
       retryable: true,
       action: "retry"
     });

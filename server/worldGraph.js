@@ -13,6 +13,7 @@ const WORLD_GRAPH_CAPSULE_ENCODING = "json-utf8-exact-v1";
 const WORLD_GRAPH_CAPSULE_SIGNATURE_DOMAIN = "worldgraph-reuse-envelope-v2\n";
 const WORLD_GRAPH_ARTIFACT_MAC_DOMAIN = "worldgraph-artifact-record-v1\n";
 const WORLD_GRAPH_EVENT_MAC_DOMAIN = "worldgraph-contest-event-v1\n";
+const PYTHON_EXTRA_WHITESPACE_CODEPOINTS = new Set([0x1c, 0x1d, 0x1e, 0x1f]);
 const replayCapsulePayloads = new WeakMap();
 
 const MAX_ARTIFACTS_PER_OWNER = 240;
@@ -130,9 +131,12 @@ function routeContractText(value, maximum) {
   // JavaScript's White_Space property omits U+001C..U+001F, while Python's
   // `\s` includes them. Include both sets so the split deployment hashes the
   // same admitted contract text.
-  const normalized = String(value || "")
-    .replaceAll("\0", "")
-    .replace(/[\p{White_Space}\u001c-\u001f]+/gu, " ")
+  const pythonCompatibleWhitespace = Array.from(
+    String(value || "").replaceAll("\0", ""),
+    (character) => PYTHON_EXTRA_WHITESPACE_CODEPOINTS.has(character.codePointAt(0)) ? " " : character
+  ).join("");
+  const normalized = pythonCompatibleWhitespace
+    .replace(/\p{White_Space}+/gu, " ")
     .trim();
   return Array.from(normalized).slice(0, maximum).join("");
 }

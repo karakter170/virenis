@@ -10,6 +10,8 @@ const DEFAULT_TIMEOUT_MS = 900000;
 const DEFAULT_CONNECT_TIMEOUT_MS = 10000;
 const DEFAULT_BODY_IDLE_TIMEOUT_MS = 60000;
 const LEGACY_STREAM_BODY_IDLE_TIMEOUT_MS = 300000;
+const DEFAULT_TERMINAL_RECOVERY_MS = 90000;
+const MAX_TERMINAL_RECOVERY_MS = 300000;
 const DEFAULT_MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
 const RUNTIME_STREAM_CONTENT_TYPE = "application/x-ndjson";
 const RUNTIME_STREAM_PROTOCOL = "heartbeat-v1";
@@ -124,7 +126,8 @@ function validateRuntimeTransportConfiguration(env) {
     ["TCAR_RUNTIME_ADMIN_TIMEOUT_MS", MAX_REQUEST_TIMEOUT_MS],
     ["TCAR_RUNTIME_CONNECT_TIMEOUT_MS", MAX_CONNECT_TIMEOUT_MS],
     ["TCAR_RUNTIME_HEADER_TIMEOUT_MS", MAX_REQUEST_TIMEOUT_MS],
-    ["TCAR_RUNTIME_BODY_IDLE_TIMEOUT_MS", MAX_BODY_IDLE_TIMEOUT_MS]
+    ["TCAR_RUNTIME_BODY_IDLE_TIMEOUT_MS", MAX_BODY_IDLE_TIMEOUT_MS],
+    ["TCAR_RUNTIME_TERMINAL_RECOVERY_MS", MAX_TERMINAL_RECOVERY_MS]
   ]) {
     const value = String(env[name] ?? "").trim();
     if (value) boundedInteger(value, name, 1, maximum);
@@ -337,6 +340,8 @@ export async function runtimeRequest(path, { method = "GET", body, timeoutMs = D
     error.retryable = projected.retryable === true;
     error.providerStatus = projected.provider_status;
     error.requestId = projected.provider_request_id;
+    error.component = projected.component;
+    error.transportStatus = response.status;
     error.diagnostic = projected;
     throw error;
   }
@@ -885,7 +890,10 @@ function createRuntimeNdjsonParser({
         throw invalidRuntimeStream("the response ended with invalid UTF-8");
       }
       if (buffered) await consumeLine(buffered);
-      if (!terminal) throw invalidRuntimeStream("the response ended before a terminal event");
+      // A well-formed prefix with no terminal record is a delivery failure,
+      // not a protocol violation. This permits an authenticated, idempotent
+      // terminal lookup without accepting any partial answer.
+      if (!terminal) throw incompleteRuntimeStream();
       if (terminal.type === "run.failed") {
         const error = new Error("TCAR runtime reported a failed streamed execution.");
         error.status = terminal.error.status;
@@ -1002,6 +1010,8 @@ function projectedRuntimeError(payload, status) {
   error.retryable = projected.retryable === true;
   error.providerStatus = projected.provider_status;
   error.requestId = projected.provider_request_id;
+  error.component = projected.component;
+  error.transportStatus = status;
   error.diagnostic = projected;
   return error;
 }
@@ -1066,6 +1076,15 @@ function invalidRuntimeStream(detail) {
   const error = new Error(`The Runtime returned an invalid event stream: ${detail}.`);
   error.status = 502;
   error.code = "runtime_stream_invalid";
+  return error;
+}
+
+function incompleteRuntimeStream() {
+  const error = new Error("TCAR runtime event stream ended before its terminal record.");
+  error.status = 502;
+  error.code = "runtime_response_incomplete";
+  error.retryable = true;
+  error.component = "runtime_stream";
   return error;
 }
 
@@ -1294,6 +1313,7 @@ export async function executeRuntimeChatStream({
   worldGraph = null,
   onPlannerCompleted
 }) {
+  const timeoutMs = Number(process.env.TCAR_RUNTIME_CHAT_TIMEOUT_MS || DEFAULT_TIMEOUT_MS);
   const body = {
     query,
     shared_memory: sharedMemory,
@@ -1306,7 +1326,7 @@ export async function executeRuntimeChatStream({
       body,
       expectedRunId: executionContext.run_id,
       onPlannerCompleted,
-      timeoutMs: Number(process.env.TCAR_RUNTIME_CHAT_TIMEOUT_MS || DEFAULT_TIMEOUT_MS)
+      timeoutMs
     });
   } catch (error) {
     // Old Runtime deployments do not expose the stream route. Only an explicit
@@ -1319,8 +1339,82 @@ export async function executeRuntimeChatStream({
         legacy: true
       };
     }
+    if (terminalRecoveryEligible(error)) {
+      const recovered = await recoverRuntimeChatResult(body, {
+        originalError: error,
+        requestTimeoutMs: timeoutMs
+      });
+      if (recovered) {
+        return {
+          result: recovered,
+          streamedPlan: null,
+          legacy: false,
+          recovered: true
+        };
+      }
+    }
     throw error;
   }
+}
+
+function terminalRecoveryEligible(error) {
+  return new Set([
+    "runtime_connection_reset",
+    "runtime_response_incomplete",
+    "runtime_stream_idle_timeout"
+  ]).has(String(error?.code || "").toLowerCase());
+}
+
+async function recoverRuntimeChatResult(body, { originalError, requestTimeoutMs }) {
+  const configuredBudgetMs = optionalBoundedEnvironmentInteger(
+    "TCAR_RUNTIME_TERMINAL_RECOVERY_MS",
+    DEFAULT_TERMINAL_RECOVERY_MS,
+    1,
+    MAX_TERMINAL_RECOVERY_MS
+  );
+  const budgetMs = Math.min(configuredBudgetMs, Math.max(1, Number(requestTimeoutMs) || DEFAULT_TIMEOUT_MS));
+  const deadline = Date.now() + budgetMs;
+  let delayMs = 250;
+
+  while (Date.now() < deadline) {
+    const remainingMs = Math.max(1, deadline - Date.now());
+    let payload;
+    try {
+      payload = await runtimeRequest("/chat/recover", {
+        method: "POST",
+        body,
+        timeoutMs: Math.min(5000, remainingMs)
+      });
+    } catch (recoveryError) {
+      // Recovery is additive and must never turn a transport interruption into
+      // a second inference call. If it is unavailable, preserve the original
+      // failure and its diagnostic identity.
+      originalError.recoveryCode = String(recoveryError?.code || "runtime_recovery_unavailable");
+      return null;
+    }
+
+    if (payload?.status === "completed" && isPlainObject(payload.result)) {
+      return payload.result;
+    }
+    if (payload?.status !== "pending") {
+      const error = new Error("TCAR runtime returned an invalid terminal recovery response.");
+      error.status = 502;
+      error.code = "runtime_recovery_invalid";
+      error.retryable = false;
+      error.component = "runtime_recovery";
+      throw error;
+    }
+
+    const advisedDelayMs = Number(payload.retry_after_ms);
+    const boundedDelayMs = Number.isSafeInteger(advisedDelayMs)
+      ? Math.max(100, Math.min(advisedDelayMs, 2000))
+      : delayMs;
+    const waitMs = Math.min(boundedDelayMs, Math.max(0, deadline - Date.now()));
+    if (waitMs > 0) await new Promise((resolve) => setTimeout(resolve, waitMs));
+    delayMs = Math.min(delayMs * 2, 2000);
+  }
+  originalError.recoveryCode = "runtime_recovery_deadline_exceeded";
+  return null;
 }
 
 export function composeRuntimeWorkflow({

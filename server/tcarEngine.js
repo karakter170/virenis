@@ -1568,6 +1568,7 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
       run.manifest_revision = result.manifestRevision || null;
       run.reality_rank_snapshot = agentRankings;
       run.runtime_result_admin_only = {
+        streamRecovered: streamed.recovered === true,
         mode: result.mode,
         plannerMode: result.plannerMode,
         sessionController: normalizeArtifactValue(result.sessionController || null),
@@ -1668,8 +1669,6 @@ function normalizeRunFailure(error, fallbackCode) {
   const classified = classifyRunFailure(error, fallbackCode);
   const code = classified.code;
   const diagnostic = normalizeDiagnosticError(error, { fallbackCode: code });
-  const preserveRuntimeTransportCode = code === "model_connection_interrupted"
-    && diagnostic.code === "runtime_stream_idle_timeout";
   return {
     public: {
       code,
@@ -1679,21 +1678,22 @@ function normalizeRunFailure(error, fallbackCode) {
     },
     admin: {
       ...diagnostic,
-      // Keep support classification aligned with the public retry policy while
-      // retaining structural status/provider metadata and no raw content.
-      code: preserveRuntimeTransportCode ? diagnostic.code : code,
-      ...(preserveRuntimeTransportCode ? { public_code: code } : {})
+      // The source diagnostic remains authoritative for support. Public
+      // classification is additive so transport/configuration evidence is
+      // never overwritten by a friendlier browser message.
+      ...(diagnostic.code !== code ? { public_code: code } : {})
     }
   };
 }
 
-function classifyRunFailure(error, fallbackCode = "run_failed") {
-  const status = Number(error?.status || error?.providerStatus || 0);
+export function classifyRunFailure(error, fallbackCode = "run_failed") {
+  const transportStatus = Number(error?.transportStatus ?? error?.status ?? 0);
+  const providerStatus = Number(error?.providerStatus ?? error?.provider_status ?? 0);
   const rawCode = String(error?.code || "").toLowerCase();
   const rawMessage = String(error?.message || "").toLowerCase();
   const matches = (...values) => values.some((value) => rawCode.includes(value) || rawMessage.includes(value));
 
-  if (status === 429 || matches("rate_limit", "rate-limited", "too_many_requests")) {
+  if (rawCode === "model_rate_limited" || providerStatus === 429) {
     return {
       code: "model_rate_limited",
       message: "The selected model is temporarily rate-limited. Wait a moment, then try again.",
@@ -1701,15 +1701,19 @@ function classifyRunFailure(error, fallbackCode = "run_failed") {
       action: "retry_later"
     };
   }
-  if (rawCode === "runtime_stream_idle_timeout") {
+  if ([
+    "runtime_stream_idle_timeout",
+    "runtime_connection_reset",
+    "runtime_response_incomplete"
+  ].includes(rawCode)) {
     return {
       code: "model_connection_interrupted",
-      message: "The connection to the model runtime stopped receiving progress. Your message is still available—try again.",
+      message: "The connection to the model runtime was interrupted. Your message is still available—try again.",
       retryable: true,
       action: "retry"
     };
   }
-  if ([408, 504].includes(status) || matches("timeout", "timed_out", "aborterror", "etimedout")) {
+  if (rawCode === "model_timeout" || [408, 504].includes(providerStatus)) {
     return {
       code: "model_timeout",
       message: "The model took too long to respond. Your message is still available—try again.",
@@ -1717,52 +1721,23 @@ function classifyRunFailure(error, fallbackCode = "run_failed") {
       action: "retry"
     };
   }
-  if (status === 413 || matches("context_length", "context window", "input requires", "too large")) {
+  if (rawCode === "model_configuration_error" || [401, 403].includes(providerStatus)) {
     return {
-      code: "model_context_limit",
-      message: "The request and output limit exceed the selected model's context window. Lower the output limit, shorten the request, or attach fewer sources, then retry.",
-      retryable: false,
-      action: "reduce_context"
-    };
-  }
-  if (status === 409 || matches("manifestrevisionchanged", "agents changed repeatedly")) {
-    return {
-      code: "agent_configuration_changed",
-      message: "The agent configuration changed while this answer was starting. Try again with the updated agents.",
-      retryable: true,
-      action: "retry"
-    };
-  }
-  if (matches("model_invalid_response")) {
-    return {
-      code: "model_invalid_response",
-      message: "The selected model returned a response that could not be processed safely. Try again.",
-      retryable: true,
-      action: "retry"
-    };
-  }
-  if (matches("runtime_contract_invalid")) {
-    return {
-      code: "runtime_contract_invalid",
-      message: "The model runtime returned an incompatible execution contract. Contact support with the run id.",
+      code: "model_configuration_error",
+      message: "The selected model connection needs administrator attention. Try another model or contact support with the run id.",
       retryable: false,
       action: "contact_support"
     };
   }
-  if (
-    [502, 503].includes(status)
-    || matches(
-      "econnrefused",
-      "enotfound",
-      "service unavailable",
-      "socket hang up",
-      "econnreset",
-      "connection reset",
-      "runtime_connection_reset",
-      "runtime_response_incomplete",
-      "closed unexpectedly"
-    )
-  ) {
+  if (rawCode === "model_request_rejected" || (providerStatus >= 400 && providerStatus < 500)) {
+    return {
+      code: "model_request_rejected",
+      message: "The selected model rejected the generated request. Adjust the request or contact support with the run id.",
+      retryable: false,
+      action: "contact_support"
+    };
+  }
+  if (rawCode === "model_service_unavailable" || providerStatus >= 500) {
     return {
       code: "model_service_unavailable",
       message: "The selected model service is temporarily unavailable. Try again shortly.",
@@ -1770,12 +1745,92 @@ function classifyRunFailure(error, fallbackCode = "run_failed") {
       action: "retry_later"
     };
   }
-  if (status === 401 || status === 403 || matches("authentication", "invalid api key")) {
+  if (rawCode === "model_context_limit" || transportStatus === 413 || matches("context_length", "context window", "input requires")) {
     return {
-      code: "model_configuration_error",
-      message: "The selected model connection needs administrator attention. Try another model or contact support with the run id.",
+      code: "model_context_limit",
+      message: "The request and output limit exceed the selected model's context window. Lower the output limit, shorten the request, or attach fewer sources, then retry.",
+      retryable: false,
+      action: "reduce_context"
+    };
+  }
+  if (rawCode === "agent_configuration_changed" || matches("manifestrevisionchanged", "agents changed repeatedly")) {
+    return {
+      code: "agent_configuration_changed",
+      message: "The agent configuration changed while this answer was starting. Try again with the updated agents.",
+      retryable: true,
+      action: "retry"
+    };
+  }
+  if (rawCode === "model_invalid_response") {
+    return {
+      code: "model_invalid_response",
+      message: "The selected model returned a response that could not be processed safely. Try again.",
+      retryable: true,
+      action: "retry"
+    };
+  }
+  if (rawCode === "runtime_contract_invalid") {
+    return {
+      code: "runtime_contract_invalid",
+      message: "The model runtime returned an incompatible execution contract. Contact support with the run id.",
       retryable: false,
       action: "contact_support"
+    };
+  }
+  if ([
+    "runtime_stream_invalid",
+    "runtime_stream_plan_mismatch",
+    "runtime_invalid_json",
+    "runtime_recovery_invalid"
+  ].includes(rawCode)) {
+    return {
+      code: "runtime_protocol_error",
+      message: "The model runtime returned an incompatible response. Contact support with the run id.",
+      retryable: false,
+      action: "contact_support"
+    };
+  }
+  if (["runtime_response_too_large", "runtime_stream_result_too_large"].includes(rawCode)) {
+    return {
+      code: "runtime_response_too_large",
+      message: "The generated response exceeded the runtime delivery limit. Lower the output limit, then retry.",
+      retryable: false,
+      action: "reduce_context"
+    };
+  }
+  if (
+    ["econnrefused", "enotfound", "ehostunreach", "runtime_service_unavailable"].includes(rawCode)
+    || matches("econnrefused", "enotfound", "ehostunreach")
+  ) {
+    return {
+      code: "runtime_service_unavailable",
+      message: "The model runtime is temporarily unreachable. Try again shortly.",
+      retryable: true,
+      action: "retry_later"
+    };
+  }
+  if ([408, 504].includes(transportStatus) || matches("aborterror", "etimedout")) {
+    return {
+      code: "runtime_timeout",
+      message: "The model runtime took too long to complete the request. Your message is still available—try again.",
+      retryable: true,
+      action: "retry"
+    };
+  }
+  if ([401, 403].includes(transportStatus)) {
+    return {
+      code: "runtime_configuration_error",
+      message: "The model runtime connection needs administrator attention. Contact support with the run id.",
+      retryable: false,
+      action: "contact_support"
+    };
+  }
+  if (transportStatus >= 500 || rawCode.startsWith("runtime_")) {
+    return {
+      code: "runtime_service_error",
+      message: "The model runtime could not complete the request. Contact support with the run id.",
+      retryable: error?.retryable === true,
+      action: error?.retryable === true ? "retry" : "contact_support"
     };
   }
   return {

@@ -3505,10 +3505,10 @@ describe("chat execution", () => {
       expect(userRun).toBeTruthy();
       expect(userRun.status).toBe("failed");
       expect(userRun.error).toMatchObject({
-        code: "model_service_unavailable",
-        message: "The selected model service is temporarily unavailable. Try again shortly.",
-        retryable: true,
-        action: "retry_later"
+        code: "runtime_service_error",
+        message: "The model runtime could not complete the request. Contact support with the run id.",
+        retryable: false,
+        action: "contact_support"
       });
       expect(userRun.error_admin_only).toBeUndefined();
       expect(JSON.stringify(userRun)).not.toContain("super-secret-value");
@@ -3520,7 +3520,7 @@ describe("chat execution", () => {
         .expect(200);
       expect(adminRun.body.error.message).toBe(userRun.error.message);
       expect(adminRun.body.error_admin_only).toMatchObject({
-        code: "model_service_unavailable",
+        code: "runtime_service_error",
         status: 502,
         error_type: "Error"
       });
