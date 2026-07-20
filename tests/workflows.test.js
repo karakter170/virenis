@@ -129,9 +129,9 @@ describe("explicit workflow Auto-Composer", () => {
     const session = await createSession();
     const ordinary = await sendMessage(session.session_id, "Explain how our workflow behaves.");
     expect(ordinary.body.kind).toBe("chat");
+    await waitForRun(ordinary.body.run_id);
     const nearMiss = await sendMessage(session.session_id, "/workflowish create a team");
     expect(nearMiss.body.kind).toBe("chat");
-    await waitForRun(ordinary.body.run_id);
     await waitForRun(nearMiss.body.run_id);
     expect(composer).not.toHaveBeenCalled();
 

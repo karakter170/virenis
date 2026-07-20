@@ -15,17 +15,22 @@ const TERMINAL_RECOVERY_CLAIM_GRACE_MS = 3000;
 const MAX_TERMINAL_RECOVERY_MS = 300000;
 const DEFAULT_MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
 const RUNTIME_STREAM_CONTENT_TYPE = "application/x-ndjson";
-const RUNTIME_STREAM_PROTOCOL = "heartbeat-v1";
-const RUNTIME_PLAN_CONTRACT_VERSIONS = [
+export const RUNTIME_STREAM_PROTOCOL = "heartbeat-v1";
+export const RUNTIME_TERMINAL_RECOVERY_PROTOCOL = "chat-recover-v1";
+export const RUNTIME_PLAN_CONTRACT_VERSIONS = Object.freeze([
   "tcar-runtime-plan-contract-v5",
   "tcar-runtime-plan-contract-v4"
-];
+]);
 // Runtime can heartbeat every five seconds for the full 30-minute hard request
 // limit (360 records). Keep a finite margin for scheduling jitter/config
 // changes while retaining a strict parser bound.
 const MAX_RUNTIME_STREAM_HEARTBEATS = 512;
 const MAX_RUNTIME_STREAM_EVENTS = MAX_RUNTIME_STREAM_HEARTBEATS + 2;
-const MAX_RUNTIME_STREAM_PLAN_STEPS = 24;
+// The Runtime can add up to 24 explicitly selected specialists plus bounded
+// dependency/resource routes. Its public stream contract therefore permits
+// 48 total steps; keeping the browser parser at 24 falsely rejected valid
+// dependency-expanded plans.
+const MAX_RUNTIME_STREAM_PLAN_STEPS = 48;
 const MAX_RUNTIME_STREAM_TASK_CHARS = 600;
 const MAX_RUNTIME_STREAM_PLAN_EVENT_BYTES = 256 * 1024;
 const MAX_RUNTIME_STREAM_HEARTBEAT_BYTES = 1024;
@@ -983,7 +988,7 @@ function validateStreamPlan(value) {
       if (
         typeof step.task !== "string"
         || Array.from(step.task).length > MAX_RUNTIME_STREAM_TASK_CHARS
-        || normalizeStreamTask(step.task) !== step.task
+        || runtimeStreamTaskProjection(step.task) !== step.task
       ) {
         throw invalidRuntimeStream("a planner task was malformed");
       }
@@ -1117,11 +1122,17 @@ function safeIdentifier(value) {
     && /^[A-Za-z0-9][A-Za-z0-9_.:@/-]*$/.test(value);
 }
 
-function normalizeStreamTask(value) {
+export function runtimeStreamTaskProjection(value) {
   const normalized = stripStreamTaskControls(String(value || ""))
     .replace(/\p{White_Space}+/gu, " ")
     .trim();
-  return Array.from(normalized).slice(0, MAX_RUNTIME_STREAM_TASK_CHARS).join("");
+  // Python's Runtime applies rstrip() after its code-point bound. Preserve
+  // that order exactly: truncation can otherwise leave a space at position
+  // 600 and make two identical plans hash differently across services.
+  return Array.from(normalized)
+    .slice(0, MAX_RUNTIME_STREAM_TASK_CHARS)
+    .join("")
+    .replace(/\p{White_Space}+$/gu, "");
 }
 
 function stripStreamTaskControls(value) {
@@ -1210,6 +1221,38 @@ function boundedInteger(value, label, minimum, maximum) {
 
 export function fetchRuntimeHealth() {
   return runtimeRequest("/health", { timeoutMs: Number(process.env.TCAR_RUNTIME_HEALTH_TIMEOUT_MS || 5000) });
+}
+
+/**
+ * Compare the web decoder's wire contracts with the Runtime's protected
+ * health advertisement. Readiness uses this to stop mixed-version deploys
+ * before a user spends tokens on an answer the web process cannot decode.
+ */
+export function runtimeProtocolCompatibility(payload = {}) {
+  const protocol = isPlainObject(payload?.protocol) ? payload.protocol : {};
+  const service = String(payload?.service || "").trim();
+  const streamProtocol = String(protocol.chat_stream || "").trim();
+  const recoveryProtocol = String(protocol.terminal_recovery || "").trim();
+  const advertisedPlanContracts = Array.isArray(protocol.plan_contract_versions)
+    ? [...new Set(protocol.plan_contract_versions
+      .slice(0, 16)
+      .map((value) => String(value || "").trim())
+      .filter((value) => safeIdentifier(value)))]
+    : [];
+  const selectedPlanContract = RUNTIME_PLAN_CONTRACT_VERSIONS.find((version) => (
+    advertisedPlanContracts.includes(version)
+  )) || null;
+  return {
+    compatible: service === "tcar-gpu-runtime-api"
+      && streamProtocol === RUNTIME_STREAM_PROTOCOL
+      && recoveryProtocol === RUNTIME_TERMINAL_RECOVERY_PROTOCOL
+      && selectedPlanContract !== null,
+    service,
+    chat_stream: streamProtocol || null,
+    terminal_recovery: recoveryProtocol || null,
+    selected_plan_contract: selectedPlanContract,
+    advertised_plan_contract_versions: advertisedPlanContracts
+  };
 }
 
 export function fetchRuntimeModels() {

@@ -254,6 +254,7 @@ export function createOutcomeContract(data, {
   const resolution = normalizeResolution(body?.resolution || {}, outcomeType, createdAt);
   const runSteps = (data.runSteps || []).filter((step) => step.run_id === run.run_id);
   const predictions = normalizePredictions(body?.predictions, outcomeType, execution.participants, runSteps);
+  const completedParticipants = execution.participants.filter((participant) => participant.status === "completed");
   const contract = {
     contract_id: makeId("outcome"),
     schema_version: "virenis-outcome-contract-v2",
@@ -275,7 +276,7 @@ export function createOutcomeContract(data, {
     resolver,
     resolution,
     participants: predictions,
-    evidence_ids: [...new Set(execution.participants.flatMap((participant) => participant.evidence_ids || []))],
+    evidence_ids: [...new Set(completedParticipants.flatMap((participant) => participant.evidence_ids || []))],
     execution_record_hash: execution.record_hash,
     created_at: createdAt,
     settled_at: null,
@@ -763,6 +764,9 @@ function normalizePredictions(value, outcomeType, executionParticipants, runStep
     const executed = byStep.get(String(prediction.step_id || "")) || byAgent.get(String(prediction.agent_id || ""));
     if (!executed || seen.has(executed.step_id)) {
       throwOutcome(400, `prediction ${index + 1} must reference one unique executed step.`);
+    }
+    if (executed.status !== "completed") {
+      throwOutcome(400, `prediction ${index + 1} must reference a successfully completed executed step.`);
     }
     seen.add(executed.step_id);
     const abstained = prediction.abstained === true;

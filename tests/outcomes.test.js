@@ -405,6 +405,95 @@ describe("execution provenance and Outcome Contracts", () => {
       .expect(404);
   });
 
+  it("rejects failed route participants while preserving completed Outcome attribution", async () => {
+    await createAgent(
+      "completed_forecast_lora",
+      "Completed forecast",
+      "mixed route forecast",
+      "Completed route probability is 0.8."
+    );
+    await createAgent(
+      "failed_forecast_lora",
+      "Failed forecast",
+      "mixed route forecast",
+      "Failed route probability is 0.2."
+    );
+    const session = await createSession("Mixed route outcome");
+    const run = await runMessage(
+      session.session_id,
+      "Ask @completed_forecast and @failed_forecast for the mixed route forecast.",
+      { max_routing_adapters: 3 }
+    );
+    const completedStep = run.expert_outputs.find((step) => step.adapter === "completed_forecast_lora");
+    const failedStep = run.expert_outputs.find((step) => step.adapter === "failed_forecast_lora");
+    expect(completedStep).toBeTruthy();
+    expect(failedStep).toBeTruthy();
+
+    await app.locals.store.mutate((data) => {
+      const storedStep = data.runSteps.find((step) => (
+        step.run_id === run.run_id && step.step_id === failedStep.step_id
+      ));
+      storedStep.status = "failed";
+      storedStep.failure = {
+        step_id: failedStep.step_id,
+        adapter: failedStep.adapter,
+        status: "failed",
+        failure_class: "worker_execution",
+        controller_synthesis_safe: true,
+        expected_outputs: [],
+        fulfills: [],
+        had_successful_tool_execution: false
+      };
+      const execution = data.executionRecords.find((record) => record.run_id === run.run_id);
+      execution.participants.find((participant) => participant.step_id === failedStep.step_id).status = "failed";
+      const recordMaterial = { ...execution };
+      delete recordMaterial.record_hash;
+      execution.record_hash = digestValue(recordMaterial);
+    });
+
+    const base = {
+      title: "Mixed route outcome",
+      claim: "The mixed route outcome will occur.",
+      domain: "mixed_route_forecast",
+      task_type: "decision",
+      outcome_type: "binary",
+      resolver: { type: "human", authority: "Outcome reviewer", reference: "mixed-route:1" },
+      resolution: { metric: "occurred", due_at: futureIso(2000) }
+    };
+    await request(app)
+      .post(`/api/chat/runs/${run.run_id}/outcome-contracts`)
+      .send({
+        ...base,
+        predictions: [{
+          step_id: failedStep.step_id,
+          value: 0.2,
+          confidence: 0.8,
+          evidence_quote: "Failed route probability is 0.2."
+        }]
+      })
+      .expect(400)
+      .expect((response) => {
+        expect(response.body.message).toMatch(/successfully completed executed step/i);
+      });
+
+    const contract = await request(app)
+      .post(`/api/chat/runs/${run.run_id}/outcome-contracts`)
+      .send({
+        ...base,
+        predictions: [{
+          step_id: completedStep.step_id,
+          value: 0.8,
+          confidence: 0.8,
+          evidence_quote: "Completed route probability is 0.8."
+        }]
+      })
+      .expect(201);
+    expect(contract.body.participants).toEqual([
+      expect.objectContaining({ step_id: completedStep.step_id, agent_id: "completed_forecast_lora" })
+    ]);
+    expect(contract.body.participants.map((participant) => participant.agent_id)).not.toContain("failed_forecast_lora");
+  });
+
   it("never returns another user's private contract on a same-workspace idempotency collision", async () => {
     process.env.APP_API_TOKENS_JSON = JSON.stringify({
       alice_token: { user_id: "alice", workspace_id: "shared_workspace", role: "admin" },

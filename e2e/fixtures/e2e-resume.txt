@@ -1,0 +1,19 @@
+Mete Veli Yesil
+Istanbul, Türkiye
+
+Education
+BS in Mathematics, Istanbul Bilgi University, 2022–2026
+
+Experience
+Intern Data Scientist, Adgager, February–June 2023
+- Cleaned data with Excel, Python, and SQL.
+- Visualized data with Power BI, Tableau, and Plotly and presented the results.
+- Trained simple machine-learning models with Python, Scikit-learn, TensorFlow, and PyTorch.
+- Integrated live, interactive data visualizations into a website with JavaScript.
+
+AI Trainee, Y Inovasyon, July–August 2024
+- Prepared audience-appropriate presentations and workshops about data and AI.
+- Explained and gamified neural networks, Bayes theorem, linear and logistic regression, and K-means.
+
+Skills
+Python, Pandas, NumPy, Scikit-learn, TensorFlow, PyTorch, SQL, R, Java, Excel, Power BI, Tableau

@@ -318,13 +318,17 @@ describe("run charging and transparency", () => {
     expect(verifyBillingState(stored).valid).toBe(true);
   });
 
-  it("preserves every credit under a burst of concurrent reservations", async () => {
+  it("preserves every credit under a burst of concurrent reservations across sessions", async () => {
     process.env.APP_MAX_ACTIVE_RUNS_PER_USER = "100";
     process.env.APP_MAX_ACTIVE_RUNS_PER_WORKSPACE = "100";
     process.env.APP_MAX_ACTIVE_RUNS_GLOBAL = "100";
     await startApp({ autoRun: false });
-    const session = await request(app).post("/api/chat/sessions").set(auth("alice")).send({ title: "Reservation stress" }).expect(201);
-    const responses = await Promise.all(Array.from({ length: 30 }, (_, index) => request(app)
+    const sessions = await Promise.all(Array.from({ length: 30 }, (_, index) => request(app)
+      .post("/api/chat/sessions")
+      .set(auth("alice"))
+      .send({ title: `Reservation stress ${index + 1}` })
+      .expect(201)));
+    const responses = await Promise.all(sessions.map((session, index) => request(app)
       .post(`/api/chat/sessions/${session.body.session_id}/messages`)
       .set(auth("alice"))
       .set("Idempotency-Key", `stress-message-${String(index + 1).padStart(4, "0")}`)
@@ -350,13 +354,18 @@ describe("run charging and transparency", () => {
       .set(auth("alice"))
       .send({ title: "Capacity guard" })
       .expect(201);
+    const secondSession = await request(app)
+      .post("/api/chat/sessions")
+      .set(auth("alice"))
+      .send({ title: "Capacity guard second chat" })
+      .expect(201);
     await request(app)
       .post(`/api/chat/sessions/${session.body.session_id}/messages`)
       .set(auth("alice"))
       .send({ content: "First active request" })
       .expect(202);
     const blocked = await request(app)
-      .post(`/api/chat/sessions/${session.body.session_id}/messages`)
+      .post(`/api/chat/sessions/${secondSession.body.session_id}/messages`)
       .set(auth("alice"))
       .send({ content: "Second active request" })
       .expect(429);

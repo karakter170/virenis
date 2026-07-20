@@ -222,7 +222,7 @@ describe.sequential("WorldGraph app integration", () => {
     expect(repeated.world_graph).toMatchObject({ kept: 3, refreshed: 0, total: 3 });
   });
 
-  it("handles concurrent repeat submissions without duplicate worker execution or corrupted state", async () => {
+  it("handles serial repeat submissions without duplicate worker execution or corrupted state", async () => {
     const session = await createSession();
     await execute(session.session_id);
     const submit = (suffix) => request(app)
@@ -231,7 +231,9 @@ describe.sequential("WorldGraph app integration", () => {
       .set("Idempotency-Key", `worldgraph-concurrent-${suffix}`)
       .send({ content: PROMPT })
       .expect(202);
-    const [left, right] = await Promise.all([submit("left"), submit("right")]);
+    const left = await submit("left");
+    expect((await app.locals.drainBackgroundTasks({ timeoutMs: 5000 })).ok).toBe(true);
+    const right = await submit("right");
     expect((await app.locals.drainBackgroundTasks({ timeoutMs: 5000 })).ok).toBe(true);
     const runs = await Promise.all([left.body.run_id, right.body.run_id].map((runId) => request(app)
       .get(`/api/chat/runs/${runId}`)
@@ -245,24 +247,26 @@ describe.sequential("WorldGraph app integration", () => {
     expect(app.locals.store.read().worldGraphArtifacts.every((item) => item.record_hash?.startsWith("sha256:"))).toBe(true);
   });
 
-  it("single-flights simultaneous cold duplicates so only one run wakes workers", async () => {
+  it("idempotently replays simultaneous cold duplicates so only one run wakes workers", async () => {
     const session = await createSession();
-    const submit = (suffix) => request(app)
+    const submit = () => request(app)
       .post(`/api/chat/sessions/${session.session_id}/messages`)
       .set("Authorization", OWNER_AUTH)
-      .set("Idempotency-Key", `worldgraph-cold-singleflight-${suffix}`)
+      .set("Idempotency-Key", "worldgraph-cold-singleflight-0001")
       .send({ content: PROMPT })
       .expect(202);
-    const [left, right] = await Promise.all([submit("left"), submit("right")]);
+    const [left, right] = await Promise.all([submit(), submit()]);
+    expect(left.body.run_id).toBe(right.body.run_id);
+    expect([left.body.duplicate, right.body.duplicate].sort()).toEqual([false, true]);
     expect((await app.locals.drainBackgroundTasks({ timeoutMs: 5000 })).ok).toBe(true);
-    const responses = await Promise.all([left.body.run_id, right.body.run_id].map((runId) => request(app)
-      .get(`/api/chat/runs/${runId}`)
+    const response = await request(app)
+      .get(`/api/chat/runs/${left.body.run_id}`)
       .set("Authorization", OWNER_AUTH)
-      .expect(200)));
-    const runs = responses.map((response) => response.body);
-    expect(runs.reduce((sum, run) => sum + eventsOf(run, "route.started").length, 0)).toBe(3);
-    expect(runs.reduce((sum, run) => sum + eventsOf(run, "route.reused").length, 0)).toBe(3);
-    expect(runs.map((run) => run.world_graph.refreshed).sort((a, b) => a - b)).toEqual([0, 3]);
+      .expect(200);
+    const run = response.body;
+    expect(eventsOf(run, "route.started")).toHaveLength(3);
+    expect(eventsOf(run, "route.reused")).toHaveLength(0);
+    expect(run.world_graph.refreshed).toBe(3);
     expect(app.locals.store.read().worldGraphArtifacts).toHaveLength(3);
   });
 

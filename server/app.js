@@ -95,7 +95,11 @@ import {
   realRuntimeEnabled,
   registerRuntimeAgent,
   registerRuntimeDocument,
+  RUNTIME_PLAN_CONTRACT_VERSIONS,
+  RUNTIME_STREAM_PROTOCOL,
+  RUNTIME_TERMINAL_RECOVERY_PROTOCOL,
   runRuntimeValidation,
+  runtimeProtocolCompatibility,
   updateRuntimeAgent,
   verifyRuntimeAuditSubject,
   verifyRuntimeExecutionSubject
@@ -722,23 +726,34 @@ export async function createApp({
     res.json({
       ok: true,
       service: "virenis",
-      runtime_mode: realRuntimeEnabled() ? "real" : "simulator"
+      runtime_mode: realRuntimeEnabled() ? "real" : "simulator",
+      runtime_protocol: {
+        chat_stream: RUNTIME_STREAM_PROTOCOL,
+        plan_contract_versions: [...RUNTIME_PLAN_CONTRACT_VERSIONS],
+        terminal_recovery: RUNTIME_TERMINAL_RECOVERY_PROTOCOL
+      }
     });
   });
   app.get("/readyz", async (_req, res) => {
     try {
       await store.readinessCheck();
+      let runtimeProtocol = null;
       if (process.env.WEB_READY_REQUIRE_RUNTIME === "1" && realRuntimeEnabled()) {
         const runtime = await fetchRuntimeHealth();
         if (runtime?.ok !== true || runtime?.ready !== true) {
           throw new Error("TCAR runtime is reachable but not ready.");
+        }
+        runtimeProtocol = runtimeProtocolCompatibility(runtime);
+        if (!runtimeProtocol.compatible) {
+          throw new Error("TCAR runtime protocol is incompatible with this web deployment.");
         }
       }
       const readiness = {
         ok: true,
         ready: true,
         service: "virenis",
-        runtime_mode: realRuntimeEnabled() ? "real" : "simulator"
+        runtime_mode: realRuntimeEnabled() ? "real" : "simulator",
+        ...(runtimeProtocol ? { runtime_protocol: runtimeProtocol } : {})
       };
       if (process.env.WEB_READY_INCLUDE_STORE_COUNTS === "1") {
         const data = store.read();
@@ -1861,14 +1876,21 @@ export async function createApp({
         outputSettings: modelOutputSettingsForWorkspace(data, session.workspace_id)
       });
       const requestedAgentIds = normalizeRequestedAgentIds(req.body.requested_agent_ids);
+      const attachments = normalizeMessageAttachments(req.body.attachments);
+      const agentWorkspace = activeAgentWorkspaceForSession(data, session);
+      const routingScope = scopedRoutingContext({
+        session,
+        agents: data.agents,
+        documents: data.documents,
+        agentWorkspace
+      });
+      const attachmentBinding = resolveChatAttachmentBinding({
+        query: req.body.content,
+        attachments,
+        session,
+        routingScope
+      });
       if (requestedAgentIds.length) {
-        const agentWorkspace = activeAgentWorkspaceForSession(data, session);
-        const routingScope = scopedRoutingContext({
-          session,
-          agents: data.agents,
-          documents: data.documents,
-          agentWorkspace
-        });
         const allowed = new Set(routingScope.allowedAdapters);
         const unavailable = requestedAgentIds.filter((agentId) => !allowed.has(agentId));
         if (unavailable.length) {
@@ -1878,11 +1900,28 @@ export async function createApp({
           throwStatus(400, `This workflow exceeds the ${runOptions.max_routing_adapters}-specialist run limit.`);
         }
       }
-      const executionOptions = requestedAgentIds.length
-        ? { ...runOptions, required_adapters: requestedAgentIds }
-        : runOptions;
+      const requestedSet = new Set(requestedAgentIds);
+      if (
+        requestedAgentIds.length
+        && attachmentBinding.agent_ids.some((agentId) => !requestedSet.has(agentId))
+      ) {
+        throwStatus(409, "The approved workflow does not include the file explicitly referenced by this message. Add its source agent to the workflow or send the file request separately.");
+      }
+      const routedAgentCount = new Set([
+        ...requestedAgentIds,
+        ...attachmentBinding.agent_ids
+      ]).size;
+      if (routedAgentCount > runOptions.max_routing_adapters) {
+        throwStatus(400, `This request exceeds the ${runOptions.max_routing_adapters}-specialist run limit after binding its chat files.`);
+      }
+      const executionOptions = {
+        ...runOptions,
+        ...(requestedAgentIds.length ? { required_adapters: requestedAgentIds } : {}),
+        ...(attachmentBinding.agent_ids.length
+          ? { attachment_adapters: attachmentBinding.agent_ids }
+          : {})
+      };
       const workflowCommand = parseWorkflowCommand(req.body.content);
-      const attachments = normalizeMessageAttachments(req.body.attachments);
       const idempotencyKey = normalizeIdempotencyKey(req.headers["idempotency-key"]);
       const submissionKeyDigest = idempotencyKey
         ? crypto.createHash("sha256").update(idempotencyKey, "utf8").digest("hex")
@@ -1922,6 +1961,8 @@ export async function createApp({
         max_routing_adapters: runOptions.max_routing_adapters,
         execution_options: executionOptions,
         requested_agent_ids: requestedAgentIds,
+        attachment_document_ids: attachmentBinding.document_ids,
+        attachment_agent_ids: attachmentBinding.agent_ids,
         query: message.content,
         plan: { steps: [] },
         parallel: { workers: runOptions.parallel_workers, batches: [], maxBatchWidth: 0, parallelizable: false },
@@ -1959,6 +2000,7 @@ export async function createApp({
         }
         const mutableSession = mutable.sessions.find((item) => item.session_id === session.session_id);
         if (!mutableSession) throwStatus(404, "Chat session not found.");
+        assertSessionAcceptsNewRun(mutable, mutableSession.session_id);
         assertSessionExecutionInputsSettled(mutable, mutableSession);
         mutable.messages.push(message);
         reserveRunCredits(mutable, {
@@ -6245,6 +6287,9 @@ function redactRuntimeHealthForRequest(payload = {}, req) {
       models_endpoint_ok: modelApi.models_endpoint_ok,
       mode: modelApi.mode
     },
+    protocol: payload.protocol && typeof payload.protocol === "object"
+      ? payload.protocol
+      : undefined,
     tool_readiness: payload.tool_readiness && typeof payload.tool_readiness === "object"
       ? payload.tool_readiness
       : undefined
@@ -6423,6 +6468,9 @@ function currentWorldGraphPreview(data, run, { runtimeComponentProvenance = null
   if (Array.isArray(run.requested_agent_ids) && run.requested_agent_ids.length) {
     refreshOptions.required_adapters = [...run.requested_agent_ids];
   }
+  if (Array.isArray(run.attachment_agent_ids) && run.attachment_agent_ids.length) {
+    refreshOptions.attachment_adapters = [...run.attachment_agent_ids];
+  }
   return previewWorldGraphRun({
     data,
     run,
@@ -6470,6 +6518,8 @@ function readRunResult(store, runId, req) {
     status: run.status,
     query: run.query,
     requested_agent_ids: Array.isArray(run.requested_agent_ids) ? run.requested_agent_ids : [],
+    attachment_document_ids: Array.isArray(run.attachment_document_ids) ? run.attachment_document_ids : [],
+    attachment_agent_ids: Array.isArray(run.attachment_agent_ids) ? run.attachment_agent_ids : [],
     final_answer: run.final_answer || "",
     plan: run.plan,
     parallel: run.parallel,
@@ -6730,6 +6780,7 @@ function redactRunStepForRequest(step, req) {
     raw_text_admin_only: _rawText,
     prompt_preview_admin_only: _promptPreview,
     model_calls_admin_only: _modelCalls,
+    failure_observability_admin_only: _failureObservability,
     agent_reasoning: _agentReasoning,
     approved_sources: _approvedSources,
     ...safeStep
@@ -7161,6 +7212,74 @@ function normalizeRequestedAgentIds(value) {
     throwStatus(400, "requested_agent_ids contains an invalid specialist identifier.");
   }
   return normalized;
+}
+
+const CHAT_ATTACHMENT_REFERENCE_RE = /\b(?:attach(?:ed|ment|ments)?|uploaded|chat[- ]scoped|chat\s+file)\b/i;
+
+function resolveChatAttachmentBinding({ query, attachments, session, routingScope }) {
+  const visibleDocuments = Array.isArray(routingScope?.documents) ? routingScope.documents : [];
+  const visibleById = new Map(visibleDocuments
+    .filter((document) => document?.document_id)
+    .map((document) => [String(document.document_id), document]));
+  const referencedDocumentIds = [...new Set(
+    (Array.isArray(attachments) ? attachments : [])
+      .map((attachment) => String(attachment?.document_id || "").trim())
+      .filter(Boolean)
+  )];
+  const unavailableDocumentIds = referencedDocumentIds.filter((documentId) => !visibleById.has(documentId));
+  if (unavailableDocumentIds.length) {
+    throwStatus(404, "One or more attached chat files are unavailable in this session.");
+  }
+
+  if (!CHAT_ATTACHMENT_REFERENCE_RE.test(String(query || ""))) {
+    return { document_ids: [], agent_ids: [] };
+  }
+
+  const sessionChatDocuments = visibleDocuments.filter((document) => (
+    document?.scope === "chat"
+    && String(document.session_id || "") === String(session?.session_id || "")
+  ));
+  let candidates = referencedDocumentIds.length
+    ? referencedDocumentIds.map((documentId) => visibleById.get(documentId)).filter((document) => (
+      document?.scope === "chat"
+      && String(document.session_id || "") === String(session?.session_id || "")
+    ))
+    : sessionChatDocuments;
+  if (!candidates.length) {
+    // Preserve ordinary Knowledge routing for prompts such as "the uploaded
+    // handbook" when no chat-scoped file exists. Knowledge sources are not
+    // per-message attachment bindings.
+    return { document_ids: [], agent_ids: [] };
+  }
+
+  if (candidates.length > 1) {
+    const normalizedQuery = String(query || "").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+    const named = candidates.filter((document) => {
+      const title = String(document?.title || "").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+      return title.length >= 3 && normalizedQuery.includes(title);
+    });
+    if (named.length === 1) {
+      candidates = named;
+    } else {
+      throwStatus(409, "More than one chat file is attached. Name the file in the message so its source agent can be bound unambiguously.");
+    }
+  }
+
+  const [document] = candidates;
+  const agentId = String(document?.agent_id || "").trim();
+  const agent = (routingScope?.agents || []).find((candidate) => candidate?.id === agentId);
+  if (
+    !agentId
+    || !agent
+    || agent.scope !== "chat"
+    || String(agent.session_id || "") !== String(session?.session_id || "")
+  ) {
+    throwStatus(409, "The referenced chat file does not have an available session source agent.");
+  }
+  return {
+    document_ids: [String(document.document_id)],
+    agent_ids: [agentId]
+  };
 }
 
 function normalizeMessageAttachments(value) {
@@ -10028,6 +10147,18 @@ function activeExecutionInputRun(data, predicate) {
     EXECUTION_INPUT_LOCK_STATUSES.has(String(run?.status || ""))
     && predicate(run)
   )) || null;
+}
+
+function assertSessionAcceptsNewRun(data, sessionId) {
+  const activeRun = (data.runs || []).find((run) => (
+    String(run?.session_id || "") === String(sessionId || "")
+    && !TERMINAL_WORK_STATUSES.has(String(run?.status || ""))
+  ));
+  if (!activeRun) return;
+  const error = new Error("This chat already has an answer in progress. Wait for it to finish before sending another message.");
+  error.status = 409;
+  error.code = "session_run_in_progress";
+  throw error;
 }
 
 function executionInputsLocked(run) {

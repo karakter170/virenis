@@ -93,6 +93,7 @@ import {
   WORKFLOW_POLL_DEADLINE_MS,
   isTerminalRunStatus,
   runIsActiveForSession,
+  refreshedSessionsPreservingCurrent,
   shouldApplySessionResponse,
   shouldRefreshOriginSession,
   sseRecoveryDelay,
@@ -204,6 +205,26 @@ export function preserveAmbiguousChatSubmission(previous, next) {
     : next;
 }
 
+export function chatDocumentMessageAttachments(documents = []) {
+  const seen = new Set();
+  return (Array.isArray(documents) ? documents : [])
+    .filter((document) => (
+      document?.scope === "chat"
+      && document.enabled !== false
+      && String(document.document_id || "").trim()
+    ))
+    .flatMap((document) => {
+      const documentId = String(document.document_id).trim();
+      if (seen.has(documentId)) return [];
+      seen.add(documentId);
+      return [{
+        type: "document",
+        name: String(document.title || "Chat document").trim().slice(0, 180) || "Chat document",
+        document_id: documentId
+      }];
+    });
+}
+
 export function availableSessionAgents(agents = []) {
   return agents
     .filter((agent) => agent.enabled !== false)
@@ -216,6 +237,17 @@ export function agentsForWorkspace(agents = [], workspace = null) {
   if (!workspace || !Array.isArray(workspace.agent_ids)) return [];
   const memberIds = new Set(workspace.agent_ids.map((agentId) => String(agentId || "")).filter(Boolean));
   return agents.filter((agent) => memberIds.has(String(agent?.id || "")));
+}
+
+export function agentsForCatalog(agents = [], workspace = null, auth = null) {
+  const workspaceAgents = agentsForWorkspace(agents, workspace)
+    .filter((agent) => auth?.is_admin || agent?.runtime_only !== true);
+  if (!auth?.is_admin) return workspaceAgents;
+  const includedIds = new Set(workspaceAgents.map((agent) => String(agent?.id || "")));
+  return [
+    ...workspaceAgents,
+    ...agents.filter((agent) => agent?.runtime_only === true && !includedIds.has(String(agent?.id || "")))
+  ];
 }
 
 export function workflowRunRequest(workflow = {}) {
@@ -292,7 +324,7 @@ function runStatusLabel(status) {
 
 function liveRunStatusForEvent(type) {
   if (type === "planner.started" || type === "run.started") return "planning";
-  if (["planner.completed", "route.started", "route.completed", "route.reused"].includes(type)) return "running";
+  if (["planner.completed", "route.started", "route.completed", "route.reused", "route.failed"].includes(type)) return "running";
   if (type === "synthesis.started") return "synthesizing";
   if (type === "final.completed") return "completed";
   if (type === "run.failed") return "failed";
@@ -1023,7 +1055,11 @@ function Workspace({ onHome, onSignedOut }) {
       }
     }
     setAuth(me);
-    setSessions(sessionList.sessions || []);
+    setSessions((current) => refreshedSessionsPreservingCurrent(
+      sessionList.sessions || [],
+      current,
+      desiredSessionIdRef.current || displayedSessionIdRef.current
+    ));
     if (agentList) setAgents(agentList.agents || []);
     if (docList) setDocuments(docList.documents || []);
     if (health) setRuntime(health);
@@ -1301,6 +1337,7 @@ function Workspace({ onHome, onSignedOut }) {
         .map((agentId) => String(agentId || "").trim())
         .filter(Boolean)
     )];
+    const messageAttachments = chatDocumentMessageAttachments(chatDocuments);
     if (
       !content
       || !originSessionId
@@ -1312,12 +1349,13 @@ function Workspace({ onHome, onSignedOut }) {
       || Boolean(bootstrapFailure)
     ) return false;
     const previousSubmission = sendRetryRef.current;
-    const routingKey = `message:${requestedAgentIds.join("|")}`;
+    const routingKey = `message:${requestedAgentIds.join("|")}:${messageAttachments.map((item) => item.document_id).join("|")}`;
     const submission = preserveAmbiguousChatSubmission(previousSubmission, {
       content,
       sessionId: originSessionId,
       routingKey,
       requestedAgentIds,
+      attachments: messageAttachments,
       idempotencyKey: mutationIdempotencyKey("message")
     });
     sendInFlightRef.current = true;
@@ -1332,12 +1370,13 @@ function Workspace({ onHome, onSignedOut }) {
       message_id: optimisticId,
       role: "user",
       content,
+      attachments: submission.attachments,
       created_at: submittedAt
     }]);
     try {
       const queued = await api.post(`/api/chat/sessions/${encodeURIComponent(originSessionId)}/messages`, {
         content,
-        attachments: [],
+        attachments: submission.attachments,
         ...(submission.requestedAgentIds.length ? { requested_agent_ids: submission.requestedAgentIds } : {}),
         options: { show_route_details: true }
       }, { idempotencyKey: submission.idempotencyKey });
@@ -1604,7 +1643,8 @@ function Workspace({ onHome, onSignedOut }) {
     const requestedAgentIds = Array.isArray(run?.requested_agent_ids)
       ? [...new Set(run.requested_agent_ids.map((agentId) => String(agentId || "").trim()).filter(Boolean))]
       : [];
-    const routingKey = `${runFresh ? "fresh" : "selective"}:${String(run?.run_id || requestedAgentIds.join("|") || "prompt")}`;
+    const messageAttachments = chatDocumentMessageAttachments(chatDocuments);
+    const routingKey = `${runFresh ? "fresh" : "selective"}:${String(run?.run_id || requestedAgentIds.join("|") || "prompt")}:${messageAttachments.map((item) => item.document_id).join("|")}`;
     if (
       !content
       || !originSessionId
@@ -1624,6 +1664,7 @@ function Workspace({ onHome, onSignedOut }) {
       sessionId: originSessionId,
       routingKey,
       requestedAgentIds,
+      attachments: messageAttachments,
       executionOptions: { ...(run?.execution_options || {}) },
       idempotencyKey: mutationIdempotencyKey(runFresh ? "fresh-message" : "selective-message")
     });
@@ -1633,12 +1674,13 @@ function Workspace({ onHome, onSignedOut }) {
       message_id: optimisticId,
       role: "user",
       content,
+      attachments: submission.attachments,
       created_at: new Date().toISOString()
     }]);
     try {
       const queued = await api.post(`/api/chat/sessions/${encodeURIComponent(originSessionId)}/messages`, {
         content,
-        attachments: [],
+        attachments: submission.attachments,
         ...(submission.requestedAgentIds.length
           ? { requested_agent_ids: submission.requestedAgentIds }
           : {}),
@@ -2176,7 +2218,10 @@ function Workspace({ onHome, onSignedOut }) {
   const workspaceNavigationDisabled = Boolean(loading || bootstrapFailure);
 
   return (
-    <div className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}>
+    <div
+      className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}
+      data-active-session-id={session?.session_id || ""}
+    >
       <WorkspaceSidebar
         auth={auth}
         billing={billing}
@@ -3201,6 +3246,7 @@ export function WorkspaceSidebar({
               type="button"
               className="sidebar-chat-row"
               key={item.session_id}
+              data-session-id={item.session_id}
               aria-current={activeSessionId === item.session_id ? "page" : undefined}
               disabled={navigationDisabled}
               onClick={() => onOpenSession(item.session_id)}
@@ -3949,11 +3995,14 @@ export function runProgressSpecialists(run, agents = []) {
   const events = Array.isArray(run?.events) ? run.events : [];
   const stepById = new Map(steps.map((step) => [step.id, step]));
   return steps.map((step) => {
+    const failed = events.find((event) => event.type === "route.failed" && event.step_id === step.id);
     const reused = events.some((event) => event.type === "route.reused" && event.step_id === step.id);
     const completed = events.some((event) => event.type === "route.completed" && event.step_id === step.id)
       || ["synthesizing", "completed"].includes(run?.status);
     const started = events.some((event) => event.type === "route.started" && event.step_id === step.id);
-    const state = reused ? "reused" : completed ? "ready" : started ? "working" : "queued";
+    const state = failed
+      ? failed.status === "blocked" ? "blocked" : "failed"
+      : reused ? "reused" : completed ? "ready" : started ? "working" : "queued";
     const dependencyIds = (step.depends_on || []).filter((dependencyId) => stepById.has(dependencyId));
     return {
       id: step.id,
@@ -3974,6 +4023,8 @@ function runProgressStateLabel(state) {
   if (state === "working") return "Working";
   if (state === "ready") return "Done";
   if (state === "reused") return "Reused";
+  if (state === "blocked") return "Blocked";
+  if (state === "failed") return "Failed";
   return "Queued";
 }
 
@@ -4180,6 +4231,22 @@ function mentionMatchScore(agent, query) {
   return 0;
 }
 
+export function insertComposerAgentMention(value, mention, agent) {
+  const agentId = String(agent?.id || "").trim();
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,239}$/.test(agentId)) return null;
+  const start = Number(mention?.start);
+  const end = Number(mention?.end);
+  if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end < start) return null;
+  const content = String(value || "");
+  if (end > content.length) return null;
+  const token = `@${agentId}`;
+  return {
+    value: `${content.slice(0, start)}${token} ${content.slice(end)}`,
+    caret: start + token.length + 1,
+    token
+  };
+}
+
 export function Composer({
   value,
   onChange,
@@ -4293,16 +4360,13 @@ export function Composer({
 
   function chooseAgent(agent) {
     if (!mention) return;
-    const title = agentFacingText(agent.title).replace(/"/g, "");
-    const alias = String(agent.id || "agent");
-    const token = title && title.length <= 58 ? `@"${title}"` : `@${alias}`;
-    const nextValue = `${value.slice(0, mention.start)}${token} ${value.slice(mention.end)}`;
-    const nextCaret = mention.start + token.length + 1;
-    onChange(nextValue);
+    const selection = insertComposerAgentMention(value, mention, agent);
+    if (!selection) return;
+    onChange(selection.value);
     setMention(null);
     requestAnimationFrame(() => {
       inputRef.current?.focus();
-      inputRef.current?.setSelectionRange(nextCaret, nextCaret);
+      inputRef.current?.setSelectionRange(selection.caret, selection.caret);
     });
   }
 
@@ -4652,6 +4716,7 @@ function ResourcesSheet({
   const [view, setView] = useState(initialView || "agents");
   const canWrite = !auth?.is_viewer;
   const activeWorkspaceAgents = agentsForWorkspace(agents, activeAgentWorkspace);
+  const catalogAgents = agentsForCatalog(agents, activeAgentWorkspace, auth);
   const workspaceLatestRun = latestRun
     && String(latestRun.agent_workspace_id || "") === String(activeAgentWorkspace?.agent_workspace_id || "")
     ? latestRun
@@ -4676,7 +4741,7 @@ function ResourcesSheet({
 
         {view === "agents" && (
           <AgentCatalog
-            agents={activeWorkspaceAgents}
+            agents={catalogAgents}
             workspaces={agentWorkspaces}
             activeWorkspace={activeAgentWorkspace}
             auth={auth}
@@ -5251,6 +5316,7 @@ export function AgentCatalog({
   const [query, setQuery] = useState("");
   const canWrite = !auth?.is_viewer;
   const filtered = agents
+    .filter((agent) => auth?.is_admin || agent?.runtime_only !== true)
     .filter((agent) => !agent.document && !agent.resource_for_agent_id)
     .filter((agent) => !query || `${agent.title || ""} ${agent.capability || ""}`.toLowerCase().includes(query.toLowerCase()))
     .sort((left, right) => Number(canManageAgent(right, auth)) - Number(canManageAgent(left, auth))
@@ -7549,6 +7615,7 @@ function eventLabel(type) {
     "runtime.requested": "Request accepted",
     "route.started": "Specialist started",
     "route.completed": "Specialist finished",
+    "route.failed": "Specialist could not complete",
     "synthesis.started": "Composing answer",
     "final.completed": "Answer completed",
     "run.failed": "Answer failed"

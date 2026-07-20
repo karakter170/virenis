@@ -356,10 +356,12 @@ function sourceStateReplayable(agent, documents) {
 }
 
 function routeOptionState(options = {}) {
+  const attachmentAdapters = normalizedStrings(options.attachment_adapters);
   return {
     max_tokens: Number(options.max_tokens) || null,
     temperature: Number(options.temperature) || 0,
-    required_adapters: normalizedStrings(options.required_adapters)
+    required_adapters: normalizedStrings(options.required_adapters),
+    ...(attachmentAdapters.length ? { attachment_adapters: attachmentAdapters } : {})
   };
 }
 

@@ -30,6 +30,17 @@ export function shouldRefreshOriginSession(originSessionId, displayedSessionId, 
     && (!desiredSessionId || String(originSessionId) === String(desiredSessionId));
 }
 
+export function refreshedSessionsPreservingCurrent(incoming, current, currentSessionId) {
+  const next = Array.isArray(incoming) ? incoming : [];
+  const preserveId = String(currentSessionId || "");
+  if (!preserveId || next.some((item) => String(item?.session_id || "") === preserveId)) {
+    return next;
+  }
+  const preserved = (Array.isArray(current) ? current : [])
+    .find((item) => String(item?.session_id || "") === preserveId);
+  return preserved ? [preserved, ...next] : next;
+}
+
 export function workflowPollDelay(attempt) {
   const index = Math.max(0, Math.min(WORKFLOW_POLL_DELAYS_MS.length - 1, Number(attempt) || 0));
   return WORKFLOW_POLL_DELAYS_MS[index];

@@ -5,7 +5,12 @@ import { releaseRunReservation, settleRunCredits } from "./billing.js";
 import { makeId, nowIso } from "./store.js";
 import { assertStoredDocumentIntegrity, scoreChunks, slugify } from "./documents.js";
 import { normalizeDiagnosticError } from "./diagnostics.js";
-import { executeRuntimeChatStream, realRuntimeEnabled, runtimeApiKey } from "./runtimeClient.js";
+import {
+  executeRuntimeChatStream,
+  realRuntimeEnabled,
+  runtimeApiKey,
+  runtimeStreamTaskProjection
+} from "./runtimeClient.js";
 import { agentRevision, digestValue, normalizeSha256Digest, realityRankMap, recordExecution } from "./outcomes.js";
 import {
   prepareWorldGraphReplay,
@@ -153,7 +158,8 @@ export function planRoutes({
   agentRankings = {},
   maxRoutingAdapters = 12,
   maxResourceSupportAdapters = 8,
-  requiredAgentIds = []
+  requiredAgentIds = [],
+  attachmentAgentIds = []
 }) {
   const enabled = agents.filter((agent) => agent.enabled !== false && agent.runtime_sync_pending !== true);
   const hasAgent = (id) => enabled.some((agent) => agent.id === id);
@@ -312,6 +318,49 @@ export function planRoutes({
       .map((agentId) => String(agentId || "").trim())
       .filter((agentId) => agentId && hasAgent(agentId))
   )];
+  const boundAttachmentAgents = [...new Set(
+    (Array.isArray(attachmentAgentIds) ? attachmentAgentIds : [])
+      .map((agentId) => String(agentId || "").trim())
+      .filter((agentId) => agentId && hasAgent(agentId))
+  )];
+  if (boundAttachmentAgents.length && !approvedWorkflowAgents.length) {
+    if (boundAttachmentAgents.length > specialistLimit) {
+      const error = new Error(`The attached files exceed the ${specialistLimit}-specialist route limit.`);
+      error.code = "chat_attachment_route_limit_exceeded";
+      throw error;
+    }
+    for (const agentId of boundAttachmentAgents) {
+      const agent = enabledById.get(agentId);
+      const added = add(agentId, `Retrieve only from the explicitly referenced chat file using ${agent?.title || "its session source agent"}.`, [], {
+        adapter: agentId,
+        source: "chat_attachment",
+        confidence: 1,
+        reality_rank: rankingScore(agentRankings[agentId]),
+        reason: "Bound to an explicitly referenced, session-authorized chat attachment."
+      });
+      if (!added) {
+        const error = new Error("The referenced chat file cannot fit its complete configured handoff graph within the current specialist limit and active team.");
+        error.code = "chat_attachment_dependency_closure_unavailable";
+        throw error;
+      }
+    }
+    return {
+      steps,
+      routing: {
+        mode: "chat_attachment",
+        candidate_trace: [],
+        explicit_adapters: [],
+        attachment_adapters: boundAttachmentAgents,
+        selected: steps.map((step) => selections.get(step.adapter) || {
+          adapter: step.adapter,
+          source: "configured_handoff",
+          confidence: 1,
+          reality_rank: rankingScore(agentRankings[step.adapter]),
+          reason: "Included by the attachment source agent's saved handoff."
+        })
+      }
+    };
+  }
   if (approvedWorkflowAgents.length) {
     if (approvedWorkflowAgents.length > specialistLimit) {
       const error = new Error(`The approved workflow exceeds the ${specialistLimit}-specialist route limit.`);
@@ -974,10 +1023,24 @@ async function processLocalChatRun({ store, bus, run_id, options = {} }) {
         .map((adapter) => String(adapter || "").trim())
         .filter(Boolean)
     )];
+    const attachmentAdapters = [...new Set(
+      (Array.isArray(snapshot.run.attachment_agent_ids)
+        ? snapshot.run.attachment_agent_ids
+        : Array.isArray(options.attachment_adapters)
+          ? options.attachment_adapters
+          : [])
+        .map((adapter) => String(adapter || "").trim())
+        .filter(Boolean)
+    )];
     const allowedAdapterSet = new Set(scoped.allowedAdapters);
     if (requiredAdapters.some((adapter) => !allowedAdapterSet.has(adapter))) {
       const error = new Error("A workflow specialist is no longer available in the active team.");
       error.code = "workflow_agent_unavailable";
+      throw error;
+    }
+    if (attachmentAdapters.some((adapter) => !allowedAdapterSet.has(adapter))) {
+      const error = new Error("A referenced chat file is no longer available in this session.");
+      error.code = "chat_attachment_agent_unavailable";
       throw error;
     }
     const agentRankings = realityRankMap(snapshot, {
@@ -991,7 +1054,8 @@ async function processLocalChatRun({ store, bus, run_id, options = {} }) {
       documents: scoped.documents,
       agentRankings,
       maxRoutingAdapters: Number(options.max_routing_adapters) || 12,
-      requiredAgentIds: requiredAdapters
+      requiredAgentIds: requiredAdapters,
+      attachmentAgentIds: attachmentAdapters
     });
     const parallel = buildParallelBatches(plan.steps, Number(options.parallel_workers) || 2);
     await persistRunTransition({
@@ -1266,10 +1330,24 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
         .map((adapter) => String(adapter || "").trim())
         .filter(Boolean)
     )];
+    const attachmentAdapters = [...new Set(
+      (Array.isArray(snapshot.run.attachment_agent_ids)
+        ? snapshot.run.attachment_agent_ids
+        : Array.isArray(options.attachment_adapters)
+          ? options.attachment_adapters
+          : [])
+        .map((adapter) => String(adapter || "").trim())
+        .filter(Boolean)
+    )];
     const allowedAdapterSet = new Set(scoped.allowedAdapters);
     if (requiredAdapters.some((adapter) => !allowedAdapterSet.has(adapter))) {
       const error = new Error("A workflow specialist is no longer available in the active team.");
       error.code = "workflow_agent_unavailable";
+      throw error;
+    }
+    if (attachmentAdapters.some((adapter) => !allowedAdapterSet.has(adapter))) {
+      const error = new Error("A referenced chat file is no longer available in this session.");
+      error.code = "chat_attachment_agent_unavailable";
       throw error;
     }
     const agentRankings = realityRankMap(snapshot, {
@@ -1344,6 +1422,7 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
         temperature: Number(options.temperature ?? process.env.TCAR_TEMPERATURE ?? 0),
         allowed_adapters: scoped.allowedAdapters,
         ...(requiredAdapters.length ? { required_adapters: requiredAdapters } : {}),
+        ...(attachmentAdapters.length ? { attachment_adapters: attachmentAdapters } : {}),
         agent_rankings: Object.fromEntries(
           Object.entries(agentRankings)
             .filter(([, ranking]) => ranking.routing_eligible === true)
@@ -1401,29 +1480,32 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
       scoped.agents
     );
     const parallel = buildParallelBatches(plan.steps, parallelWorkers);
-    if (
-      streamedSafePlanDigest
-      && runtimePlanSafeProjectionDigest(plan) !== streamedSafePlanDigest
-    ) {
-      const error = new Error("Runtime terminal plan did not match its streamed planner contract.");
-      error.code = "runtime_stream_plan_mismatch";
-      error.status = 502;
-      throw error;
+    const planCommit = assertRuntimePlanStreamCommit({
+      rawTerminalPlan,
+      normalizedTerminalPlan: plan,
+      streamedSafePlanDigest,
+      streamedExactPlanDigest,
+      streamedExactPlanContractVersion
+    });
+    if (planCommit.safe_projection_reconciled) {
+      // The negotiated exact digest is authoritative for execution. A safe
+      // progress-preview mismatch must not discard a validated answer after
+      // tokens were spent; correct the UI to the terminal plan and retain a
+      // content-free event for operations diagnostics.
+      await updateRun(store, bus, run_id, {}, {
+        type: "runtime.plan_projection_reconciled",
+        contract_version: streamedExactPlanContractVersion || null
+      });
     }
-    if (
-      streamedExactPlanDigest
-      && !runtimePlanContractDigestMatches(
-        rawTerminalPlan,
-        streamedExactPlanDigest,
-        streamedExactPlanContractVersion
-      )
-    ) {
-      const error = new Error("Runtime terminal plan did not match its exact execution contract digest.");
-      error.code = "runtime_stream_plan_mismatch";
-      error.status = 502;
-      throw error;
-    }
-    const outputs = assertRuntimeRouteCoverage(plan, result.expertOutputs);
+    const { outputs, routeFailures } = validateRuntimeRouteResults(
+      plan,
+      result.expertOutputs,
+      result.routeFailureSummary
+    );
+    const routeFailureByStep = new Map(routeFailures.map((failure) => [failure.step_id, failure]));
+    const successfulOutputs = outputs.filter((output) => (
+      !routeFailureByStep.has(String(output.id || output.step_id || ""))
+    ));
     if (outputs.some((output) => output?.execution_mode === "reused")) {
       const reportedCalls = Array.isArray(result.tokenAccounting?.calls) ? result.tokenAccounting.calls : [];
       for (const output of outputs.filter((item) => item?.execution_mode === "reused")) {
@@ -1455,7 +1537,7 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
         run: validationRun,
         session: validationSession,
         plan,
-        outputs,
+        outputs: successfulOutputs,
         agents: scoped.agents,
         documents: scoped.documents,
         sharedMemory,
@@ -1483,34 +1565,38 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
       plannerCompletedPersisted = true;
     }
 
-    const completedRoutes = outputs.map((output) => {
+    const terminalRoutes = outputs.map((output) => {
       const reused = output.execution_mode === "reused";
+      const failure = routeFailureByStep.get(String(output.id || output.step_id || "")) || null;
       const routeStartedEvent = reused ? null : {
         type: "route.started",
         step_id: output.id,
         adapter: output.adapter,
         batch: output.parallel_batch || null
       };
-      const routeCompletedEvent = {
-        type: reused ? "route.reused" : "route.completed",
-        step_id: output.id,
-        adapter: output.adapter,
-        elapsed_sec: output.elapsed_sec ?? null
-      };
+      const routeTerminalEvent = failure
+        ? { type: "route.failed", ...failure, elapsed_sec: output.elapsed_sec ?? null }
+        : {
+          type: reused ? "route.reused" : "route.completed",
+          step_id: output.id,
+          adapter: output.adapter,
+          elapsed_sec: output.elapsed_sec ?? null
+        };
       return {
         startedEvent: routeStartedEvent,
-        completedEvent: routeCompletedEvent,
+        terminalEvent: routeTerminalEvent,
         runStep: runtimeOutputToRunStep({
           run_id,
           output,
           parallel,
-          step: plan.steps.find((item) => item.id === (output.id || output.step_id))
+          step: plan.steps.find((item) => item.id === (output.id || output.step_id)),
+          failure
         })
       };
     });
 
-    const citations = runtimeCitations(outputs);
-    const policyEvents = outputs.flatMap((output) =>
+    const citations = runtimeCitations(successfulOutputs);
+    const policyEvents = successfulOutputs.flatMap((output) =>
       (output.policy_violations || []).map((violation) => ({ step_id: output.id, adapter: output.adapter, violation }))
     );
     const finalAnswer = sanitizeRuntimeFinalAnswer(result);
@@ -1545,7 +1631,7 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
         run,
         session,
         plan,
-        outputs,
+        outputs: successfulOutputs,
         agents: scoped.agents,
         documents: scoped.documents,
         sharedMemory,
@@ -1558,16 +1644,16 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
         replayCandidateIds: worldGraphReplayCandidateIds(replayCapsule),
         createdAt: completedAt
       });
-      for (const completedRoute of completedRoutes) {
-        if (completedRoute.startedEvent) {
-          run.events.push({ ...completedRoute.startedEvent, at: completedAt });
+      for (const terminalRoute of terminalRoutes) {
+        if (terminalRoute.startedEvent) {
+          run.events.push({ ...terminalRoute.startedEvent, at: completedAt });
         }
         const index = data.runSteps.findIndex((item) => (
-          item.run_id === run_id && item.step_id === completedRoute.runStep.step_id
+          item.run_id === run_id && item.step_id === terminalRoute.runStep.step_id
         ));
-        if (index >= 0) data.runSteps[index] = completedRoute.runStep;
-        else data.runSteps.push(completedRoute.runStep);
-        run.events.push({ ...completedRoute.completedEvent, at: completedAt });
+        if (index >= 0) data.runSteps[index] = terminalRoute.runStep;
+        else data.runSteps.push(terminalRoute.runStep);
+        run.events.push({ ...terminalRoute.terminalEvent, at: completedAt });
       }
       run.events.push({ type: "synthesis.started", at: completedAt });
       run.status = "completed";
@@ -1614,7 +1700,7 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
         const clarificationTurn = orchestratorDecision === "clarify";
         session.shared_memory = nextSharedMemory(session.shared_memory, [
           { tag: "user_request", source: "user", content: query },
-          ...routeOutputSharedMemoryEntries(outputs),
+          ...routeOutputSharedMemoryEntries(successfulOutputs),
           {
             tag: clarificationTurn ? "session.clarification" : "base.synthesis",
             source: clarificationTurn ? "session_controller" : result.baseModel || BASE_MODEL,
@@ -1635,9 +1721,9 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
       });
       return run;
     });
-    for (const completedRoute of completedRoutes) {
-      if (completedRoute.startedEvent) bus.publish(run_id, completedRoute.startedEvent);
-      bus.publish(run_id, completedRoute.completedEvent);
+    for (const terminalRoute of terminalRoutes) {
+      if (terminalRoute.startedEvent) bus.publish(run_id, terminalRoute.startedEvent);
+      bus.publish(run_id, terminalRoute.terminalEvent);
     }
     bus.publish(run_id, { type: "synthesis.started" });
     bus.publish(run_id, { type: "final.completed", message_id: assistantMessageId, elapsed_sec: elapsedSec });
@@ -1870,7 +1956,7 @@ function normalizeRuntimePlan(plan) {
 }
 
 function assertRuntimeRouteCoverage(plan, value) {
-  const outputs = Array.isArray(value) ? value : [];
+  const outputs = Array.isArray(value) ? value : null;
   const steps = Array.isArray(plan?.steps) ? plan.steps : [];
   const expected = new Map(steps.map((step) => [String(step.id || ""), step]));
   const seen = new Set();
@@ -1880,6 +1966,9 @@ function assertRuntimeRouteCoverage(plan, value) {
     error.retryable = false;
     throw error;
   };
+  if (!outputs) {
+    fail("runtime route outputs are malformed");
+  }
   if (outputs.length !== steps.length) {
     fail(`runtime returned ${outputs.length} route outputs for ${steps.length} planned steps`);
   }
@@ -1887,8 +1976,17 @@ function assertRuntimeRouteCoverage(plan, value) {
     if (!output || typeof output !== "object" || Array.isArray(output)) {
       fail("runtime returned a malformed route output");
     }
-    const stepId = String(output.id || output.step_id || "");
-    if (!stepId || (output.id && output.step_id && String(output.id) !== String(output.step_id))) {
+    const hasId = Object.prototype.hasOwnProperty.call(output, "id");
+    const hasStepId = Object.prototype.hasOwnProperty.call(output, "step_id");
+    const outputId = hasId && typeof output.id === "string" ? output.id : "";
+    const outputStepId = hasStepId && typeof output.step_id === "string" ? output.step_id : "";
+    const stepId = outputId || outputStepId;
+    if (
+      !stepId
+      || (hasId && !outputId)
+      || (hasStepId && !outputStepId)
+      || (hasId && hasStepId && outputId !== outputStepId)
+    ) {
       fail("runtime route output has an invalid step identity");
     }
     const step = expected.get(stepId);
@@ -1898,12 +1996,6 @@ function assertRuntimeRouteCoverage(plan, value) {
     if (String(output.adapter || "") !== String(step.adapter || "")) {
       fail(`runtime route output adapter does not match planned step ${stepId}`);
     }
-    if (
-      plan?.routing?.orchestrator?.contract_version === "session-orchestrator-v3"
-      && !worldGraphRouteOutputMatchesOutcomeContract(output, plan, step)
-    ) {
-      fail(`runtime route output does not prove the compiled outcome contract for step ${stepId}`);
-    }
     seen.add(stepId);
   }
   if (seen.size !== expected.size) fail("runtime omitted a planned route output");
@@ -1911,7 +2003,347 @@ function assertRuntimeRouteCoverage(plan, value) {
   return steps.map((step) => byStep.get(String(step.id)));
 }
 
-function runtimePlanSafeProjectionDigest(plan) {
+function assertRuntimeSuccessfulRouteOutcomeContracts(plan, outputs, routeFailures) {
+  if (plan?.routing?.orchestrator?.contract_version !== "session-orchestrator-v3") return;
+  const failedStepIds = new Set(routeFailures.map((failure) => String(failure.step_id || "")));
+  const stepById = new Map((Array.isArray(plan?.steps) ? plan.steps : []).map((step) => [
+    String(step.id || ""),
+    step
+  ]));
+  for (const output of outputs) {
+    const stepId = String(output.id || output.step_id || "");
+    if (failedStepIds.has(stepId)) continue;
+    if (!worldGraphRouteOutputMatchesOutcomeContract(output, plan, stepById.get(stepId))) {
+      throw runtimeRouteContractError(
+        `runtime route output does not prove the compiled outcome contract for step ${stepId}`
+      );
+    }
+  }
+}
+
+export function validateRuntimeRouteResults(plan, value, failureSummary = []) {
+  // Cardinality and route identity are authoritative even when a worker
+  // failed. Only after every output is bound to its exact planned step may a
+  // Runtime failure summary (or the output's own validation evidence) classify
+  // that route as failed. Failed output content is subsequently redacted and
+  // excluded from synthesis/WorldGraph; all remaining outputs must prove the
+  // compiled v3 outcome contract before any terminal route state is persisted.
+  const outputs = assertRuntimeRouteCoverage(plan, value);
+  const routeFailures = runtimeRouteFailureDetails(plan, outputs, failureSummary);
+  assertRuntimeSuccessfulRouteOutcomeContracts(plan, outputs, routeFailures);
+  return { outputs, routeFailures };
+}
+
+const RUNTIME_ROUTE_FAILURE_STATUS = Object.freeze({
+  provider_safety_block: "blocked",
+  required_tool_or_live_evidence: "blocked",
+  worker_execution: "failed",
+  source_evidence_validation: "blocked",
+  model_output_limit: "failed",
+  upstream_input_contract: "blocked",
+  policy_validation: "blocked",
+  artifact_contract: "failed",
+  expected_output_contract: "failed",
+  non_result: "failed",
+  route_validation_failed: "blocked"
+});
+
+const RUNTIME_BLOCKED_FINISH_REASONS = new Set([
+  "content_filter", "content-filter", "safety", "recitation", "blocked", "block", "prohibited_content"
+]);
+
+const RUNTIME_LIMIT_FINISH_REASONS = new Set([
+  "length", "max_tokens", "max_output_tokens", "incomplete", "token_limit"
+]);
+
+// Runtime validators may carry rejected claim text, source ids, artifact
+// names, tool arguments, and provider diagnostics. None of those values are
+// suitable for durable operational telemetry. Preserve only this closed set
+// of content-free reason codes; prefix rules deliberately discard their
+// potentially sensitive suffixes.
+const RUNTIME_FAILURE_REASON_CODES = new Set([
+  "approved_source_context_missing",
+  "artifact_validation_failed",
+  "claim_not_supported_by_execution_evidence",
+  "consumption_validation_failed",
+  "empty_route_answer",
+  "execution_claims_missing_citations",
+  "fresh_evidence_tool_unavailable",
+  "internal_synthesis_narration",
+  "malformed_tool_call",
+  "missing_expected_output",
+  "model_output_truncated",
+  "outcome_validation_failed",
+  "provider_safety_block",
+  "refusal_only_route_answer",
+  "required_live_tool_not_executed",
+  "required_tool_not_executed",
+  "route_validation_failed",
+  "source_claim_not_supported_by_cited_excerpt",
+  "source_claims_missing_citations",
+  "source_integrity_missing",
+  "source_validation_failed",
+  "tool_call_mixed_with_text",
+  "tool_round_limit_exceeded",
+  "unauthorized_tool",
+  "uncited_source_claim",
+  "unknown_citation",
+  "unvalidated_interaction_claim",
+  "upstream_input_contract_invalid",
+  "validated_upstream_denied",
+  "worker_execution_failed"
+]);
+
+const RUNTIME_FAILURE_REASON_PREFIXES = Object.freeze([
+  ["required_tool_not_executed", "required_tool_not_executed"],
+  ["required_live_tool_not_executed", "required_live_tool_not_executed"],
+  ["fresh_evidence_tool_unavailable", "fresh_evidence_tool_unavailable"],
+  ["missing_expected_output", "missing_expected_output"],
+  ["invalid_upstream_contract", "upstream_input_contract_invalid"],
+  ["validated_upstream_denied", "validated_upstream_denied"],
+  ["unsupported_citation", "unknown_citation"],
+  ["source_integrity_missing", "source_integrity_missing"]
+]);
+
+const RUNTIME_ROUTE_REPAIR_FIELDS = Object.freeze([
+  "source_repair",
+  "execution_evidence_repair",
+  "execution_evidence_sanitizer",
+  "extractive_source_fallback",
+  "upstream_consistency_repair",
+  "handoff_contract_repair"
+]);
+
+function normalizeRuntimeFailureReasonCode(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (RUNTIME_FAILURE_REASON_CODES.has(normalized)) return normalized;
+  for (const [prefix, code] of RUNTIME_FAILURE_REASON_PREFIXES) {
+    if (normalized === prefix || normalized.startsWith(`${prefix}:`)) return code;
+  }
+  return null;
+}
+
+function addRuntimeFailureReasonCodes(target, value) {
+  if (!Array.isArray(value)) return;
+  for (const raw of value.slice(0, 256)) {
+    const code = normalizeRuntimeFailureReasonCode(raw);
+    if (code) target.add(code);
+  }
+}
+
+function boundedArrayCount(value) {
+  return Array.isArray(value) ? Math.min(value.length, 10_000) : 0;
+}
+
+/**
+ * Build privacy-safe diagnostics for a failed Runtime route.
+ *
+ * The returned shape contains only fixed enums, booleans, and a bounded
+ * integer. It intentionally never copies a validator row, policy suffix,
+ * repair error, claim, source id, prompt, tool argument, or tool result.
+ */
+export function runtimeRouteFailureObservability(output = {}) {
+  const reasonCodes = new Set();
+  addRuntimeFailureReasonCodes(reasonCodes, output.policy_violations);
+  const modelCalls = Array.isArray(output?.model_calls) ? output.model_calls : [];
+  const lastModelCall = modelCalls.length ? modelCalls.at(-1) : null;
+  const finishReason = String(lastModelCall?.finish_reason || output?.finish_reason || "").trim().toLowerCase();
+  if (RUNTIME_BLOCKED_FINISH_REASONS.has(finishReason)) reasonCodes.add("provider_safety_block");
+  if (RUNTIME_LIMIT_FINISH_REASONS.has(finishReason)) reasonCodes.add("model_output_truncated");
+
+  const sourceValidation = output?.source_validation;
+  if (sourceValidation && typeof sourceValidation === "object" && !Array.isArray(sourceValidation)) {
+    addRuntimeFailureReasonCodes(reasonCodes, sourceValidation.violations);
+    if (boundedArrayCount(sourceValidation.unknown_citations) > 0) reasonCodes.add("unknown_citation");
+    if (boundedArrayCount(sourceValidation.invalid_source_integrity) > 0) reasonCodes.add("source_integrity_missing");
+    if (boundedArrayCount(sourceValidation.unsupported_claims) > 0) {
+      reasonCodes.add("source_claim_not_supported_by_cited_excerpt");
+    }
+    if (boundedArrayCount(sourceValidation.unsupported_execution_evidence_claims) > 0) {
+      reasonCodes.add("claim_not_supported_by_execution_evidence");
+    }
+    if (sourceValidation.valid !== true) reasonCodes.add("source_validation_failed");
+  }
+
+  const validationReasonCodes = [
+    ["consumption_validation", "consumption_validation_failed"],
+    ["artifact_validation", "artifact_validation_failed"],
+    ["outcome_validation", "outcome_validation_failed"]
+  ];
+  for (const [field, reasonCode] of validationReasonCodes) {
+    const validation = output?.[field];
+    if (!validation || typeof validation !== "object" || Array.isArray(validation)) continue;
+    addRuntimeFailureReasonCodes(reasonCodes, validation.violations);
+    addRuntimeFailureReasonCodes(reasonCodes, validation.errors);
+    if (validation.valid !== true) reasonCodes.add(reasonCode);
+  }
+  if (String(output?.output_contract || "").trim().toLowerCase() === "failed_closed") {
+    reasonCodes.add("route_validation_failed");
+  }
+
+  const repairAttempts = RUNTIME_ROUTE_REPAIR_FIELDS.flatMap((field) => {
+    const value = output?.[field];
+    return value && typeof value === "object" && !Array.isArray(value) && value.attempted === true
+      ? [value]
+      : [];
+  });
+  const unsupportedClaimCount = Math.min(10_000,
+    boundedArrayCount(sourceValidation?.unsupported_claims)
+    + boundedArrayCount(sourceValidation?.unsupported_execution_evidence_claims));
+
+  return {
+    schema_version: "runtime-route-failure-observability-v1",
+    failure_reason_codes: [...reasonCodes].sort(),
+    repair_attempted: repairAttempts.length > 0,
+    repair_valid: repairAttempts.some((repair) => (
+      repair.valid === true || repair.revalidation_valid === true || repair.used === true
+    )),
+    unsupported_claim_count: unsupportedClaimCount
+  };
+}
+
+function runtimeValidationFailed(validation, fields = []) {
+  const hasFailureValue = (value) => Array.isArray(value)
+    ? value.length > 0
+    : value && typeof value === "object"
+      ? Object.keys(value).length > 0
+      : Boolean(value);
+  return !validation
+    || typeof validation !== "object"
+    || Array.isArray(validation)
+    || validation.valid !== true
+    || fields.some((field) => hasFailureValue(validation[field]));
+}
+
+function runtimeRouteOutputFailureClass(output) {
+  const rawViolations = output?.policy_violations;
+  const violations = (Array.isArray(rawViolations) ? rawViolations : [])
+    .map((value) => String(value || ""));
+  const modelCalls = Array.isArray(output?.model_calls) ? output.model_calls : [];
+  const lastModelCall = modelCalls.length ? modelCalls.at(-1) : null;
+  const finishReason = String(lastModelCall?.finish_reason || output?.finish_reason || "").trim().toLowerCase();
+  if (RUNTIME_BLOCKED_FINISH_REASONS.has(finishReason)) return "provider_safety_block";
+  if (rawViolations && !Array.isArray(rawViolations)) return "policy_validation";
+  if (violations.some((value) => value.startsWith("required_tool_not_executed:")
+    || value.startsWith("required_live_tool_not_executed")
+    || value.startsWith("fresh_evidence_tool_unavailable"))) {
+    return "required_tool_or_live_evidence";
+  }
+  if (violations.includes("worker_execution_failed")) return "worker_execution";
+  if (Object.prototype.hasOwnProperty.call(output || {}, "source_validation")
+    && runtimeValidationFailed(output.source_validation, [
+      "violations", "invalid_source_integrity", "unsupported_claims", "unsupported_execution_evidence_claims"
+    ])) return "source_evidence_validation";
+  if (violations.includes("model_output_truncated") || RUNTIME_LIMIT_FINISH_REASONS.has(finishReason)) {
+    return "model_output_limit";
+  }
+  if (Object.prototype.hasOwnProperty.call(output || {}, "consumption_validation")
+    && runtimeValidationFailed(output.consumption_validation, ["errors", "rejected", "missing_from_upstream"])) {
+    return "upstream_input_contract";
+  }
+  if (violations.some((value) => value.startsWith("invalid_upstream_contract:"))) {
+    return "upstream_input_contract";
+  }
+  const recoverableViolations = new Set([
+    "worker_execution_failed", "model_output_truncated", "empty_route_answer", "refusal_only_route_answer"
+  ]);
+  if (violations.some((value) => !recoverableViolations.has(value)
+    && !value.startsWith("missing_expected_output:")
+    && !value.startsWith("invalid_upstream_contract:"))) {
+    return "policy_validation";
+  }
+  if (Object.prototype.hasOwnProperty.call(output || {}, "artifact_validation")
+    && runtimeValidationFailed(output.artifact_validation, ["errors", "missing"])) return "artifact_contract";
+  if (Object.prototype.hasOwnProperty.call(output || {}, "outcome_validation")
+    && runtimeValidationFailed(output.outcome_validation, ["errors", "missing_expected_outputs"])) {
+    return "expected_output_contract";
+  }
+  if (violations.some((value) => value.startsWith("missing_expected_output:"))) {
+    return "expected_output_contract";
+  }
+  if (String(output?.output_contract || "").trim().toLowerCase() === "failed_closed") {
+    return "route_validation_failed";
+  }
+  if (violations.includes("empty_route_answer")
+    || violations.includes("refusal_only_route_answer")
+    || typeof output?.domain_answer !== "string"
+    || !output.domain_answer.trim()) return "non_result";
+  return null;
+}
+
+function runtimeRouteContractError(detail) {
+  const error = new Error(`runtime_contract_invalid: ${detail}`);
+  error.code = "runtime_contract_invalid";
+  error.retryable = false;
+  return error;
+}
+
+export function runtimeRouteFailureDetails(plan, outputs, value = []) {
+  if (value !== null && value !== undefined && !Array.isArray(value)) {
+    throw runtimeRouteContractError("runtime route failure summary is malformed");
+  }
+  const steps = Array.isArray(plan?.steps) ? plan.steps : [];
+  const stepById = new Map(steps.map((step) => [String(step.id || ""), step]));
+  const outputByStep = new Map((Array.isArray(outputs) ? outputs : []).map((output) => [
+    String(output?.id || output?.step_id || ""),
+    output
+  ]));
+  const summaries = new Map();
+  for (const row of value || []) {
+    if (!row || typeof row !== "object" || Array.isArray(row)) {
+      throw runtimeRouteContractError("runtime route failure summary contains a malformed row");
+    }
+    const stepId = String(row.step_id || "");
+    const step = stepById.get(stepId);
+    const output = outputByStep.get(stepId);
+    if (!step || !output || summaries.has(stepId)) {
+      throw runtimeRouteContractError(`runtime route failure summary has an unexpected or duplicate step: ${stepId || "missing"}`);
+    }
+    if (String(row.adapter || "") !== String(step.adapter || "") || output.execution_mode === "reused") {
+      throw runtimeRouteContractError(`runtime route failure summary does not match planned step ${stepId}`);
+    }
+    const requestedClass = String(row.failure_class || "");
+    const failureClass = Object.hasOwn(RUNTIME_ROUTE_FAILURE_STATUS, requestedClass)
+      && requestedClass !== "route_validation_failed"
+      ? requestedClass
+      : "route_validation_failed";
+    summaries.set(stepId, {
+      failureClass,
+      controllerSynthesisSafe: row.controller_synthesis_safe === true
+    });
+  }
+
+  return steps.flatMap((step) => {
+    const stepId = String(step.id || "");
+    const output = outputByStep.get(stepId);
+    if (!output) return [];
+    const outputClass = runtimeRouteOutputFailureClass(output);
+    const summary = summaries.get(stepId) || null;
+    if (!outputClass && !summary) return [];
+    if (output.execution_mode === "reused") {
+      throw runtimeRouteContractError(`runtime reused route failed validation for step ${stepId}`);
+    }
+    const failureClass = summary?.failureClass || outputClass || "route_validation_failed";
+    const outputStatus = outputClass ? RUNTIME_ROUTE_FAILURE_STATUS[outputClass] || "blocked" : "failed";
+    const summaryStatus = summary?.controllerSynthesisSafe === false
+      ? "blocked"
+      : RUNTIME_ROUTE_FAILURE_STATUS[failureClass] || "blocked";
+    const status = outputStatus === "blocked" || summaryStatus === "blocked" ? "blocked" : "failed";
+    return [{
+      step_id: stepId,
+      adapter: String(step.adapter || "").slice(0, 160),
+      status,
+      failure_class: failureClass,
+      controller_synthesis_safe: status === "failed",
+      expected_outputs: boundedStringList(step.expected_outputs, 32, 160),
+      fulfills: boundedStringList(step.fulfills, 24, 120),
+      had_successful_tool_execution: (Array.isArray(output.tool_executions) ? output.tool_executions : [])
+        .some((execution) => execution?.result?.ok === true)
+    }];
+  });
+}
+
+export function runtimePlanSafeProjectionDigest(plan) {
   return digestValue((Array.isArray(plan?.steps) ? plan.steps : []).map((step) => ({
     id: String(step.id || ""),
     adapter: String(step.adapter || ""),
@@ -1920,24 +2352,9 @@ function runtimePlanSafeProjectionDigest(plan) {
     // and cap at 600 characters. Compare identical projections so a legitimate
     // multiline or detailed task cannot fail merely because its safe preview
     // differs from the exact terminal execution text.
-    task: Array.from(stripRuntimePlanTaskControls(String(step.task || ""))
-      .replace(/\p{White_Space}+/gu, " ")
-      .trim()).slice(0, 600).join(""),
+    task: runtimeStreamTaskProjection(step.task),
     depends_on: (Array.isArray(step.depends_on) ? step.depends_on : []).map(String)
   })));
-}
-
-function stripRuntimePlanTaskControls(value) {
-  return Array.from(value).filter((character) => {
-    const code = character.codePointAt(0);
-    return !(
-      code <= 0x08
-      || code === 0x0b
-      || code === 0x0c
-      || (code >= 0x0e && code <= 0x1f)
-      || code === 0x7f
-    );
-  }).join("");
 }
 
 export function runtimePlanExactContractDigest(
@@ -2022,6 +2439,45 @@ function runtimePlanContractDigestMatches(plan, digest, selectedVersion = null) 
   return versions.some((version) => (
     runtimePlanExactContractDigest(plan, version) === digest
   ));
+}
+
+export function assertRuntimePlanStreamCommit({
+  rawTerminalPlan,
+  normalizedTerminalPlan,
+  streamedSafePlanDigest = null,
+  streamedExactPlanDigest = null,
+  streamedExactPlanContractVersion = null
+}) {
+  const exactContractMatches = streamedExactPlanDigest
+    ? runtimePlanContractDigestMatches(
+      rawTerminalPlan,
+      streamedExactPlanDigest,
+      streamedExactPlanContractVersion
+    )
+    : false;
+  if (streamedExactPlanDigest && !exactContractMatches) {
+    const error = new Error("Runtime terminal plan did not match its exact execution contract digest.");
+    error.code = "runtime_stream_plan_mismatch";
+    error.status = 502;
+    error.component = "runtime_plan_exact_contract";
+    throw error;
+  }
+
+  const safeProjectionMismatch = Boolean(
+    streamedSafePlanDigest
+    && runtimePlanSafeProjectionDigest(normalizedTerminalPlan) !== streamedSafePlanDigest
+  );
+  if (safeProjectionMismatch && !exactContractMatches) {
+    const error = new Error("Runtime terminal plan did not match its streamed planner contract.");
+    error.code = "runtime_stream_plan_mismatch";
+    error.status = 502;
+    error.component = "runtime_plan_safe_projection";
+    throw error;
+  }
+  return {
+    exact_contract_verified: exactContractMatches,
+    safe_projection_reconciled: safeProjectionMismatch && exactContractMatches
+  };
 }
 
 function runtimeRouteAdmissionDigestProjection(value) {
@@ -2694,8 +3150,9 @@ function finiteNonNegativeOrNull(value) {
   return Number.isFinite(number) && number >= 0 ? number : null;
 }
 
-function runtimeOutputToRunStep({ run_id, output, parallel, step = null }) {
+function runtimeOutputToRunStep({ run_id, output, parallel, step = null, failure = null }) {
   const reused = output.execution_mode === "reused";
+  const failed = Boolean(failure);
   // Reused output is authorized replay material, not a new worker turn. Do
   // not persist free-form runtime narration, prompts, raw text, model calls,
   // or timing claims that are outside the replay digest.
@@ -2717,28 +3174,32 @@ function runtimeOutputToRunStep({ run_id, output, parallel, step = null }) {
     used_upstream: output.used_upstream || [],
     parallel_batch: batch,
     parallel_width: width,
-    status: "completed",
+    status: failure?.status || "completed",
     execution_mode: reused ? "reused" : "refreshed",
     reused_from_artifact_id: output.reused_from_artifact_id || null,
     reused_from_run_id: output.reused_from_run_id || null,
     world_graph_reason: reused ? "inputs_and_evidence_unchanged" : output.world_graph_reason || null,
-    agent_reasoning: reused ? "" : output.agent_reasoning || sections.agent_reasoning,
-    domain_answer: output.domain_answer || sections.domain_answer,
-    handoffs: reused ? "" : typeof output.handoffs === "string" ? output.handoffs : sections.handoffs,
-    handoff_artifacts: normalizeHandoffArtifacts(output.handoff_artifacts || output.handoffs, output),
-    artifact_validation: normalizeArtifactValue(output.artifact_validation || {}),
-    outcome_validation: normalizeArtifactValue(output.outcome_validation || {}),
-    consumed_artifacts: normalizeArtifactValue(output.consumed_artifacts || []),
-    consumption_validation: normalizeArtifactValue(output.consumption_validation || {}),
-    source_validation: normalizeArtifactValue(output.source_validation || {}),
-    used_memory: normalizeArtifactValue(output.used_memory || []),
-    boundary_check: output.boundary_check || sections.boundary_check,
+    agent_reasoning: failed || reused ? "" : output.agent_reasoning || sections.agent_reasoning,
+    domain_answer: failed ? "" : output.domain_answer || sections.domain_answer,
+    handoffs: failed || reused ? "" : typeof output.handoffs === "string" ? output.handoffs : sections.handoffs,
+    handoff_artifacts: failed ? [] : normalizeHandoffArtifacts(output.handoff_artifacts || output.handoffs, output),
+    artifact_validation: failed ? { valid: output.artifact_validation?.valid === true } : normalizeArtifactValue(output.artifact_validation || {}),
+    outcome_validation: failed ? { valid: output.outcome_validation?.valid === true } : normalizeArtifactValue(output.outcome_validation || {}),
+    consumed_artifacts: failed ? [] : normalizeArtifactValue(output.consumed_artifacts || []),
+    consumption_validation: failed ? { valid: output.consumption_validation?.valid === true } : normalizeArtifactValue(output.consumption_validation || {}),
+    source_validation: failed ? { valid: output.source_validation?.valid === true } : normalizeArtifactValue(output.source_validation || {}),
+    used_memory: failed ? [] : normalizeArtifactValue(output.used_memory || []),
+    boundary_check: failed ? "" : output.boundary_check || sections.boundary_check,
     allowed_tools: output.allowed_tools || [],
     tool_executions: safeRuntimeToolExecutions(output.tool_executions),
     approved_sources: output.approved_sources || [],
-    policy_violations: output.policy_violations || [],
-    retrieved_context: output.retrieved_context || sections.retrieved_context,
-    citations: runtimeCitations([output]),
+    policy_violations: failed ? [] : output.policy_violations || [],
+    retrieved_context: failed ? "" : output.retrieved_context || sections.retrieved_context,
+    citations: failed ? [] : runtimeCitations([output]),
+    failure: failure ? normalizeArtifactValue(failure) : null,
+    failure_observability_admin_only: failed
+      ? runtimeRouteFailureObservability(output)
+      : null,
     raw_text_admin_only: reused ? "" : output.raw_text || output.text || "",
     prompt_preview_admin_only: reused ? "" : output.prompt_preview || "",
     started_at: nowIso(),
@@ -3554,36 +4015,483 @@ export function runtimeHealth(data) {
 }
 
 export function computeMetrics(data) {
-  const completedRuns = data.runs.filter((run) => run.status === "completed");
-  const elapsed = completedRuns.map((run) => run.elapsed_sec || 0).sort((a, b) => a - b);
-  const percentile = (p) => {
-    if (elapsed.length === 0) return 0;
-    const index = Math.min(elapsed.length - 1, Math.floor((elapsed.length - 1) * p));
-    return elapsed[index];
-  };
-  const routeCounts = new Map();
-  for (const step of data.runSteps) {
-    routeCounts.set(step.adapter, (routeCounts.get(step.adapter) || 0) + 1);
+  const runs = Array.isArray(data?.runs) ? data.runs : [];
+  const sessions = Array.isArray(data?.sessions) ? data.sessions : [];
+  const runSteps = Array.isArray(data?.runSteps) ? data.runSteps : [];
+  const agents = Array.isArray(data?.agents) ? data.agents : [];
+  const runById = new Map(runs.map((run) => [String(run?.run_id || ""), run]));
+  const stepsByRun = new Map();
+  for (const step of runSteps) {
+    const runId = String(step?.run_id || "");
+    if (!stepsByRun.has(runId)) stepsByRun.set(runId, []);
+    stepsByRun.get(runId).push(step);
   }
+
+  const statusCounts = Object.fromEntries(
+    ["queued", "planning", "running", "synthesizing", "completed", "failed", "cancelled", "unknown"]
+      .map((status) => [status, 0])
+  );
+  for (const run of runs) {
+    const rawStatus = String(run?.status || "").trim().toLowerCase();
+    const status = Object.hasOwn(statusCounts, rawStatus) ? rawStatus : "unknown";
+    statusCounts[status] += 1;
+  }
+  const completedRuns = runs.filter((run) => run?.status === "completed");
+  const activeRuns = statusCounts.queued + statusCounts.planning + statusCounts.running + statusCounts.synthesizing;
+
+  const decisionMix = { direct: 0, clarify: 0, delegate: 0, unknown: 0 };
+  for (const run of runs) {
+    const decision = String(run?.plan?.routing?.orchestrator?.decision || "").trim().toLowerCase();
+    if (Object.hasOwn(decisionMix, decision) && decision !== "unknown") decisionMix[decision] += 1;
+    else decisionMix.unknown += 1;
+  }
+  const decisionSampleCount = runs.length - decisionMix.unknown;
+  const decisionRates = Object.fromEntries(
+    ["direct", "clarify", "delegate"].map((decision) => [
+      decision,
+      decisionSampleCount > 0 ? Number((decisionMix[decision] / decisionSampleCount).toFixed(4)) : null
+    ])
+  );
+
+  const opportunities = [];
+  const opportunitiesByRun = new Map();
+  const ensureOpportunity = ({ run, stepId, adapter, fallbackKey }) => {
+    const runId = String(run?.run_id || "");
+    if (!opportunitiesByRun.has(runId)) opportunitiesByRun.set(runId, new Map());
+    const byKey = opportunitiesByRun.get(runId);
+    const normalizedStepId = String(stepId || "").trim();
+    const normalizedAdapter = String(adapter || "").trim();
+    let key = normalizedStepId ? `step:${normalizedStepId}` : "";
+    if (!key && normalizedAdapter) {
+      const matches = [...byKey.values()].filter((item) => item.adapter === normalizedAdapter);
+      if (matches.length === 1) return matches[0];
+    }
+    if (!key) key = `anonymous:${fallbackKey}`;
+    if (!byKey.has(key)) {
+      const opportunity = {
+        run,
+        run_id: runId,
+        step_id: normalizedStepId,
+        adapter: normalizedAdapter,
+        selected: false,
+        step: null,
+        events: []
+      };
+      byKey.set(key, opportunity);
+      opportunities.push(opportunity);
+    }
+    const opportunity = byKey.get(key);
+    if (!opportunity.adapter && normalizedAdapter) opportunity.adapter = normalizedAdapter;
+    if (!opportunity.step_id && normalizedStepId) opportunity.step_id = normalizedStepId;
+    return opportunity;
+  };
+
+  for (const run of runs) {
+    const planSteps = Array.isArray(run?.plan?.steps) ? run.plan.steps : [];
+    for (const [index, step] of planSteps.entries()) {
+      const opportunity = ensureOpportunity({
+        run,
+        stepId: step?.id || step?.step_id,
+        adapter: step?.adapter,
+        fallbackKey: `plan:${index}`
+      });
+      opportunity.selected = true;
+      opportunity.planStep = step;
+    }
+    for (const [index, step] of (stepsByRun.get(String(run?.run_id || "")) || []).entries()) {
+      const opportunity = ensureOpportunity({
+        run,
+        stepId: step?.step_id || step?.id,
+        adapter: step?.adapter,
+        fallbackKey: `stored:${index}`
+      });
+      // A durable run-step can only exist after the route was selected, even
+      // when an older run predates persisted planner contracts.
+      opportunity.selected = true;
+      opportunity.step = step;
+    }
+    for (const [index, event] of (Array.isArray(run?.events) ? run.events : []).entries()) {
+      const eventType = String(event?.type || "");
+      if (!["route.started", "route.completed", "route.failed", "route.reused"].includes(eventType)) continue;
+      const opportunity = ensureOpportunity({
+        run,
+        stepId: event?.step_id || event?.id,
+        adapter: event?.adapter,
+        fallbackKey: `event:${index}`
+      });
+      opportunity.selected = true;
+      opportunity.events.push(event);
+    }
+  }
+
+  // Retain orphaned durable steps in the operational totals. They should not
+  // disappear merely because a damaged legacy store lost the parent run.
+  for (const [index, step] of runSteps.entries()) {
+    const runId = String(step?.run_id || "");
+    if (runById.has(runId)) continue;
+    const syntheticRun = { run_id: runId, status: "unknown", events: [] };
+    const opportunity = ensureOpportunity({
+      run: syntheticRun,
+      stepId: step?.step_id || step?.id,
+      adapter: step?.adapter,
+      fallbackKey: `orphan:${index}`
+    });
+    opportunity.selected = true;
+    opportunity.step = step;
+  }
+
+  const hasInvalidValidation = (step) => [
+    "source_validation", "consumption_validation", "artifact_validation", "outcome_validation"
+  ].some((field) => Object.prototype.hasOwnProperty.call(step || {}, field) && step?.[field]?.valid !== true);
+  const routeFacts = opportunities.map((opportunity) => {
+    const step = opportunity.step;
+    const eventTypes = new Set(opportunity.events.map((event) => String(event?.type || "")));
+    const reused = step?.execution_mode === "reused" || eventTypes.has("route.reused");
+    const stepStatus = String(step?.status || "").trim().toLowerCase();
+    const terminalSuccess = eventTypes.has("route.completed") || stepStatus === "completed";
+    const terminalFailureEvent = opportunity.events.find((event) => event?.type === "route.failed") || null;
+    const policyViolations = Array.isArray(step?.policy_violations) ? step.policy_violations.filter(Boolean) : [];
+    const explicitlyFailed = Boolean(
+      terminalFailureEvent
+      || ["failed", "blocked"].includes(stepStatus)
+      || step?.failure_class
+      || step?.failure?.failure_class
+      || hasInvalidValidation(step)
+      || policyViolations.length > 0
+    );
+    const attempted = !reused && Boolean(
+      step
+      || eventTypes.has("route.started")
+      || eventTypes.has("route.completed")
+      || eventTypes.has("route.failed")
+    );
+    const runTerminal = ["completed", "failed", "cancelled"].includes(String(opportunity.run?.status || ""));
+    const missingTerminal = attempted && !terminalSuccess && !explicitlyFailed && runTerminal;
+    const failed = attempted && (explicitlyFailed || missingTerminal);
+    const validated = attempted && terminalSuccess && !failed;
+    const failureClass = String(
+      terminalFailureEvent?.failure_class
+      || step?.failure_class
+      || step?.failure?.failure_class
+      || (stepStatus === "blocked" ? "blocked" : "")
+      || (hasInvalidValidation(step) ? "validation_failed" : "")
+      || (policyViolations.length > 0 ? "policy_validation" : "")
+      || (missingTerminal ? "missing_terminal_route" : "")
+    ).trim() || null;
+    const failureStatus = failed
+      ? String(terminalFailureEvent?.status || stepStatus || "failed").toLowerCase() === "blocked"
+        ? "blocked"
+        : missingTerminal
+          ? "incomplete"
+          : "failed"
+      : null;
+    const terminalEvent = [...opportunity.events].reverse().find((event) => (
+      ["route.completed", "route.failed", "route.reused"].includes(String(event?.type || ""))
+    ));
+    const elapsed = metricDuration(step?.elapsed_sec ?? terminalEvent?.elapsed_sec);
+    return {
+      ...opportunity,
+      attempted,
+      failed,
+      failure_class: failureClass,
+      failure_status: failureStatus,
+      reused,
+      validated,
+      elapsed_sec: reused ? null : elapsed
+    };
+  });
+
+  const selectedRoutes = routeFacts.filter((route) => route.selected);
+  const attemptedRoutes = routeFacts.filter((route) => route.attempted);
+  const validatedRoutes = routeFacts.filter((route) => route.validated);
+  const failedRoutes = routeFacts.filter((route) => route.failed);
+  const reusedRoutes = routeFacts.filter((route) => route.reused);
+  const selectedRouteCounts = countByAdapter(selectedRoutes);
+  const attemptedRouteCounts = countByAdapter(attemptedRoutes);
+  const validatedRouteCounts = countByAdapter(validatedRoutes);
+  const reusedRouteCounts = countByAdapter(reusedRoutes);
+  const failedAgentCounts = new Map();
+  for (const route of failedRoutes) {
+    if (!route.adapter) continue;
+    if (!failedAgentCounts.has(route.adapter)) {
+      failedAgentCounts.set(route.adapter, { count: 0, failureClasses: new Map() });
+    }
+    const entry = failedAgentCounts.get(route.adapter);
+    entry.count += 1;
+    const failureClass = route.failure_class || "unknown";
+    entry.failureClasses.set(failureClass, (entry.failureClasses.get(failureClass) || 0) + 1);
+  }
+
+  const runRouteSummaries = new Map();
+  for (const route of routeFacts) {
+    if (!runRouteSummaries.has(route.run_id)) {
+      runRouteSummaries.set(route.run_id, { failed: 0, successful: 0 });
+    }
+    const summary = runRouteSummaries.get(route.run_id);
+    if (route.failed) summary.failed += 1;
+    if (route.validated || route.reused) summary.successful += 1;
+  }
+  const runHasPartialFailure = (summary) => summary.failed > 0 && summary.successful > 0;
+  const runHasAllRoutesFailed = (summary) => summary.failed > 0 && summary.successful === 0;
+  const routeFailureRuns = [...runRouteSummaries.values()].filter((summary) => summary.failed > 0).length;
+  const partialFailureRuns = [...runRouteSummaries.values()].filter(runHasPartialFailure).length;
+  const allRoutesFailedRuns = [...runRouteSummaries.values()].filter(runHasAllRoutesFailed).length;
+  const completedRunIds = new Set(completedRuns.map((run) => String(run?.run_id || "")));
+  const completedPartialFailureRuns = [...runRouteSummaries.entries()]
+    .filter(([runId, summary]) => completedRunIds.has(runId) && runHasPartialFailure(summary)).length;
+  const completedAllRoutesFailedRuns = [...runRouteSummaries.entries()]
+    .filter(([runId, summary]) => completedRunIds.has(runId) && runHasAllRoutesFailed(summary)).length;
+
+  const queueLatencies = [];
+  const plannerLatencies = [];
+  const routePhaseLatencies = [];
+  const synthesisLatencies = [];
+  const executionLatencies = [];
+  const totalLatencies = [];
+  for (const run of runs) {
+    const createdAt = metricTimestamp(run?.created_at);
+    const startedAt = firstMetricTimestamp(
+      metricTimestamp(run?.started_at),
+      metricEventTimestamp(run, ["run.started"], false)
+    );
+    const plannerStartedAt = firstMetricTimestamp(
+      metricEventTimestamp(run, ["planner.started"], false),
+      metricEventTimestamp(run, ["runtime.requested"], false),
+      startedAt
+    );
+    const plannerCompletedAt = metricEventTimestamp(run, ["planner.completed"], false);
+    const synthesisStartedAt = metricEventTimestamp(run, ["synthesis.started"], false);
+    const terminalAt = firstMetricTimestamp(
+      metricTimestamp(run?.completed_at),
+      metricEventTimestamp(run, ["final.completed", "run.failed"], true)
+    );
+    pushMetricDuration(queueLatencies, secondsBetween(createdAt, startedAt));
+    pushMetricDuration(plannerLatencies, secondsBetween(plannerStartedAt, plannerCompletedAt));
+    pushMetricDuration(routePhaseLatencies, secondsBetween(plannerCompletedAt, synthesisStartedAt));
+    pushMetricDuration(synthesisLatencies, secondsBetween(synthesisStartedAt, terminalAt));
+    pushMetricDuration(executionLatencies, secondsBetween(startedAt, terminalAt) ?? metricDuration(run?.elapsed_sec));
+    pushMetricDuration(totalLatencies, secondsBetween(createdAt, terminalAt) ?? metricDuration(run?.elapsed_sec));
+  }
+  const routeLatencies = attemptedRoutes.map((route) => route.elapsed_sec).filter((value) => value !== null);
+  const latencyPercentile = (values, percentile) => {
+    if (values.length === 0) return 0;
+    const sorted = [...values].sort((left, right) => left - right);
+    const index = Math.min(sorted.length - 1, Math.floor((sorted.length - 1) * percentile));
+    return Number(sorted[index].toFixed(3));
+  };
+
+  const agentById = new Map(agents.map((agent) => [String(agent?.id || ""), agent]));
+  const retrievalMissCount = routeFacts.filter((route) => {
+    if (!(route.attempted || route.reused)) return false;
+    const step = route.step || {};
+    const agent = agentById.get(route.adapter) || {};
+    const declaredTools = [...(Array.isArray(agent.tools) ? agent.tools : []), ...(Array.isArray(step.allowed_tools) ? step.allowed_tools : [])];
+    const consumes = Array.isArray(agent.consumes) ? agent.consumes : [];
+    const hasRetrievalContract = agentOwnsSemanticContext(agent)
+      || declaredTools.some((tool) => ["document_search", "document_read"].includes(String(tool)))
+      || consumes.some((name) => DOCUMENT_CONTEXT_ARTIFACTS.has(String(name)));
+    if (!hasRetrievalContract) return false;
+    const successfulDocumentTool = (Array.isArray(step.tool_executions) ? step.tool_executions : []).some((execution) => (
+      ["document_search", "document_read"].includes(String(execution?.tool || execution?.name || execution?.result?.tool || ""))
+      && execution?.result?.ok === true
+    ));
+    const retrievedContext = step.retrieved_context;
+    const hasRetrievedContext = typeof retrievedContext === "string"
+      ? retrievedContext.trim().length > 0
+      : Array.isArray(retrievedContext)
+        ? retrievedContext.length > 0
+        : Boolean(retrievedContext && typeof retrievedContext === "object" && Object.keys(retrievedContext).length > 0);
+    const hasCitations = Array.isArray(step.citations) && step.citations.length > 0;
+    const approvedSourceCount = metricDuration(step?.source_validation?.approved_source_count) || 0;
+    return !successfulDocumentTool && !hasRetrievedContext && !hasCitations && approvedSourceCount <= 0;
+  }).length;
+
+  const failedAgents = [...failedAgentCounts.entries()]
+    .map(([agent_id, failure]) => ({
+      agent_id,
+      count: failure.count,
+      attempts: attemptedRouteCounts.get(agent_id) || 0,
+      failure_rate: ratio(failure.count, attemptedRouteCounts.get(agent_id) || 0),
+      failure_classes: Object.fromEntries([...failure.failureClasses.entries()].sort(([left], [right]) => left.localeCompare(right)))
+    }))
+    .sort((left, right) => right.count - left.count || left.agent_id.localeCompare(right.agent_id));
+  const allAgentIds = [...new Set([
+    ...selectedRouteCounts.keys(),
+    ...attemptedRouteCounts.keys(),
+    ...validatedRouteCounts.keys(),
+    ...reusedRouteCounts.keys(),
+    ...failedAgentCounts.keys()
+  ])].sort();
+  const agentInvocationMetrics = allAgentIds.map((agent_id) => ({
+    agent_id,
+    selected: selectedRouteCounts.get(agent_id) || 0,
+    attempted: attemptedRouteCounts.get(agent_id) || 0,
+    validated: validatedRouteCounts.get(agent_id) || 0,
+    failed: failedAgentCounts.get(agent_id)?.count || 0,
+    reused: reusedRouteCounts.get(agent_id) || 0,
+    success_rate: ratio(validatedRouteCounts.get(agent_id) || 0, attemptedRouteCounts.get(agent_id) || 0)
+  }));
+  const invocationSuccessRate = ratio(validatedRoutes.length, attemptedRoutes.length);
+  const routeFailureStatusCounts = { failed: 0, blocked: 0, incomplete: 0 };
+  for (const route of failedRoutes) {
+    const status = Object.hasOwn(routeFailureStatusCounts, route.failure_status) ? route.failure_status : "failed";
+    routeFailureStatusCounts[status] += 1;
+  }
+  const routeFailureReasonCounts = new Map();
+  let routeRepairAttemptedCount = 0;
+  let routeRepairValidCount = 0;
+  let unsupportedClaimCount = 0;
+  for (const route of failedRoutes) {
+    const observability = route.step?.failure_observability_admin_only;
+    if (!observability || typeof observability !== "object" || Array.isArray(observability)) continue;
+    const safeCodes = new Set((Array.isArray(observability.failure_reason_codes)
+      ? observability.failure_reason_codes
+      : [])
+      .map(normalizeRuntimeFailureReasonCode)
+      .filter(Boolean));
+    for (const code of safeCodes) {
+      routeFailureReasonCounts.set(code, (routeFailureReasonCounts.get(code) || 0) + 1);
+    }
+    if (observability.repair_attempted === true) routeRepairAttemptedCount += 1;
+    if (observability.repair_attempted === true && observability.repair_valid === true) {
+      routeRepairValidCount += 1;
+    }
+    const routeUnsupportedClaims = Number(observability.unsupported_claim_count);
+    if (Number.isSafeInteger(routeUnsupportedClaims) && routeUnsupportedClaims > 0) {
+      unsupportedClaimCount = Math.min(10_000_000, unsupportedClaimCount + Math.min(routeUnsupportedClaims, 10_000));
+    }
+  }
+
   return {
-    total_chats: data.sessions.length,
-    total_runs: data.runs.length,
-    average_planner_latency: 0.01,
-    average_route_latency: average(data.runSteps.map((step) => step.elapsed_sec || 0)),
-    average_synthesis_latency: 0.01,
-    p50_end_to_end_latency: percentile(0.5),
-    p95_end_to_end_latency: percentile(0.95),
-    p99_end_to_end_latency: percentile(0.99),
-    average_parallel_batch_width: average(data.runs.flatMap((run) => run.parallel?.batches?.map((batch) => batch.width) || [])),
+    schema_version: "admin-metrics-v2",
+    latency_unit: "seconds",
+    total_chats: sessions.length,
+    // `total_runs` is retained for the existing Admin UI, whose label is
+    // "Completed runs". `total_run_records` exposes every durable status.
+    total_runs: completedRuns.length,
+    total_run_records: runs.length,
+    completed_runs: completedRuns.length,
+    failed_runs: statusCounts.failed,
+    active_runs: activeRuns,
+    run_status_counts: statusCounts,
+    routing_decision_mix: decisionMix,
+    routing_decision_rates: decisionRates,
+    routing_decision_sample_count: decisionSampleCount,
+    selected_route_count: selectedRoutes.length,
+    attempted_route_count: attemptedRoutes.length,
+    validated_route_count: validatedRoutes.length,
+    failed_route_count: failedRoutes.length,
+    blocked_route_count: routeFailureStatusCounts.blocked,
+    reused_route_count: reusedRoutes.length,
+    successful_route_count: validatedRoutes.length + reusedRoutes.length,
+    unattempted_route_count: selectedRoutes.length - attemptedRoutes.length - reusedRoutes.length,
+    invocation_success_rate: invocationSuccessRate,
+    invocation_success_percent: invocationSuccessRate === null ? null : Number((invocationSuccessRate * 100).toFixed(2)),
+    runs_with_route_failures: routeFailureRuns,
+    partial_route_failure_runs: partialFailureRuns,
+    all_route_failure_runs: allRoutesFailedRuns,
+    completed_partial_route_failure_runs: completedPartialFailureRuns,
+    completed_all_route_failure_runs: completedAllRoutesFailedRuns,
+    route_failure_status_counts: routeFailureStatusCounts,
+    route_failure_reason_counts: Object.fromEntries(
+      [...routeFailureReasonCounts.entries()].sort(([left], [right]) => left.localeCompare(right))
+    ),
+    route_repair_attempted_count: routeRepairAttemptedCount,
+    route_repair_valid_count: routeRepairValidCount,
+    unsupported_claim_count: unsupportedClaimCount,
+    average_queue_latency: average(queueLatencies),
+    average_planner_latency: average(plannerLatencies),
+    average_route_latency: average(routeLatencies),
+    average_route_phase_latency: average(routePhaseLatencies),
+    average_synthesis_latency: average(synthesisLatencies),
+    average_execution_latency: average(executionLatencies),
+    average_end_to_end_latency: average(totalLatencies),
+    average_total_latency: average(totalLatencies),
+    p50_end_to_end_latency: latencyPercentile(totalLatencies, 0.5),
+    p95_end_to_end_latency: latencyPercentile(totalLatencies, 0.95),
+    p99_end_to_end_latency: latencyPercentile(totalLatencies, 0.99),
+    latency_sample_counts: {
+      queue: queueLatencies.length,
+      planner: plannerLatencies.length,
+      route: routeLatencies.length,
+      route_phase: routePhaseLatencies.length,
+      synthesis: synthesisLatencies.length,
+      execution: executionLatencies.length,
+      total: totalLatencies.length
+    },
+    average_parallel_batch_width: average(runs.flatMap((run) => (
+      Array.isArray(run?.parallel?.batches)
+        ? run.parallel.batches.map((batch) => metricDuration(batch?.width)).filter((width) => width !== null)
+        : []
+    ))),
     vllm_waiting_queue_count: null,
     gpu_kv_cache_usage: null,
-    policy_violation_count: data.runs.reduce((total, run) => total + (run.policy_events?.length || 0), 0),
-    retrieval_miss_count: data.runSteps.filter((step) => step.adapter.includes("document") && !step.retrieved_context).length,
-    bad_response_flags: data.runs.filter((run) => run.feedback?.some((item) => item.rating === "bad")).length,
-    most_used_agents: [...routeCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8).map(([agent_id, count]) => ({ agent_id, count })),
-    failed_agents: [],
-    most_common_routes: [...routeCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8).map(([agent_id, count]) => ({ agent_id, count }))
+    policy_violation_count: runs.reduce((total, run) => total + (Array.isArray(run?.policy_events) ? run.policy_events.length : 0), 0),
+    retrieval_miss_count: retrievalMissCount,
+    bad_response_flags: runs.filter((run) => run?.feedback?.some((item) => item?.rating === "bad")).length,
+    // Usage means a fresh, validated invocation. Selection, attempts, reuse,
+    // and failures remain separately observable below.
+    most_used_agents: rankedCounts(validatedRouteCounts),
+    most_attempted_agents: rankedCounts(attemptedRouteCounts),
+    failed_agents: failedAgents,
+    most_common_routes: rankedCounts(selectedRouteCounts),
+    agent_invocation_metrics: agentInvocationMetrics
   };
+}
+
+function metricDuration(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? number : null;
+}
+
+function metricTimestamp(value) {
+  if (!value) return null;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function firstMetricTimestamp(...values) {
+  return values.find((value) => value !== null && value !== undefined) ?? null;
+}
+
+function metricEventTimestamp(run, types, last) {
+  const allowed = new Set(types);
+  const timestamps = (Array.isArray(run?.events) ? run.events : [])
+    .filter((event) => allowed.has(String(event?.type || "")))
+    .map((event) => metricTimestamp(event?.at))
+    .filter((timestamp) => timestamp !== null);
+  if (timestamps.length === 0) return null;
+  return last ? Math.max(...timestamps) : Math.min(...timestamps);
+}
+
+function secondsBetween(start, end) {
+  if (start === null || end === null || end < start) return null;
+  return Number(((end - start) / 1000).toFixed(3));
+}
+
+function pushMetricDuration(target, value) {
+  if (value !== null) target.push(value);
+}
+
+function ratio(numerator, denominator) {
+  return denominator > 0 ? Number((numerator / denominator).toFixed(4)) : null;
+}
+
+function countByAdapter(routes) {
+  const counts = new Map();
+  for (const route of routes) {
+    if (!route.adapter) continue;
+    counts.set(route.adapter, (counts.get(route.adapter) || 0) + 1);
+  }
+  return counts;
+}
+
+function rankedCounts(counts) {
+  return [...counts.entries()]
+    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+    .slice(0, 8)
+    .map(([agent_id, count]) => ({ agent_id, count }));
 }
 
 function average(values) {

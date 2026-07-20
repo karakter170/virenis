@@ -33,8 +33,10 @@ import {
   agentPayloadFromForm,
   createAgentForm,
   approvalActivityPresentation,
+  agentsForCatalog,
   agentsForWorkspace,
   availableSessionAgents,
+  chatDocumentMessageAttachments,
   graphConnectionInputs,
   graphConnectionWouldCycle,
   graphConnections,
@@ -74,6 +76,19 @@ afterEach(() => {
 
 
 describe("Agent Studio product surfaces", () => {
+  it("serializes only bounded chat documents as message attachment identities", () => {
+    expect(chatDocumentMessageAttachments([
+      { document_id: "doc_chat", title: "Candidate Resume", scope: "chat", enabled: true },
+      { document_id: "doc_chat", title: "Duplicate", scope: "chat", enabled: true },
+      { document_id: "doc_knowledge", title: "Global Resume", scope: "knowledge", enabled: true },
+      { document_id: "doc_disabled", title: "Old File", scope: "chat", enabled: false }
+    ])).toEqual([{
+      type: "document",
+      name: "Candidate Resume",
+      document_id: "doc_chat"
+    }]);
+  });
+
   it("describes denied and uncertain app actions without calling them approved", () => {
     expect(approvalActivityPresentation("denied")).toMatchObject({
       label: "Declined · nothing ran",
@@ -186,6 +201,21 @@ describe("Agent Studio product surfaces", () => {
       { id: "s2", level: 1, state: "working" }
     ]);
     expect(graph.edges).toEqual([expect.objectContaining({ from: "s1", to: "s2" })]);
+
+    const partialRun = {
+      ...run,
+      status: "completed",
+      events: [
+        { type: "route.failed", step_id: "s1", adapter: "renault_specialist", status: "blocked" },
+        { type: "route.completed", step_id: "s2", adapter: "idea_specialist" },
+        { type: "final.completed" }
+      ]
+    };
+    expect(runProgressSpecialists(partialRun, agents)).toMatchObject([
+      { name: "Renault Specialist", state: "blocked" },
+      { name: "Business Idea Specialist", state: "ready" }
+    ]);
+    expect(renderToStaticMarkup(createElement(RunProgress, { run: partialRun, agents }))).toContain("Blocked");
 
     const markup = renderToStaticMarkup(createElement(RunProgress, { run, agents }));
     expect(markup).toContain("1 working · 2 selected");
@@ -1460,6 +1490,65 @@ describe("Agent Studio product surfaces", () => {
     expect(agentsForWorkspace(agents, null)).toEqual([]);
   });
 
+  it("adds unowned runtime inventory only to the admin catalog", () => {
+    const agents = [
+      { id: "team_writer", title: "Team Writer", enabled: true },
+      { id: "other_reviewer", title: "Other Reviewer", enabled: true },
+      { id: "runtime_auditor", title: "Runtime Auditor", enabled: true, runtime_only: true }
+    ];
+    const workspace = { agent_workspace_id: "team_first", agent_ids: ["team_writer"] };
+
+    expect(agentsForCatalog(agents, workspace, { is_admin: true }).map((agent) => agent.id)).toEqual([
+      "team_writer",
+      "runtime_auditor"
+    ]);
+    expect(agentsForCatalog(agents, workspace, { user_id: "ordinary_user" }).map((agent) => agent.id)).toEqual([
+      "team_writer"
+    ]);
+    expect(agentsForWorkspace(agents, workspace).map((agent) => agent.id)).toEqual(["team_writer"]);
+    expect(availableSessionAgents(agentsForCatalog(agents, workspace, { is_admin: true })).map((agent) => agent.id)).toEqual([
+      "team_writer"
+    ]);
+  });
+
+  it("renders runtime adoption inventory for admins but never for ordinary users", () => {
+    const agents = [
+      { id: "team_writer", title: "Team Writer", capability: "Drafts reports.", enabled: true },
+      { id: "runtime_auditor", title: "Runtime Auditor", capability: "Audits model results.", enabled: true, runtime_only: true }
+    ];
+    const workspace = {
+      agent_workspace_id: "team_first",
+      name: "Writing team",
+      agent_ids: ["team_writer"],
+      agent_count: 1,
+      max_agents: 16
+    };
+    const adminMarkup = renderToStaticMarkup(createElement(AgentCatalog, {
+      agents: agentsForCatalog(agents, workspace, { is_admin: true }),
+      workspaces: [workspace],
+      activeWorkspace: workspace,
+      auth: { is_admin: true },
+      onAdopt: vi.fn()
+    }));
+    const ordinaryMarkup = renderToStaticMarkup(createElement(AgentCatalog, {
+      agents,
+      workspaces: [workspace],
+      activeWorkspace: workspace,
+      auth: { user_id: "ordinary_user" },
+      onAdopt: vi.fn()
+    }));
+
+    expect(adminMarkup).toContain("Runtime Auditor");
+    expect(adminMarkup).toContain("Audits model results.");
+    expect(adminMarkup).toContain("Needs an owner");
+    expect(adminMarkup).toContain('aria-label="Adopt Runtime Auditor"');
+    expect(adminMarkup).toContain('placeholder="Search this team"');
+    expect(ordinaryMarkup).not.toContain("Runtime Auditor");
+    expect(ordinaryMarkup).not.toContain("Audits model results.");
+    expect(ordinaryMarkup).not.toContain("Needs an owner");
+    expect(ordinaryMarkup).not.toContain("Adopt Runtime Auditor");
+  });
+
   it("combines team switching and per-chat specialist toggles beside the composer", () => {
     const agents = [
       { id: "first_writer", title: "First Writer", capability: "Drafts the current team's response", enabled: true, session_active: true },
@@ -2166,7 +2255,7 @@ describe("Agent Studio product surfaces", () => {
     expect(markup).not.toContain('title="Admin"');
     expect(markup.match(/aria-current="page"/g) || []).toHaveLength(2);
     expect(markup).toMatch(/<button class="sidebar-nav-item"[^>]*aria-current="page"[^>]*>[\s\S]*?<span class="sidebar-label">Team map<\/span><\/button>/);
-    expect(markup).toMatch(/<button type="button" class="sidebar-chat-row"[^>]*aria-current="page"[^>]*>[\s\S]*?<span>Backend techniques<\/span>/);
+    expect(markup).toMatch(/<button type="button" class="sidebar-chat-row"[^>]*data-session-id="chat_active"[^>]*aria-current="page"[^>]*>[\s\S]*?<span>Backend techniques<\/span>/);
 
     const adminMarkup = renderToStaticMarkup(createElement(WorkspaceSidebar, {
       ...commonProps,

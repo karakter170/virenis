@@ -6,6 +6,7 @@ import { Composer, WorkspaceLoadFailure, preserveAmbiguousChatSubmission, reques
 import {
   SSE_RECOVERY_MAX_ATTEMPTS,
   isTerminalRunStatus,
+  refreshedSessionsPreservingCurrent,
   runIsActiveForSession,
   shouldApplySessionResponse,
   shouldRefreshOriginSession,
@@ -69,6 +70,17 @@ describe("chat lifecycle safety", () => {
     expect(shouldRefreshOriginSession("chat_old", "chat_new", "chat_new")).toBe(false);
     expect(shouldRefreshOriginSession("chat_old", "chat_old", "chat_new")).toBe(false);
     expect(shouldRefreshOriginSession("chat_new", "chat_new", "chat_new")).toBe(true);
+  });
+
+  it("does not let a stale session-list refresh drop the newly opened chat", () => {
+    const created = { session_id: "chat_new", title: "New chat" };
+    const old = { session_id: "chat_old", title: "Old chat" };
+    expect(refreshedSessionsPreservingCurrent([old], [created, old], "chat_new"))
+      .toEqual([created, old]);
+    expect(refreshedSessionsPreservingCurrent([created, old], [old], "chat_new"))
+      .toEqual([created, old]);
+    expect(refreshedSessionsPreservingCurrent([old], [old], "chat_missing"))
+      .toEqual([old]);
   });
 
   it("uses bounded backoff for workflow and live-run recovery checks", () => {

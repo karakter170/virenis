@@ -8,9 +8,17 @@ import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { createApp } from "../server/app.js";
-import { runtimePlanExactContractDigest } from "../server/tcarEngine.js";
+import {
+  assertRuntimePlanStreamCommit,
+  runtimePlanExactContractDigest,
+  runtimeRouteFailureObservability,
+  runtimeRouteFailureDetails,
+  runtimePlanSafeProjectionDigest,
+  validateRuntimeRouteResults
+} from "../server/tcarEngine.js";
 import {
   executeRuntimeChatStream,
+  runtimeStreamTaskProjection,
   setRuntimeFetchForTests
 } from "../server/runtimeClient.js";
 
@@ -105,6 +113,92 @@ const blockedClarificationPlan = {
     }
   }
 };
+
+const coveredDocumentRoutePlan = {
+  steps: [{
+    id: "s1",
+    adapter: "document_agent",
+    task: "Retrieve the cited setup instructions.",
+    depends_on: [],
+    evidence_requirement: "document",
+    expected_outputs: ["retrieved_context", "cited_passages"],
+    fulfills: ["d1"]
+  }],
+  routing: {
+    mode: "session",
+    orchestrator: {
+      contract_version: "session-orchestrator-v3",
+      decision: "delegate",
+      final_synthesis_required: true,
+      outcome_contract: {
+        contract_version: "session-outcome-v1",
+        route_admission_contract_version: "session-route-admission-v1",
+        compiler_authority: "runtime",
+        status: "covered",
+        deliverables: [{
+          id: "d1",
+          title: "Cited setup instructions",
+          description: "Return setup instructions grounded in the attached document.",
+          required: true,
+          evidence_requirement: "document",
+          required_outputs: ["retrieved_context", "cited_passages"],
+          controller_can_synthesize: false,
+          assigned_to_session_controller: false
+        }],
+        steps: [{
+          step_id: "s1",
+          route_admission_valid: true,
+          route_dependency_closure_valid: true,
+          route_admission: {
+            contract_version: "session-route-admission-v1",
+            valid: true,
+            route_role: "outcome_owner",
+            obligation_source: "compiled_deliverables",
+            deliverable_ids: ["d1"],
+            expected_outputs: ["retrieved_context", "cited_passages"],
+            downstream_bindings: [],
+            strict_constraints_checked: [
+              "activation_policy", "boundary", "write_policy", "tool_policy",
+              "source_policy", "escalation_policy"
+            ],
+            violations: [],
+            obligation: "Retrieve and cite the document setup instructions."
+          }
+        }]
+      }
+    }
+  }
+};
+
+function coveredDocumentRouteOutput(patch = {}) {
+  return {
+    id: "s1",
+    step_id: "s1",
+    adapter: "document_agent",
+    domain_answer: "The cited setup instructions.",
+    output_contract: "terminal_domain_answer",
+    policy_violations: [],
+    source_validation: { valid: true, violations: [] },
+    consumption_validation: { valid: true, errors: [] },
+    artifact_validation: { valid: true, errors: [], missing: [] },
+    outcome_validation: {
+      contract_version: "session-step-outcome-v1",
+      expected_outputs: ["retrieved_context", "cited_passages"],
+      produced_expected_outputs: ["retrieved_context", "cited_passages"],
+      missing_expected_outputs: [],
+      fulfills: ["d1"],
+      valid: true
+    },
+    handoff_artifacts: [
+      { name: "retrieved_context", verified: true },
+      { name: "cited_passages", verified: true }
+    ],
+    citations: [{ chunk_id: "chunk_1" }],
+    tool_executions: [],
+    execution_mode: "executed",
+    ...patch
+  };
+}
 
 let app;
 let previousEnv;
@@ -294,6 +388,382 @@ afterEach(async () => {
 });
 
 describe.sequential("Runtime early-plan stream", () => {
+  it("classifies structurally matched v3 route failures before requiring a success outcome contract", () => {
+    const failedOutput = coveredDocumentRouteOutput({
+      domain_answer: "uncited worker text must not enter synthesis",
+      output_contract: "failed_closed",
+      policy_violations: [
+        "missing_expected_output:retrieved_context",
+        "missing_expected_output:cited_passages"
+      ],
+      source_validation: { valid: false, violations: ["missing_citation"] },
+      artifact_validation: {
+        valid: false,
+        errors: ["missing_expected_outputs"],
+        missing: ["retrieved_context", "cited_passages"]
+      },
+      outcome_validation: {
+        contract_version: "session-step-outcome-v1",
+        expected_outputs: ["retrieved_context", "cited_passages"],
+        produced_expected_outputs: [],
+        missing_expected_outputs: ["retrieved_context", "cited_passages"],
+        fulfills: ["d1"],
+        valid: false
+      },
+      handoff_artifacts: [],
+      citations: []
+    });
+
+    expect(validateRuntimeRouteResults(
+      coveredDocumentRoutePlan,
+      [failedOutput],
+      [{
+        step_id: "s1",
+        adapter: "document_agent",
+        failure_class: "source_evidence_validation",
+        controller_synthesis_safe: false
+      }]
+    )).toEqual({
+      outputs: [failedOutput],
+      routeFailures: [{
+        step_id: "s1",
+        adapter: "document_agent",
+        status: "blocked",
+        failure_class: "source_evidence_validation",
+        controller_synthesis_safe: false,
+        expected_outputs: ["retrieved_context", "cited_passages"],
+        fulfills: ["d1"],
+        had_successful_tool_execution: false
+      }]
+    });
+  });
+
+  it("rejects malformed failure summaries before they can exempt a v3 route contract", () => {
+    const failedOutput = coveredDocumentRouteOutput({
+      output_contract: "failed_closed",
+      policy_violations: ["missing_expected_output:cited_passages"]
+    });
+
+    expect(() => validateRuntimeRouteResults(
+      coveredDocumentRoutePlan,
+      [failedOutput],
+      { step_id: "s1", adapter: "document_agent" }
+    )).toThrow(/route failure summary is malformed/i);
+    expect(() => validateRuntimeRouteResults(
+      coveredDocumentRoutePlan,
+      [{ ...failedOutput, adapter: "different_agent" }],
+      [{
+        step_id: "s1",
+        adapter: "different_agent",
+        failure_class: "expected_output_contract"
+      }]
+    )).toThrow(/adapter does not match planned step s1/i);
+    expect(() => validateRuntimeRouteResults(
+      coveredDocumentRoutePlan,
+      [{ ...failedOutput, id: "", step_id: "s1" }],
+      []
+    )).toThrow(/invalid step identity/i);
+  });
+
+  it("still rejects successful v3 outputs that do not prove the compiled outcome contract", () => {
+    const invalidSuccess = coveredDocumentRouteOutput({
+      outcome_validation: {
+        contract_version: "session-step-outcome-v1",
+        expected_outputs: ["retrieved_context", "cited_passages"],
+        produced_expected_outputs: ["retrieved_context"],
+        missing_expected_outputs: [],
+        fulfills: ["d1"],
+        valid: true
+      }
+    });
+
+    expect(() => validateRuntimeRouteResults(
+      coveredDocumentRoutePlan,
+      [invalidSuccess],
+      []
+    )).toThrow(/does not prove the compiled outcome contract for step s1/i);
+  });
+
+  it("projects failed and blocked route truth without changing successful or reused routes", () => {
+    const plan = {
+      steps: [
+        { id: "s1", adapter: "writer", task: "Write.", depends_on: [] },
+        { id: "s2", adapter: "cached", task: "Reuse.", depends_on: [] },
+        { id: "s3", adapter: "worker", task: "Calculate.", depends_on: [], expected_outputs: ["calculation"] },
+        { id: "s4", adapter: "reviewer", task: "Review.", depends_on: [], fulfills: ["risk_review"] }
+      ]
+    };
+    const valid = (id, adapter, extra = {}) => ({
+      id,
+      step_id: id,
+      adapter,
+      domain_answer: "Validated result.",
+      policy_violations: [],
+      source_validation: { valid: true, violations: [] },
+      consumption_validation: { valid: true, errors: [] },
+      artifact_validation: { valid: true, missing: [] },
+      ...extra
+    });
+    const outputs = [
+      valid("s1", "writer"),
+      valid("s2", "cached", { execution_mode: "reused" }),
+      {
+        ...valid("s3", "worker"),
+        domain_answer: "provider-secret must not become public metadata",
+        raw_text: "provider-secret raw body",
+        output_contract: "failed_closed",
+        policy_violations: ["worker_execution_failed"],
+        source_validation: { valid: false, violations: ["worker_execution_failed"] },
+        artifact_validation: { valid: false, errors: ["worker_execution_failed"] }
+      },
+      {
+        ...valid("s4", "reviewer"),
+        domain_answer: "provider-secret refusal",
+        model_calls: [{ finish_reason: "content_filter", provider_error: "provider-secret" }]
+      }
+    ];
+    const failures = runtimeRouteFailureDetails(plan, outputs, [
+      {
+        step_id: "s3",
+        adapter: "worker",
+        failure_class: "worker_execution",
+        controller_synthesis_safe: true,
+        detail: "provider-secret"
+      },
+      {
+        step_id: "s4",
+        adapter: "reviewer",
+        failure_class: "provider_safety_block",
+        controller_synthesis_safe: false,
+        detail: "provider-secret"
+      }
+    ]);
+
+    expect(failures).toEqual([
+      {
+        step_id: "s3",
+        adapter: "worker",
+        status: "failed",
+        failure_class: "worker_execution",
+        controller_synthesis_safe: true,
+        expected_outputs: ["calculation"],
+        fulfills: [],
+        had_successful_tool_execution: false
+      },
+      {
+        step_id: "s4",
+        adapter: "reviewer",
+        status: "blocked",
+        failure_class: "provider_safety_block",
+        controller_synthesis_safe: false,
+        expected_outputs: [],
+        fulfills: ["risk_review"],
+        had_successful_tool_execution: false
+      }
+    ]);
+    expect(JSON.stringify(failures)).not.toContain("provider-secret");
+    expect(failures.map((failure) => failure.step_id)).not.toContain("s1");
+    expect(failures.map((failure) => failure.step_id)).not.toContain("s2");
+    expect(runtimeRouteFailureDetails(plan, outputs, []).map((failure) => ({
+      step_id: failure.step_id,
+      status: failure.status,
+      failure_class: failure.failure_class
+    }))).toEqual([
+      { step_id: "s3", status: "failed", failure_class: "worker_execution" },
+      { step_id: "s4", status: "blocked", failure_class: "provider_safety_block" }
+    ]);
+  });
+
+  it("reduces failed-route validator details to allowlisted content-free observability", () => {
+    const observability = runtimeRouteFailureObservability({
+      output_contract: "failed_closed",
+      policy_violations: [
+        "required_tool_not_executed:private-tool-name",
+        "missing_expected_output:private-output-name",
+        "owner_policy_violation:provider-secret"
+      ],
+      source_validation: {
+        valid: false,
+        violations: [
+          "unsupported_citation:private-source-id",
+          "source_integrity_missing:private-source-path",
+          "claim_not_supported_by_execution_evidence",
+          "private-validator-reason"
+        ],
+        unknown_citations: ["private-source-id"],
+        invalid_source_integrity: ["private-source-path"],
+        unsupported_claims: ["private rejected source claim"],
+        unsupported_execution_evidence_claims: [
+          "private rejected execution claim one",
+          "private rejected execution claim two"
+        ]
+      },
+      consumption_validation: { valid: true, errors: [] },
+      artifact_validation: {
+        valid: false,
+        errors: ["missing_expected_output:private-output-name"]
+      },
+      outcome_validation: { valid: false, missing_expected_outputs: ["private-output-name"] },
+      source_repair: { attempted: false, valid: false },
+      execution_evidence_repair: {
+        attempted: true,
+        valid: false,
+        error: "PrivateProviderError",
+        original_validation: { rejected_claim: "private rejected execution claim one" }
+      },
+      execution_evidence_sanitizer: {
+        attempted: true,
+        revalidation_valid: true,
+        removed_claims: ["private rejected execution claim two"]
+      }
+    });
+
+    expect(observability).toEqual({
+      schema_version: "runtime-route-failure-observability-v1",
+      failure_reason_codes: [
+        "artifact_validation_failed",
+        "claim_not_supported_by_execution_evidence",
+        "missing_expected_output",
+        "outcome_validation_failed",
+        "required_tool_not_executed",
+        "route_validation_failed",
+        "source_claim_not_supported_by_cited_excerpt",
+        "source_integrity_missing",
+        "source_validation_failed",
+        "unknown_citation"
+      ],
+      repair_attempted: true,
+      repair_valid: true,
+      unsupported_claim_count: 3
+    });
+    expect(JSON.stringify(observability)).not.toMatch(
+      /private|provider-secret|PrivateProviderError/
+    );
+  });
+
+  it("canonicalizes 599/600/601 task boundaries identically to the Runtime", () => {
+    const at599 = `${"x".repeat(598)}\u2003z-tail`;
+    const at600 = `${"x".repeat(599)}\u0085z-tail`;
+    const at601 = `${"x".repeat(600)}\u00a0z-tail`;
+
+    expect(runtimeStreamTaskProjection(at599)).toBe(`${"x".repeat(598)} z`);
+    expect(runtimeStreamTaskProjection(at600)).toBe("x".repeat(599));
+    expect(runtimeStreamTaskProjection(at601)).toBe("x".repeat(600));
+
+    const terminalPlan = {
+      steps: [{ id: "s1", adapter: "agent_one", task: at600, depends_on: [] }]
+    };
+    const streamedPlan = {
+      steps: [{ id: "s1", adapter: "agent_one", task: "x".repeat(599), depends_on: [] }]
+    };
+    expect(runtimePlanSafeProjectionDigest(terminalPlan))
+      .toBe(runtimePlanSafeProjectionDigest(streamedPlan));
+  });
+
+  it("uses the negotiated exact contract as authority and reconciles only the safe preview", () => {
+    const terminalPlan = {
+      steps: [{ id: "s1", adapter: "agent_one", task: "Authoritative terminal task.", depends_on: [] }]
+    };
+    const differentPreview = {
+      steps: [{ id: "s1", adapter: "agent_one", task: "Stale progress preview.", depends_on: [] }]
+    };
+    const exactDigest = runtimePlanExactContractDigest(terminalPlan, PLAN_CONTRACT_V5);
+
+    expect(assertRuntimePlanStreamCommit({
+      rawTerminalPlan: terminalPlan,
+      normalizedTerminalPlan: terminalPlan,
+      streamedSafePlanDigest: runtimePlanSafeProjectionDigest(differentPreview),
+      streamedExactPlanDigest: exactDigest,
+      streamedExactPlanContractVersion: PLAN_CONTRACT_V5
+    })).toEqual({
+      exact_contract_verified: true,
+      safe_projection_reconciled: true
+    });
+
+    let exactMismatch;
+    try {
+      assertRuntimePlanStreamCommit({
+        rawTerminalPlan: terminalPlan,
+        normalizedTerminalPlan: terminalPlan,
+        streamedSafePlanDigest: runtimePlanSafeProjectionDigest(terminalPlan),
+        streamedExactPlanDigest: runtimePlanExactContractDigest(differentPreview, PLAN_CONTRACT_V5),
+        streamedExactPlanContractVersion: PLAN_CONTRACT_V5
+      });
+    } catch (error) {
+      exactMismatch = error;
+    }
+    expect(exactMismatch).toMatchObject({
+      code: "runtime_stream_plan_mismatch",
+      component: "runtime_plan_exact_contract"
+    });
+
+    let safeMismatch;
+    try {
+      assertRuntimePlanStreamCommit({
+        rawTerminalPlan: terminalPlan,
+        normalizedTerminalPlan: terminalPlan,
+        streamedSafePlanDigest: runtimePlanSafeProjectionDigest(differentPreview)
+      });
+    } catch (error) {
+      safeMismatch = error;
+    }
+    expect(safeMismatch).toMatchObject({
+      code: "runtime_stream_plan_mismatch",
+      component: "runtime_plan_safe_projection"
+    });
+  });
+
+  it("accepts dependency-expanded plans while retaining the 48-step wire bound", async () => {
+    const expandedPlan = {
+      steps: Array.from({ length: 32 }, (_, index) => ({
+        id: `s${index + 1}`,
+        adapter: `agent_${index + 1}`,
+        task: `Execute route ${index + 1}.`,
+        depends_on: index === 0 ? [] : [`s${index}`]
+      }))
+    };
+    restoreFetch = setRuntimeFetchForTests(async () => ndjsonResponse([
+      event("planner.completed", 1, {
+        plan: expandedPlan,
+        contract_digest: contractDigest(expandedPlan)
+      }),
+      event("run.completed", 2, {
+        result: { ok: true, plan: expandedPlan, finalAnswer: "Expanded route complete." }
+      })
+    ]));
+
+    await expect(executeRuntimeChatStream({
+      query: "Execute the complete dependency-expanded team.",
+      executionContext: { run_id: RUN_ID }
+    })).resolves.toMatchObject({
+      legacy: false,
+      result: { ok: true, finalAnswer: "Expanded route complete." }
+    });
+
+    restoreFetch();
+    const oversizedPlan = {
+      steps: Array.from({ length: 49 }, (_, index) => ({
+        id: `s${index + 1}`,
+        adapter: `agent_${index + 1}`,
+        task: `Execute route ${index + 1}.`,
+        depends_on: []
+      }))
+    };
+    restoreFetch = setRuntimeFetchForTests(async () => ndjsonResponse([
+      event("planner.completed", 1, {
+        plan: oversizedPlan,
+        contract_digest: contractDigest(oversizedPlan)
+      }),
+      event("run.completed", 2, {
+        result: { ok: true, plan: oversizedPlan, finalAnswer: "Must not be accepted." }
+      })
+    ]));
+    await expect(executeRuntimeChatStream({
+      query: "Execute an oversized team.",
+      executionContext: { run_id: RUN_ID }
+    })).rejects.toMatchObject({ code: "runtime_stream_invalid", status: 502 });
+  });
+
   it("binds hidden blocked-clarification state in the v5 exact contract", () => {
     const baseline = runtimePlanExactContractDigest(blockedClarificationPlan);
     expect(baseline).toBe(contractDigest(blockedClarificationPlan));
@@ -1028,10 +1498,11 @@ describe.sequential("Runtime early-plan stream", () => {
   it("persists and publishes the validated plan while Runtime workers are still delayed", async () => {
     const releaseTerminal = deferred();
     const plannerTransported = deferred();
-    const exactTask = `Prepare the concise note.\n${"🚗".repeat(610)} Include relevant detail.`;
-    const projectedTask = Array.from(exactTask.replace(/\p{White_Space}+/gu, " ").trim())
-      .slice(0, 600)
-      .join("");
+    // The normalized 600th code point is whitespace. This is the boundary
+    // that previously made the Python safe projection and JavaScript terminal
+    // verifier disagree after an otherwise successful model execution.
+    const exactTask = `${"🚗".repeat(599)}\u0085Include relevant detail.`;
+    const projectedTask = runtimeStreamTaskProjection(exactTask);
     const streamedSafePlan = {
       steps: [{
         id: "s1",
@@ -1041,8 +1512,9 @@ describe.sequential("Runtime early-plan stream", () => {
       }]
     };
     expect(exactTask.length).toBeGreaterThan(600);
-    expect(Array.from(projectedTask)).toHaveLength(600);
+    expect(Array.from(projectedTask)).toHaveLength(599);
     expect(projectedTask.length).toBeGreaterThan(600);
+    expect(projectedTask).toBe("🚗".repeat(599));
     let runtimeAgent;
     const baseDigest = "2".repeat(64);
     const executorDigest = "3".repeat(64);

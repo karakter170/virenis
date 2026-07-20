@@ -658,6 +658,15 @@ describe("runtime and catalog", () => {
     };
     const previousFetch = globalThis.fetch;
     let runtimeReady = false;
+    let runtimeService = "tcar-gpu-runtime-api";
+    let runtimeProtocol = {
+      chat_stream: "heartbeat-v1",
+      plan_contract_versions: [
+        "tcar-runtime-plan-contract-v5",
+        "tcar-runtime-plan-contract-v4"
+      ],
+      terminal_recovery: "chat-recover-v1"
+    };
 
     try {
       process.env.TCAR_ENGINE_MODE = "real";
@@ -667,7 +676,8 @@ describe("runtime and catalog", () => {
       globalThis.fetch = async () => Response.json({
         ok: true,
         ready: runtimeReady,
-        service: "tcar-gpu-runtime-api"
+        service: runtimeService,
+        protocol: runtimeProtocol
       });
 
       await request(app).get("/healthz").expect(200);
@@ -676,7 +686,30 @@ describe("runtime and catalog", () => {
 
       runtimeReady = true;
       const ready = await request(app).get("/readyz").expect(200);
-      expect(ready.body).toMatchObject({ ok: true, ready: true, runtime_mode: "real" });
+      expect(ready.body).toMatchObject({
+        ok: true,
+        ready: true,
+        runtime_mode: "real",
+        runtime_protocol: {
+          compatible: true,
+          selected_plan_contract: "tcar-runtime-plan-contract-v5"
+        }
+      });
+
+      runtimeProtocol = {
+        ...runtimeProtocol,
+        plan_contract_versions: ["tcar-runtime-plan-contract-v99"]
+      };
+      await request(app).get("/healthz").expect(200);
+      await request(app).get("/readyz").expect(503);
+
+      runtimeProtocol = {
+        chat_stream: "heartbeat-v1",
+        plan_contract_versions: ["tcar-runtime-plan-contract-v5"],
+        terminal_recovery: "chat-recover-v1"
+      };
+      runtimeService = "unexpected-service";
+      await request(app).get("/readyz").expect(503);
     } finally {
       globalThis.fetch = previousFetch;
       for (const [key, value] of Object.entries(previous)) {
@@ -3192,13 +3225,19 @@ describe("chat execution", () => {
         session_id: sessionId,
         status: "failed",
         query: "Sensitive event",
-        plan: { steps: [] },
+        plan: { steps: [{ id: "s1", adapter: "writing_synthesis_lora", task: "Write safely.", depends_on: [] }] },
         parallel: { workers: 1, batches: [], maxBatchWidth: 0, parallelizable: false },
         events: [
           {
-            type: "route.completed",
+            type: "route.failed",
+            step_id: "s1",
+            adapter: "writing_synthesis_lora",
+            status: "blocked",
+            failure_class: "provider_safety_block",
+            controller_synthesis_safe: false,
             citations: [{ chunk_id: "c1", title: "Chunk", path: "sources/tcar_documents/private/chunks/c1.md" }],
-            raw_text_admin_only: "hidden route text"
+            raw_text_admin_only: "hidden route text super-secret-value",
+            detail: "provider response super-secret-value"
           },
           {
             type: "run.failed",
@@ -3210,6 +3249,30 @@ describe("chat execution", () => {
         ],
         error: { code: "runtime_failed", message: "The run failed before completion. Try again or contact support with the run id." },
         error_admin_only: { message: "super-secret-value" }
+      });
+      data.runSteps.push({
+        run_step_id: "run_step_sse_redaction",
+        run_id: runId,
+        step_id: "s1",
+        adapter: "writing_synthesis_lora",
+        task: "Write safely.",
+        depends_on: [],
+        status: "blocked",
+        domain_answer: "",
+        handoffs: "",
+        citations: [],
+        failure: {
+          step_id: "s1",
+          adapter: "writing_synthesis_lora",
+          status: "blocked",
+          failure_class: "provider_safety_block",
+          controller_synthesis_safe: false,
+          expected_outputs: [],
+          fulfills: [],
+          had_successful_tool_execution: false
+        },
+        raw_text_admin_only: "provider response super-secret-value",
+        model_calls_admin_only: [{ provider_error: "super-secret-value" }]
       });
       return runId;
     });
@@ -3227,10 +3290,29 @@ describe("chat execution", () => {
       expect(app.locals.eventStreams.size).toBe(0);
       expect(app.locals.bus.listenerCount(runId)).toBe(0);
       expect(body).toContain("run.failed");
+      expect(body).toContain("route.failed");
+      expect(body).toContain("provider_safety_block");
       expect(body).toContain("The run failed before completion");
       expect(body).not.toContain("super-secret-value");
       expect(body).not.toContain("sources/tcar_documents");
       expect(body).not.toContain("raw_text_admin_only");
+
+      const route = await request(app)
+        .get(`/api/chat/runs/${runId}/routes/s1`)
+        .set("Authorization", "Bearer event_user_token")
+        .expect(200);
+      expect(route.body).toMatchObject({
+        status: "blocked",
+        domain_answer: "",
+        failure: {
+          status: "blocked",
+          failure_class: "provider_safety_block",
+          controller_synthesis_safe: false
+        }
+      });
+      expect(route.body.raw_text_admin_only).toBeUndefined();
+      expect(route.body.model_calls_admin_only).toBeUndefined();
+      expect(JSON.stringify(route.body)).not.toContain("super-secret-value");
     } finally {
       if (previousTokens === undefined) {
         delete process.env.APP_API_TOKENS_JSON;
@@ -3538,6 +3620,301 @@ describe("chat execution", () => {
         } else {
           process.env[key] = value;
         }
+      }
+      await fs.rm(realTmp, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a synthesized real-runtime answer completed while exposing failed route truth", async () => {
+    const previous = {
+      APP_API_TOKENS_JSON: process.env.APP_API_TOKENS_JSON,
+      TCAR_ENGINE_MODE: process.env.TCAR_ENGINE_MODE,
+      TCAR_RUNTIME_API_URL: process.env.TCAR_RUNTIME_API_URL,
+      TCAR_RUNTIME_API_KEY: process.env.TCAR_RUNTIME_API_KEY
+    };
+    const previousFetch = globalThis.fetch;
+    const realTmp = await fs.mkdtemp(path.join(os.tmpdir(), "tcar-chat-route-fail-"));
+    const tokenUser = "route_fail_user_token_0123456789";
+    const tokenAdmin = "route_fail_admin_token_0123456789";
+    let realApp;
+
+    try {
+      process.env.APP_API_TOKENS_JSON = JSON.stringify({
+        [tokenUser]: { user_id: "route_user", workspace_id: "workspace_route_fail", role: "user" },
+        [tokenAdmin]: { user_id: "route_admin", workspace_id: "workspace_route_fail", role: "admin" }
+      });
+      process.env.TCAR_ENGINE_MODE = "real";
+      process.env.TCAR_RUNTIME_API_URL = "http://gpu-runtime.internal:9000";
+      process.env.TCAR_RUNTIME_API_KEY = "runtime-secret-for-tests";
+      globalThis.fetch = async () => new Response(JSON.stringify({
+        ok: true,
+        mode: "session_delegated_vllm_execute",
+        baseModel: "qwen36-awq",
+        manifestRevision: "1".repeat(64),
+        componentProvenance: {
+          revision_authority: "runtime",
+          manifest_revision: "1".repeat(64),
+          base_model_id: "qwen36-awq",
+          base_model_content_digest: "2".repeat(64),
+          session_model_id: "qwen36-awq",
+          session_model_content_digest: "2".repeat(64),
+          session_contract_version: "session-orchestrator-v3",
+          executor_code_digest: "5".repeat(64),
+          agents: [{
+            adapter: "writing_synthesis_lora",
+            agent_revision: "6".repeat(64),
+            revision_authority: "runtime",
+            manifest_contract_digest: "7".repeat(64),
+            adapter_content_digest: "8".repeat(64)
+          }]
+        },
+        executionProvenance: {
+          execution_id: "runtime-route-failure-execution",
+          receipt_id: "runtime-route-failure-receipt",
+          record_hash: "9".repeat(64),
+          schema_version: 1,
+          created_at: "2026-07-19T00:00:00.000Z"
+        },
+        plan: {
+          steps: [{
+            id: "s1",
+            adapter: "writing_synthesis_lora",
+            task: "Prepare the requested draft.",
+            depends_on: [],
+            evidence_requirement: "none",
+            expected_outputs: ["final_answer"],
+            fulfills: ["draft"]
+          }],
+          adapters: ["writing_synthesis_lora"],
+          edges: [],
+          routing: {
+            mode: "session",
+            candidate_count: 1,
+            candidate_adapters: ["writing_synthesis_lora"],
+            selected: [{ adapter: "writing_synthesis_lora", source: "explicit" }],
+            orchestrator: {
+              contract_version: "session-orchestrator-v3",
+              decision: "delegate",
+              final_synthesis_required: true,
+              outcome_contract: {
+                contract_version: "session-outcome-v1",
+                route_admission_contract_version: "session-route-admission-v1",
+                compiler_authority: "runtime",
+                status: "covered",
+                deliverables: [{
+                  id: "draft",
+                  title: "Requested draft",
+                  description: "Prepare the requested draft.",
+                  required: true,
+                  evidence_requirement: "none",
+                  required_outputs: ["final_answer"],
+                  controller_can_synthesize: false,
+                  assigned_to_session_controller: false
+                }],
+                steps: [{
+                  step_id: "s1",
+                  route_admission_valid: true,
+                  route_dependency_closure_valid: true,
+                  route_admission: {
+                    contract_version: "session-route-admission-v1",
+                    valid: true,
+                    route_role: "outcome_owner",
+                    obligation_source: "compiled_deliverables",
+                    deliverable_ids: ["draft"],
+                    expected_outputs: ["final_answer"],
+                    downstream_bindings: [],
+                    strict_constraints_checked: [
+                      "activation_policy", "boundary", "write_policy", "tool_policy",
+                      "source_policy", "escalation_policy"
+                    ],
+                    violations: [],
+                    obligation: "Prepare the requested draft."
+                  }
+                }]
+              }
+            }
+          }
+        },
+        expertOutputs: [{
+          id: "s1",
+          step_id: "s1",
+          adapter: "writing_synthesis_lora",
+          agent_revision: "6".repeat(64),
+          adapter_content_digest: "8".repeat(64),
+          model_id: "qwen36-awq",
+          task: "Prepare the requested draft.",
+          domain_answer: "provider-secret partial worker text",
+          raw_text: "provider-secret raw worker response",
+          output_contract: "failed_closed",
+          policy_violations: [
+            "worker_execution_failed",
+            "claim_not_supported_by_execution_evidence",
+            "private-validator-reason"
+          ],
+          source_validation: {
+            valid: false,
+            violations: ["worker_execution_failed", "claim_not_supported_by_execution_evidence"],
+            unsupported_claims: ["private rejected source claim"],
+            unsupported_execution_evidence_claims: [
+              "private rejected execution claim one",
+              "private rejected execution claim two"
+            ]
+          },
+          execution_evidence_repair: {
+            attempted: true,
+            valid: false,
+            error: "PrivateProviderError",
+            original_validation: { rejected_claim: "private rejected execution claim one" }
+          },
+          execution_evidence_sanitizer: {
+            attempted: true,
+            revalidation_valid: true,
+            removed_claims: ["private rejected execution claim two"]
+          },
+          consumption_validation: { valid: true, errors: [] },
+          artifact_validation: { valid: false, errors: ["worker_execution_failed"] },
+          outcome_validation: { valid: false, missing_expected_outputs: ["final_answer"] },
+          handoff_artifacts: [],
+          citations: [],
+          allowed_tools: [],
+          tool_executions: [],
+          model_calls: [{ finish_reason: "error", provider_error: "provider-secret" }],
+          execution_mode: "executed"
+        }],
+        routeFailureSummary: [{
+          step_id: "s1",
+          adapter: "writing_synthesis_lora",
+          failure_class: "worker_execution",
+          controller_synthesis_safe: true,
+          expected_outputs: ["final_answer"],
+          fulfills: ["draft"],
+          had_successful_tool_execution: false
+        }],
+        finalAnswer: "The specialist draft was unavailable, so I need a narrower brief before continuing."
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+
+      realApp = await createApp({
+        dbPath: path.join(realTmp, "db.json"),
+        uploadRoot: realTmp
+      });
+      const session = await request(realApp)
+        .post("/api/chat/sessions")
+        .set("Authorization", `Bearer ${tokenUser}`)
+        .send({ title: "Route failure truth" })
+        .expect(201);
+      const queued = await request(realApp)
+        .post(`/api/chat/sessions/${session.body.session_id}/messages`)
+        .set("Authorization", `Bearer ${tokenUser}`)
+        .send({ content: "Ask @writing_synthesis for a draft." })
+        .expect(202);
+
+      let run;
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        const response = await request(realApp)
+          .get(`/api/chat/runs/${queued.body.run_id}`)
+          .set("Authorization", `Bearer ${tokenUser}`)
+          .expect(200);
+        if (["completed", "failed"].includes(response.body.status)) {
+          run = response.body;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+
+      expect(run.status, JSON.stringify(run.error)).toBe("completed");
+      expect(run).toMatchObject({
+        final_answer: "The specialist draft was unavailable, so I need a narrower brief before continuing.",
+        expert_outputs: [expect.objectContaining({
+          step_id: "s1",
+          status: "failed",
+          domain_answer: "",
+          handoff_artifacts: [],
+          citations: [],
+          failure: expect.objectContaining({
+            status: "failed",
+            failure_class: "worker_execution",
+            controller_synthesis_safe: true,
+            expected_outputs: ["final_answer"],
+            fulfills: ["draft"]
+          })
+        })]
+      });
+      expect(run.events.some((event) => event.type === "route.completed")).toBe(false);
+      expect(run.events).toContainEqual(expect.objectContaining({
+        type: "route.failed",
+        step_id: "s1",
+        status: "failed",
+        failure_class: "worker_execution"
+      }));
+      expect(run.expert_outputs[0].failure_observability_admin_only).toBeUndefined();
+      expect(JSON.stringify(run)).not.toContain("provider-secret");
+
+      const adminRun = await request(realApp)
+        .get(`/api/chat/runs/${queued.body.run_id}`)
+        .set("Authorization", `Bearer ${tokenAdmin}`)
+        .expect(200);
+      expect(adminRun.body.expert_outputs[0].failure_observability_admin_only).toEqual({
+        schema_version: "runtime-route-failure-observability-v1",
+        failure_reason_codes: [
+          "artifact_validation_failed",
+          "claim_not_supported_by_execution_evidence",
+          "outcome_validation_failed",
+          "route_validation_failed",
+          "source_claim_not_supported_by_cited_excerpt",
+          "source_validation_failed",
+          "worker_execution_failed"
+        ],
+        repair_attempted: true,
+        repair_valid: true,
+        unsupported_claim_count: 3
+      });
+      expect(JSON.stringify(adminRun.body.expert_outputs[0].failure_observability_admin_only))
+        .not.toMatch(/private|provider-secret|PrivateProviderError/);
+
+      const metrics = await request(realApp)
+        .get("/api/admin/metrics")
+        .set("Authorization", `Bearer ${tokenAdmin}`)
+        .expect(200);
+      expect(metrics.body).toMatchObject({
+        route_repair_attempted_count: 1,
+        route_repair_valid_count: 1,
+        unsupported_claim_count: 3,
+        route_failure_reason_counts: {
+          claim_not_supported_by_execution_evidence: 1,
+          worker_execution_failed: 1
+        }
+      });
+      expect(JSON.stringify(metrics.body)).not.toMatch(/private|provider-secret|PrivateProviderError/);
+      const persisted = JSON.stringify(realApp.locals.store.read());
+      expect(persisted).not.toMatch(
+        /private rejected source claim|private rejected execution claim|private-validator-reason|PrivateProviderError/
+      );
+
+      const dag = await request(realApp)
+        .get(`/api/chat/runs/${queued.body.run_id}/dag`)
+        .set("Authorization", `Bearer ${tokenUser}`)
+        .expect(200);
+      expect(dag.body.nodes).toContainEqual(expect.objectContaining({ id: "s1", status: "failed" }));
+
+      const execution = await request(realApp)
+        .get(`/api/executions/${run.execution.execution_id}`)
+        .set("Authorization", `Bearer ${tokenUser}`)
+        .expect(200);
+      expect(execution.body.participants).toContainEqual(expect.objectContaining({
+        step_id: "s1",
+        status: "failed"
+      }));
+      expect(execution.body.record_hash_valid).toBe(true);
+      expect(realApp.locals.store.read().worldGraphArtifacts.some((artifact) => (
+        artifact.origin_run_id === queued.body.run_id && artifact.step_id === "s1"
+      ))).toBe(false);
+    } finally {
+      await realApp?.locals?.drainBackgroundTasks?.({ timeoutMs: 5000 });
+      await realApp?.locals?.store?.close?.();
+      globalThis.fetch = previousFetch;
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
       }
       await fs.rm(realTmp, { recursive: true, force: true });
     }
@@ -4236,16 +4613,15 @@ describe("documents and sources", () => {
       .post(`/api/chat/sessions/${sessionB.session_id}/messages`)
       .send({ content: '@"Chat A Notes source agent" must not be available here.' })
       .expect(202);
+    const [chatARun, chatBRun] = await Promise.all([
+      waitForRun(chatAQueued.body.run_id),
+      waitForRun(chatBQueued.body.run_id)
+    ]);
     const knowledgeQueued = await request(app)
       .post(`/api/chat/sessions/${sessionB.session_id}/messages`)
       .send({ content: '@“Reusable README source agent” use the reusable file.' })
       .expect(202);
-
-    const [chatARun, chatBRun, knowledgeRun] = await Promise.all([
-      waitForRun(chatAQueued.body.run_id),
-      waitForRun(chatBQueued.body.run_id),
-      waitForRun(knowledgeQueued.body.run_id)
-    ]);
+    const knowledgeRun = await waitForRun(knowledgeQueued.body.run_id);
     expect(chatARun.plan.steps.map((step) => step.adapter)).toContain(chatOnly.body.agent_id);
     expect(chatBRun.plan.steps.map((step) => step.adapter)).not.toContain(chatOnly.body.agent_id);
     expect(knowledgeRun.plan.steps.map((step) => step.adapter)).toContain(knowledge.body.agent_id);
@@ -4256,6 +4632,87 @@ describe("documents and sources", () => {
       .field("scope", "chat")
       .attach("file", Buffer.from("invalid"), "invalid.txt")
       .expect(400);
+  });
+
+  it("binds an explicit chat attachment to its session source and rejects cross-session document ids", async () => {
+    const sessionA = await createSession("Attachment binding A");
+    const sessionB = await createSession("Attachment binding B");
+    const globalResume = await request(app)
+      .post("/api/documents")
+      .field("title", "Global Resume")
+      .field("scope", "knowledge")
+      .field("routing_cues", "resume, candidate experience")
+      .attach("file", Buffer.from("Unrelated archived candidate experience."), "global-resume.txt")
+      .expect(201);
+    const chatResume = await request(app)
+      .post("/api/documents")
+      .field("title", "Candidate Resume")
+      .field("scope", "chat")
+      .field("session_id", sessionA.session_id)
+      .field("routing_cues", "resume, data science, AI experience")
+      .attach("file", Buffer.from("Python, SQL, visualization, machine learning, and AI training experience."), "candidate-resume.txt")
+      .expect(201);
+
+    const queued = await request(app)
+      .post(`/api/chat/sessions/${sessionA.session_id}/messages`)
+      .send({
+        content: "Using only the attached resume, extract and cite the candidate's data and AI experience.",
+        attachments: [{
+          type: "document",
+          name: "Candidate Resume",
+          document_id: chatResume.body.document_id
+        }]
+      })
+      .expect(202);
+    const run = await waitForRun(queued.body.run_id);
+
+    expect(run.status).toBe("completed");
+    expect(run.attachment_document_ids).toEqual([chatResume.body.document_id]);
+    expect(run.attachment_agent_ids).toEqual([chatResume.body.agent_id]);
+    expect(run.plan.routing.mode).toBe("chat_attachment");
+    expect(run.plan.steps.map((step) => step.adapter)).toContain(chatResume.body.agent_id);
+    expect(run.plan.steps.map((step) => step.adapter)).not.toContain(globalResume.body.agent_id);
+
+    await request(app)
+      .post(`/api/chat/sessions/${sessionB.session_id}/messages`)
+      .send({
+        content: "Use the attached resume.",
+        attachments: [{
+          type: "document",
+          name: "Candidate Resume",
+          document_id: chatResume.body.document_id
+        }]
+      })
+      .expect(404);
+  });
+
+  it("fails closed when an attached-file reference is ambiguous within one chat", async () => {
+    const session = await createSession("Attachment ambiguity");
+    const uploads = [];
+    for (const title of ["Candidate Resume", "Manager Resume"]) {
+      const upload = await request(app)
+        .post("/api/documents")
+        .field("title", title)
+        .field("scope", "chat")
+        .field("session_id", session.session_id)
+        .field("routing_cues", "resume")
+        .attach("file", Buffer.from(`${title} evidence.`), `${title.toLowerCase().replaceAll(" ", "-")}.txt`)
+        .expect(201);
+      uploads.push(upload.body);
+    }
+
+    const response = await request(app)
+      .post(`/api/chat/sessions/${session.session_id}/messages`)
+      .send({
+        content: "Use only the attached resume.",
+        attachments: uploads.map((upload) => ({
+          type: "document",
+          name: upload.title,
+          document_id: upload.document_id
+        }))
+      })
+      .expect(409);
+    expect(response.body.message).toMatch(/more than one chat file/i);
   });
 
   it("keeps a deleted document agent inspectable as an owner-scoped tombstone after Runtime purge", async () => {

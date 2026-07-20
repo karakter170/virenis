@@ -7,7 +7,7 @@ export const apiSeedAgents = [
     title: "Finance and economic analysis",
     capability: "Provides financial and economic analysis, including statements, cash flow, macroeconomic conditions, scenarios, and quantitative checks. Labels assumptions and uncertainty when current data is unavailable.",
     boundary: "Provide general analysis, not personalized regulated advice. Distinguish estimates from verified current facts.",
-    consumes: ["user_request", "financial_context", "evidence_summary"],
+    consumes: ["user_request", "shared_memory", "financial_context", "evidence_summary"],
     produces: ["financial_analysis", "calculation_trace", "assumptions", "risk_factors"],
     routing_cues: ["finance", "financial analysis", "cash flow", "valuation", "economy", "inflation", "interest rate", "economic outlook"],
     resources: ["general_model_knowledge", "canonical_tool_contracts"],
