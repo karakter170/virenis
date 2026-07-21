@@ -199,7 +199,7 @@ describe("Virenis curated Marketplace teams", () => {
         expect(new Set(declaredDependencies)).toEqual(new Set(incoming.get(agent.id).map((source) => source.id)));
         expect(new Set(agent.agent_contract.execution.handoffs.requires_agents)).toEqual(new Set(declaredDependencies));
         if (incoming.get(agent.id).length) {
-          expect(agent.consumes).toContain("upstream_route_outputs");
+          expect(agent.consumes).not.toContain("upstream_route_outputs");
           expect(agent.policies.knowledge.requirements).toContain("upstream_specialist");
         }
 

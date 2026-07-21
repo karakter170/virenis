@@ -4516,10 +4516,11 @@ describe("chat execution", () => {
     expect(metrics.body.total_runs).toBe(25);
     expect(metrics.body.most_used_agents.length).toBeGreaterThan(0);
     // This intentionally performs many serialized durable JSON commits. On a
-    // shared CI host the integrity work can exceed 45 seconds even though every
-    // run continues to make progress; keep the workload and give it a realistic
-    // wall-clock budget so cleanup never races still-active writers.
-  }, 75000);
+    // shared CI host the integrity work can exceed 75 seconds when the rest of
+    // the suite is running concurrently, even though every run continues to
+    // make progress. Keep the workload and give it a realistic wall-clock
+    // budget so cleanup never races still-active writers.
+  }, 120000);
 });
 
 describe("documents and sources", () => {

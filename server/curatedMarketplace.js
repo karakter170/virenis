@@ -8,7 +8,7 @@ const CURATED_WORKSPACE_ID = "virenis-curated-catalog";
 const CURATED_PUBLISHED_AT = "2026-07-21T00:00:00.000Z";
 
 export const CURATED_MARKETPLACE_PUBLISHER_ID = "publisher_b457575a5f0ca27cb824647f1f10601c";
-export const CURATED_MARKETPLACE_REVISION = "2026-07-v4";
+export const CURATED_MARKETPLACE_REVISION = "2026-07-v6";
 
 function clone(value) {
   return typeof globalThis.structuredClone === "function"
@@ -109,7 +109,7 @@ function teamDefinitions() {
     title: "Systems Architecture Agent",
     capability: "Develops viable architecture options from the verified requirements, compares their failure modes and operational costs, and records a recommended system boundary, interfaces, data flow, and reversibility strategy.",
     boundary: "Use the requirements handoff as the source of truth. Do not claim a repository or deployment was inspected. Make tradeoffs and rejected options explicit, and never hide an unresolved requirement behind implementation detail.",
-    consumes: ["user_request", "shared_memory", "upstream_route_outputs", teammateOutput(engineeringRequirements)],
+    consumes: ["user_request", "shared_memory", teammateOutput(engineeringRequirements)],
     produces: ["architecture_decision_record"],
     routingCues: ["system architecture", "architecture decision", "service boundaries", "data flow", "technical tradeoffs"],
     avoidWhen: ["requests that need only requirements clarification", "implementation status reporting", "non-technical strategy"],
@@ -120,12 +120,11 @@ function teamDefinitions() {
   });
   const engineeringDelivery = curatedAgent("engineering", "delivery", {
     title: "Delivery Planning Agent",
-    capability: "Converts the requirements and architecture decision into an executable sequence of increments, interface changes, data migrations, compatibility measures, ownership checkpoints, and rollback-safe release steps.",
-    boundary: "Plan only from verified handoffs. Do not fabricate code locations, estimates, staffing, completed work, or deployment evidence. Mark dependencies and decisions that require inspection or owner confirmation.",
+    capability: "Converts the requirements and selected architecture into an executable sequence of increments. It translates every named service and interface into concrete provisioning, configuration, deployment, migration, verification, ownership, and rollback actions while preserving compatibility and dependency order.",
+    boundary: "Implement the selected architecture rather than reopening rejected options. Recommendations and assumption-gated defaults are allowed; label them clearly. Do not fabricate code locations, estimates, staffing, completed work, or deployment evidence. When an input is unknown, identify the owner decision without deferring the rest of the plan.",
     consumes: [
       "user_request",
       "shared_memory",
-      "upstream_route_outputs",
       teammateOutput(engineeringRequirements),
       teammateOutput(engineeringArchitect)
     ],
@@ -144,7 +143,6 @@ function teamDefinitions() {
     consumes: [
       "user_request",
       "shared_memory",
-      "upstream_route_outputs",
       teammateOutput(engineeringRequirements),
       teammateOutput(engineeringArchitect)
     ],
@@ -163,7 +161,6 @@ function teamDefinitions() {
     consumes: [
       "user_request",
       "shared_memory",
-      "upstream_route_outputs",
       teammateOutput(engineeringRequirements),
       teammateOutput(engineeringArchitect),
       teammateOutput(engineeringDelivery),
@@ -184,7 +181,6 @@ function teamDefinitions() {
     consumes: [
       "user_request",
       "shared_memory",
-      "upstream_route_outputs",
       teammateOutput(engineeringRequirements),
       teammateOutput(engineeringArchitect),
       teammateOutput(engineeringDelivery),
@@ -228,7 +224,6 @@ function teamDefinitions() {
     consumes: [
       "user_request",
       "shared_memory",
-      "upstream_route_outputs",
       teammateOutput(marketingAudience),
       teammateOutput(marketingEvidence)
     ],
@@ -247,7 +242,6 @@ function teamDefinitions() {
     consumes: [
       "user_request",
       "shared_memory",
-      "upstream_route_outputs",
       teammateOutput(marketingAudience),
       teammateOutput(marketingEvidence),
       teammateOutput(positioningStrategist)
@@ -267,7 +261,6 @@ function teamDefinitions() {
     consumes: [
       "user_request",
       "shared_memory",
-      "upstream_route_outputs",
       teammateOutput(marketingAudience),
       teammateOutput(marketingEvidence),
       teammateOutput(positioningStrategist),
@@ -288,7 +281,6 @@ function teamDefinitions() {
     consumes: [
       "user_request",
       "shared_memory",
-      "upstream_route_outputs",
       teammateOutput(marketingAudience),
       teammateOutput(marketingEvidence),
       teammateOutput(positioningStrategist),
@@ -332,7 +324,6 @@ function teamDefinitions() {
     consumes: [
       "user_request",
       "shared_memory",
-      "upstream_route_outputs",
       teammateOutput(productProblem),
       teammateOutput(productEvidence)
     ],
@@ -351,7 +342,6 @@ function teamDefinitions() {
     consumes: [
       "user_request",
       "shared_memory",
-      "upstream_route_outputs",
       teammateOutput(productProblem),
       teammateOutput(productStrategist)
     ],
@@ -370,7 +360,6 @@ function teamDefinitions() {
     consumes: [
       "user_request",
       "shared_memory",
-      "upstream_route_outputs",
       teammateOutput(productEvidence),
       teammateOutput(productStrategist),
       teammateOutput(productExperience)
@@ -390,7 +379,6 @@ function teamDefinitions() {
     consumes: [
       "user_request",
       "shared_memory",
-      "upstream_route_outputs",
       teammateOutput(productProblem),
       teammateOutput(productEvidence),
       teammateOutput(productStrategist),
@@ -420,7 +408,7 @@ function teamDefinitions() {
     title: "Divergent Ideas Agent",
     capability: "Generates a deliberately varied portfolio across incremental, bold, low-cost, systemic, service, partnership, behavioral, and unconventional directions, explaining the distinct mechanism behind each idea.",
     boundary: "Optimize for meaningful variety rather than cosmetic rewrites or volume. Honor the challenge frame, avoid unsafe or exclusionary concepts, and label assumptions that need validation.",
-    consumes: ["user_request", "shared_memory", "upstream_route_outputs", teammateOutput(brainstormingFramer)],
+    consumes: ["user_request", "shared_memory", teammateOutput(brainstormingFramer)],
     produces: ["idea_portfolio"],
     routingCues: ["brainstorm", "generate ideas", "creative options", "idea exploration", "new concepts"],
     avoidWhen: ["requests to choose one answer before divergence", "irrelevant random novelty", "implementation certification"],
@@ -433,7 +421,7 @@ function teamDefinitions() {
     title: "Perspective & Analogy Agent",
     capability: "Independently reframes the challenge through different users, moments, incentives, analogies, reversals, adjacent fields, accessibility lenses, and constraint substitutions to expose non-obvious opportunity spaces.",
     boundary: "Produce relevant reframes, not random novelty. Preserve hard constraints, identify the logic of every analogy, and explicitly label any assumption relaxed only for exploration.",
-    consumes: ["user_request", "shared_memory", "upstream_route_outputs", teammateOutput(brainstormingFramer)],
+    consumes: ["user_request", "shared_memory", teammateOutput(brainstormingFramer)],
     produces: ["alternative_lenses"],
     routingCues: ["reframe problem", "alternative perspective", "creative analogy", "unexpected connection", "lateral thinking"],
     avoidWhen: ["literal execution plans", "analogies without a transferable mechanism", "requests to ignore hard constraints"],
@@ -449,7 +437,6 @@ function teamDefinitions() {
     consumes: [
       "user_request",
       "shared_memory",
-      "upstream_route_outputs",
       teammateOutput(brainstormingFramer),
       teammateOutput(ideaExplorer),
       teammateOutput(perspectiveAgent)
@@ -468,7 +455,6 @@ function teamDefinitions() {
     consumes: [
       "user_request",
       "shared_memory",
-      "upstream_route_outputs",
       teammateOutput(brainstormingFramer),
       teammateOutput(feasibilityEditor)
     ],
@@ -487,7 +473,6 @@ function teamDefinitions() {
     consumes: [
       "user_request",
       "shared_memory",
-      "upstream_route_outputs",
       teammateOutput(brainstormingFramer),
       teammateOutput(ideaExplorer),
       teammateOutput(perspectiveAgent),
