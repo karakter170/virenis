@@ -6,6 +6,10 @@ import express from "express";
 import multer from "multer";
 import { basicAuthPassword, parseConfiguredApiTokens, secretConfigured } from "./authConfig.js";
 import { readConfiguredSecret } from "./secretConfig.js";
+import {
+  CANONICAL_AGENT_SCHEMA_VERSION,
+  ensureCanonicalAgentContract
+} from "./agentContract.js";
 import { seedAgentsForMode, withoutLegacySeedAgents, BASE_MODEL } from "./catalog.js";
 import {
   activePricingVersion,
@@ -310,6 +314,9 @@ export async function createApp({
   });
   const store = createStore({ dbPath, seedAgents: configuredSeedAgents });
   await store.init();
+  await store.mutate((data) => {
+    data.agents = (data.agents || []).map((agent) => ensureCanonicalAgentContract(agent));
+  });
   await store.mutate((data) => pruneExpiredWorldGraphData(data));
   await store.mutate((data) => activePricingVersion(data));
   const workflowRegistrationStartupRecovery = workflowRegistrationAnchorInventory(store, {
@@ -3136,6 +3143,7 @@ export async function createApp({
       if (sourceText && agent.sources.length === 0) {
         agent.sources = [ownedAgentSourcePath(agent.id)];
       }
+      Object.assign(agent, ensureCanonicalAgentContract(agent));
       if (agent.sources.some((sourcePath) => {
         assertSafeSourcePath(sourcePath);
         return false;
@@ -3251,7 +3259,6 @@ export async function createApp({
         if (sourceText) {
           agent.source_text_internal = sourceText;
         }
-        agent.ready = true;
         data.agents.push(agent);
         if (targetAgentWorkspace) {
           commitAgentWorkspaceReservation(
@@ -3266,7 +3273,7 @@ export async function createApp({
           eventType: "agent.created",
           agent,
           actor: req.auth,
-          details: { ready: true }
+          details: { ready: agent.ready === true }
         });
         return agent;
       });
@@ -3280,7 +3287,7 @@ export async function createApp({
         agent_workspace_id: targetAgentWorkspace?.agent_workspace_id || null,
         manifest: "configs/router_agent_library.json",
         skill_path: agent.skill_path,
-        ready: true
+        ready: agent.ready === true
       }, req));
     } catch (error) {
       if (runtimeRegistrationCleanup) {
@@ -3338,6 +3345,11 @@ export async function createApp({
       assertAgentMutationAccess(localAgent, req);
       assertAgentExecutionInputsMutable(store.read(), localAgent);
       const patch = normalizeAgentPatchPayload(req.body);
+      if (patch.enabled !== undefined && patch.lifecycle === undefined) {
+        patch.lifecycle = patch.enabled
+          ? { state: "ready", health: "healthy" }
+          : { state: "disabled", health: "unknown" };
+      }
       const requestedMcpBindings = resolveAgentMcpBindings(req.body.mcp_bindings, store.read(), req.auth);
       if (requestedMcpBindings !== undefined || patch.tools) {
         const boundAgent = applyAgentMcpBindings({
@@ -3357,6 +3369,21 @@ export async function createApp({
         patch.sources = [ownedAgentSourcePath(localAgent.id)];
       }
       assertOwnedAgentSources(req, req.params.agent_id, patch.sources || localAgent?.sources || [], localAgent);
+      const canonicalPatchedAgent = ensureCanonicalAgentContract({
+        ...localAgent,
+        ...patch,
+        id: localAgent.id
+      });
+      Object.assign(patch, {
+        contract_version: canonicalPatchedAgent.contract_version,
+        agent_contract: canonicalPatchedAgent.agent_contract,
+        routing: canonicalPatchedAgent.routing,
+        memory: canonicalPatchedAgent.memory,
+        permissions: canonicalPatchedAgent.permissions,
+        lifecycle: canonicalPatchedAgent.lifecycle,
+        ready: canonicalPatchedAgent.ready,
+        enabled: canonicalPatchedAgent.enabled
+      });
       if (realRuntimeEnabled()) {
         lifecycleIntent = await store.mutate((data) => beginRuntimeLifecycleIntent(data, {
           agentId: req.params.agent_id,
@@ -3439,6 +3466,7 @@ export async function createApp({
             agent[key] = value;
           }
         }
+        Object.assign(agent, ensureCanonicalAgentContract(agent));
         agent.last_edited_by = req.auth.user_id;
         agent.last_edited_at = nowIso();
         appendAgentEvent(data, {
@@ -4503,8 +4531,8 @@ function durableChatOptions(run, suppliedOptions) {
   return {
     planner_mode: run.planner_mode || process.env.TCAR_PLANNER_MODE || "session",
     parallel_workers: Number(run.parallel_workers) || Number(process.env.TCAR_PARALLEL_WORKERS || 2),
-    max_routing_adapters: Number(run.max_routing_adapters) || Number(process.env.TCAR_MAX_ROUTING_ADAPTERS || 12),
-    max_tokens: Number(process.env.TCAR_MAX_TOKENS || 1024),
+    max_routing_adapters: Number(run.max_routing_adapters) || Number(process.env.TCAR_MAX_ROUTING_ADAPTERS || 16),
+    max_tokens: Number(process.env.TCAR_MAX_TOKENS || 1536),
     refiner_max_tokens: Number(process.env.TCAR_REFINER_MAX_TOKENS || 2048),
     temperature: Number(process.env.TCAR_TEMPERATURE || 0)
   };
@@ -7179,7 +7207,7 @@ function normalizeChatOptions(options = {}, { outputSettings = null } = {}) {
     throwStatus(400, "planner_mode must be 'cue', 'llm', 'session', or 'tcandon'.");
   }
   const agentOutputTokens = Number(outputSettings?.agent_output_tokens)
-    || Number(process.env.TCAR_MAX_TOKENS || 1024);
+    || Number(process.env.TCAR_MAX_TOKENS || 1536);
   const finalOutputTokens = Number(outputSettings?.final_output_tokens)
     || Number(process.env.TCAR_REFINER_MAX_TOKENS || 2048);
   const maximumAgentOutputTokens = Math.min(
@@ -7194,8 +7222,8 @@ function normalizeChatOptions(options = {}, { outputSettings = null } = {}) {
     show_route_details: options.show_route_details !== false,
     run_fresh: options.run_fresh === true,
     planner_mode: plannerMode,
-    planner_max_tokens: boundedInt(options.planner_max_tokens, Number(process.env.TCAR_PLANNER_MAX_TOKENS || 384), plannerMode === "session" ? 256 : 32, Number(process.env.TCAR_CLIENT_MAX_PLANNER_TOKENS || 512)),
-    max_routing_adapters: boundedInt(options.max_routing_adapters, Number(process.env.TCAR_MAX_ROUTING_ADAPTERS || 12), 1, Number(process.env.TCAR_CLIENT_MAX_ROUTING_ADAPTERS || 24)),
+    planner_max_tokens: boundedInt(options.planner_max_tokens, Number(process.env.TCAR_PLANNER_MAX_TOKENS || 768), plannerMode === "session" ? 256 : 32, Number(process.env.TCAR_CLIENT_MAX_PLANNER_TOKENS || 4096)),
+    max_routing_adapters: boundedInt(options.max_routing_adapters, Math.min(Number(process.env.TCAR_MAX_ROUTING_ADAPTERS || 16), 16), 1, Math.min(Number(process.env.TCAR_CLIENT_MAX_ROUTING_ADAPTERS || 16), 16)),
     parallel_workers: boundedInt(options.parallel_workers, Number(process.env.TCAR_PARALLEL_WORKERS || 2), 1, Number(process.env.TCAR_CLIENT_MAX_PARALLEL_WORKERS || 4)),
     max_tokens: boundedInt(options.max_tokens, agentOutputTokens, 16, maximumAgentOutputTokens),
     refiner_max_tokens: boundedInt(options.refiner_max_tokens, finalOutputTokens, 32, maximumFinalOutputTokens),
@@ -8475,6 +8503,7 @@ async function createWorkflowGeneratedAgent({
       ...(derivedFrom ? { source_agent_id: derivedFrom } : {})
     }
   });
+  Object.assign(agent, ensureCanonicalAgentContract(agent));
   let runtimeCleanup = null;
   let provisionalStored = false;
   let registrationAnchor = null;
@@ -8782,14 +8811,18 @@ function normalizeAgentPayload(body) {
   if (body.item_type && body.item_type !== "agent") {
     throwStatus(410, "Only API agents are supported.");
   }
-  return {
+  const provisioningRequired = body.provisioning_required === true
+    || body.lifecycle?.state === "provisioning";
+  return ensureCanonicalAgentContract({
     id,
-    title: cleanTitle(body.title),
+    title: String(body.title).replace(/\s+/g, " ").trim().slice(0, 160),
     capability: String(body.capability).trim(),
     boundary: String(body.boundary).trim(),
     consumes: splitList(body.consumes).length ? splitList(body.consumes) : ["user_request"],
     produces: splitList(body.produces).length ? splitList(body.produces) : ["domain_outputs"],
-    routing_cues: splitList(body.routing_cues).length ? splitList(body.routing_cues) : [cleanTitle(body.title)],
+    routing_cues: splitList(body.routing_cues).length
+      ? splitList(body.routing_cues).map((value) => value.slice(0, 160))
+      : [String(body.title).replace(/\s+/g, " ").trim().slice(0, 160)],
     resources: splitList(body.resources),
     tools: splitList(body.tools),
     sources: splitList(body.sources),
@@ -8798,14 +8831,28 @@ function normalizeAgentPayload(body) {
     stage: Number(body.stage) || 50,
     skill_path: `skills/router_agents/${id}/SKILL.md`,
     execution: { type: "api", model: "inherit" },
-    contract_version: "router-agent-v2",
+    contract_version: CANONICAL_AGENT_SCHEMA_VERSION,
     policies: body.policies && typeof body.policies === "object" ? body.policies : {},
+    workflow_profile: body.workflow_profile && typeof body.workflow_profile === "object"
+      ? body.workflow_profile
+      : undefined,
+    agent_contract: body.agent_contract && typeof body.agent_contract === "object"
+      ? body.agent_contract
+      : undefined,
+    routing: body.routing && typeof body.routing === "object" ? body.routing : {},
+    memory: body.memory && typeof body.memory === "object" ? body.memory : {},
+    permissions: body.permissions && typeof body.permissions === "object" ? body.permissions : {},
+    lifecycle: provisioningRequired
+      ? { state: "provisioning", health: "unknown" }
+      : body.lifecycle && typeof body.lifecycle === "object"
+        ? body.lifecycle
+        : { state: "ready", health: "healthy" },
     item_type: "agent",
-    enabled: true,
-    ready: true,
+    enabled: !provisioningRequired,
+    ready: !provisioningRequired,
     last_edited_by: "system",
     last_edited_at: now
-  };
+  });
 }
 
 function normalizeAgentPatchPayload(body = {}) {
@@ -8813,7 +8860,7 @@ function normalizeAgentPatchPayload(body = {}) {
   if (retired.some((key) => key in body) || (body.item_type && body.item_type !== "agent")) {
     throwStatus(410, "Model-adapter settings have been retired; configure the server-owned API provider instead.");
   }
-  const allowed = ["title", "capability", "boundary", "consumes", "produces", "routing_cues", "resources", "sources", "tools", "policies", "stage", "enabled", "source_text", "item_type", "license"];
+  const allowed = ["title", "capability", "boundary", "consumes", "produces", "routing_cues", "resources", "sources", "tools", "policies", "workflow_profile", "agent_contract", "routing", "memory", "permissions", "lifecycle", "stage", "enabled", "source_text", "item_type", "license"];
   const patch = {};
   for (const key of allowed) {
     if (!(key in body)) {
@@ -8848,18 +8895,18 @@ function normalizeAgentPatchPayload(body = {}) {
       patch.source_text = normalizeSourceText(body.source_text);
       continue;
     }
+    if (["policies", "workflow_profile", "agent_contract", "routing", "memory", "permissions", "lifecycle"].includes(key)) {
+      if (!body[key] || typeof body[key] !== "object" || Array.isArray(body[key])) {
+        throwStatus(400, `${key} must be an object.`);
+      }
+      patch[key] = structuredClone(body[key]);
+      continue;
+    }
     if (key === "stage") {
       patch.stage = Number(body.stage);
       if (!Number.isFinite(patch.stage)) {
         throwStatus(400, "stage must be a number.");
       }
-      continue;
-    }
-    if (key === "policies") {
-      if (!body.policies || typeof body.policies !== "object" || Array.isArray(body.policies)) {
-        throwStatus(400, "policies must be an object.");
-      }
-      patch.policies = body.policies;
       continue;
     }
     if (key === "enabled") {
@@ -8911,20 +8958,61 @@ function marketplaceAgentSnapshot(agent = {}) {
         })).filter((tool) => tool.name)
       }))
     : marketplaceMcpRequirements(agent);
-  return {
-    schema_version: "virenis-marketplace-agent-v1",
+  const canonical = ensureCanonicalAgentContract({
+    id: agent.id || agent.agent_contract?.id || "marketplace_agent",
     title: cleanTitle(agent.title) || "Community agent",
     capability: String(agent.capability || "").replaceAll("\0", "").trim().slice(0, 2400),
     boundary: String(agent.boundary || "").replaceAll("\0", "").trim().slice(0, 4000),
-    consumes: consumes.slice(0, 20),
+    consumes,
     produces: splitList(agent.produces).length ? splitList(agent.produces) : ["domain_outputs"],
     routing_cues: splitList(agent.routing_cues).slice(0, 20),
     tools: tools.slice(0, 20),
-    connector_requirements: connectorRequirements,
+    tool_contracts: {},
+    resources: [],
+    sources: [],
     policies: agent.policies && typeof agent.policies === "object" && !Array.isArray(agent.policies)
       ? JSON.parse(JSON.stringify(agent.policies))
       : {},
+    workflow_profile: agent.workflow_profile && typeof agent.workflow_profile === "object" && !Array.isArray(agent.workflow_profile)
+      ? JSON.parse(JSON.stringify(agent.workflow_profile))
+      : undefined,
+    routing: agent.routing && typeof agent.routing === "object" && !Array.isArray(agent.routing)
+      ? { avoid_when: splitList(agent.routing.avoid_when) }
+      : {},
+    memory: agent.memory && typeof agent.memory === "object" && !Array.isArray(agent.memory)
+      ? JSON.parse(JSON.stringify(agent.memory))
+      : {},
+    permissions: agent.permissions && typeof agent.permissions === "object" && !Array.isArray(agent.permissions)
+      ? JSON.parse(JSON.stringify(agent.permissions))
+      : {},
+    lifecycle: { state: "ready", health: "healthy" },
     stage: Number.isFinite(Number(agent.stage)) ? Number(agent.stage) : 50,
+    enabled: true,
+    ready: true
+  });
+  return {
+    schema_version: "virenis-marketplace-agent-v1",
+    contract_version: canonical.contract_version,
+    agent_contract: JSON.parse(JSON.stringify(canonical.agent_contract)),
+    routing: JSON.parse(JSON.stringify(canonical.routing)),
+    memory: JSON.parse(JSON.stringify(canonical.memory)),
+    permissions: JSON.parse(JSON.stringify(canonical.permissions)),
+    lifecycle: JSON.parse(JSON.stringify(canonical.lifecycle)),
+    ...(canonical.workflow_profile ? {
+      workflow_profile: JSON.parse(JSON.stringify(canonical.workflow_profile))
+    } : {}),
+    title: canonical.title,
+    capability: canonical.capability,
+    boundary: canonical.boundary,
+    consumes: canonical.consumes.slice(0, 20),
+    produces: canonical.produces.slice(0, 20),
+    routing_cues: canonical.routing_cues.slice(0, 20),
+    tools: canonical.tools.slice(0, 20),
+    connector_requirements: connectorRequirements,
+    policies: canonical.policies && typeof canonical.policies === "object"
+      ? JSON.parse(JSON.stringify(canonical.policies))
+      : {},
+    stage: canonical.stage,
     exclusions: {
       private_knowledge: omittedPrivateKnowledge,
       agent_connections: omittedAgentConnections,
@@ -9608,9 +9696,12 @@ async function copyMarketplaceWorkspaceToUser({ store, req, sourceWorkspace, ide
       await store.mutate((data) => {
         const stored = data.agents.find((agent) => agent.id === targetId);
         if (!stored) throwStatus(409, "A copied workspace agent disappeared during setup.");
-        stored.consumes = consumes;
-        stored.last_edited_by = req.auth.user_id;
-        stored.last_edited_at = nowIso();
+        Object.assign(stored, ensureCanonicalAgentContract({
+          ...stored,
+          consumes,
+          last_edited_by: req.auth.user_id,
+          last_edited_at: nowIso()
+        }));
         return stored;
       });
     }
@@ -9717,6 +9808,11 @@ async function copyMarketplaceAgentToWorkspace({
     resources: [],
     sources: [],
     policies: snapshot.policies,
+    workflow_profile: snapshot.workflow_profile,
+    routing: snapshot.routing,
+    memory: snapshot.memory,
+    permissions: snapshot.permissions,
+    lifecycle: snapshot.lifecycle,
     stage: snapshot.stage
   });
   // Workflow activation registers the final compiled role in one Runtime

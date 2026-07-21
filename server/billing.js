@@ -1219,7 +1219,7 @@ function aggregateUsageComponents(components) {
 }
 
 function estimateReservation(pricing, options, kind) {
-  const contextTokens = boundedEnvInteger("ROUTER_SESSION_CONTEXT_TOKENS", boundedEnvInteger("TCAR_MODEL_CONTEXT_TOKENS", 4096, 2048, 2_000_000), 2048, 2_000_000);
+  const contextTokens = boundedEnvInteger("ROUTER_SESSION_CONTEXT_TOKENS", boundedEnvInteger("TCAR_MODEL_CONTEXT_TOKENS", 32768, 2048, 2_000_000), 2048, 2_000_000);
   const routeInput = boundedEnvInteger("TCAR_ROUTE_INPUT_MAX_TOKENS", 3000, 1500, 2_000_000);
   const refinerInput = boundedEnvInteger("TCAR_REFINER_INPUT_MAX_TOKENS", 2800, 1500, 2_000_000);
   const defaultRule = pricingRuleForModel(pricing, "");
@@ -1232,10 +1232,19 @@ function estimateReservation(pricing, options, kind) {
     promptTokens = contextTokens;
     completionTokens = boundedEnvInteger("ROUTER_CONTINUATION_MAX_TOKENS", 900, 256, 2048);
   } else {
-    const routes = boundedInteger(options.max_routing_adapters, 12, 1, 24) + 1;
+    const maximumSelected = boundedInteger(options.max_routing_adapters, 16, 1, 16);
+    const routes = maximumSelected + 1;
     const rounds = boundedEnvInteger("TCAR_TOOL_MAX_ROUNDS", 3, 0, 6) + 1;
-    const maxTokens = boundedInteger(options.max_tokens, 1024, 16, 4096);
-    const plannerTokens = boundedInteger(options.planner_max_tokens, 384, 32, 512);
+    const maxTokens = boundedInteger(options.max_tokens, 1536, 16, 4096);
+    const requestedPlannerTokens = boundedInteger(options.planner_max_tokens, 768, 32, 4096);
+    // Reservation cannot know the eventual active catalog size, so assume it
+    // reaches Runtime's fan-out threshold and mirror the worst-case controller
+    // expansion for the client-selected fan-out ceiling.
+    const fanoutPlannerTokens = Math.min(
+      Math.max(1024, boundedEnvInteger("ROUTER_SESSION_FANOUT_PLANNER_MAX_TOKENS", 3072, 1024, 4096)),
+      512 + (maximumSelected * 160)
+    );
+    const plannerTokens = Math.max(requestedPlannerTokens, fanoutPlannerTokens);
     const refinerTokens = boundedInteger(options.refiner_max_tokens, 2048, 32, 8192);
     promptTokens = contextTokens + routes * rounds * routeInput + refinerInput;
     completionTokens = plannerTokens + routes * rounds * maxTokens + refinerTokens;

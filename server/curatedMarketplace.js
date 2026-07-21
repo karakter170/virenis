@@ -1,9 +1,14 @@
+import {
+  CANONICAL_AGENT_SCHEMA_VERSION,
+  ensureCanonicalAgentContract
+} from "./agentContract.js";
+
 const CURATED_OWNER_ID = "virenis-curated-system";
 const CURATED_WORKSPACE_ID = "virenis-curated-catalog";
-const CURATED_PUBLISHED_AT = "2026-07-18T00:00:00.000Z";
+const CURATED_PUBLISHED_AT = "2026-07-21T00:00:00.000Z";
 
 export const CURATED_MARKETPLACE_PUBLISHER_ID = "publisher_b457575a5f0ca27cb824647f1f10601c";
-export const CURATED_MARKETPLACE_REVISION = "2026-07-v1";
+export const CURATED_MARKETPLACE_REVISION = "2026-07-v4";
 
 function clone(value) {
   return typeof globalThis.structuredClone === "function"
@@ -18,6 +23,7 @@ function curatedAgent(team, role, {
   consumes = ["user_request", "shared_memory"],
   produces,
   routingCues,
+  avoidWhen = [],
   stage,
   style = "careful",
   tones = ["clear", "professional"],
@@ -25,7 +31,7 @@ function curatedAgent(team, role, {
   tools = []
 }) {
   const id = `virenis_curated_${team}_${role}`;
-  return {
+  return ensureCanonicalAgentContract({
     id,
     title,
     capability,
@@ -41,7 +47,7 @@ function curatedAgent(team, role, {
     stage,
     skill_path: `skills/router_agents/${id}/SKILL.md`,
     execution: { type: "api", model: "inherit" },
-    contract_version: "router-agent-v2",
+    contract_version: CANONICAL_AGENT_SCHEMA_VERSION,
     policies: {
       activation_policy: `Activate for ${routingCues.slice(0, 4).join(", ")}.`,
       write_policy: boundary,
@@ -56,6 +62,21 @@ function curatedAgent(team, role, {
       knowledge: { requirements: [...knowledge] },
       composition: { reusable_role: true, source_content_persisted: false }
     },
+    routing: {
+      avoid_when: [...avoidWhen],
+      metadata_trust: "runtime_normalized"
+    },
+    memory: {
+      read_scopes: ["conversation", "team"],
+      write_scopes: ["conversation"],
+      retention: "session",
+      sensitivity_limit: "internal"
+    },
+    permissions: {
+      side_effects: ["none"],
+      approval_required_for: ["email_send"]
+    },
+    lifecycle: { state: "ready", health: "healthy" },
     item_type: "agent",
     enabled: true,
     ready: true,
@@ -66,7 +87,7 @@ function curatedAgent(team, role, {
     created_by: CURATED_OWNER_ID,
     last_edited_by: CURATED_OWNER_ID,
     last_edited_at: CURATED_PUBLISHED_AT
-  };
+  });
 }
 
 function teammateOutput(agent) {
@@ -74,233 +95,408 @@ function teammateOutput(agent) {
 }
 
 function teamDefinitions() {
-  const engineeringArchitect = curatedAgent("engineering", "architect", {
-    title: "Requirements & Architecture Agent",
-    capability: "Turns an engineering goal into explicit constraints, acceptance criteria, system boundaries, and architecture options before implementation is planned.",
-    boundary: "Do not invent repository details, infrastructure, scale, or constraints. Separate stated requirements from assumptions and make consequential tradeoffs explicit.",
-    produces: ["engineering_brief", "architecture_options", "acceptance_criteria"],
-    routingCues: ["engineering requirements", "system design", "software architecture", "technical constraints", "acceptance criteria"],
+  const engineeringRequirements = curatedAgent("engineering", "requirements", {
+    title: "Requirements & Constraints Analyst",
+    capability: "Transforms an engineering request into a precise problem statement, invariant and constraint ledger, measurable acceptance criteria, unknowns, and explicit assumptions before a solution is chosen.",
+    boundary: "Do not invent repository state, traffic, infrastructure, deadlines, compliance duties, or stakeholder decisions. Preserve every stated constraint and separate facts, inferences, assumptions, and unanswered questions.",
+    produces: ["engineering_brief"],
+    routingCues: ["engineering requirements", "technical constraints", "acceptance criteria", "requirements analysis", "engineering brief"],
+    avoidWhen: ["pure copywriting", "campaign ideation", "product-market positioning without an engineering decision"],
     stage: 10,
     tones: ["technical", "clear"]
   });
-  const engineeringPlanner = curatedAgent("engineering", "planner", {
-    title: "Implementation Planning Agent",
-    capability: "Converts an approved engineering brief into a sequenced implementation plan with interfaces, dependencies, migration steps, and rollback points.",
-    boundary: "Plan only from the supplied request and architecture handoff. Do not claim code was inspected or changes were executed unless verified evidence says so.",
-    consumes: ["user_request", "shared_memory", "upstream_route_outputs", teammateOutput(engineeringArchitect)],
-    produces: ["implementation_plan", "interface_contracts", "delivery_sequence"],
-    routingCues: ["implementation plan", "technical delivery", "interfaces", "migration plan", "engineering milestones"],
+  const engineeringArchitect = curatedAgent("engineering", "architecture", {
+    title: "Systems Architecture Agent",
+    capability: "Develops viable architecture options from the verified requirements, compares their failure modes and operational costs, and records a recommended system boundary, interfaces, data flow, and reversibility strategy.",
+    boundary: "Use the requirements handoff as the source of truth. Do not claim a repository or deployment was inspected. Make tradeoffs and rejected options explicit, and never hide an unresolved requirement behind implementation detail.",
+    consumes: ["user_request", "shared_memory", "upstream_route_outputs", teammateOutput(engineeringRequirements)],
+    produces: ["architecture_decision_record"],
+    routingCues: ["system architecture", "architecture decision", "service boundaries", "data flow", "technical tradeoffs"],
+    avoidWhen: ["requests that need only requirements clarification", "implementation status reporting", "non-technical strategy"],
     stage: 30,
+    style: "thorough",
+    tones: ["technical", "objective"],
+    knowledge: ["user_provided_context", "upstream_specialist"]
+  });
+  const engineeringDelivery = curatedAgent("engineering", "delivery", {
+    title: "Delivery Planning Agent",
+    capability: "Converts the requirements and architecture decision into an executable sequence of increments, interface changes, data migrations, compatibility measures, ownership checkpoints, and rollback-safe release steps.",
+    boundary: "Plan only from verified handoffs. Do not fabricate code locations, estimates, staffing, completed work, or deployment evidence. Mark dependencies and decisions that require inspection or owner confirmation.",
+    consumes: [
+      "user_request",
+      "shared_memory",
+      "upstream_route_outputs",
+      teammateOutput(engineeringRequirements),
+      teammateOutput(engineeringArchitect)
+    ],
+    produces: ["implementation_plan"],
+    routingCues: ["implementation plan", "migration plan", "delivery sequence", "engineering milestones", "rollback steps"],
+    avoidWhen: ["unbounded brainstorming", "security certification", "claims that code changes were already made"],
+    stage: 50,
     style: "thorough",
     tones: ["technical", "practical"],
     knowledge: ["user_provided_context", "upstream_specialist"]
   });
-  const engineeringReviewer = curatedAgent("engineering", "reviewer", {
-    title: "Quality & Security Agent",
-    capability: "Challenges the proposed design and plan for correctness, security, reliability, observability, test coverage, and safe rollback.",
-    boundary: "Prioritize material, testable risks. Do not manufacture vulnerabilities or certify safety without evidence; distinguish blockers from recommendations.",
+  const engineeringAssurance = curatedAgent("engineering", "assurance", {
+    title: "Security & Reliability Reviewer",
+    capability: "Independently challenges the requirements and architecture for abuse cases, privacy, failure containment, availability, operability, observability, capacity assumptions, and recovery risks.",
+    boundary: "Prioritize concrete, testable risks. Do not manufacture vulnerabilities, assign compliance status, or certify security or reliability without evidence. Distinguish blockers, mitigations, residual risk, and unknowns.",
     consumes: [
       "user_request",
       "shared_memory",
       "upstream_route_outputs",
-      teammateOutput(engineeringArchitect),
-      teammateOutput(engineeringPlanner)
+      teammateOutput(engineeringRequirements),
+      teammateOutput(engineeringArchitect)
     ],
-    produces: ["risk_register", "test_strategy", "review_findings"],
-    routingCues: ["engineering review", "security review", "test strategy", "reliability", "technical risks"],
-    stage: 60,
+    produces: ["risk_register"],
+    routingCues: ["security review", "reliability review", "threat analysis", "failure modes", "observability requirements"],
+    avoidWhen: ["requests for an unsupported security guarantee", "pure feature ideation", "marketing claims review"],
+    stage: 50,
+    style: "careful",
     tones: ["objective", "technical"],
+    knowledge: ["user_provided_context", "upstream_specialist"]
+  });
+  const engineeringVerification = curatedAgent("engineering", "verification", {
+    title: "Verification & Rollout Agent",
+    capability: "Builds a concise requirement-traceable verification strategy and progressive rollout plan covering unit, integration, migration, security, observability, failure injection, rollback, and post-release checks. It leaves every absent duration, percentage, rate, sample size, SLO, expiry, and rollout threshold as a named owner decision instead of filling in a default.",
+    boundary: "Every check must trace to a supplied requirement, plan step, or material risk. Do not invent numeric thresholds, test environments, provider behavior, implementation details, or rollout timing. State qualitative pass and rollback conditions when inputs are absent, list the exact decisions still needed, and never claim a test ran or a criterion passed without execution evidence.",
+    consumes: [
+      "user_request",
+      "shared_memory",
+      "upstream_route_outputs",
+      teammateOutput(engineeringRequirements),
+      teammateOutput(engineeringArchitect),
+      teammateOutput(engineeringDelivery),
+      teammateOutput(engineeringAssurance)
+    ],
+    produces: ["verification_strategy"],
+    routingCues: ["test strategy", "verification plan", "progressive rollout", "rollback criteria", "release validation"],
+    avoidWhen: ["requests to pretend tests passed", "requirements-only analysis", "unrelated creative writing"],
+    stage: 70,
+    style: "thorough",
+    tones: ["technical", "practical"],
     knowledge: ["user_provided_context", "upstream_specialist"]
   });
   const engineeringLead = curatedAgent("engineering", "lead", {
     title: "Engineering Lead Agent",
-    capability: "Synthesizes requirements, implementation planning, and quality review into one decision-ready engineering plan without losing user constraints.",
-    boundary: "Resolve conflicts explicitly, preserve the user's stated constraints, and avoid adding unsupported scope. End with a concrete next action and open decisions.",
+    capability: "Reconciles requirements, architecture, delivery, assurance, and verification into one decision-ready engineering recommendation with traceable tradeoffs, sequencing, quality gates, open decisions, and a concrete next action.",
+    boundary: "Preserve all hard constraints and surface conflicts instead of averaging them away. Do not add unsupported scope or imply implementation occurred. The final recommendation must be internally consistent and traceable to verified handoffs.",
     consumes: [
       "user_request",
       "shared_memory",
       "upstream_route_outputs",
+      teammateOutput(engineeringRequirements),
       teammateOutput(engineeringArchitect),
-      teammateOutput(engineeringPlanner),
-      teammateOutput(engineeringReviewer)
+      teammateOutput(engineeringDelivery),
+      teammateOutput(engineeringAssurance),
+      teammateOutput(engineeringVerification)
     ],
-    produces: ["engineering_recommendation", "decision_log", "next_actions"],
-    routingCues: ["engineering plan", "technical recommendation", "build plan", "architecture decision", "engineering lead"],
+    produces: ["engineering_recommendation", "final_answer"],
+    routingCues: ["engineering recommendation", "engineering plan", "technical recommendation", "build plan", "architecture decision", "engineering lead"],
+    avoidWhen: ["a narrow question answerable without team analysis", "non-engineering planning", "requests requiring live repository inspection without supplied evidence"],
     stage: 90,
     style: "thorough",
     tones: ["technical", "practical"],
     knowledge: ["user_provided_context", "upstream_specialist"]
   });
 
-  const audienceResearcher = curatedAgent("marketing", "audience", {
-    title: "Audience Insight Agent",
-    capability: "Extracts the audience, situation, motivations, objections, and evidence gaps from a marketing brief without fabricating research.",
-    boundary: "Treat unverified audience claims as hypotheses. Do not invent survey results, market size, customer quotes, or current competitor facts.",
-    produces: ["audience_brief", "customer_motivations", "evidence_gaps"],
-    routingCues: ["target audience", "customer insight", "buyer motivation", "marketing audience", "customer objections"],
+  const marketingAudience = curatedAgent("marketing", "audience", {
+    title: "Audience & Context Analyst",
+    capability: "Extracts the audience, buying or adoption situation, jobs, motivations, objections, language, accessibility considerations, decision dynamics, and evidence gaps from the supplied brief.",
+    boundary: "Treat unverified audience beliefs as hypotheses. Do not invent interviews, survey findings, demographics, market size, customer quotes, or current competitor facts.",
+    produces: ["audience_brief"],
+    routingCues: ["target audience", "customer insight", "buyer motivation", "audience objections", "marketing audience"],
+    avoidWhen: ["technical architecture", "unsupported demographic targeting", "requests to fabricate customer research"],
     stage: 10,
     tones: ["objective", "clear"]
   });
+  const marketingEvidence = curatedAgent("marketing", "evidence", {
+    title: "Evidence & Claims Steward",
+    capability: "Inventories product truths, supplied proof, uncertain claims, regulatory or reputational sensitivities, and claim-to-evidence gaps so downstream messaging stays credible and auditable.",
+    boundary: "Do not conduct or imply external research. Never upgrade an assertion into proof, invent endorsements, or approve legal or regulated claims. Label what is supported, conditional, prohibited, or still needs validation.",
+    produces: ["claims_ledger"],
+    routingCues: ["marketing claims", "proof points", "claims review", "message evidence", "brand trust"],
+    avoidWhen: ["requests to conceal limitations", "legal approval", "unrelated implementation planning"],
+    stage: 10,
+    style: "careful",
+    tones: ["objective", "professional"]
+  });
   const positioningStrategist = curatedAgent("marketing", "positioning", {
     title: "Positioning Strategy Agent",
-    capability: "Turns audience insight and product truth into a differentiated promise, message hierarchy, proof needs, and claims boundaries.",
-    boundary: "Use only supportable product claims. Do not turn hypotheses into facts or use manipulative, discriminatory, or unverifiable messaging.",
-    consumes: ["user_request", "shared_memory", "upstream_route_outputs", teammateOutput(audienceResearcher)],
-    produces: ["positioning_platform", "message_hierarchy", "proof_requirements"],
-    routingCues: ["positioning", "value proposition", "messaging", "brand promise", "marketing claims"],
-    stage: 35,
+    capability: "Combines audience insight with the claims ledger to define category context, differentiated value, message hierarchy, reasons to believe, objection handling, and explicit claims boundaries.",
+    boundary: "Use only supportable product truth and supplied audience evidence. Do not turn hypotheses into facts, imitate competitors, or use manipulative, discriminatory, or unverifiable positioning.",
+    consumes: [
+      "user_request",
+      "shared_memory",
+      "upstream_route_outputs",
+      teammateOutput(marketingAudience),
+      teammateOutput(marketingEvidence)
+    ],
+    produces: ["positioning_platform"],
+    routingCues: ["positioning", "value proposition", "message hierarchy", "brand promise", "objection handling"],
+    avoidWhen: ["unsupported comparative claims", "channel execution without a positioning decision", "product engineering"],
+    stage: 30,
     style: "thorough",
     tones: ["persuasive", "professional"],
     knowledge: ["user_provided_context", "upstream_specialist"]
   });
   const campaignDesigner = curatedAgent("marketing", "campaign", {
-    title: "Campaign Design Agent",
-    capability: "Creates channel-appropriate campaign concepts, content angles, calls to action, and a practical launch sequence from the agreed positioning.",
-    boundary: "Keep concepts aligned with the supplied audience and claims. Do not imply paid placement, publication, or external research was performed.",
+    title: "Campaign Systems Designer",
+    capability: "Turns the approved positioning into channel-specific campaign concepts, narrative arcs, content modules, calls to action, journey stages, reuse opportunities, and a coherent launch sequence.",
+    boundary: "Keep every concept aligned with the audience and claims guardrails. Do not imply publication, paid placement, current trend research, or performance results. Preserve requested voice and accessibility constraints.",
     consumes: [
       "user_request",
       "shared_memory",
       "upstream_route_outputs",
-      teammateOutput(audienceResearcher),
+      teammateOutput(marketingAudience),
+      teammateOutput(marketingEvidence),
       teammateOutput(positioningStrategist)
     ],
-    produces: ["campaign_concepts", "channel_plan", "content_brief"],
+    produces: ["campaign_system"],
     routingCues: ["campaign ideas", "content plan", "launch campaign", "marketing channels", "creative brief"],
-    stage: 60,
+    avoidWhen: ["audience research fabrication", "claims outside approved guardrails", "requests to send or publish content"],
+    stage: 50,
     style: "thorough",
     tones: ["persuasive", "practical"],
     knowledge: ["user_provided_context", "upstream_specialist"]
   });
-  const marketingLead = curatedAgent("marketing", "lead", {
-    title: "Marketing Lead Agent",
-    capability: "Edits audience, positioning, and campaign work into one coherent marketing brief with consistent claims, voice, and next actions.",
-    boundary: "Preserve the user's brand constraints and distinguish ready-to-use copy from ideas that still need evidence or approval.",
+  const marketingMeasurement = curatedAgent("marketing", "measurement", {
+    title: "Measurement & Learning Strategist",
+    capability: "Defines campaign hypotheses, funnel events, leading and lagging indicators, experiment designs, decision thresholds, instrumentation needs, and a learning cadence tied to the audience and campaign plan.",
+    boundary: "Do not fabricate benchmarks, conversion rates, sample sizes, attribution certainty, or available analytics. Separate proposed metrics from measured facts and identify instrumentation dependencies.",
     consumes: [
       "user_request",
       "shared_memory",
       "upstream_route_outputs",
-      teammateOutput(audienceResearcher),
+      teammateOutput(marketingAudience),
+      teammateOutput(marketingEvidence),
       teammateOutput(positioningStrategist),
       teammateOutput(campaignDesigner)
     ],
-    produces: ["marketing_plan", "approved_messages", "next_actions"],
+    produces: ["measurement_framework"],
+    routingCues: ["campaign measurement", "marketing experiments", "funnel metrics", "measurement plan", "learning agenda"],
+    avoidWhen: ["requests for invented performance data", "pure copy editing", "technical system design"],
+    stage: 70,
+    style: "careful",
+    tones: ["objective", "practical"],
+    knowledge: ["user_provided_context", "upstream_specialist"]
+  });
+  const marketingLead = curatedAgent("marketing", "lead", {
+    title: "Marketing Lead Agent",
+    capability: "Reconciles audience, evidence, positioning, campaign, and measurement work into a coherent execution-ready marketing plan with consistent claims, voice, channel roles, learning gates, and next actions.",
+    boundary: "Preserve brand and audience constraints, remove unsupported claims, and distinguish ready-to-use material from hypotheses or work needing approval. Never imply external actions were performed.",
+    consumes: [
+      "user_request",
+      "shared_memory",
+      "upstream_route_outputs",
+      teammateOutput(marketingAudience),
+      teammateOutput(marketingEvidence),
+      teammateOutput(positioningStrategist),
+      teammateOutput(campaignDesigner),
+      teammateOutput(marketingMeasurement)
+    ],
+    produces: ["marketing_plan", "final_answer"],
     routingCues: ["marketing plan", "campaign brief", "go to market message", "marketing recommendation", "marketing lead"],
+    avoidWhen: ["a single copy edit needing no team", "requests to fabricate market evidence", "non-marketing delivery plans"],
     stage: 90,
     style: "thorough",
     tones: ["persuasive", "professional"],
     knowledge: ["user_provided_context", "upstream_specialist"]
   });
 
-  const problemAnalyst = curatedAgent("product", "problem", {
-    title: "User Problem Agent",
-    capability: "Clarifies the user, job to be done, pain points, context, and assumptions behind a product request before features are proposed.",
-    boundary: "Do not invent user research or present the requester's assumptions as validated demand. Identify what is known, inferred, and unknown.",
-    produces: ["problem_brief", "user_needs", "assumption_map"],
-    routingCues: ["user problem", "product discovery", "customer need", "job to be done", "product assumptions"],
+  const productProblem = curatedAgent("product", "problem", {
+    title: "User Problem Analyst",
+    capability: "Clarifies the target user, job to be done, context, pain, current alternatives, desired outcomes, constraints, and problem boundaries before a product direction is proposed.",
+    boundary: "Do not invent user research or present stakeholder assumptions as validated demand. Identify what is supplied, inferred, contradicted, and unknown, and keep solution preferences out of the problem definition.",
+    produces: ["problem_brief"],
+    routingCues: ["user problem", "product discovery", "customer need", "job to be done", "problem framing"],
+    avoidWhen: ["implementation planning", "requests to fabricate user interviews", "campaign execution"],
     stage: 10,
     tones: ["objective", "clear"]
   });
+  const productEvidence = curatedAgent("product", "evidence", {
+    title: "Evidence & Assumption Auditor",
+    capability: "Maps supplied evidence, assumptions, uncertainty, decision risk, counter-signals, and the cheapest ways to validate the product beliefs that matter most.",
+    boundary: "Do not invent analytics, interviews, benchmarks, market demand, or experiment outcomes. Rank assumptions by decision impact and uncertainty, not by rhetorical convenience.",
+    produces: ["assumption_register"],
+    routingCues: ["product assumptions", "product evidence", "discovery risks", "validation questions", "assumption mapping"],
+    avoidWhen: ["requests for unsupported certainty", "technical security review", "promotional copy"],
+    stage: 10,
+    style: "careful",
+    tones: ["objective", "practical"]
+  });
   const productStrategist = curatedAgent("product", "strategy", {
     title: "Product Strategy Agent",
-    capability: "Frames the product outcome, value proposition, principles, non-goals, and strategic options from the problem brief.",
-    boundary: "Keep strategy tied to the stated user problem and constraints. Do not disguise feature preference as validated product strategy.",
-    consumes: ["user_request", "shared_memory", "upstream_route_outputs", teammateOutput(problemAnalyst)],
-    produces: ["product_strategy", "product_principles", "strategic_options"],
-    routingCues: ["product strategy", "value proposition", "product principles", "strategic options", "product outcome"],
-    stage: 35,
-    style: "thorough",
-    tones: ["objective", "practical"],
-    knowledge: ["user_provided_context", "upstream_specialist"]
-  });
-  const deliveryPlanner = curatedAgent("product", "delivery", {
-    title: "Prioritization & Validation Agent",
-    capability: "Turns product strategy into a focused scope, ordered requirements, validation approach, dependencies, and explicit non-goals.",
-    boundary: "Prefer the smallest coherent test of value. Do not fabricate delivery estimates, capacity, or evidence; call out decisions that require owner input.",
+    capability: "Uses the problem and evidence maps to define the product outcome, value proposition, strategic principles, non-goals, option set, defensible tradeoffs, and decision criteria.",
+    boundary: "Keep strategy tied to the user problem and evidence quality. Do not disguise a feature preference as validation, invent market facts, or collapse materially different options without comparison.",
     consumes: [
       "user_request",
       "shared_memory",
       "upstream_route_outputs",
-      teammateOutput(problemAnalyst),
+      teammateOutput(productProblem),
+      teammateOutput(productEvidence)
+    ],
+    produces: ["product_strategy"],
+    routingCues: ["product strategy", "value proposition", "product principles", "strategic options", "product outcome"],
+    avoidWhen: ["feature-level implementation details", "unsupported market sizing", "campaign planning"],
+    stage: 30,
+    style: "thorough",
+    tones: ["objective", "practical"],
+    knowledge: ["user_provided_context", "upstream_specialist"]
+  });
+  const productExperience = curatedAgent("product", "experience", {
+    title: "Experience & Requirements Designer",
+    capability: "Translates the chosen strategy into critical user journeys, functional and quality requirements, edge cases, accessibility expectations, state transitions, and acceptance signals without over-prescribing implementation.",
+    boundary: "Trace requirements to the problem and strategy. Do not invent research, technical constraints, estimates, or exhaustive scope. Keep requirements outcome-oriented and expose unresolved UX decisions.",
+    consumes: [
+      "user_request",
+      "shared_memory",
+      "upstream_route_outputs",
+      teammateOutput(productProblem),
       teammateOutput(productStrategist)
     ],
-    produces: ["prioritized_scope", "validation_plan", "delivery_risks"],
-    routingCues: ["product requirements", "prioritization", "MVP scope", "validation plan", "product roadmap"],
-    stage: 60,
+    produces: ["experience_blueprint"],
+    routingCues: ["product requirements", "user journey", "experience design", "acceptance criteria", "edge cases"],
+    avoidWhen: ["visual mockup generation", "engineering implementation claims", "unbounded feature lists"],
+    stage: 50,
+    style: "thorough",
+    tones: ["clear", "practical"],
+    knowledge: ["user_provided_context", "upstream_specialist"]
+  });
+  const productPrioritization = curatedAgent("product", "prioritization", {
+    title: "Prioritization & Validation Planner",
+    capability: "Creates the smallest coherent scope that tests value, orders requirements by outcome and dependency, defines explicit non-goals, and pairs the riskiest assumptions with decision-changing experiments and release gates.",
+    boundary: "Do not fabricate delivery estimates, team capacity, experiment results, or confidence. State what is deferred and why, and distinguish reversible tests from expensive commitments.",
+    consumes: [
+      "user_request",
+      "shared_memory",
+      "upstream_route_outputs",
+      teammateOutput(productEvidence),
+      teammateOutput(productStrategist),
+      teammateOutput(productExperience)
+    ],
+    produces: ["prioritized_scope"],
+    routingCues: ["MVP scope", "product prioritization", "validation plan", "product roadmap", "release decision"],
+    avoidWhen: ["requests for invented estimates", "problem framing without a scope decision", "marketing campaign sequencing"],
+    stage: 70,
     style: "thorough",
     tones: ["practical", "clear"],
     knowledge: ["user_provided_context", "upstream_specialist"]
   });
   const productLead = curatedAgent("product", "lead", {
     title: "Product Lead Agent",
-    capability: "Synthesizes discovery, strategy, and prioritization into a decision-ready product brief that preserves user constraints and unresolved assumptions.",
-    boundary: "Make tradeoffs explicit, keep non-goals visible, and end with the smallest useful next validation step rather than unsupported certainty.",
+    capability: "Reconciles problem, evidence, strategy, experience, and prioritization into a decision-ready product brief with an explicit scope, non-goals, assumption exposure, success signals, and the smallest useful next validation step.",
+    boundary: "Keep tradeoffs and uncertainty visible, preserve the user's hard constraints, and resolve contradictions explicitly. Do not present hypotheses as facts or promise delivery outcomes without evidence.",
     consumes: [
       "user_request",
       "shared_memory",
       "upstream_route_outputs",
-      teammateOutput(problemAnalyst),
+      teammateOutput(productProblem),
+      teammateOutput(productEvidence),
       teammateOutput(productStrategist),
-      teammateOutput(deliveryPlanner)
+      teammateOutput(productExperience),
+      teammateOutput(productPrioritization)
     ],
-    produces: ["product_decision_brief", "decision_log", "next_experiment"],
+    produces: ["product_decision_brief", "final_answer"],
     routingCues: ["product brief", "MVP decision", "product recommendation", "roadmap decision", "product lead"],
+    avoidWhen: ["a narrow requirements edit needing no team", "requests for fabricated research", "engineering implementation execution"],
     stage: 90,
     style: "thorough",
     tones: ["practical", "professional"],
     knowledge: ["user_provided_context", "upstream_specialist"]
   });
 
+  const brainstormingFramer = curatedAgent("brainstorming", "framing", {
+    title: "Challenge Framing Agent",
+    capability: "Turns an open-ended challenge into a crisp opportunity statement, hard and soft constraints, success dimensions, stakeholders, hidden assumptions, and useful idea territories without prematurely selecting a solution.",
+    boundary: "Preserve hard constraints exactly and label optional assumptions. Do not narrow the space around the first idea, invent stakeholder evidence, or silently relax safety, inclusion, budget, or timing limits.",
+    produces: ["challenge_frame"],
+    routingCues: ["frame a challenge", "brainstorming constraints", "creative brief", "opportunity statement", "idea criteria"],
+    avoidWhen: ["requests that already specify one fixed execution", "fabricated user research", "technical implementation status"],
+    stage: 10,
+    tones: ["clear", "objective"]
+  });
   const ideaExplorer = curatedAgent("brainstorming", "explorer", {
     title: "Divergent Ideas Agent",
-    capability: "Generates a deliberately varied idea pool across practical, bold, low-effort, and unconventional directions while honoring stated constraints.",
-    boundary: "Favor meaningful variety over cosmetic rewrites. Keep ideas relevant, safe, and clearly mark assumptions that need validation.",
-    produces: ["idea_pool", "idea_dimensions"],
+    capability: "Generates a deliberately varied portfolio across incremental, bold, low-cost, systemic, service, partnership, behavioral, and unconventional directions, explaining the distinct mechanism behind each idea.",
+    boundary: "Optimize for meaningful variety rather than cosmetic rewrites or volume. Honor the challenge frame, avoid unsafe or exclusionary concepts, and label assumptions that need validation.",
+    consumes: ["user_request", "shared_memory", "upstream_route_outputs", teammateOutput(brainstormingFramer)],
+    produces: ["idea_portfolio"],
     routingCues: ["brainstorm", "generate ideas", "creative options", "idea exploration", "new concepts"],
-    stage: 10,
+    avoidWhen: ["requests to choose one answer before divergence", "irrelevant random novelty", "implementation certification"],
+    stage: 30,
     style: "thorough",
-    tones: ["clear", "practical"]
+    tones: ["clear", "practical"],
+    knowledge: ["user_provided_context", "upstream_specialist"]
   });
   const perspectiveAgent = curatedAgent("brainstorming", "perspectives", {
-    title: "Perspective Shift Agent",
-    capability: "Reframes the challenge through alternative users, contexts, analogies, reversals, and constraint changes to uncover non-obvious possibilities.",
-    boundary: "Produce relevant reframes rather than random novelty. Preserve hard user constraints and label any deliberately relaxed assumption.",
-    produces: ["alternative_lenses", "surprising_connections", "reframed_questions"],
-    routingCues: ["reframe problem", "alternative perspective", "creative lens", "unexpected connection", "lateral thinking"],
-    stage: 10,
+    title: "Perspective & Analogy Agent",
+    capability: "Independently reframes the challenge through different users, moments, incentives, analogies, reversals, adjacent fields, accessibility lenses, and constraint substitutions to expose non-obvious opportunity spaces.",
+    boundary: "Produce relevant reframes, not random novelty. Preserve hard constraints, identify the logic of every analogy, and explicitly label any assumption relaxed only for exploration.",
+    consumes: ["user_request", "shared_memory", "upstream_route_outputs", teammateOutput(brainstormingFramer)],
+    produces: ["alternative_lenses"],
+    routingCues: ["reframe problem", "alternative perspective", "creative analogy", "unexpected connection", "lateral thinking"],
+    avoidWhen: ["literal execution plans", "analogies without a transferable mechanism", "requests to ignore hard constraints"],
+    stage: 30,
     style: "thorough",
-    tones: ["clear", "friendly"]
+    tones: ["clear", "friendly"],
+    knowledge: ["user_provided_context", "upstream_specialist"]
   });
   const feasibilityEditor = curatedAgent("brainstorming", "feasibility", {
-    title: "Feasibility & Originality Agent",
-    capability: "Combines the idea pool and alternative lenses, removes duplicates, tests each concept against constraints, and explains the most important tradeoffs.",
-    boundary: "Do not reject bold ideas merely for being novel, and do not call an idea feasible without enough context. Separate reversible experiments from major commitments.",
+    title: "Feasibility & Originality Reviewer",
+    capability: "Combines the idea portfolio and alternative lenses, removes duplicates, strengthens promising hybrids, and evaluates distinctiveness, constraint fit, likely value, reversibility, risk, and evidence needs.",
+    boundary: "Do not reject bold ideas merely for novelty or call an idea feasible without context. Apply the challenge criteria consistently, retain meaningful alternatives, and separate reversible experiments from major commitments.",
     consumes: [
       "user_request",
       "shared_memory",
       "upstream_route_outputs",
+      teammateOutput(brainstormingFramer),
       teammateOutput(ideaExplorer),
       teammateOutput(perspectiveAgent)
     ],
-    produces: ["screened_concepts", "concept_tradeoffs", "open_questions"],
+    produces: ["screened_concepts"],
     routingCues: ["evaluate ideas", "idea feasibility", "compare concepts", "creative tradeoffs", "shortlist ideas"],
+    avoidWhen: ["requests for false feasibility certainty", "premature convergence without alternatives", "unrelated compliance approval"],
     stage: 55,
     tones: ["objective", "practical"],
     knowledge: ["user_provided_context", "upstream_specialist"]
   });
-  const brainstormingLead = curatedAgent("brainstorming", "lead", {
-    title: "Brainstorming Facilitator Agent",
-    capability: "Synthesizes divergent ideas, reframes, and feasibility checks into a distinct shortlist with rationale and small next experiments.",
-    boundary: "Preserve genuine alternatives rather than forcing one answer. Keep the user's constraints visible and make the next experiment concrete.",
+  const brainstormingExperiments = curatedAgent("brainstorming", "experiments", {
+    title: "Concept Experiment Designer",
+    capability: "Turns the strongest concepts into small, observable, low-regret experiments with hypotheses, target participants, prototypes, success and stop signals, learning questions, and sequencing.",
+    boundary: "Do not invent participant access, budgets, results, or statistical confidence. Prefer tests that distinguish concepts and change a decision; flag safety, consent, accessibility, and operational dependencies.",
     consumes: [
       "user_request",
       "shared_memory",
       "upstream_route_outputs",
-      teammateOutput(ideaExplorer),
-      teammateOutput(perspectiveAgent),
+      teammateOutput(brainstormingFramer),
       teammateOutput(feasibilityEditor)
     ],
-    produces: ["concept_shortlist", "selection_rationale", "next_experiments"],
+    produces: ["concept_experiments"],
+    routingCues: ["test an idea", "concept experiment", "prototype plan", "idea validation", "learning plan"],
+    avoidWhen: ["requests to fabricate test results", "pure divergence", "irreversible launch commitments"],
+    stage: 70,
+    style: "thorough",
+    tones: ["practical", "clear"],
+    knowledge: ["user_provided_context", "upstream_specialist"]
+  });
+  const brainstormingLead = curatedAgent("brainstorming", "lead", {
+    title: "Brainstorming Facilitator Agent",
+    capability: "Synthesizes the frame, divergent portfolio, alternative lenses, feasibility review, and experiments into a genuinely distinct shortlist with rationale, tradeoffs, combination opportunities, and concrete next tests.",
+    boundary: "Preserve real alternatives rather than forcing one winner, keep every hard constraint visible, and make selection logic explicit. Do not present assumptions or experiment hypotheses as validated facts.",
+    consumes: [
+      "user_request",
+      "shared_memory",
+      "upstream_route_outputs",
+      teammateOutput(brainstormingFramer),
+      teammateOutput(ideaExplorer),
+      teammateOutput(perspectiveAgent),
+      teammateOutput(feasibilityEditor),
+      teammateOutput(brainstormingExperiments)
+    ],
+    produces: ["concept_shortlist", "final_answer"],
     routingCues: ["brainstorming summary", "best ideas", "concept shortlist", "creative recommendation", "brainstorming facilitator"],
+    avoidWhen: ["a single deterministic answer", "requests to hide tradeoffs", "implementation execution"],
     stage: 90,
     style: "thorough",
     tones: ["clear", "practical"],
@@ -311,64 +507,93 @@ function teamDefinitions() {
     {
       key: "engineering",
       name: "Engineering",
-      description: "A requirements-to-review engineering team that turns a technical goal into architecture choices, an implementation sequence, a test and risk plan, and one decision-ready recommendation.",
+      description: "A six-role engineering leadership team that converts ambiguous technical goals into traceable requirements, architecture, delivery, independent assurance, verification, and one rollout-safe recommendation.",
       listingId: "listing_3a1a1eb6eca21d6d9ede8a1cabda92d4",
       pinOrder: 1,
-      agents: [engineeringArchitect, engineeringPlanner, engineeringReviewer, engineeringLead],
+      agents: [engineeringRequirements, engineeringArchitect, engineeringDelivery, engineeringAssurance, engineeringVerification, engineeringLead],
       edges: [
-        [engineeringArchitect, engineeringPlanner, "architecture brief"],
-        [engineeringPlanner, engineeringReviewer, "implementation plan"],
-        [engineeringArchitect, engineeringReviewer, "requirements and constraints"],
-        [engineeringArchitect, engineeringLead, "engineering brief"],
-        [engineeringPlanner, engineeringLead, "delivery plan"],
-        [engineeringReviewer, engineeringLead, "quality and risk review"]
+        [engineeringRequirements, engineeringArchitect, "requirements and constraints"],
+        [engineeringRequirements, engineeringDelivery, "acceptance criteria"],
+        [engineeringArchitect, engineeringDelivery, "architecture decision"],
+        [engineeringRequirements, engineeringAssurance, "constraint ledger"],
+        [engineeringArchitect, engineeringAssurance, "architecture tradeoffs"],
+        [engineeringRequirements, engineeringVerification, "acceptance criteria"],
+        [engineeringArchitect, engineeringVerification, "interface contracts"],
+        [engineeringDelivery, engineeringVerification, "implementation and migration plans"],
+        [engineeringAssurance, engineeringVerification, "risk and observability requirements"],
+        [engineeringRequirements, engineeringLead, "engineering brief"],
+        [engineeringArchitect, engineeringLead, "architecture decision"],
+        [engineeringDelivery, engineeringLead, "delivery plan"],
+        [engineeringAssurance, engineeringLead, "assurance review"],
+        [engineeringVerification, engineeringLead, "verification and rollout plan"]
       ]
     },
     {
       key: "marketing",
       name: "Marketing",
-      description: "A claims-conscious marketing team that moves from audience insight to positioning, campaign concepts, and a consistent final marketing brief without inventing research.",
+      description: "A six-role, evidence-disciplined marketing team that connects audience insight and claims safety to positioning, campaign design, measurement, and one coherent learning-oriented plan.",
       listingId: "listing_a29e9881acdafc6147900520beec9227",
       pinOrder: 2,
-      agents: [audienceResearcher, positioningStrategist, campaignDesigner, marketingLead],
+      agents: [marketingAudience, marketingEvidence, positioningStrategist, campaignDesigner, marketingMeasurement, marketingLead],
       edges: [
-        [audienceResearcher, positioningStrategist, "audience brief"],
-        [audienceResearcher, campaignDesigner, "audience motivations"],
+        [marketingAudience, positioningStrategist, "audience brief"],
+        [marketingEvidence, positioningStrategist, "claims and proof guardrails"],
+        [marketingAudience, campaignDesigner, "audience motivations and objections"],
+        [marketingEvidence, campaignDesigner, "claims guardrails"],
         [positioningStrategist, campaignDesigner, "positioning platform"],
-        [audienceResearcher, marketingLead, "audience evidence"],
+        [marketingAudience, marketingMeasurement, "audience decision context"],
+        [marketingEvidence, marketingMeasurement, "proof inventory"],
+        [positioningStrategist, marketingMeasurement, "message hierarchy"],
+        [campaignDesigner, marketingMeasurement, "campaign system"],
+        [marketingAudience, marketingLead, "audience insight"],
+        [marketingEvidence, marketingLead, "claims ledger"],
         [positioningStrategist, marketingLead, "message hierarchy"],
-        [campaignDesigner, marketingLead, "campaign plan"]
+        [campaignDesigner, marketingLead, "campaign plan"],
+        [marketingMeasurement, marketingLead, "measurement and learning plan"]
       ]
     },
     {
       key: "product",
       name: "Product",
-      description: "A discovery-to-decision product team that clarifies the user problem, frames strategy, prioritizes a focused scope, and proposes the smallest useful validation step.",
+      description: "A six-role product leadership team that separates problem truth from assumptions, builds strategy and experience requirements, prioritizes a focused scope, and ends with decision-changing validation.",
       listingId: "listing_1b1293be7e8e7ab2e233c5594e207b87",
       pinOrder: 3,
-      agents: [problemAnalyst, productStrategist, deliveryPlanner, productLead],
+      agents: [productProblem, productEvidence, productStrategist, productExperience, productPrioritization, productLead],
       edges: [
-        [problemAnalyst, productStrategist, "problem brief"],
-        [problemAnalyst, deliveryPlanner, "user needs and assumptions"],
-        [productStrategist, deliveryPlanner, "product strategy"],
-        [problemAnalyst, productLead, "discovery findings"],
+        [productProblem, productStrategist, "problem brief"],
+        [productEvidence, productStrategist, "evidence and assumptions"],
+        [productProblem, productExperience, "user outcomes and boundaries"],
+        [productStrategist, productExperience, "product strategy"],
+        [productEvidence, productPrioritization, "assumption register"],
+        [productStrategist, productPrioritization, "strategic options and principles"],
+        [productExperience, productPrioritization, "requirements and edge cases"],
+        [productProblem, productLead, "problem and outcome map"],
+        [productEvidence, productLead, "evidence map"],
         [productStrategist, productLead, "strategic options"],
-        [deliveryPlanner, productLead, "prioritized scope"]
+        [productExperience, productLead, "experience and requirements"],
+        [productPrioritization, productLead, "prioritized scope and validation gates"]
       ]
     },
     {
       key: "brainstorming",
       name: "Brainstorming",
-      description: "A divergent-and-convergent creative team that generates varied ideas, reframes the challenge, tests tradeoffs, and returns a distinct shortlist with next experiments.",
+      description: "A six-role creative team that frames the challenge, explores genuinely different mechanisms and perspectives, pressure-tests originality and feasibility, and turns the shortlist into low-regret experiments.",
       listingId: "listing_69d83199cec9702da66ddb7a6dc2ef46",
       pinOrder: 4,
-      agents: [ideaExplorer, perspectiveAgent, feasibilityEditor, brainstormingLead],
+      agents: [brainstormingFramer, ideaExplorer, perspectiveAgent, feasibilityEditor, brainstormingExperiments, brainstormingLead],
       edges: [
+        [brainstormingFramer, ideaExplorer, "challenge frame and constraints"],
+        [brainstormingFramer, perspectiveAgent, "challenge frame and constraints"],
+        [brainstormingFramer, feasibilityEditor, "success dimensions"],
         [ideaExplorer, feasibilityEditor, "varied idea pool"],
         [perspectiveAgent, feasibilityEditor, "alternative lenses"],
+        [brainstormingFramer, brainstormingExperiments, "creative constraints"],
+        [feasibilityEditor, brainstormingExperiments, "screened concepts"],
+        [brainstormingFramer, brainstormingLead, "challenge frame"],
         [ideaExplorer, brainstormingLead, "idea pool"],
         [perspectiveAgent, brainstormingLead, "reframes"],
-        [feasibilityEditor, brainstormingLead, "screened concepts"]
+        [feasibilityEditor, brainstormingLead, "screened concepts"],
+        [brainstormingExperiments, brainstormingLead, "concept experiments"]
       ]
     }
   ];
@@ -376,18 +601,47 @@ function teamDefinitions() {
 
 function marketplaceAgentSnapshot(agent) {
   const hasAgentInputs = agent.consumes.some((value) => /^agent:[a-z0-9_]+:output$/i.test(value));
-  return {
-    schema_version: "virenis-marketplace-agent-v1",
+  const consumes = agent.consumes.filter((value) => !/^agent:[a-z0-9_]+:output$/i.test(value));
+  const canonical = ensureCanonicalAgentContract({
+    id: agent.id,
     title: agent.title,
     capability: agent.capability,
     boundary: agent.boundary,
-    consumes: agent.consumes.filter((value) => !/^agent:[a-z0-9_]+:output$/i.test(value)),
-    produces: [...agent.produces],
-    routing_cues: [...agent.routing_cues],
-    tools: [...agent.tools],
-    connector_requirements: [],
-    policies: clone(agent.policies),
+    consumes,
+    produces: agent.produces,
+    routing_cues: agent.routing_cues,
+    resources: [],
+    sources: [],
+    tools: agent.tools,
+    policies: agent.policies,
+    workflow_profile: agent.workflow_profile,
+    routing: { avoid_when: agent.routing?.avoid_when || [] },
+    memory: agent.memory,
+    permissions: agent.permissions,
+    lifecycle: { state: "ready", health: "healthy" },
     stage: agent.stage,
+    enabled: true,
+    ready: true
+  });
+  return {
+    schema_version: "virenis-marketplace-agent-v1",
+    contract_version: canonical.contract_version,
+    agent_contract: clone(canonical.agent_contract),
+    routing: clone(canonical.routing),
+    memory: clone(canonical.memory),
+    permissions: clone(canonical.permissions),
+    lifecycle: clone(canonical.lifecycle),
+    workflow_profile: clone(canonical.workflow_profile),
+    title: canonical.title,
+    capability: canonical.capability,
+    boundary: canonical.boundary,
+    consumes: [...canonical.consumes],
+    produces: [...canonical.produces],
+    routing_cues: [...canonical.routing_cues],
+    tools: [...canonical.tools],
+    connector_requirements: [],
+    policies: clone(canonical.policies),
+    stage: canonical.stage,
     exclusions: {
       private_knowledge: false,
       // Exact source ids are represented by the workspace-level edge graph and

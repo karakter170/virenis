@@ -344,6 +344,11 @@ describe("Agent Studio product surfaces", () => {
       title: "Packaging analyst",
       capability: "Combine approved context into packaging guidance.",
       routing_cues: "packaging, catalog",
+      routing: {
+        use_when: ["packaging", "catalog"],
+        avoid_when: [],
+        metadata_trust: "runtime_normalized"
+      },
       consumes: [
         "user_request",
         "shared_memory",
@@ -354,7 +359,18 @@ describe("Agent Studio product surfaces", () => {
       produces: ["recommendations", "structured_data"],
       tools: ["calculator", "document_search", "document_read"],
       resources: ["agent:catalog_document"],
-      source_text: "The approved packaging color is amber."
+      source_text: "The approved packaging color is amber.",
+      memory: {
+        read_scopes: ["conversation", "team"],
+        write_scopes: ["conversation"],
+        retention: "session",
+        sensitivity_limit: "internal"
+      },
+      permissions: {
+        side_effects: ["none"],
+        approval_required_for: ["email_send"]
+      },
+      lifecycle: { state: "ready", health: "healthy" }
     });
     expect(payload.boundary).toContain("Prioritize verified evidence");
     expect(payload.policies).toMatchObject({
@@ -391,7 +407,7 @@ describe("Agent Studio product surfaces", () => {
     });
     expect(form).toMatchObject({
       response_style: "careful",
-      boundary: "",
+      boundary: "Compiler-authored comprehensive workflow boundary.",
       policies: {
         response: { tones: ["empathetic", "calm"] },
         memory: { mode: "conversation" }
@@ -403,6 +419,7 @@ describe("Agent Studio product surfaces", () => {
       memory: { mode: "conversation" },
       knowledge: { requirements: expect.arrayContaining(["current_web", "upstream_specialist"]) }
     });
+    expect(payload.boundary).toContain("Compiler-authored comprehensive workflow boundary.");
   });
 
   it("layers response preference onto custom guardrails without destroying either", () => {
@@ -2035,6 +2052,19 @@ describe("Agent Studio product surfaces", () => {
         consumes: ["user_request"],
         produces: ["first_draft"],
         routing_cues: ["write a draft"],
+        contract_version: "virenis-agent-v4",
+        routing: { metadata_trust: "runtime_normalized" },
+        memory: {
+          read_scopes: ["conversation", "team"],
+          write_scopes: ["conversation"],
+          retention: "session",
+          sensitivity_limit: "internal"
+        },
+        permissions: {
+          side_effects: ["none"],
+          approval_required_for: ["email_send"]
+        },
+        lifecycle: { state: "ready", health: "healthy" },
         policies: {
           response: { style: "careful", tones: ["clear", "professional"] },
           memory: { mode: "conversation" },
@@ -2072,7 +2102,14 @@ describe("Agent Studio product surfaces", () => {
     expect(detailMarkup).toContain("Google Drive · Read files");
     expect(detailMarkup).toContain("VERIFIED TEAM SPECIALIST");
     expect(detailMarkup).toContain("Careful · clear, professional");
-    expect(detailMarkup).toContain("Relevant context from this chat");
+    expect(detailMarkup).toContain("virenis-agent-v4");
+    expect(detailMarkup).toContain("Runtime-normalized metadata");
+    expect(detailMarkup).toContain("Reads this conversation and the active team");
+    expect(detailMarkup).toContain("session retention");
+    expect(detailMarkup).toContain("internal sensitivity limit");
+    expect(detailMarkup).toContain("No side effects");
+    expect(detailMarkup).toContain("Approval required for email send");
+    expect(detailMarkup).toContain("ready · healthy");
     expect(detailMarkup).toContain("user provided context");
     expect(detailMarkup).toContain("upstream specialist");
     expect(detailMarkup).toContain("first draft");

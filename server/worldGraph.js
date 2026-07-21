@@ -229,6 +229,7 @@ export function worldGraphRouteOutcomeContract(plan, step) {
   ));
   const outcome = plan?.routing?.orchestrator?.outcome_contract;
   const safeOutcome = outcome && typeof outcome === "object" && !Array.isArray(outcome) ? outcome : {};
+  const expectedOutputs = routeContractIds(step?.expected_outputs);
   const fulfills = routeContractIds(step?.fulfills);
   const assigned = new Set(fulfills);
   const deliverables = (Array.isArray(safeOutcome.deliverables) ? safeOutcome.deliverables : [])
@@ -259,9 +260,13 @@ export function worldGraphRouteOutcomeContract(plan, step) {
       safeOutcome.route_admission_contract_version,
       120
     ),
-    expected_outputs: routeContractIds(step?.expected_outputs),
+    expected_outputs: expectedOutputs,
     fulfills,
-    execution_output_contract: terminal ? "terminal_domain_answer" : "full_handoff",
+    execution_output_contract: terminal
+      ? "terminal_domain_answer"
+      : expectedOutputs.length === 1
+        ? "single_handoff_domain_answer"
+        : "full_handoff",
     deliverables,
     route_admission: routeAdmissionContract(safeOutcome, stepId)
   };

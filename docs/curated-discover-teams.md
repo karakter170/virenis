@@ -1,91 +1,119 @@
 # Virenis curated Discover teams
 
-Virenis ships four first-party teams at the top of Discover: **Engineering**, **Marketing**, **Product**, and **Brainstorming**. Each listing is published by Virenis, carries a server-derived Verified label, and is pinned in that order. Verified and pinned status cannot be supplied through the public publishing API.
+Virenis publishes four first-party teams at the top of Discover: **Engineering**, **Marketing**, **Product**, and **Brainstorming**. Catalog revision `2026-07-v4` is server-owned, Verified, pinned in that order, and gives each team six agents. Public Marketplace fields cannot grant first-party verification or pinning.
 
-Adding a team creates a new private team and four new private agents in the signed-in user's workspace. Agent IDs and handoffs are remapped to the copy. Private knowledge, source files, credentials, MCP bindings, and connected-account access are never distributed with a listing.
+Adding a listing creates a new private team and six new private agents for the signed-in user. Agent IDs, typed handoffs, and the canonical contract digest are remapped to the copy. Private knowledge, source files, credentials, MCP bindings, and connected-account access are never distributed.
 
-## Shared configuration principles
+## Shared contract and routing principles
 
-Every curated role:
+Every role uses `virenis-agent-v4` and carries the same safe runtime envelope:
 
-- uses the selected session's relevant conversation memory (`shared_memory` with `memory.mode = conversation`);
-- relies on user-provided context and, for downstream roles, verified upstream-specialist handoffs;
-- has a bounded purpose, explicit limits, response style, tone, routing cues, and named outputs;
-- uses no external tool by default, so the team works without a connection and never implies that it checked a repository, private account, or current source;
-- preserves uncertainty and separates supplied facts from assumptions.
+```json
+{
+  "memory": {
+    "read_scopes": ["conversation", "team"],
+    "write_scopes": ["conversation"],
+    "retention": "session",
+    "sensitivity_limit": "internal"
+  },
+  "permissions": {
+    "side_effects": ["none"],
+    "approval_required_for": ["email_send"]
+  },
+  "routing": { "metadata_trust": "runtime_normalized" },
+  "lifecycle": { "state": "ready", "health": "healthy" }
+}
+```
 
-The Discover detail screen exposes each role's instructions, response profile, memory source, knowledge requirements, inputs, outputs, and routing cues. It also shows the team's labeled handoff graph.
+Each role also declares a bounded capability, boundary, positive routing cues, `avoid_when` conditions, exact inputs and outputs, stage, evidence policy, and response profile. Every specialist produces one atomic typed handoff; this avoids duplicated prose/JSON claim surfaces and gives the next role one authoritative input. The final role is the only coordinator and the only producer of `final_answer`. It consumes all five specialist handoffs, making the saved graph a complete, acyclic terminal-owner contract.
+
+Qwen sees all agents in the active team (maximum 16) and remains the primary semantic selector. Runtime independently validates IDs, outputs, permissions, lifecycle, and dependency closure. If the model response is invalid or unavailable, an exact action/output contract can recover the uniquely requested terminal owner and its complete DAG; ordinary deterministic cues remain the final bounded fallback. Runtime readiness also compares the configured 32,768-token context window with the provider's advertised `max_model_len`, preventing a smaller Qwen deployment from silently degrading selection.
+
+The executor gives literal user constraints a content-bound `query:<digest>` identity and validated route results their own content-bound evidence IDs. Markers apply only to the clause or structured `claim:` field that carries them; they cannot spread across a semicolon or through sibling metadata to bless a new recommendation. One-output and terminal agents return only a validated domain answer, which the executor wraps into the declared artifact. Four-or-more-result fan-in uses a compact, coverage-preserving representation, and ordinary agent output has a 1,536-token ceiling.
+
+If a terminal lead response fails only execution-evidence publication checks, Runtime may promote its complete set of already validated upstream results. This recovery is allowed only when every upstream route and the lead's consumption contract passed, there are no source, policy, lifecycle, or integrity failures, and the promoted result passes the same validator again. Rejected lead text is never published.
+
+The Discover detail screen exposes the canonical lifecycle, normalized routing trust, memory scope, permission and approval envelope, instructions, inputs, outputs, and labeled handoff graph.
 
 ## Engineering
 
-| Role | Primary output | Receives from |
+| Role | Primary outputs | Depends on |
 |---|---|---|
-| Requirements & Architecture Agent | Engineering brief, architecture options, acceptance criteria | User request and this chat |
-| Implementation Planning Agent | Implementation plan, interface contracts, delivery sequence | Architecture Agent |
-| Quality & Security Agent | Risk register, test strategy, review findings | Architecture and Implementation Agents |
-| Engineering Lead Agent | Engineering recommendation, decision log, next actions | All three specialists |
+| Requirements & Constraints Analyst | `engineering_brief` | Current request and session memory |
+| Systems Architecture Agent | `architecture_decision_record` | Requirements |
+| Delivery Planning Agent | `implementation_plan` | Requirements and Architecture |
+| Security & Reliability Reviewer | `risk_register` | Requirements and Architecture |
+| Verification & Rollout Agent | `verification_strategy` | Requirements, Architecture, Delivery, and Assurance |
+| Engineering Lead Agent | `engineering_recommendation`, `final_answer` | All five roles |
 
-The team deliberately sequences definition before planning and review. The lead cannot produce its final recommendation until all required handoffs validate.
+The two middle reviews can proceed independently after Architecture. Verification reconciles delivery and assurance before the lead issues one traceable, rollback-safe recommendation.
 
 ## Marketing
 
-| Role | Primary output | Receives from |
+| Role | Primary outputs | Depends on |
 |---|---|---|
-| Audience Insight Agent | Audience brief, motivations, evidence gaps | User request and this chat |
-| Positioning Strategy Agent | Positioning platform, message hierarchy, proof requirements | Audience Agent |
-| Campaign Design Agent | Campaign concepts, channel plan, content brief | Audience and Positioning Agents |
-| Marketing Lead Agent | Marketing plan, approved messages, next actions | All three specialists |
+| Audience & Context Analyst | `audience_brief` | Current request and session memory |
+| Evidence & Claims Steward | `claims_ledger` | Current request and session memory |
+| Positioning Strategy Agent | `positioning_platform` | Audience and Evidence |
+| Campaign Systems Designer | `campaign_system` | Audience, Evidence, and Positioning |
+| Measurement & Learning Strategist | `measurement_framework` | Audience, Evidence, Positioning, and Campaign |
+| Marketing Lead Agent | `marketing_plan`, `final_answer` | All five roles |
 
-The contracts explicitly forbid invented market research, survey findings, quotes, and unsupported claims.
+Audience and evidence work begins in parallel. Claims remain explicitly separated from hypotheses through positioning, campaign design, measurement, and final synthesis.
 
 ## Product
 
-| Role | Primary output | Receives from |
+| Role | Primary outputs | Depends on |
 |---|---|---|
-| User Problem Agent | Problem brief, user needs, assumption map | User request and this chat |
-| Product Strategy Agent | Product strategy, principles, strategic options | Problem Agent |
-| Prioritization & Validation Agent | Prioritized scope, validation plan, delivery risks | Problem and Strategy Agents |
-| Product Lead Agent | Product decision brief, decision log, next experiment | All three specialists |
+| User Problem Analyst | `problem_brief` | Current request and session memory |
+| Evidence & Assumption Auditor | `assumption_register` | Current request and session memory |
+| Product Strategy Agent | `product_strategy` | Problem and Evidence |
+| Experience & Requirements Designer | `experience_blueprint` | Problem and Strategy |
+| Prioritization & Validation Planner | `prioritized_scope` | Evidence, Strategy, and Experience |
+| Product Lead Agent | `product_decision_brief`, `final_answer` | All five roles |
 
-The team keeps assumptions visible and favors the smallest coherent validation of value over an unbounded feature list.
+The graph prevents feature preferences from masquerading as evidence and ends with the smallest coherent scope that can change a product decision.
 
 ## Brainstorming
 
-| Role | Primary output | Receives from |
+| Role | Primary outputs | Depends on |
 |---|---|---|
-| Divergent Ideas Agent | Varied idea pool and idea dimensions | User request and this chat |
-| Perspective Shift Agent | Alternative lenses, surprising connections, reframed questions | User request and this chat |
-| Feasibility & Originality Agent | Screened concepts, tradeoffs, open questions | Both divergent specialists |
-| Brainstorming Facilitator Agent | Concept shortlist, rationale, next experiments | All three specialists |
+| Challenge Framing Agent | `challenge_frame` | Current request and session memory |
+| Divergent Ideas Agent | `idea_portfolio` | Challenge frame |
+| Perspective & Analogy Agent | `alternative_lenses` | Challenge frame |
+| Feasibility & Originality Reviewer | `screened_concepts` | Frame, Ideas, and Perspectives |
+| Concept Experiment Designer | `concept_experiments` | Frame and Feasibility review |
+| Brainstorming Facilitator Agent | `concept_shortlist`, `final_answer` | All five roles |
 
-The first two roles can run in parallel. Convergence happens only after both viewpoints are available, preserving variety without returning an unfiltered idea dump.
+Ideas and perspectives run in parallel. Convergence preserves materially different options, and every finalist receives a low-regret, decision-changing experiment.
 
-## Realistic same-session proofs
+## Proofs
 
-The integration suite copies each listing into a user tenant, starts a clean chat, selects the copied team, and sends both prompts naturally—without forcing agent IDs.
+The deterministic integration suite copies each listing, binds it to a new chat, runs two same-session turns, and proves canonical ID remapping, six valid outputs, exact typed handoffs, bounded parallelism, retained user memory, tenant isolation, and a non-empty final answer.
 
-| Team | First turn | Follow-up in the same chat |
-|---|---|---|
-| Engineering | “Create an engineering plan for Project Cedar: add passwordless login to a Node.js and PostgreSQL SaaS with no downtime, no forced logout, and a reversible rollout.” | “Revise the engineering plan for Project Cedar to fit two weeks while keeping the earlier no-downtime, no-forced-logout, and reversible-rollout constraints.” |
-| Marketing | “Create a marketing plan for Moss Bottle, a refillable household cleaner for apartment renters who want less plastic, using email and short-form video with a calm, playful voice.” | “Revise the marketing plan for Moss Bottle into a four-week campaign while keeping the earlier audience, channels, and calm playful voice.” |
-| Product | “Create a product brief for PantryPair, a shared grocery-list app for roommates, prioritizing offline edits, conflict resolution, and simple onboarding while excluding social feeds.” | “Revise the product brief for PantryPair to ship in one month; keep the earlier users, priorities, and no-social-feed constraint, and state what to defer.” |
-| Brainstorming | “Create a concept shortlist for Project Lantern: help neighborhood libraries attract teenagers after school with low-cost, inclusive ideas and no new construction.” | “Turn the concept shortlist for Project Lantern into one six-week pilot while keeping the earlier low-cost, inclusive, and no-new-construction constraints.” |
-
-For every pair, the tests prove:
-
-1. the Router naturally selects the lead from the prompt and recursively includes its saved dependencies;
-2. exactly the four copied team agents execute—no default or unrelated agent appears;
-3. all named handoff artifacts validate and the lead consumes at least three verified upstream artifacts;
-4. the first turn has no earlier memory, while every role receives allowed user-session memory on the follow-up;
-5. the same private copied team remains selected throughout the conversation;
-6. all runs complete with a non-empty final answer.
-
-These are deterministic application integration proofs, not claims about subjective model quality or a live-provider benchmark. They validate the product contracts, routing, tenancy, handoffs, and memory behavior independently of provider variability.
-
-## Verification commands
+The live proof uses the current web application and real GPU Runtime. It loads Discover through the web API, copies and registers each team, sends natural prompts without agent IDs, verifies all six agents were visible to Qwen, executes the GPU DAG, validates every handoff and usage receipt, settles billing, and purges all temporary agents:
 
 ```bash
-npm test -- --run tests/curatedMarketplace.test.js tests/curatedTeamsE2E.test.js tests/productFeatures.test.js tests/agentWorkspaces.test.js
+node scripts/test_curated_discover_live.mjs
+# Optional focused replay:
+CURATED_LIVE_TEAMS=Engineering node scripts/test_curated_discover_live.mjs
+```
+
+The `2026-07-v4` live run completed all four teams with 24/24 validated route outputs:
+
+| Team | Visible to Qwen | Selected | Valid outputs | Maximum parallel width | Terminal publication |
+|---|---:|---:|---:|---:|---|
+| Engineering | 6 | 6 | 6 | 1 | Validated-upstream recovery |
+| Marketing | 6 | 6 | 6 | 2 | Direct lead result |
+| Product | 6 | 6 | 6 | 2 | Validated-upstream recovery |
+| Brainstorming | 6 | 6 | 6 | 1 | Validated-upstream recovery |
+
+Every live proof ended with zero reserved billing credits, deletion of its temporary workspace, and archive/purge of all copied agents.
+
+Standard verification:
+
+```bash
+npm test -- --run tests/curatedMarketplace.test.js tests/curatedTeamsE2E.test.js tests/productFeatures.test.js tests/agentContract.test.js
 npm run lint
 npm run build
 ```

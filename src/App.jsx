@@ -6153,6 +6153,62 @@ export function MarketplacePanel({ items, auth, onOpen = () => undefined, onRate
   );
 }
 
+export function marketplaceCanonicalSummary(agent = {}) {
+  const contractVersion = String(agent.contract_version || agent.agent_contract?.schema_version || "").trim();
+  const memory = agent.memory && typeof agent.memory === "object" ? agent.memory : {};
+  const readScopes = Array.isArray(memory.read_scopes) ? memory.read_scopes : [];
+  const writeScopes = Array.isArray(memory.write_scopes) ? memory.write_scopes : [];
+  const legacyConversation = agent.policies?.memory?.mode === "conversation";
+  const effectiveReadScopes = readScopes.length
+    ? readScopes
+    : legacyConversation ? ["conversation"] : [];
+  const memoryParts = [];
+  if (effectiveReadScopes.includes("conversation")) memoryParts.push("this conversation");
+  if (effectiveReadScopes.includes("team")) memoryParts.push("the active team");
+  const memorySource = memoryParts.length
+    ? `Reads ${memoryParts.join(" and ")}`
+    : "Current request only";
+  const retention = String(memory.retention || "").trim();
+  const sensitivity = String(memory.sensitivity_limit || "").trim();
+  const memoryDetails = [
+    memorySource,
+    retention ? `${contractFieldLabel(retention)} retention` : "",
+    sensitivity ? `${contractFieldLabel(sensitivity)} sensitivity limit` : "",
+    writeScopes.includes("conversation") ? "writes conversation memory only" : ""
+  ].filter(Boolean).join(" · ");
+  const sideEffects = Array.isArray(agent.permissions?.side_effects)
+    ? agent.permissions.side_effects
+    : [];
+  const approvals = Array.isArray(agent.permissions?.approval_required_for)
+    ? agent.permissions.approval_required_for
+    : [];
+  const permissions = [
+    sideEffects.length === 1 && sideEffects[0] === "none"
+      ? "No side effects"
+      : sideEffects.length ? `Side effects: ${sideEffects.map((value) => contractFieldLabel(value)).join(", ")}` : "No declared side effects",
+    approvals.length
+      ? `Approval required for ${approvals.map((value) => contractFieldLabel(value)).join(", ")}`
+      : "No declared approval gates"
+  ].join(" · ");
+  const lifecycle = agent.lifecycle && typeof agent.lifecycle === "object"
+    ? agent.lifecycle
+    : agent.agent_contract?.lifecycle || {};
+  const lifecycleLabel = [lifecycle.state, lifecycle.health]
+    .filter(Boolean)
+    .map((value) => contractFieldLabel(value))
+    .join(" · ") || "Ready";
+  const trust = String(agent.routing?.metadata_trust || agent.agent_contract?.routing?.metadata_trust || "").trim();
+  return {
+    contractLabel: contractVersion || "Legacy marketplace contract",
+    lifecycleLabel,
+    memoryLabel: memoryDetails,
+    permissionsLabel: permissions,
+    routingLabel: trust === "runtime_normalized"
+      ? "Runtime-normalized metadata"
+      : trust ? contractFieldLabel(trust) : "Publisher metadata"
+  };
+}
+
 export function PublishDialog({ agent, onClose, onSaved }) {
   const existing = agent.marketplace || {};
   const workspaceListing = agent.item_type === "workspace";
@@ -6239,6 +6295,7 @@ export function MarketplaceWorkspaceAgentDetails({
     : [];
   const responseStyle = String(responsePolicy.style || "direct");
   const responseSummary = `${responseStyle.charAt(0).toUpperCase()}${responseStyle.slice(1)}${Array.isArray(responsePolicy.tones) && responsePolicy.tones.length ? ` · ${responsePolicy.tones.join(", ")}` : ""}`;
+  const canonicalSummary = marketplaceCanonicalSummary(agent);
   const connectionTools = connectorRequirements.flatMap((requirement, requirementIndex) => (
     (Array.isArray(requirement?.tools) ? requirement.tools : []).map((tool, toolIndex) => ({
       key: `${requirementIndex}:${toolIndex}:${tool?.name || "tool"}`,
@@ -6271,8 +6328,11 @@ export function MarketplaceWorkspaceAgentDetails({
             <dl className="marketplace-spec-list compact">
               <div><dt>Abilities</dt><dd>{tools.length ? tools.map((value) => <span className="marketplace-spec-chip" key={value}>{workflowToolLabel(value)}</span>) : "No tools required"}</dd></div>
               <div><dt>Connections</dt><dd>{connectionTools.length ? connectionTools.map((tool) => <span className="marketplace-spec-chip" key={tool.key}>{tool.label}</span>) : "No external connection required"}</dd></div>
+              <div><dt>Contract</dt><dd>{canonicalSummary.contractLabel} · {canonicalSummary.lifecycleLabel}</dd></div>
+              <div><dt>Routing</dt><dd>{canonicalSummary.routingLabel}</dd></div>
               <div><dt>Response</dt><dd>{responseSummary}</dd></div>
-              <div><dt>Memory</dt><dd>{memoryMode === "conversation" ? "Relevant context from this chat" : "Current request only"}</dd></div>
+              <div><dt>Memory</dt><dd>{canonicalSummary.memoryLabel}</dd></div>
+              <div><dt>Permissions</dt><dd>{canonicalSummary.permissionsLabel}</dd></div>
               <div><dt>Knowledge</dt><dd>{knowledgeRequirements.length ? knowledgeRequirements.map((value) => <span className="marketplace-spec-chip" key={value}>{contractFieldLabel(value)}</span>) : "User-provided context"}</dd></div>
               <div><dt>Receives</dt><dd>{consumes.length ? consumes.map((value) => <span className="marketplace-spec-chip" key={value}>{contractFieldLabel(value)}</span>) : "Your request"}</dd></div>
               <div><dt>Hands back</dt><dd>{produces.length ? produces.map((value) => <span className="marketplace-spec-chip" key={value}>{contractFieldLabel(value)}</span>) : "Working answer"}</dd></div>
@@ -6295,6 +6355,8 @@ export function MarketplaceWorkspaceAgentDetails({
           <dl>
             <div><dt>Team</dt><dd>{agentFacingText(workspaceTitle, "Shared team")}</dd></div>
             <div><dt>Publisher</dt><dd>{publisher}</dd></div>
+            <div><dt>Contract</dt><dd>{canonicalSummary.contractLabel}</dd></div>
+            <div><dt>Status</dt><dd>{canonicalSummary.lifecycleLabel}</dd></div>
             <div><dt>Memory</dt><dd>{memoryMode === "conversation" ? "This chat" : "Current request"}</dd></div>
             <div><dt>Knowledge</dt><dd>{knowledgeRequirements.length || "User context"}</dd></div>
             <div><dt>Tools</dt><dd>{tools.length || "None"}</dd></div>
@@ -6419,12 +6481,12 @@ export function MarketplaceAgentDialog({
   const cues = agent.routing_cues || [];
   const connectorRequirements = agent.connector_requirements || [];
   const responsePolicy = agent.policies?.response || {};
-  const memoryMode = agent.policies?.memory?.mode === "conversation" ? "conversation" : "none";
   const knowledgeRequirements = Array.isArray(agent.policies?.knowledge?.requirements)
     ? agent.policies.knowledge.requirements
     : [];
   const responseStyle = String(responsePolicy.style || "direct");
   const responseSummary = `${responseStyle.charAt(0).toUpperCase()}${responseStyle.slice(1)}${Array.isArray(responsePolicy.tones) && responsePolicy.tones.length ? ` · ${responsePolicy.tones.join(", ")}` : ""}`;
+  const canonicalSummary = marketplaceCanonicalSummary(agent);
   const targetWorkspace = agentWorkspaces.find((workspace) => workspace.agent_workspace_id === targetWorkspaceId);
   const targetWorkspaceFull = Boolean(
     targetWorkspace
@@ -6551,8 +6613,11 @@ export function MarketplaceAgentDialog({
               <dl className="marketplace-spec-list compact">
                 <div><dt>Abilities</dt><dd>{tools.length ? tools.map((value) => <span className="marketplace-spec-chip" key={value}>{workflowToolLabel(value)}</span>) : "No external abilities required"}</dd></div>
                 <div><dt>Connections</dt><dd>{connectorRequirements.length ? connectorRequirements.flatMap((requirement) => requirement.tools.map((tool) => <span className="marketplace-spec-chip" key={`${requirement.connection_name}:${tool.name}`}>{requirement.connection_name} · {tool.title || tool.name}</span>)) : "No external connection required"}</dd></div>
+                <div><dt>Contract</dt><dd>{canonicalSummary.contractLabel} · {canonicalSummary.lifecycleLabel}</dd></div>
+                <div><dt>Routing</dt><dd>{canonicalSummary.routingLabel}</dd></div>
                 <div><dt>Response</dt><dd>{responseSummary}</dd></div>
-                <div><dt>Memory</dt><dd>{memoryMode === "conversation" ? "Relevant context from this chat" : "Current request only"}</dd></div>
+                <div><dt>Memory</dt><dd>{canonicalSummary.memoryLabel}</dd></div>
+                <div><dt>Permissions</dt><dd>{canonicalSummary.permissionsLabel}</dd></div>
                 <div><dt>Knowledge</dt><dd>{knowledgeRequirements.length ? knowledgeRequirements.map((value) => <span className="marketplace-spec-chip" key={value}>{contractFieldLabel(value)}</span>) : "User-provided context"}</dd></div>
                 <div><dt>Receives</dt><dd>{consumes.length ? consumes.map((value) => <span className="marketplace-spec-chip" key={value}>{contractFieldLabel(value)}</span>) : "Your request"}</dd></div>
                 <div><dt>Hands back</dt><dd>{produces.length ? produces.map((value) => <span className="marketplace-spec-chip" key={value}>{contractFieldLabel(value)}</span>) : "Working answer"}</dd></div>
@@ -6574,6 +6639,8 @@ export function MarketplaceAgentDialog({
             <p>{agentFacingText(detail.description || detail.capability)}</p>
             <dl>
               <div><dt>Publisher</dt><dd>{publisher}</dd></div>
+              <div><dt>Contract</dt><dd>{canonicalSummary.contractLabel}</dd></div>
+              <div><dt>Status</dt><dd>{canonicalSummary.lifecycleLabel}</dd></div>
               <div><dt>Tools</dt><dd>{tools.length || "None"}</dd></div>
               <div><dt>Connections</dt><dd>{connectorRequirements.length || "None"}</dd></div>
               <div><dt>Outputs</dt><dd>{produces.length || "Default"}</dd></div>
@@ -7771,12 +7838,27 @@ export function agentPayloadFromForm(form, { isAdmin = false, hasDocumentResourc
   if ((form.mcp_bindings || []).some((binding) => binding.tool_names?.length)) knowledgeRequirements.add("connected_app");
   if (consumes.includes("upstream_route_outputs") || consumes.some((item) => /^agent:.+:output$/.test(item))) knowledgeRequirements.add("upstream_specialist");
   if (!knowledgeRequirements.size) knowledgeRequirements.add("user_provided_context");
+  const routingUseWhen = String(form.routing_cues || `${form.title}, ${form.capability}`)
+    .split(/[\n,]+/)
+    .map((value) => value.trim())
+    .filter(Boolean)
+    .slice(0, 20);
+  const routingAvoidWhen = String(form.routing_avoid || "")
+    .split(/[\n,]+/)
+    .map((value) => value.trim())
+    .filter(Boolean)
+    .slice(0, 20);
   return {
     item_type: form.item_type,
     title: form.title.trim(),
     capability: form.capability.trim(),
     boundary: combinedBoundary,
     routing_cues: form.routing_cues || `${form.title}, ${form.capability}`,
+    routing: {
+      use_when: routingUseWhen,
+      avoid_when: routingAvoidWhen,
+      metadata_trust: "runtime_normalized"
+    },
     consumes,
     produces: form.produces?.length ? [...form.produces] : ["domain_outputs"],
     tools,
@@ -7786,7 +7868,7 @@ export function agentPayloadFromForm(form, { isAdmin = false, hasDocumentResourc
       ...(form.policies || {}),
       response: {
         ...(form.policies?.response || {}),
-        style: responseStyle?.id || "direct",
+        style: responseStyle?.id || (form.response_style === "custom" ? "custom" : "direct"),
         tones: Array.isArray(form.policies?.response?.tones) && form.policies.response.tones.length
           ? [...form.policies.response.tones]
           : ["clear"]
@@ -7806,6 +7888,20 @@ export function agentPayloadFromForm(form, { isAdmin = false, hasDocumentResourc
         reusable_role: form.policies?.composition?.reusable_role !== false,
         source_content_persisted: false
       }
+    },
+    memory: {
+      read_scopes: ["conversation", "team"],
+      write_scopes: ["conversation"],
+      retention: "session",
+      sensitivity_limit: "internal"
+    },
+    permissions: {
+      side_effects: ["none"],
+      approval_required_for: ["email_send"]
+    },
+    lifecycle: {
+      state: "ready",
+      health: "healthy"
     },
     source_text: form.source_text || "",
     ...(isAdmin ? { sources: form.sources } : {})
@@ -7836,9 +7932,14 @@ export function createAgentForm(agent) {
       id: agent.id,
       title: agentFacingText(agent.title),
       capability: agentFacingText(agent.capability),
-      boundary: agent.workflow_origin && policyStyle ? "" : responseConfiguration.boundary,
+      boundary: responseConfiguration.boundary,
       response_style: policyStyle || responseConfiguration.response_style,
       routing_cues: (agent.routing_cues || []).join(", "),
+      routing_avoid: (
+        agent.agent_contract?.routing?.avoid_when
+        || agent.routing?.avoid_when
+        || []
+      ).join(", "),
       consumes: agent.consumes?.length ? [...agent.consumes] : ["user_request"],
       produces: agent.produces?.length ? [...agent.produces] : ["domain_outputs"],
       tools: (agent.tools || []).filter((tool) => !/^mcp_[a-f0-9]{8}_[a-z0-9_]+_[a-f0-9]{6}$/.test(tool)),
@@ -7861,6 +7962,7 @@ export function createAgentForm(agent) {
     boundary: "",
     response_style: "direct",
     routing_cues: "",
+    routing_avoid: "",
     consumes: ["user_request"],
     produces: ["domain_outputs"],
     tools: [],
@@ -8041,6 +8143,12 @@ function AgentDialog({ auth, runtime, agent, agents, documents, mcpConnections =
       isAdmin: Boolean(auth?.is_admin),
       hasDocumentResources
     });
+    const provisioningRequired = newFiles.some((file) => (
+      !uploadedFileKeys.includes(`${file.name}:${file.size}:${file.lastModified}`)
+    ));
+    payload.lifecycle = provisioningRequired
+      ? { state: "provisioning", health: "unknown" }
+      : { state: "ready", health: "healthy" };
     let newAgentPersisted = Boolean(createdAgentId);
     try {
       if (editing || createdAgentId) {
@@ -8050,6 +8158,7 @@ function AgentDialog({ auth, runtime, agent, agents, documents, mcpConnections =
         await api.post("/api/agents", {
           id: form.id,
           ...payload,
+          provisioning_required: provisioningRequired,
           ...(agentWorkspaceId ? { agent_workspace_id: agentWorkspaceId } : {})
         });
         setCreatedAgentId(form.id);
@@ -8073,8 +8182,18 @@ function AgentDialog({ auth, runtime, agent, agents, documents, mcpConnections =
           tools: [...new Set([...payload.tools, "document_search", "document_read"])]
         });
       }
+      if (provisioningRequired) {
+        await api.patch(`/api/agents/${encodeURIComponent(activeAgentId)}`, {
+          lifecycle: { state: "ready", health: "healthy" }
+        });
+      }
       await onSaved({ id: activeAgentId, title: form.title.trim(), editing });
     } catch (saveError) {
+      if (provisioningRequired && (editing || newAgentPersisted)) {
+        await api.patch(`/api/agents/${encodeURIComponent(activeAgentId)}`, {
+          lifecycle: { state: "error", health: "unhealthy" }
+        }).catch(() => undefined);
+      }
       const prefix = !editing && newAgentPersisted
         ? "The specialist joined your team, but its knowledge setup is not finished. You can retry without creating a duplicate. "
         : "";
@@ -8347,6 +8466,7 @@ function AgentDialog({ auth, runtime, agent, agents, documents, mcpConnections =
                   <summary><Settings2 size={15} /> Advanced setup</summary>
                   <div className="advanced-builder-grid">
                     <div className="builder-field"><label htmlFor="agent-cues">When should Virenis use it?</label><textarea id="agent-cues" value={form.routing_cues} onChange={(event) => update("routing_cues", event.target.value)} placeholder={`${form.title || "Agent name"}, related topics, common requests`} /></div>
+                    <div className="builder-field"><label htmlFor="agent-avoid">When should Virenis avoid it?</label><textarea id="agent-avoid" value={form.routing_avoid} onChange={(event) => update("routing_avoid", event.target.value)} placeholder="Requests this role should not handle" /></div>
                     {auth?.is_admin && <div className="builder-field"><label htmlFor="agent-sources">Approved source paths</label><input id="agent-sources" value={form.sources} onChange={(event) => update("sources", event.target.value)} /></div>}
                   </div>
                 </details>

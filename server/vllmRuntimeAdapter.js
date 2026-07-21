@@ -232,7 +232,7 @@ async function executeRoute({ step, query, agents, sharedMemory, outputsById, ba
   const rawText = await chatCompletion({
     model: agent.id,
     messages: [{ role: "user", content: prompt }],
-    maxTokens: boundedInteger(options.max_tokens, 1024, 32, 4096),
+    maxTokens: boundedInteger(options.max_tokens, 1536, 32, 4096),
     temperature: boundedNumber(options.temperature, 0, 0, 2),
     vllmRequest
   });

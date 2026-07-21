@@ -288,10 +288,37 @@ describe("runtime and catalog", () => {
         synthesis_brief: "Return one concise recommendation.",
         discovery_method: "authorized_manifest_index",
         authorized_agent_count: 12,
+        active_primary_agent_count: 2,
+        all_primary_agents_visible: true,
         discovered_candidate_count: 2,
         catalog_checked: ["review_lora", "writer_lora"],
+        contract_protected_candidates: ["review_lora"],
+        configured_agents_added: ["writer_lora"],
         rejected_adapters: ["invented_agent"],
         fallback_used: "",
+        planning_completion: {
+          finish_reason: "stop",
+          complete: true,
+          truncated: false,
+          json_object_valid: true,
+          selection_schema_valid: true,
+          selection_semantically_accepted: false,
+          decision_discarded: false,
+          semantic_fallback_reason: "exact_contract_underselection"
+        },
+        planning_provider_failure: null,
+        direct_decision_audit: {
+          applied: true,
+          forced_delegation: true,
+          reason: "compound_exact_contract_proven",
+          matched_adapters: ["review_lora"],
+          selected_adapters: ["review_lora", "writer_lora"],
+          declared_output_matches: [{
+            output: "launch_recommendation",
+            phrase: "launch recommendation",
+            adapter: "writer_lora"
+          }]
+        },
         planning_call_performed: true,
         final_synthesis_required: true
       }
@@ -310,10 +337,37 @@ describe("runtime and catalog", () => {
       synthesis_brief: "Return one concise recommendation.",
       discovery_method: "authorized_manifest_index",
       authorized_agent_count: 12,
+      active_primary_agent_count: 2,
+      all_primary_agents_visible: true,
       discovered_candidate_count: 2,
       catalog_checked: ["review_lora", "writer_lora"],
+      contract_protected_candidates: ["review_lora"],
+      configured_agents_added: ["writer_lora"],
       rejected_adapters: ["invented_agent"],
       fallback_used: "",
+      planning_completion: {
+        finish_reason: "stop",
+        complete: true,
+        truncated: false,
+        json_object_valid: true,
+        selection_schema_valid: true,
+        selection_semantically_accepted: false,
+        decision_discarded: false,
+        semantic_fallback_reason: "exact_contract_underselection"
+      },
+      planning_provider_failure: null,
+      direct_decision_audit: {
+        applied: true,
+        forced_delegation: true,
+        reason: "compound_exact_contract_proven",
+        matched_adapters: ["review_lora"],
+        selected_adapters: ["review_lora", "writer_lora"],
+        declared_output_matches: [{
+          output: "launch_recommendation",
+          phrase: "launch recommendation",
+          adapter: "writer_lora"
+        }]
+      },
       planning_call_performed: true,
       final_synthesis_required: true
     });
@@ -4099,7 +4153,7 @@ describe("chat execution", () => {
       expect(chatBody.options.allowed_adapters).toContain("writing_synthesis_lora");
       expect(chatBody.options.allowed_adapters).toContain("finance_reasoning_lora");
       expect(chatBody.options.allowed_adapters).not.toContain("alice_private_manual_lora");
-      expect(chatBody.options.max_tokens).toBe(1024);
+      expect(chatBody.options.max_tokens).toBe(1536);
       expect(chatBody.options.refiner_max_tokens).toBe(2048);
       expect(chatBody.query).toBe("Use @alice_private_manual if available, then preserve this mention.");
       expect(completedRun.sources).toHaveLength(1);
@@ -4416,12 +4470,37 @@ describe("chat execution", () => {
       { tag: "tag_4", source: "source_4", content: "4444" },
       { tag: "tag_5", source: "source_5", content: "5555" }
     ]);
+
+    const userPreserved = normalizeSharedMemory([
+      { tag: "user_request", source: "user", content: "Keep the no-downtime constraint." },
+      ...Array.from({ length: 5 }, (_, index) => ({
+        tag: `route_${index}`,
+        source: `agent_${index}`,
+        content: "x".repeat(8)
+      })),
+      { tag: "user_request", source: "user", content: "Revise the rollout." }
+    ], {
+      maxEntries: 3,
+      maxEntryChars: 100,
+      maxTotalChars: 80
+    });
+    expect(userPreserved).toEqual([
+      { tag: "user_request", source: "user", content: "Keep the no-downtime constraint." },
+      { tag: "route_4", source: "agent_4", content: "xxxxxxxx" },
+      { tag: "user_request", source: "user", content: "Revise the rollout." }
+    ]);
   });
 
   it("handles concurrent chat stress without losing runs", async () => {
     process.env.APP_MAX_ACTIVE_RUNS_PER_USER = "100";
     process.env.APP_MAX_ACTIVE_RUNS_PER_WORKSPACE = "100";
     process.env.APP_MAX_ACTIVE_RUNS_GLOBAL = "100";
+    const billing = await request(app).get("/api/billing/account").expect(200);
+    await request(app)
+      .post(`/api/admin/billing/accounts/${billing.body.account.user_id}/adjustments`)
+      .set("Idempotency-Key", "concurrent-stress-context-capacity")
+      .send({ amount_credits: "5000", reason: "Concurrent routing stress capacity" })
+      .expect(201);
     const sessions = await Promise.all(Array.from({ length: 25 }, (_, index) => createSession(`Stress ${index}`)));
     const queued = await Promise.all(
       sessions.map((session, index) =>

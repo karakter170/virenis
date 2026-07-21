@@ -65,7 +65,7 @@ describe("administrator model output settings API", () => {
       .expect(200);
     expect(defaults.body.settings).toMatchObject({
       workspace_id: "workspace_a",
-      agent_output_tokens: 1024,
+      agent_output_tokens: 1536,
       final_output_tokens: 2048,
       revision: 0
     });
@@ -93,7 +93,7 @@ describe("administrator model output settings API", () => {
       .expect(200);
     expect(otherWorkspace.body.settings).toMatchObject({
       workspace_id: "workspace_b",
-      agent_output_tokens: 1024,
+      agent_output_tokens: 1536,
       final_output_tokens: 2048,
       revision: 0
     });
@@ -133,7 +133,7 @@ describe("administrator model output settings API", () => {
     const unsafeContextSplit = await request(app)
       .patch("/api/admin/model-output-settings")
       .set(authorization(TOKENS.adminA))
-      .send({ agent_output_tokens: 2048, final_output_tokens: 4096, reason: "Consumes the full context" })
+      .send({ agent_output_tokens: 2048, final_output_tokens: 9000, reason: "Exceeds the configured output ceiling" })
       .expect(400);
     expect(unsafeContextSplit.body).toMatchObject({ error: "invalid_model_output_settings" });
     expect(unsafeContextSplit.body.message).toMatch(/final_output_tokens/i);

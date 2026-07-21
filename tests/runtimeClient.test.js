@@ -498,6 +498,7 @@ describe("TCAR runtime HTTP transport", () => {
             composition: { reusable_role: true, source_content_persisted: false }
           },
           stage: 20,
+          ready: true,
           registration_id: "registration_contract_test",
           audit_context: { user_id: "alice" }
         }

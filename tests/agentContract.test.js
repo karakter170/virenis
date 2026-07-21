@@ -278,6 +278,61 @@ describe("canonical Agent Studio execution contract", () => {
     expect(analysis.depends_on).toContain(source.id);
   });
 
+  it("keeps an aggregate input scoped to explicitly configured producers", () => {
+    const agents = [
+      {
+        id: "configured_source",
+        title: "Configured source",
+        capability: "Prepare the required evidence.",
+        routing_cues: [],
+        consumes: ["user_request"],
+        produces: ["configured_evidence"],
+        resources: [],
+        enabled: true
+      },
+      {
+        id: "independent_source",
+        title: "Independent source",
+        capability: "Prepare an independent perspective.",
+        routing_cues: [],
+        consumes: ["user_request"],
+        produces: ["independent_evidence"],
+        resources: [],
+        enabled: true
+      },
+      {
+        id: "scoped_consumer",
+        title: "Scoped consumer",
+        capability: "Use only its configured producer handoff.",
+        routing_cues: [],
+        consumes: [
+          "user_request",
+          "upstream_route_outputs",
+          "agent:configured_source:output"
+        ],
+        produces: ["scoped_result"],
+        resources: [],
+        enabled: true
+      }
+    ];
+    const plan = planRoutes({
+      query: "Ask @configured_source, @independent_source, and @scoped_consumer.",
+      agents,
+      maxRoutingAdapters: 3
+    });
+    const configured = plan.steps.find((step) => step.adapter === "configured_source");
+    const independent = plan.steps.find((step) => step.adapter === "independent_source");
+    const consumer = plan.steps.find((step) => step.adapter === "scoped_consumer");
+
+    expect(consumer.depends_on).toContain(configured.id);
+    expect(consumer.depends_on).not.toContain(independent.id);
+    expect(configuredPlanGaps(plan.steps, agents)).toEqual([]);
+    expect(buildParallelBatches(plan.steps, 2)).toMatchObject({
+      parallelizable: true,
+      maxBatchWidth: 2
+    });
+  });
+
   it("keeps independent document-backed agents parallel despite their semantic context aliases", () => {
     const documentAgent = (id, title) => ({
       id,

@@ -16,13 +16,15 @@ const CASES = [
     prompt: "Create an engineering plan for Project Cedar: add passwordless login to a Node.js and PostgreSQL SaaS with no downtime, no forced logout, and a reversible rollout.",
     followUp: "Revise the engineering plan for Project Cedar to fit two weeks while keeping the earlier no-downtime, no-forced-logout, and reversible-rollout constraints.",
     titles: [
-      "Requirements & Architecture Agent",
-      "Implementation Planning Agent",
-      "Quality & Security Agent",
+      "Requirements & Constraints Analyst",
+      "Systems Architecture Agent",
+      "Delivery Planning Agent",
+      "Security & Reliability Reviewer",
+      "Verification & Rollout Agent",
       "Engineering Lead Agent"
     ],
-    artifacts: ["engineering_brief", "implementation_plan", "risk_register", "engineering_recommendation"],
-    maxBatchWidth: 1
+    artifacts: ["engineering_brief", "architecture_decision_record", "implementation_plan", "risk_register", "verification_strategy", "engineering_recommendation"],
+    maxBatchWidth: 2
   },
   {
     team: "Marketing",
@@ -30,13 +32,15 @@ const CASES = [
     prompt: "Create a marketing plan for Moss Bottle, a refillable household cleaner for apartment renters who want less plastic, using email and short-form video with a calm, playful voice.",
     followUp: "Revise the marketing plan for Moss Bottle into a four-week campaign while keeping the earlier audience, channels, and calm playful voice.",
     titles: [
-      "Audience Insight Agent",
+      "Audience & Context Analyst",
+      "Evidence & Claims Steward",
       "Positioning Strategy Agent",
-      "Campaign Design Agent",
+      "Campaign Systems Designer",
+      "Measurement & Learning Strategist",
       "Marketing Lead Agent"
     ],
-    artifacts: ["audience_brief", "positioning_platform", "campaign_concepts", "marketing_plan"],
-    maxBatchWidth: 1
+    artifacts: ["audience_brief", "claims_ledger", "positioning_platform", "campaign_system", "measurement_framework", "marketing_plan"],
+    maxBatchWidth: 2
   },
   {
     team: "Product",
@@ -44,13 +48,15 @@ const CASES = [
     prompt: "Create a product brief for PantryPair, a shared grocery-list app for roommates, prioritizing offline edits, conflict resolution, and simple onboarding while excluding social feeds.",
     followUp: "Revise the product brief for PantryPair to ship in one month; keep the earlier users, priorities, and no-social-feed constraint, and state what to defer.",
     titles: [
-      "User Problem Agent",
+      "User Problem Analyst",
+      "Evidence & Assumption Auditor",
       "Product Strategy Agent",
-      "Prioritization & Validation Agent",
+      "Experience & Requirements Designer",
+      "Prioritization & Validation Planner",
       "Product Lead Agent"
     ],
-    artifacts: ["problem_brief", "product_strategy", "prioritized_scope", "product_decision_brief"],
-    maxBatchWidth: 1
+    artifacts: ["problem_brief", "assumption_register", "product_strategy", "experience_blueprint", "prioritized_scope", "product_decision_brief"],
+    maxBatchWidth: 2
   },
   {
     team: "Brainstorming",
@@ -58,12 +64,14 @@ const CASES = [
     prompt: "Create a concept shortlist for Project Lantern: help neighborhood libraries attract teenagers after school with low-cost, inclusive ideas and no new construction.",
     followUp: "Turn the concept shortlist for Project Lantern into one six-week pilot while keeping the earlier low-cost, inclusive, and no-new-construction constraints.",
     titles: [
+      "Challenge Framing Agent",
       "Divergent Ideas Agent",
-      "Perspective Shift Agent",
-      "Feasibility & Originality Agent",
+      "Perspective & Analogy Agent",
+      "Feasibility & Originality Reviewer",
+      "Concept Experiment Designer",
       "Brainstorming Facilitator Agent"
     ],
-    artifacts: ["idea_pool", "alternative_lenses", "screened_concepts", "concept_shortlist"],
+    artifacts: ["challenge_frame", "idea_portfolio", "alternative_lenses", "screened_concepts", "concept_experiments", "concept_shortlist"],
     maxBatchWidth: 2
   }
 ];
@@ -132,7 +140,7 @@ describe("curated Discover teams", () => {
     const listing = discovery.body.items.find((item) => item.title === scenario.team);
     expect(listing).toMatchObject({
       item_type: "workspace",
-      agent_count: 4,
+      agent_count: 6,
       publisher_display_name: "Virenis",
       verified: true,
       pinned: true,
@@ -146,6 +154,14 @@ describe("curated Discover teams", () => {
     expect(publishedDetail.body.workspace.agents.map((entry) => entry.agent.title)).toEqual(scenario.titles);
     expect(publishedDetail.body.workspace.agents.every((entry) => (
       entry.agent.policies?.memory?.mode === "conversation"
+      && entry.agent.contract_version === "virenis-agent-v4"
+      && entry.agent.agent_contract?.schema_version === "virenis-agent-v4"
+      && entry.agent.routing?.metadata_trust === "runtime_normalized"
+      && entry.agent.memory?.read_scopes?.includes("conversation")
+      && entry.agent.memory?.read_scopes?.includes("team")
+      && entry.agent.permissions?.side_effects?.includes("none")
+      && entry.agent.lifecycle?.state === "ready"
+      && entry.agent.lifecycle?.health === "healthy"
       && entry.agent.consumes.includes("shared_memory")
       && entry.agent.policies?.knowledge?.requirements?.length > 0
       && entry.agent.resources === undefined
@@ -160,7 +176,7 @@ describe("curated Discover teams", () => {
       .send({ listing_id: listing.listing_id })
       .expect(201);
     expect(copied.body.agent_workspace).toMatchObject({
-      agent_count: 4,
+      agent_count: 6,
       setup_status: "ready"
     });
     expect(copied.body.agent_workspace.name).toBe(`${scenario.team} copy`);
@@ -170,12 +186,20 @@ describe("curated Discover teams", () => {
       .get(`/api/agent-workspaces/${copiedWorkspaceId}`)
       .set(auth())
       .expect(200);
-    expect(copiedDetail.body.agents).toHaveLength(4);
+    expect(copiedDetail.body.agents).toHaveLength(6);
     expect(copiedDetail.body.agents.map((agent) => agent.title)).toEqual(scenario.titles);
     expect(copiedDetail.body.agents.every((agent) => (
       agent.workspace_id === ACTOR.workspace_id
       && agent.created_by === ACTOR.user_id
       && agent.visibility === "private"
+      && agent.contract_version === "virenis-agent-v4"
+      && agent.agent_contract?.schema_version === "virenis-agent-v4"
+      && agent.routing?.metadata_trust === "runtime_normalized"
+      && agent.memory?.read_scopes?.includes("conversation")
+      && agent.memory?.read_scopes?.includes("team")
+      && agent.permissions?.side_effects?.includes("none")
+      && agent.lifecycle?.state === "ready"
+      && agent.lifecycle?.health === "healthy"
       && agent.policies?.memory?.mode === "conversation"
       && agent.consumes.includes("shared_memory")
       && agent.policies?.knowledge?.requirements?.length > 0
@@ -191,6 +215,9 @@ describe("curated Discover teams", () => {
         expect(copiedIds.has(dependencyId)).toBe(true);
         expect(sourceIds.has(dependencyId)).toBe(false);
       }
+      expect(new Set(agent.agent_contract.execution.handoffs.requires_agents)).toEqual(new Set(
+        agent.consumes.flatMap((value) => String(value).match(/^agent:([a-z0-9_]+):output$/i)?.[1] || [])
+      ));
     }
 
     const session = await request(app)
@@ -209,7 +236,7 @@ describe("curated Discover teams", () => {
     expect(new Set(first.plan.steps.map((step) => step.adapter))).toEqual(copiedIds);
     expect(first.plan.routing.mode).toBe("simulator");
     expect(first.parallel.maxBatchWidth).toBe(scenario.maxBatchWidth);
-    expect(first.expert_outputs).toHaveLength(4);
+    expect(first.expert_outputs).toHaveLength(6);
     expect(first.expert_outputs.every((route) => route.artifact_validation?.valid === true)).toBe(true);
     expect(first.expert_outputs.every((route) => route.used_memory.length === 0)).toBe(true);
     for (const artifact of scenario.artifacts) {
@@ -220,20 +247,20 @@ describe("curated Discover teams", () => {
     const leadId = copiedDetail.body.agents.find((agent) => agent.title === scenario.lead).id;
     const firstLead = first.expert_outputs.find((route) => route.adapter === leadId);
     expect(firstLead.consumption_validation).toMatchObject({ valid: true });
-    expect(firstLead.consumed_artifacts.length).toBeGreaterThanOrEqual(3);
+    expect(firstLead.consumed_artifacts.length).toBeGreaterThanOrEqual(5);
     expect(first.final_answer).toBeTruthy();
 
     const second = await sendMessage(session.body.session_id, scenario.followUp);
     expect(second.status).toBe("completed");
     expect(new Set(second.plan.steps.map((step) => step.adapter))).toEqual(copiedIds);
-    expect(second.expert_outputs).toHaveLength(4);
+    expect(second.expert_outputs).toHaveLength(6);
     expect(second.expert_outputs.every((route) => (
       route.used_memory.some((entry) => entry.tag === "user_request" && entry.source === "user")
     ))).toBe(true);
     expect(second.expert_outputs.every((route) => route.artifact_validation?.valid === true)).toBe(true);
     const secondLead = second.expert_outputs.find((route) => route.adapter === leadId);
     expect(secondLead.consumption_validation).toMatchObject({ valid: true });
-    expect(secondLead.consumed_artifacts.length).toBeGreaterThanOrEqual(3);
+    expect(secondLead.consumed_artifacts.length).toBeGreaterThanOrEqual(5);
     expect(second.final_answer).toBeTruthy();
 
     const conversation = await request(app)

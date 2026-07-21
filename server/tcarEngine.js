@@ -5,6 +5,7 @@ import { releaseRunReservation, settleRunCredits } from "./billing.js";
 import { makeId, nowIso } from "./store.js";
 import { assertStoredDocumentIntegrity, scoreChunks, slugify } from "./documents.js";
 import { normalizeDiagnosticError } from "./diagnostics.js";
+import { agentIsRoutingReady } from "./agentContract.js";
 import {
   executeRuntimeChatStream,
   realRuntimeEnabled,
@@ -156,18 +157,20 @@ export function planRoutes({
   agents,
   documents = [],
   agentRankings = {},
-  maxRoutingAdapters = 12,
+  maxRoutingAdapters = 16,
   maxResourceSupportAdapters = 8,
   requiredAgentIds = [],
   attachmentAgentIds = []
 }) {
-  const enabled = agents.filter((agent) => agent.enabled !== false && agent.runtime_sync_pending !== true);
+  const enabled = agents.filter((agent) => (
+    agentIsRoutingReady(agent) && agent.runtime_sync_pending !== true
+  ));
   const hasAgent = (id) => enabled.some((agent) => agent.id === id);
   const lower = query.toLowerCase();
   const steps = [];
   const idByAdapter = new Map();
   const selections = new Map();
-  const specialistLimit = Math.max(1, Number(maxRoutingAdapters) || 12);
+  const specialistLimit = Math.max(1, Math.min(Number(maxRoutingAdapters) || 16, 16));
   const resourceSupportLimit = Math.max(0, Math.min(Number(maxResourceSupportAdapters) || 0, 24));
   const enabledById = new Map(enabled.map((agent) => [agent.id, agent]));
 
@@ -515,11 +518,16 @@ export function planRoutes({
   for (const [destinationIndex, destinationStep] of [...steps].entries()) {
     const destinationAgent = enabled.find((agent) => agent.id === destinationStep.adapter);
     const consumes = destinationAgent?.consumes || [];
+    const consumedNames = new Set(consumes.map((value) => String(value || "").trim()).filter(Boolean));
     const consumesAggregate = consumes.some((value) => AGGREGATE_CONTEXT_INPUTS.has(value));
+    const hasConfiguredProducerScope = configuredHandoffDependencies(destinationAgent).length > 0;
     const inferredDependencies = steps
       .slice(0, destinationIndex)
       .filter((sourceStep) => {
         const sourceAgent = enabled.find((agent) => agent.id === sourceStep.adapter);
+        if (hasConfiguredProducerScope) {
+          return (sourceAgent?.produces || []).some((name) => consumedNames.has(String(name || "").trim()));
+        }
         return consumesAggregate || producedContractSupportsInferredEdge(sourceAgent, destinationAgent);
       })
       .map((sourceStep) => sourceStep.adapter);
@@ -628,7 +636,7 @@ export function scopedRoutingContext({ session, agents = [], documents = [], age
     ? new Set(Array.isArray(agentWorkspace.agent_ids) ? agentWorkspace.agent_ids : [])
     : null;
   const eligibleAgents = agents.filter((agent) =>
-    agent.enabled !== false &&
+    agentIsRoutingReady(agent) &&
     agent.mounted !== false &&
     agent.runtime_sync_pending !== true &&
     !inactiveAgentIds.has(agent.id) &&
@@ -657,10 +665,19 @@ export function scopedRoutingContext({ session, agents = [], documents = [], age
     resourceVisibleToSession(document, session)
   );
   const allowedAdapters = [...new Set(visibleAgents.map((agent) => agent.id).filter(Boolean))];
+  const teamAdapters = [...new Set(visibleAgents
+    .filter((agent) => (
+      (!workspaceAgentIds || workspaceAgentIds.has(agent.id))
+      && !agent.document
+      && !agent.resource_for_agent_id
+    ))
+    .map((agent) => agent.id)
+    .filter(Boolean))].slice(0, 16);
   return {
     agents: visibleAgents,
     documents: visibleDocuments,
-    allowedAdapters
+    allowedAdapters,
+    teamAdapters
   };
 }
 
@@ -852,15 +869,23 @@ export function normalizeSharedMemory(
     .filter((entry) => entry.content.length > 0);
 
   const retained = [];
+  const retainedIndexes = new Set();
   let totalChars = 0;
-  for (const entry of normalized.slice(-maxEntries).reverse()) {
-    if (totalChars + entry.content.length > maxTotalChars && retained.length > 0) {
-      break;
-    }
-    retained.push(entry);
+  const newestFirst = normalized.map((entry, index) => ({ entry, index })).reverse();
+  const prioritized = [
+    ...newestFirst.filter(({ entry }) => entry.tag === "user_request" && entry.source === "user"),
+    ...newestFirst
+  ];
+  for (const { entry, index } of prioritized) {
+    if (retainedIndexes.has(index) || retained.length >= maxEntries) continue;
+    if (totalChars + entry.content.length > maxTotalChars) continue;
+    retained.push({ entry, index });
+    retainedIndexes.add(index);
     totalChars += entry.content.length;
   }
-  return retained.reverse();
+  return retained
+    .sort((left, right) => left.index - right.index)
+    .map(({ entry }) => entry);
 }
 
 function nextSharedMemory(existing, additions) {
@@ -1053,7 +1078,7 @@ async function processLocalChatRun({ store, bus, run_id, options = {} }) {
       agents: scoped.agents,
       documents: scoped.documents,
       agentRankings,
-      maxRoutingAdapters: Number(options.max_routing_adapters) || 12,
+      maxRoutingAdapters: Number(options.max_routing_adapters) || 16,
       requiredAgentIds: requiredAdapters,
       attachmentAgentIds: attachmentAdapters
     });
@@ -1388,7 +1413,10 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
         { type: "runtime.requested" }
       ]
     });
-    const routeLimit = Number(options.max_routing_adapters) || Number(process.env.TCAR_MAX_ROUTING_ADAPTERS || 12);
+    const routeLimit = Math.max(
+      1,
+      Math.min(Number(options.max_routing_adapters) || Number(process.env.TCAR_MAX_ROUTING_ADAPTERS || 16), 16)
+    );
     const resourceSupportLimit = Math.max(
       0,
       Math.min(Number(process.env.TCAR_MAX_RESOURCE_SUPPORT_ADAPTERS || 8), 24)
@@ -1417,10 +1445,11 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
         planner_mode: options.planner_mode || process.env.TCAR_PLANNER_MODE || "session",
         max_routing_adapters: routeLimit,
         parallel_workers: parallelWorkers,
-        max_tokens: Number(options.max_tokens) || Number(process.env.TCAR_MAX_TOKENS || 1024),
+        max_tokens: Number(options.max_tokens) || Number(process.env.TCAR_MAX_TOKENS || 1536),
         refiner_max_tokens: Number(options.refiner_max_tokens) || Number(process.env.TCAR_REFINER_MAX_TOKENS || 2048),
         temperature: Number(options.temperature ?? process.env.TCAR_TEMPERATURE ?? 0),
         allowed_adapters: scoped.allowedAdapters,
+        team_adapters: scoped.teamAdapters,
         ...(requiredAdapters.length ? { required_adapters: requiredAdapters } : {}),
         ...(attachmentAdapters.length ? { attachment_adapters: attachmentAdapters } : {}),
         agent_rankings: Object.fromEntries(
@@ -2111,7 +2140,8 @@ const RUNTIME_ROUTE_REPAIR_FIELDS = Object.freeze([
   "execution_evidence_sanitizer",
   "extractive_source_fallback",
   "upstream_consistency_repair",
-  "handoff_contract_repair"
+  "handoff_contract_repair",
+  "terminal_fan_in_recovery"
 ]);
 
 function normalizeRuntimeFailureReasonCode(value) {
@@ -2279,6 +2309,18 @@ function runtimeRouteContractError(detail) {
 }
 
 export function runtimeRouteFailureDetails(plan, outputs, value = []) {
+  const retryableFailureClasses = new Set([
+    "worker_execution",
+    "worker_empty_output",
+    "model_output_limit",
+    "provider_output_limit",
+    "artifact_contract",
+    "artifact_validation",
+    "expected_output_contract",
+    "expected_output_validation",
+    "non_result",
+    "non_result_output"
+  ]);
   if (value !== null && value !== undefined && !Array.isArray(value)) {
     throw runtimeRouteContractError("runtime route failure summary is malformed");
   }
@@ -2309,7 +2351,12 @@ export function runtimeRouteFailureDetails(plan, outputs, value = []) {
       : "route_validation_failed";
     summaries.set(stepId, {
       failureClass,
-      controllerSynthesisSafe: row.controller_synthesis_safe === true
+      controllerSynthesisSafe: row.controller_synthesis_safe === true,
+      retryable: typeof row.retryable === "boolean"
+        ? row.retryable
+        : retryableFailureClasses.has(failureClass),
+      details: String(row.details || "").slice(0, 400),
+      recommendedAction: String(row.recommended_action || "").slice(0, 80)
     });
   }
 
@@ -2333,6 +2380,10 @@ export function runtimeRouteFailureDetails(plan, outputs, value = []) {
       step_id: stepId,
       adapter: String(step.adapter || "").slice(0, 160),
       status,
+      code: failureClass,
+      retryable: summary?.retryable === true,
+      details: summary?.details || "The route did not produce a validated result.",
+      recommended_action: summary?.recommendedAction || (status === "failed" ? "select_alternate_or_retry" : "clarify_or_answer_directly"),
       failure_class: failureClass,
       controller_synthesis_safe: status === "failed",
       expected_outputs: boundedStringList(step.expected_outputs, 32, 160),
@@ -2526,7 +2577,7 @@ function canonicalRuntimeContractValue(value) {
 
 export function assertRuntimePlan(plan, {
   allowedAdapters = [],
-  maxSteps = 12,
+  maxSteps = 16,
   maxResourceSupportSteps = 0,
   agents = []
 } = {}) {
@@ -2537,7 +2588,7 @@ export function assertRuntimePlan(plan, {
     throw error;
   };
   const rawSteps = Array.isArray(plan?.steps) ? plan.steps : [];
-  const routeLimit = Math.max(1, Math.min(Number(maxSteps) || 12, 64));
+  const routeLimit = Math.max(1, Math.min(Number(maxSteps) || 16, 16));
   const resourceSupportLimit = Math.max(0, Math.min(Number(maxResourceSupportSteps) || 0, 24));
   const absoluteStepLimit = routeLimit + resourceSupportLimit;
   if (rawSteps.length > absoluteStepLimit) {
@@ -2949,10 +3000,53 @@ export function normalizeRuntimeRouting(routing) {
       synthesis_brief: boundedText(rawOrchestrator.synthesis_brief, 1200),
       discovery_method: boundedText(rawOrchestrator.discovery_method, 120),
       authorized_agent_count: Math.max(0, Math.min(Number(rawOrchestrator.authorized_agent_count) || 0, 100000)),
+      active_primary_agent_count: Math.max(0, Math.min(Number(rawOrchestrator.active_primary_agent_count) || 0, 16)),
+      all_primary_agents_visible: rawOrchestrator.all_primary_agents_visible === true,
       discovered_candidate_count: Math.max(0, Math.min(Number(rawOrchestrator.discovered_candidate_count) || 0, 100000)),
       catalog_checked: boundedStringList(rawOrchestrator.catalog_checked, 64, 240),
+      contract_protected_candidates: boundedStringList(rawOrchestrator.contract_protected_candidates, 16, 240),
+      configured_agents_added: boundedStringList(rawOrchestrator.configured_agents_added, 64, 240),
       rejected_adapters: boundedStringList(rawOrchestrator.rejected_adapters, 24, 240),
       fallback_used: boundedText(rawOrchestrator.fallback_used, 120),
+      planning_completion: rawOrchestrator.planning_completion && typeof rawOrchestrator.planning_completion === "object"
+        ? {
+          finish_reason: boundedText(rawOrchestrator.planning_completion.finish_reason, 80),
+          complete: rawOrchestrator.planning_completion.complete === true,
+          truncated: rawOrchestrator.planning_completion.truncated === true,
+          json_object_valid: rawOrchestrator.planning_completion.json_object_valid === true,
+          selection_schema_valid: rawOrchestrator.planning_completion.selection_schema_valid === true,
+          selection_semantically_accepted: rawOrchestrator.planning_completion.selection_semantically_accepted === true,
+          decision_discarded: rawOrchestrator.planning_completion.decision_discarded === true,
+          semantic_fallback_reason: boundedText(rawOrchestrator.planning_completion.semantic_fallback_reason, 160)
+        }
+        : null,
+      planning_provider_failure: rawOrchestrator.planning_provider_failure && typeof rawOrchestrator.planning_provider_failure === "object"
+        ? {
+          stage: boundedText(rawOrchestrator.planning_provider_failure.stage, 80),
+          error_type: boundedText(rawOrchestrator.planning_provider_failure.error_type, 120),
+          fallback_allowed: rawOrchestrator.planning_provider_failure.fallback_allowed === true
+        }
+        : null,
+      direct_decision_audit: rawOrchestrator.direct_decision_audit && typeof rawOrchestrator.direct_decision_audit === "object"
+        ? {
+          applied: rawOrchestrator.direct_decision_audit.applied === true,
+          forced_delegation: rawOrchestrator.direct_decision_audit.forced_delegation === true,
+          reason: boundedText(rawOrchestrator.direct_decision_audit.reason, 160),
+          matched_adapters: boundedStringList(rawOrchestrator.direct_decision_audit.matched_adapters, 16, 240),
+          selected_adapters: boundedStringList(rawOrchestrator.direct_decision_audit.selected_adapters, 16, 240),
+          declared_output_matches: (Array.isArray(rawOrchestrator.direct_decision_audit.declared_output_matches)
+            ? rawOrchestrator.direct_decision_audit.declared_output_matches
+            : []).slice(0, 16).flatMap((match) => (
+            match && typeof match === "object" && !Array.isArray(match)
+              ? [{
+                output: boundedText(match.output, 160),
+                phrase: boundedText(match.phrase, 160),
+                adapter: boundedText(match.adapter, 240)
+              }]
+              : []
+          ))
+        }
+        : null,
       planning_call_performed: rawOrchestrator.planning_call_performed === true,
       final_synthesis_required: rawOrchestrator.final_synthesis_required === true,
       ...(outcomeContract ? { outcome_contract: outcomeContract } : {})
@@ -3188,6 +3282,7 @@ function runtimeOutputToRunStep({ run_id, output, parallel, step = null, failure
     consumed_artifacts: failed ? [] : normalizeArtifactValue(output.consumed_artifacts || []),
     consumption_validation: failed ? { valid: output.consumption_validation?.valid === true } : normalizeArtifactValue(output.consumption_validation || {}),
     source_validation: failed ? { valid: output.source_validation?.valid === true } : normalizeArtifactValue(output.source_validation || {}),
+    terminal_fan_in_recovery: failed ? null : normalizeArtifactValue(output.terminal_fan_in_recovery || null),
     used_memory: failed ? [] : normalizeArtifactValue(output.used_memory || []),
     boundary_check: failed ? "" : output.boundary_check || sections.boundary_check,
     allowed_tools: output.allowed_tools || [],
@@ -3821,9 +3916,10 @@ function buildLocalHandoffArtifacts({ step, agent, domainAnswer, citations, retr
     if (value === "" || value === null || value === undefined || (Array.isArray(value) && value.length === 0)) {
       return [];
     }
-    const contentDigest = digestValue(value);
+    const normalizedValue = normalizeArtifactValue(value);
+    const contentDigest = digestValue(normalizedValue);
     return [{
-      artifact_id: `artifact_${digestValue({ step_id: step.id, name: artifact, value }).slice("sha256:".length, "sha256:".length + 24)}`,
+      artifact_id: `artifact_${digestValue({ step_id: step.id, name: artifact, value: normalizedValue }).slice("sha256:".length, "sha256:".length + 24)}`,
       schema_version: "tcar-handoff-artifact-v1",
       name: artifact,
       artifact,
@@ -3831,7 +3927,7 @@ function buildLocalHandoffArtifacts({ step, agent, domainAnswer, citations, retr
       producer_agent_id: step.adapter,
       producer: step.adapter,
       content_type: contentType,
-      value,
+      value: normalizedValue,
       content_digest: contentDigest,
       evidence: citations.map((citation) => citation.chunk_id).filter(Boolean),
       confidence: citations.length > 0 ? 1 : null,
@@ -3885,13 +3981,23 @@ function domainAnswerFor(adapter, query, citations, agent, consumedArtifacts = [
     return "Merge upstream route outputs into one clear answer, preserving legal, health, finance, source, and policy caveats where relevant.";
   }
   if (consumedArtifacts.length > 0) {
-    const contextSummary = consumedArtifacts.slice(0, 8).map((artifact) => {
-      const value = typeof artifact.value === "string"
-        ? artifact.value
-        : JSON.stringify(artifact.value);
-      return `${artifact.name} from ${artifact.producer || "upstream"}: ${boundedText(value, 900)}`;
-    }).join(" ");
-    return `Using verified upstream context: ${contextSummary}`;
+    const byProducer = new Map();
+    for (const artifact of consumedArtifacts) {
+      const producer = artifact.producer || "upstream";
+      const group = byProducer.get(producer) || { producer, names: [], sample: "" };
+      if (!group.names.includes(artifact.name)) group.names.push(artifact.name);
+      if (!group.sample) {
+        const value = typeof artifact.value === "string"
+          ? artifact.value
+          : JSON.stringify(artifact.value);
+        group.sample = boundedText(value, 600);
+      }
+      byProducer.set(producer, group);
+    }
+    const contextSummary = [...byProducer.values()].slice(0, 6)
+      .map((group) => `${group.producer} supplied ${group.names.slice(0, 6).join(", ")}: ${group.sample}`)
+      .join(" ");
+    return boundedText(`Using verified upstream context: ${contextSummary}`, 5000);
   }
   if (citations.length > 0) {
     return `Based on the agent's approved knowledge: ${citations.map((citation) => citation.excerpt).join(" ")}`;

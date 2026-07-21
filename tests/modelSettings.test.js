@@ -9,25 +9,25 @@ describe("workspace model output settings", () => {
   it("uses substantially larger safe defaults and publishes the administrator bounds", () => {
     const env = {};
     expect(defaultModelOutputSettings(env)).toEqual({
-      agent_output_tokens: 1024,
+      agent_output_tokens: 1536,
       final_output_tokens: 2048
     });
     expect(modelOutputSettingsForWorkspace({}, "workspace_a", env)).toMatchObject({
       workspace_id: "workspace_a",
-      agent_output_tokens: 1024,
+      agent_output_tokens: 1536,
       final_output_tokens: 2048,
       bounds: {
         agent_output_tokens: {
           min: 128,
-          max: 2304,
-          context_tokens: 4096,
+          max: 4096,
+          context_tokens: 32768,
           reserved_input_tokens: 1500,
           safety_margin_tokens: 128
         },
         final_output_tokens: {
           min: 256,
-          max: 3072,
-          context_tokens: 4096,
+          max: 8192,
+          context_tokens: 32768,
           reserved_input_tokens: 768,
           safety_margin_tokens: 192
         }
@@ -91,7 +91,7 @@ describe("workspace model output settings", () => {
     expect(() => updateModelOutputSettings({ workspaceModelSettings: [] }, {
       ...base,
       finalOutputTokens: 9000
-    })).toThrow("final_output_tokens must be between 256 and 3072");
+    })).toThrow("final_output_tokens must be between 256 and 8192");
     expect(() => updateModelOutputSettings({ workspaceModelSettings: [] }, {
       ...base,
       reason: ""

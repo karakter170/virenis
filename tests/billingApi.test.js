@@ -322,6 +322,8 @@ describe("run charging and transparency", () => {
     process.env.APP_MAX_ACTIVE_RUNS_PER_USER = "100";
     process.env.APP_MAX_ACTIVE_RUNS_PER_WORKSPACE = "100";
     process.env.APP_MAX_ACTIVE_RUNS_GLOBAL = "100";
+    // Fund all 30 simultaneous worst-case 32K-context, 16-route reservations.
+    process.env.APP_BILLING_WELCOME_CREDITS = "5000";
     await startApp({ autoRun: false });
     const sessions = await Promise.all(Array.from({ length: 30 }, (_, index) => request(app)
       .post("/api/chat/sessions")
@@ -339,7 +341,7 @@ describe("run charging and transparency", () => {
     const reservations = stored.billingReservations.filter((reservation) => reservation.account_id === account.account_id);
     expect(reservations).toHaveLength(30);
     expect(new Set(reservations.map((reservation) => reservation.run_id)).size).toBe(30);
-    expect(account.available_micros + account.reserved_micros).toBe(1_000_000_000);
+    expect(account.available_micros + account.reserved_micros).toBe(5_000_000_000);
     expect(account.reserved_micros).toBe(reservations.reduce((sum, reservation) => sum + reservation.authorized_micros, 0));
     expect(verifyBillingState(stored)).toEqual({ valid: true, errors: [] });
   });

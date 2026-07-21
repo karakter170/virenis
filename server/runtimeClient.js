@@ -26,11 +26,10 @@ export const RUNTIME_PLAN_CONTRACT_VERSIONS = Object.freeze([
 // changes while retaining a strict parser bound.
 const MAX_RUNTIME_STREAM_HEARTBEATS = 512;
 const MAX_RUNTIME_STREAM_EVENTS = MAX_RUNTIME_STREAM_HEARTBEATS + 2;
-// The Runtime can add up to 24 explicitly selected specialists plus bounded
-// dependency/resource routes. Its public stream contract therefore permits
-// 48 total steps; keeping the browser parser at 24 falsely rejected valid
-// dependency-expanded plans.
-const MAX_RUNTIME_STREAM_PLAN_STEPS = 48;
+// A team contributes at most 16 selected specialists. Runtime may add up to
+// 24 separately authorized dependency/resource routes, so the public stream
+// parser accepts the resulting 40-step hard ceiling.
+const MAX_RUNTIME_STREAM_PLAN_STEPS = 40;
 const MAX_RUNTIME_STREAM_TASK_CHARS = 600;
 const MAX_RUNTIME_STREAM_PLAN_EVENT_BYTES = 256 * 1024;
 const MAX_RUNTIME_STREAM_HEARTBEAT_BYTES = 1024;
@@ -1609,6 +1608,13 @@ export async function registerRuntimeAgent(agent) {
     "sources",
     "policies",
     "workflow_profile",
+    "agent_contract",
+    "routing",
+    "memory",
+    "permissions",
+    "lifecycle",
+    "enabled",
+    "ready",
     "stage",
     "source_text",
     "overwrite",
@@ -1637,6 +1643,12 @@ export async function updateRuntimeAgent(agentId, patch) {
     "sources",
     "policies",
     "workflow_profile",
+    "agent_contract",
+    "routing",
+    "memory",
+    "permissions",
+    "lifecycle",
+    "ready",
     "stage",
     "enabled",
     "source_text",
@@ -1658,7 +1670,7 @@ const RUNTIME_FLAT_POLICY_KEYS = [
   "citation_policy",
   "escalation_policy"
 ];
-const RUNTIME_WORKFLOW_RESPONSE_STYLES = new Set(["direct", "thorough", "careful"]);
+const RUNTIME_WORKFLOW_RESPONSE_STYLES = new Set(["direct", "thorough", "careful", "custom"]);
 const RUNTIME_WORKFLOW_TONES = new Set([
   "calm", "clear", "concise", "direct", "diplomatic", "educational", "empathetic",
   "formal", "friendly", "neutral", "objective", "patient", "persuasive", "practical",
