@@ -3295,6 +3295,9 @@ function runtimeOutputToRunStep({ run_id, output, parallel, step = null, failure
     failure_observability_admin_only: failed
       ? runtimeRouteFailureObservability(output)
       : null,
+    execution_error_admin_only: failed
+      ? normalizeArtifactValue(output.execution_error_admin_only || output.execution_error || null)
+      : null,
     raw_text_admin_only: reused ? "" : output.raw_text || output.text || "",
     prompt_preview_admin_only: reused ? "" : output.prompt_preview || "",
     started_at: nowIso(),

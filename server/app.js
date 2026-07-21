@@ -6809,6 +6809,7 @@ function redactRunStepForRequest(step, req) {
     prompt_preview_admin_only: _promptPreview,
     model_calls_admin_only: _modelCalls,
     failure_observability_admin_only: _failureObservability,
+    execution_error_admin_only: _executionError,
     agent_reasoning: _agentReasoning,
     approved_sources: _approvedSources,
     ...safeStep

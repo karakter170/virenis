@@ -99,6 +99,11 @@ import {
   sseRecoveryDelay,
   workflowPollDelay
 } from "./chatLifecycle.js";
+import {
+  answerContributorReferences,
+  copyableAssistantAnswer,
+  prepareAssistantAnswer
+} from "./answerPresentation.js";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const UPLOAD_REQUEST_TIMEOUT_MS = 120_000;
@@ -668,6 +673,7 @@ function Workspace({ onHome, onSignedOut }) {
   const [resourcesOpen, setResourcesOpen] = useState(false);
   const [resourceView, setResourceView] = useState("agents");
   const [detailsRunId, setDetailsRunId] = useState(null);
+  const [detailsReference, setDetailsReference] = useState(null);
   const [uploadOpen, setUploadOpen] = useState(false);
   const [uploadScope, setUploadScope] = useState("knowledge");
   const [customMcpOpen, setCustomMcpOpen] = useState(false);
@@ -1621,7 +1627,8 @@ function Workspace({ onHome, onSignedOut }) {
     }
   }
 
-  async function openRunDetails(runId) {
+  async function openRunDetails(runId, reference = null) {
+    setDetailsReference(reference);
     setDetailsRunId(runId);
     if (!runsById[runId]?.expert_outputs) {
       await fetchRun(runId, { hydrateContracts: true }).catch((detailsError) => setError(friendlyError(detailsError)));
@@ -2587,7 +2594,11 @@ function Workspace({ onHome, onSignedOut }) {
           contractsById={contractsById}
           canWrite={canWrite}
           isAdmin={auth?.is_admin === true}
-          onClose={() => setDetailsRunId(null)}
+          focusReference={detailsReference}
+          onClose={() => {
+            setDetailsRunId(null);
+            setDetailsReference(null);
+          }}
           onCreateOutcome={() => {
             setDetailsRunId(null);
             setOutcomeEditorRun(detailsRun);
@@ -3313,17 +3324,32 @@ export function ChatMessage({
   onProgressiveRenderProgress = () => undefined
 }) {
   const isAssistant = message.role === "assistant";
+  const inlineSources = isAssistant ? prepareAssistantAnswer(message.content, run, agents).references : new Map();
+  const inlineAgentIds = new Set([...inlineSources.values()].map((reference) => reference.agentId).filter(Boolean));
+  const contributorSources = isAssistant
+    ? answerContributorReferences(run, agents).filter((reference) => !inlineAgentIds.has(reference.agentId))
+    : [];
   return (
     <article className={`message ${message.role}`}>
       <div className="message-content">
         {isAssistant
           ? <ProgressiveFormattedText
               text={message.content}
+              run={run}
+              agents={agents}
+              onReference={(reference) => onDetails(message.run_id, reference)}
               active={progressivelyRender}
               onComplete={onProgressiveRenderComplete}
               onProgress={onProgressiveRenderProgress}
             />
           : message.content}
+        {isAssistant && message.run_id && contributorSources.length > 0 && (
+          <AnswerSourceStrip
+            references={contributorSources}
+            onOpen={(reference) => onDetails(message.run_id, reference)}
+            onOpenAll={() => onDetails(message.run_id)}
+          />
+        )}
         {message.kind === "workflow_draft" && workflow && (
           <WorkflowDraftCard
             workflow={workflow}
@@ -3345,7 +3371,7 @@ export function ChatMessage({
               <RunReceipt run={run} agents={agents} onClick={() => onDetails(message.run_id)} />
             )}
             <div className="answer-actions" aria-label="Answer actions">
-              <IconButton label="Copy answer" compact onClick={() => onCopy(message.content)}>
+              <IconButton label="Copy answer" compact onClick={() => onCopy(copyableAssistantAnswer(message.content, run, agents))}>
                 <Copy size={16} />
               </IconButton>
               <IconButton
@@ -3369,6 +3395,25 @@ export function ChatMessage({
         </div>
       )}
     </article>
+  );
+}
+
+export function AnswerSourceStrip({ references = [], onOpen = () => undefined, onOpenAll = () => undefined }) {
+  const visible = references.slice(0, 6);
+  const hiddenCount = Math.max(0, references.length - visible.length);
+  if (!visible.length) return null;
+  return (
+    <div className="answer-source-strip" aria-label="Answer sources">
+      <small>Answer sources</small>
+      <div>
+        {visible.map((reference) => (
+          <AnswerSourceControl key={reference.id} reference={reference} onOpen={onOpen} />
+        ))}
+        {hiddenCount > 0 && (
+          <button type="button" className="answer-source-more" onClick={onOpenAll}>+{hiddenCount} more</button>
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -3717,7 +3762,28 @@ function workflowStatusCopy(status, { sourcePhase = false } = {}) {
   return { label: sourcePhase ? "Source check · review required" : "Draft · review required", tone: "draft" };
 }
 
-export function FormattedText({ text }) {
+export function AnswerSourceControl({ reference, onOpen = () => undefined }) {
+  return (
+    <button
+      type="button"
+      className="answer-source-control"
+      aria-label={`Open answer source: ${reference.title}`}
+      onClick={() => onOpen(reference)}
+    >
+      <BookOpen size={13} aria-hidden="true" />
+      <span>{reference.label}</span>
+      <span className="answer-source-popover" role="tooltip">
+        <strong>{reference.title}</strong>
+        <small>{reference.kind === "document" ? "Document source" : reference.detail}</small>
+        {reference.summary && <span>{reference.summary}</span>}
+        <em>Open source details</em>
+      </span>
+    </button>
+  );
+}
+
+export function FormattedText({ text, run = null, agents = [], onReference = () => undefined }) {
+  const presentation = prepareAssistantAnswer(text, run, agents);
   return (
     <div className="formatted-text">
       <ReactMarkdown
@@ -3726,11 +3792,15 @@ export function FormattedText({ text }) {
         skipHtml
         urlTransform={safeMarkdownUrl}
         components={{
-          a: ({ children, href, node: _node, ...props }) => <a {...props} href={href} target="_blank" rel="noreferrer">{children}</a>,
+          a: ({ children, href, node: _node, ...props }) => {
+            const reference = presentation.references.get(href);
+            if (reference) return <AnswerSourceControl reference={reference} onOpen={onReference} />;
+            return <a {...props} href={href} target="_blank" rel="noreferrer">{children}</a>;
+          },
           img: () => null
         }}
       >
-        {String(text || "").replace(/\r\n?/g, "\n")}
+        {presentation.markdown}
       </ReactMarkdown>
     </div>
   );
@@ -3749,6 +3819,9 @@ export function progressiveRevealPlan(characterCount) {
 
 export function ProgressiveFormattedText({
   text,
+  run = null,
+  agents = [],
+  onReference = () => undefined,
   active = false,
   onComplete = () => undefined,
   onProgress = () => undefined
@@ -3798,7 +3871,12 @@ export function ProgressiveFormattedText({
   return (
     <div className={`progressive-answer ${streaming ? "streaming" : "complete"}`}>
       <div aria-hidden={streaming ? "true" : undefined}>
-        <FormattedText text={normalized.slice(0, visibleCharacters)} />
+        <FormattedText
+          text={normalized.slice(0, visibleCharacters)}
+          run={run}
+          agents={agents}
+          onReference={onReference}
+        />
       </div>
       {streaming && <span className="sr-only" role="status">{normalized}</span>}
     </div>
@@ -7397,6 +7475,7 @@ export function RunDetailsSheet({
   contractsById,
   canWrite,
   isAdmin = false,
+  focusReference = null,
   onClose,
   onCreateOutcome,
   onSettleOutcome,
@@ -7405,7 +7484,9 @@ export function RunDetailsSheet({
   onRefreshTracked,
   onRunFresh
 }) {
-  const [view, setView] = useState("agents");
+  const [activeReference, setActiveReference] = useState(focusReference);
+  const focusedView = activeReference?.kind === "document" ? "sources" : "agents";
+  const [view, setView] = useState(focusedView);
   const userSelectedViewRef = useRef(false);
   const viewedRunIdRef = useRef(run?.run_id || null);
   const routeSelections = new Map((run?.plan?.routing?.selected || []).map((item) => [item.adapter, item]));
@@ -7420,6 +7501,16 @@ export function RunDetailsSheet({
     }
     if (!userSelectedViewRef.current) setView("agents");
   }, [run?.run_id]);
+
+  useEffect(() => {
+    setActiveReference(focusReference);
+  }, [focusReference]);
+
+  useEffect(() => {
+    if (!activeReference?.id) return;
+    userSelectedViewRef.current = false;
+    setView(activeReference.kind === "document" ? "sources" : "agents");
+  }, [activeReference?.id, activeReference?.kind]);
 
   useEffect(() => {
     if (!isAdmin && view === "activity") setView("agents");
@@ -7444,6 +7535,15 @@ export function RunDetailsSheet({
               {isAdmin && <button type="button" aria-pressed={view === "activity"} onClick={() => selectView("activity")}>Activity</button>}
             </div>
 
+            {activeReference && (
+              <aside className="answer-source-summary" aria-label="Answer source summary">
+                <span>{activeReference.kind === "document" ? "Document source" : activeReference.kind === "request" ? "Conversation source" : "Specialist source"}</span>
+                <strong>{activeReference.title}</strong>
+                {activeReference.detail && <small>{activeReference.detail}</small>}
+                {activeReference.summary && <p>{activeReference.summary}</p>}
+              </aside>
+            )}
+
             {view === "agents" && (
               <section className="detail-section answer-team-view" aria-labelledby="used-agents-heading">
                 <div className="section-heading compact-heading">
@@ -7456,8 +7556,16 @@ export function RunDetailsSheet({
                     const resolvedInputs = route.consumption_validation?.resolved_contract_inputs || [];
                     const producedOutputs = route.artifact_validation?.produced
                       || (route.handoff_artifacts || []).map((artifact) => artifact.name || artifact.artifact).filter(Boolean);
+                    const routeFocused = !["document", "request"].includes(activeReference?.kind) && (
+                      (activeReference?.stepId && activeReference.stepId === (route.step_id || route.id))
+                      || (activeReference?.agentId && activeReference.agentId === route.adapter)
+                    );
                     return (
-                      <details className="detail-row" key={route.step_id || route.adapter}>
+                      <details
+                        className={`detail-row ${routeFocused ? "source-focused" : ""}`.trim()}
+                        key={`${route.step_id || route.adapter}:${activeReference?.id || "all"}`}
+                        open={routeFocused || undefined}
+                      >
                         <summary>
                           <span className="status-dot ready" aria-hidden="true" />
                           <span>
@@ -7472,7 +7580,7 @@ export function RunDetailsSheet({
                           {route.domain_answer && (
                             <div className="agent-full-output">
                               <strong>Specialist result</strong>
-                              <FormattedText text={route.domain_answer} />
+                              <FormattedText text={route.domain_answer} run={run} agents={agents} onReference={setActiveReference} />
                             </div>
                           )}
                           {resolvedInputs.length > 0 && (
@@ -7532,7 +7640,14 @@ export function RunDetailsSheet({
                 </div>
                 <div className="detail-list">
                   {(run.sources || []).map((source, index) => (
-                    <div className="source-row" key={source.citation_id || source.chunk_id || index}>
+                    <div
+                      className={`source-row ${activeReference?.kind === "document" && (
+                        activeReference.source?.chunk_id === source.chunk_id
+                        || activeReference.token === source.chunk_id
+                        || activeReference.token === source.citation_id
+                      ) ? "source-focused" : ""}`.trim()}
+                      key={source.citation_id || source.chunk_id || index}
+                    >
                       <div>
                         <strong>{source.title || "Source"}</strong>
                         <span>{[source.page ? `Page ${source.page}` : "", source.chunk_id].filter(Boolean).join(" · ")}</span>

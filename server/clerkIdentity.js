@@ -1318,6 +1318,7 @@ function safeAccountExportRunStep(step) {
     raw_text_admin_only: _rawText,
     prompt_preview_admin_only: _promptPreview,
     model_calls_admin_only: _modelCalls,
+    execution_error_admin_only: _executionError,
     approved_sources: _approvedSources,
     ...safe
   } = step || {};

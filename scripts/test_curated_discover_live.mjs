@@ -61,6 +61,8 @@ const requestedTeams = new Set(
 const CASES = requestedTeams.size
   ? ALL_CASES.filter((scenario) => requestedTeams.has(scenario.team.toLowerCase()))
   : ALL_CASES;
+const promptOverride = String(process.env.CURATED_LIVE_PROMPT || "").trim();
+if (promptOverride && CASES.length === 1) CASES[0] = { ...CASES[0], prompt: promptOverride };
 const MANAGED_ENV = [
   "NODE_ENV",
   "WEB_STORE_DRIVER",
@@ -246,6 +248,7 @@ async function main() {
             status: output.status,
             failure: output.failure,
             failure_observability: output.failure_observability_admin_only,
+            execution_error: output.execution_error_admin_only,
             output_contract: output.output_contract,
             expected_outputs: output.outcome_validation?.expected_outputs,
             domain_answer_chars: String(output.domain_answer || "").length,
@@ -276,6 +279,45 @@ async function main() {
       requireCondition(leadOutput?.handoff_artifacts?.some((artifact) => artifact.name === scenario.output && artifact.verified === true), `${scenario.team} lead did not produce ${scenario.output}`);
       requireCondition(leadOutput?.consumption_validation?.missing_from_upstream?.length === 0, `${scenario.team} lead missed an upstream handoff`);
       requireCondition(run.usage_receipt?.provider_reported === true && run.usage_receipt.total_tokens > 0, `${scenario.team} lacks provider-reported GPU usage`);
+
+      if (process.env.CURATED_LIVE_INSPECT_OUTPUTS === "1") {
+        const compactInspection = process.env.CURATED_LIVE_INSPECT_COMPACT === "1";
+        console.log(JSON.stringify({
+          stage: "agent_output_inspection",
+          team: scenario.team,
+          query: scenario.prompt,
+          outputs: run.expert_outputs.map((output) => ({
+            step_id: output.step_id,
+            title: titlesById.get(output.adapter) || output.adapter,
+            task: output.task,
+            output_contract: output.output_contract,
+            domain_answer: compactInspection
+              ? String(output.domain_answer || "").slice(0, 2_000)
+              : output.domain_answer,
+            presentation: {
+              starts_with_schema_envelope: /^\s*[a-z][a-z0-9_]*(?:answer|brief|framework|ledger|plan|platform|recommendation|shortlist|strategy|system)\s*:\s*(?:\{|$)/i.test(String(output.domain_answer || "")),
+              has_markdown_structure: /(^|\n)#{1,6}\s+\S/.test(String(output.domain_answer || "")),
+              contains_raw_runtime_id: /\b(?:route:s\d+:[a-f0-9]+|s\d+:[a-z][a-z0-9_]*:[a-f0-9]+)\b/i.test(String(output.domain_answer || ""))
+            },
+            artifacts: (output.handoff_artifacts || []).map((artifact) => ({
+              artifact_id: artifact.artifact_id,
+              name: artifact.name,
+              value: compactInspection ? undefined : artifact.value,
+              verified: artifact.verified
+            })),
+            source_validation: output.source_validation,
+            artifact_validation: output.artifact_validation,
+            consumption_validation: output.consumption_validation
+          })),
+          final_answer: compactInspection
+            ? String(run.final_answer || "").slice(0, 6_000)
+            : run.final_answer,
+          final_presentation: {
+            starts_with_schema_envelope: /^\s*[a-z][a-z0-9_]*(?:answer|brief|framework|ledger|plan|platform|recommendation|shortlist|strategy|system)\s*:\s*(?:\{|$)/i.test(String(run.final_answer || "")),
+            has_markdown_structure: /(^|\n)#{1,6}\s+\S/.test(String(run.final_answer || ""))
+          }
+        }, null, 2));
+      }
 
       proofs.push({
         team: scenario.team,
