@@ -5,6 +5,7 @@ import request from "supertest";
 import { buildPublishableKey } from "@clerk/shared/keys";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createApp } from "../server/app.js";
+import { processLocalChatRun } from "./fixtures/agentRuntimeSimulator.js";
 import {
   clerkAuthorizedParties,
   requireAuthorizedClerkBrowserOrigin,
@@ -31,9 +32,9 @@ const ENV_KEYS = [
   "APP_SSE_MAX_LIFETIME_MS",
   "PORT",
   "WEB_STORE_DRIVER",
-  "TCAR_ENGINE_MODE",
-  "TCAR_RUNTIME_API_URL",
-  "TCAR_RUNTIME_API_KEY"
+  "AGENT_RUNTIME_MODE",
+  "AGENT_RUNTIME_API_URL",
+  "AGENT_RUNTIME_API_KEY"
 ];
 
 let previousEnv;
@@ -45,7 +46,7 @@ beforeEach(async () => {
   previousEnv = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]]));
   process.env.APP_IDENTITY_PROVIDER = "clerk";
   process.env.WEB_STORE_DRIVER = "json";
-  process.env.TCAR_ENGINE_MODE = "simulator";
+  process.env.AGENT_RUNTIME_MODE = "simulator";
   for (const key of [
     "APP_AUTH_ADMIN_EMAILS",
     "APP_CLERK_ADMIN_USER_IDS",
@@ -61,8 +62,8 @@ beforeEach(async () => {
     "APP_SSE_HEARTBEAT_MS",
     "APP_SSE_MAX_LIFETIME_MS",
     "PORT",
-    "TCAR_RUNTIME_API_URL",
-    "TCAR_RUNTIME_API_KEY"
+    "AGENT_RUNTIME_API_URL",
+    "AGENT_RUNTIME_API_KEY"
   ]) delete process.env[key];
   tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "virenis-clerk-"));
   fake = createFakeClerk();
@@ -84,6 +85,7 @@ async function startApp(adapter = fake.adapter, options = {}) {
     uploadRoot: path.join(tmpDir, "uploads"),
     autoRun: false,
     clerkAdapter: adapter,
+    ...(process.env.AGENT_RUNTIME_MODE === "real" ? {} : { chatProcessor: processLocalChatRun }),
     ...options
   });
   return app;
@@ -726,9 +728,9 @@ describe("Clerk identity integration", () => {
   });
 
   it("drains background workflow activation, rejects its post-Runtime commit, and leaves no orphan during deletion", async () => {
-    process.env.TCAR_ENGINE_MODE = "real";
-    process.env.TCAR_RUNTIME_API_URL = "http://runtime.identity-race.test";
-    process.env.TCAR_RUNTIME_API_KEY = "identity-workflow-race-test-key";
+    process.env.AGENT_RUNTIME_MODE = "real";
+    process.env.AGENT_RUNTIME_API_URL = "http://runtime.identity-race.test";
+    process.env.AGENT_RUNTIME_API_KEY = "identity-workflow-race-test-key";
     fake.addUser({
       id: "user_delete_workflow_race",
       email: "delete-workflow-race@example.com",

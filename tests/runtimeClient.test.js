@@ -16,17 +16,17 @@ import {
 } from "../server/runtimeClient.js";
 
 const ENVIRONMENT_KEYS = [
-  "TCAR_RUNTIME_API_URL",
-  "TCAR_RUNTIME_API_KEY",
-  "TCAR_ENGINE_MODE",
-  "TCAR_RUNTIME_HEALTH_TIMEOUT_MS",
-  "TCAR_RUNTIME_AGENT_LIST_TIMEOUT_MS",
-  "TCAR_RUNTIME_CONNECT_TIMEOUT_MS",
-  "TCAR_RUNTIME_HEADER_TIMEOUT_MS",
-  "TCAR_RUNTIME_BODY_IDLE_TIMEOUT_MS",
-  "TCAR_RUNTIME_MAX_RESPONSE_BYTES",
-  "TCAR_RUNTIME_WORKFLOW_TIMEOUT_MS",
-  "TCAR_RUNTIME_CONTINUATION_TIMEOUT_MS"
+  "AGENT_RUNTIME_API_URL",
+  "AGENT_RUNTIME_API_KEY",
+  "AGENT_RUNTIME_MODE",
+  "AGENT_RUNTIME_HEALTH_TIMEOUT_MS",
+  "AGENT_RUNTIME_AGENT_LIST_TIMEOUT_MS",
+  "AGENT_RUNTIME_CONNECT_TIMEOUT_MS",
+  "AGENT_RUNTIME_HEADER_TIMEOUT_MS",
+  "AGENT_RUNTIME_BODY_IDLE_TIMEOUT_MS",
+  "AGENT_RUNTIME_MAX_RESPONSE_BYTES",
+  "AGENT_RUNTIME_WORKFLOW_TIMEOUT_MS",
+  "AGENT_RUNTIME_CONTINUATION_TIMEOUT_MS"
 ];
 const originalEnvironment = Object.fromEntries(
   ENVIRONMENT_KEYS.map((key) => [key, process.env[key]])
@@ -41,7 +41,7 @@ afterEach(async () => {
   }
 });
 
-describe("TCAR runtime HTTP transport", () => {
+describe("Agent Runtime HTTP transport", () => {
   it("uses dedicated runtime contracts for workflow composition and tool continuation", async () => {
     const observed = [];
     const runtime = await startHttpServer(async (incoming, response) => {
@@ -52,8 +52,8 @@ describe("TCAR runtime HTTP transport", () => {
         : { content: "Continued safely." }));
     });
     configureRuntime(runtime.url, {
-      TCAR_RUNTIME_WORKFLOW_TIMEOUT_MS: "2000",
-      TCAR_RUNTIME_CONTINUATION_TIMEOUT_MS: "2000"
+      AGENT_RUNTIME_WORKFLOW_TIMEOUT_MS: "2000",
+      AGENT_RUNTIME_CONTINUATION_TIMEOUT_MS: "2000"
     });
     const executionContext = {
       run_id: "run_contract",
@@ -76,6 +76,10 @@ describe("TCAR runtime HTTP transport", () => {
       content: observationContent,
       content_digest: crypto.createHash("sha256").update(observationContent).digest("hex")
     }];
+    const workflowContract = {
+      contract_version: "virenis-workflow-semantic-contract-v1",
+      providers: [{ provider_id: "gmail", access: "read" }]
+    };
     await expect(composeRuntimeWorkflow({
       command: "workflow",
       mode: "workflow",
@@ -85,6 +89,9 @@ describe("TCAR runtime HTTP transport", () => {
       conversation_context: [{ tag: "context", content: "Keep it concise." }],
       composition_dependencies: compositionDependencies,
       source_observations: sourceObservations,
+      composition_phase: "source_informed_design",
+      workflow_contract: workflowContract,
+      workflow_contract_digest: "sha256:contract-proof",
       execution_context: executionContext
     })).resolves.toEqual({ title: "Composed", nodes: [] });
     await expect(continueRuntimeConversation({
@@ -108,6 +115,9 @@ describe("TCAR runtime HTTP transport", () => {
           conversation_context: [{ tag: "context", content: "Keep it concise." }],
           composition_dependencies: compositionDependencies,
           source_observations: sourceObservations,
+          composition_phase: "source_informed_design",
+          workflow_contract: workflowContract,
+          workflow_contract_digest: "sha256:contract-proof",
           execution_context: executionContext
         }
       },
@@ -199,10 +209,10 @@ describe("TCAR runtime HTTP transport", () => {
       response.end(JSON.stringify({ ok: true, body, api_key: request.headers["x-tcar-api-key"] }));
     });
     configureRuntime(runtime.url, {
-      TCAR_RUNTIME_API_KEY: "runtime-test-key",
-      TCAR_RUNTIME_CONNECT_TIMEOUT_MS: "100",
-      TCAR_RUNTIME_HEADER_TIMEOUT_MS: "200",
-      TCAR_RUNTIME_BODY_IDLE_TIMEOUT_MS: "100"
+      AGENT_RUNTIME_API_KEY: "runtime-test-key",
+      AGENT_RUNTIME_CONNECT_TIMEOUT_MS: "100",
+      AGENT_RUNTIME_HEADER_TIMEOUT_MS: "200",
+      AGENT_RUNTIME_BODY_IDLE_TIMEOUT_MS: "100"
     });
 
     const result = await runtimeRequest("/chat/execute", {
@@ -225,10 +235,10 @@ describe("TCAR runtime HTTP transport", () => {
       response.end(JSON.stringify({ ok: true, agents: [] }));
     });
     configureRuntime(runtime.url, {
-      TCAR_RUNTIME_HEALTH_TIMEOUT_MS: "10",
-      TCAR_RUNTIME_AGENT_LIST_TIMEOUT_MS: "100",
-      TCAR_RUNTIME_CONNECT_TIMEOUT_MS: "100",
-      TCAR_RUNTIME_HEADER_TIMEOUT_MS: "100"
+      AGENT_RUNTIME_HEALTH_TIMEOUT_MS: "10",
+      AGENT_RUNTIME_AGENT_LIST_TIMEOUT_MS: "100",
+      AGENT_RUNTIME_CONNECT_TIMEOUT_MS: "100",
+      AGENT_RUNTIME_HEADER_TIMEOUT_MS: "100"
     });
 
     await expect(fetchRuntimeAgents()).resolves.toEqual({ ok: true, agents: [] });
@@ -255,13 +265,13 @@ describe("TCAR runtime HTTP transport", () => {
       if (!response.destroyed) response.end("{}");
     });
     configureRuntime(runtime.url, {
-      TCAR_RUNTIME_CONNECT_TIMEOUT_MS: "100",
-      TCAR_RUNTIME_HEADER_TIMEOUT_MS: "30"
+      AGENT_RUNTIME_CONNECT_TIMEOUT_MS: "100",
+      AGENT_RUNTIME_HEADER_TIMEOUT_MS: "30"
     });
 
     await expect(runtimeRequest("/slow-headers", { timeoutMs: 500 })).rejects.toMatchObject({
       status: 504,
-      message: "TCAR runtime request timed out after 30ms."
+      message: "Agent Runtime request timed out after 30ms."
     });
     await waitForSocketsToClose(runtime.sockets);
   });
@@ -269,13 +279,13 @@ describe("TCAR runtime HTTP transport", () => {
   it("bounds DNS/TCP/TLS connection establishment separately", async () => {
     const runtime = await startTcpServer((socket) => socket.resume());
     configureRuntime(`https://127.0.0.1:${runtime.port}`, {
-      TCAR_RUNTIME_CONNECT_TIMEOUT_MS: "30",
-      TCAR_RUNTIME_HEADER_TIMEOUT_MS: "400"
+      AGENT_RUNTIME_CONNECT_TIMEOUT_MS: "30",
+      AGENT_RUNTIME_HEADER_TIMEOUT_MS: "400"
     });
 
     await expect(runtimeRequest("/tls-never-ready", { timeoutMs: 500 })).rejects.toMatchObject({
       status: 504,
-      message: "TCAR runtime request timed out after 30ms."
+      message: "Agent Runtime request timed out after 30ms."
     });
     await waitForSocketsToClose(runtime.sockets);
   });
@@ -288,14 +298,14 @@ describe("TCAR runtime HTTP transport", () => {
       if (!response.destroyed) response.end("true}");
     });
     configureRuntime(runtime.url, {
-      TCAR_RUNTIME_CONNECT_TIMEOUT_MS: "100",
-      TCAR_RUNTIME_HEADER_TIMEOUT_MS: "200",
-      TCAR_RUNTIME_BODY_IDLE_TIMEOUT_MS: "30"
+      AGENT_RUNTIME_CONNECT_TIMEOUT_MS: "100",
+      AGENT_RUNTIME_HEADER_TIMEOUT_MS: "200",
+      AGENT_RUNTIME_BODY_IDLE_TIMEOUT_MS: "30"
     });
 
     await expect(runtimeRequest("/stalled-body", { timeoutMs: 500 })).rejects.toMatchObject({
       status: 504,
-      message: "TCAR runtime request timed out after 30ms."
+      message: "Agent Runtime request timed out after 30ms."
     });
     await waitForSocketsToClose(runtime.sockets);
   });
@@ -310,14 +320,14 @@ describe("TCAR runtime HTTP transport", () => {
       if (!response.destroyed) response.end("null]}");
     });
     configureRuntime(runtime.url, {
-      TCAR_RUNTIME_CONNECT_TIMEOUT_MS: "50",
-      TCAR_RUNTIME_HEADER_TIMEOUT_MS: "50",
-      TCAR_RUNTIME_BODY_IDLE_TIMEOUT_MS: "50"
+      AGENT_RUNTIME_CONNECT_TIMEOUT_MS: "50",
+      AGENT_RUNTIME_HEADER_TIMEOUT_MS: "50",
+      AGENT_RUNTIME_BODY_IDLE_TIMEOUT_MS: "50"
     });
 
     await expect(runtimeRequest("/overall-timeout", { timeoutMs: 75 })).rejects.toMatchObject({
       status: 504,
-      message: "TCAR runtime request timed out after 75ms."
+      message: "Agent Runtime request timed out after 75ms."
     });
     await waitForSocketsToClose(runtime.sockets);
   });
@@ -328,12 +338,12 @@ describe("TCAR runtime HTTP transport", () => {
       response.end(JSON.stringify({ payload: "x".repeat(2048) }));
     });
     configureRuntime(runtime.url, {
-      TCAR_RUNTIME_MAX_RESPONSE_BYTES: "1024"
+      AGENT_RUNTIME_MAX_RESPONSE_BYTES: "1024"
     });
 
     await expect(runtimeRequest("/oversized", { timeoutMs: 500 })).rejects.toMatchObject({
       status: 502,
-      message: "TCAR runtime response exceeded the configured size limit."
+      message: "Agent Runtime response exceeded the configured size limit."
     });
     await waitForSocketsToClose(runtime.sockets);
   });
@@ -348,7 +358,7 @@ describe("TCAR runtime HTTP transport", () => {
       status: 502,
       code: "runtime_connection_reset",
       retryable: true,
-      message: "TCAR runtime connection closed unexpectedly."
+      message: "Agent Runtime connection closed unexpectedly."
     });
     await waitForSocketsToClose(runtime.sockets);
   });
@@ -526,42 +536,42 @@ describe("TCAR runtime HTTP transport", () => {
   });
 
   it("rejects invalid transport bounds before opening a socket", async () => {
-    process.env.TCAR_RUNTIME_API_URL = "http://127.0.0.1:1";
-    process.env.TCAR_RUNTIME_CONNECT_TIMEOUT_MS = "0";
+    process.env.AGENT_RUNTIME_API_URL = "http://127.0.0.1:1";
+    process.env.AGENT_RUNTIME_CONNECT_TIMEOUT_MS = "0";
 
     await expect(runtimeRequest("/invalid", { timeoutMs: 500 })).rejects.toThrow(
-      /TCAR_RUNTIME_CONNECT_TIMEOUT_MS must be an integer/
+      /AGENT_RUNTIME_CONNECT_TIMEOUT_MS must be an integer/
     );
   });
 
   it("rejects invalid transport bounds during real-runtime startup validation", () => {
-    process.env.TCAR_ENGINE_MODE = "real";
-    process.env.TCAR_RUNTIME_API_URL = "http://127.0.0.1:9000";
-    process.env.TCAR_RUNTIME_CONNECT_TIMEOUT_MS = "0";
+    process.env.AGENT_RUNTIME_MODE = "real";
+    process.env.AGENT_RUNTIME_API_URL = "http://127.0.0.1:9000";
+    process.env.AGENT_RUNTIME_CONNECT_TIMEOUT_MS = "0";
 
-    expect(() => requireRuntimeConfigured()).toThrow(/TCAR_RUNTIME_CONNECT_TIMEOUT_MS must be an integer/);
+    expect(() => requireRuntimeConfigured()).toThrow(/AGENT_RUNTIME_CONNECT_TIMEOUT_MS must be an integer/);
   });
 
   it("validates workflow and continuation Runtime budgets at startup", () => {
-    process.env.TCAR_ENGINE_MODE = "real";
-    process.env.TCAR_RUNTIME_API_URL = "http://127.0.0.1:9000";
-    process.env.TCAR_RUNTIME_WORKFLOW_TIMEOUT_MS = "0";
-    expect(() => requireRuntimeConfigured()).toThrow(/TCAR_RUNTIME_WORKFLOW_TIMEOUT_MS must be an integer/);
-    delete process.env.TCAR_RUNTIME_WORKFLOW_TIMEOUT_MS;
-    process.env.TCAR_RUNTIME_CONTINUATION_TIMEOUT_MS = "1800001";
-    expect(() => requireRuntimeConfigured()).toThrow(/TCAR_RUNTIME_CONTINUATION_TIMEOUT_MS must be an integer/);
+    process.env.AGENT_RUNTIME_MODE = "real";
+    process.env.AGENT_RUNTIME_API_URL = "http://127.0.0.1:9000";
+    process.env.AGENT_RUNTIME_WORKFLOW_TIMEOUT_MS = "0";
+    expect(() => requireRuntimeConfigured()).toThrow(/AGENT_RUNTIME_WORKFLOW_TIMEOUT_MS must be an integer/);
+    delete process.env.AGENT_RUNTIME_WORKFLOW_TIMEOUT_MS;
+    process.env.AGENT_RUNTIME_CONTINUATION_TIMEOUT_MS = "1800001";
+    expect(() => requireRuntimeConfigured()).toThrow(/AGENT_RUNTIME_CONTINUATION_TIMEOUT_MS must be an integer/);
   });
 });
 
 function configureRuntime(url, values = {}) {
-  process.env.TCAR_RUNTIME_API_URL = url;
-  delete process.env.TCAR_RUNTIME_API_KEY;
-  delete process.env.TCAR_RUNTIME_HEALTH_TIMEOUT_MS;
-  delete process.env.TCAR_RUNTIME_AGENT_LIST_TIMEOUT_MS;
-  delete process.env.TCAR_RUNTIME_CONNECT_TIMEOUT_MS;
-  delete process.env.TCAR_RUNTIME_HEADER_TIMEOUT_MS;
-  delete process.env.TCAR_RUNTIME_BODY_IDLE_TIMEOUT_MS;
-  delete process.env.TCAR_RUNTIME_MAX_RESPONSE_BYTES;
+  process.env.AGENT_RUNTIME_API_URL = url;
+  delete process.env.AGENT_RUNTIME_API_KEY;
+  delete process.env.AGENT_RUNTIME_HEALTH_TIMEOUT_MS;
+  delete process.env.AGENT_RUNTIME_AGENT_LIST_TIMEOUT_MS;
+  delete process.env.AGENT_RUNTIME_CONNECT_TIMEOUT_MS;
+  delete process.env.AGENT_RUNTIME_HEADER_TIMEOUT_MS;
+  delete process.env.AGENT_RUNTIME_BODY_IDLE_TIMEOUT_MS;
+  delete process.env.AGENT_RUNTIME_MAX_RESPONSE_BYTES;
   for (const [key, value] of Object.entries(values)) process.env[key] = value;
 }
 

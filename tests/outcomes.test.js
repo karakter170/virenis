@@ -4,6 +4,7 @@ import path from "node:path";
 import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createApp } from "../server/app.js";
+import { processLocalChatRun } from "./fixtures/agentRuntimeSimulator.js";
 import { parseConfiguredApiTokens } from "../server/authConfig.js";
 import {
   correctOutcomeContract,
@@ -29,7 +30,11 @@ beforeEach(async () => {
   delete process.env.APP_API_TOKENS_JSON;
   delete process.env.VIRENIS_REALITY_RANK_MIN_VERIFIED_SAMPLES;
   tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "virenis-outcomes-"));
-  app = await createApp({ dbPath: path.join(tmpDir, "db.json"), uploadRoot: tmpDir });
+  app = await createApp({
+    dbPath: path.join(tmpDir, "db.json"),
+    uploadRoot: tmpDir,
+    chatProcessor: processLocalChatRun
+  });
 });
 
 afterEach(async () => {

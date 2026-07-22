@@ -6,6 +6,7 @@ import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { createApp } from "../server/app.js";
+import { processLocalChatRun } from "./fixtures/agentRuntimeSimulator.js";
 
 const TOKENS = {
   workspace_alice: { user_id: "alice", workspace_id: "tenant_shared", role: "user" },
@@ -117,7 +118,8 @@ beforeEach(async () => {
   app = await createApp({
     dbPath: path.join(tmpDir, "db.json"),
     uploadRoot: tmpDir,
-    workflowComposer: composer
+    workflowComposer: composer,
+    chatProcessor: processLocalChatRun
   });
 });
 
@@ -918,7 +920,8 @@ describe("agent workspaces", () => {
     app = await createApp({
       dbPath: path.join(tmpDir, "db.json"),
       uploadRoot: tmpDir,
-      workflowComposer: composer
+      workflowComposer: composer,
+      chatProcessor: processLocalChatRun
     });
 
     const storedRatings = app.locals.store.read().agentWorkspaceRatings.filter((rating) => (

@@ -6,6 +6,7 @@ import request from "supertest";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { createApp } from "../server/app.js";
+import { processLocalChatRun } from "./fixtures/agentRuntimeSimulator.js";
 
 const TOKEN = "curated_consumer";
 const ACTOR = { user_id: "curated-consumer", workspace_id: "tenant-curated-consumer", role: "user" };
@@ -109,15 +110,16 @@ beforeAll(async () => {
   previousEnvironment = {
     WEB_STORE_DRIVER: process.env.WEB_STORE_DRIVER,
     APP_API_TOKENS_JSON: process.env.APP_API_TOKENS_JSON,
-    TCAR_ENGINE_MODE: process.env.TCAR_ENGINE_MODE
+    AGENT_RUNTIME_MODE: process.env.AGENT_RUNTIME_MODE
   };
   process.env.WEB_STORE_DRIVER = "json";
   process.env.APP_API_TOKENS_JSON = JSON.stringify({ [TOKEN]: ACTOR });
-  process.env.TCAR_ENGINE_MODE = "mock";
+  process.env.AGENT_RUNTIME_MODE = "mock";
   tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "virenis-curated-e2e-"));
   app = await createApp({
     dbPath: path.join(tmpDir, "db.json"),
-    uploadRoot: path.join(tmpDir, "uploads")
+    uploadRoot: path.join(tmpDir, "uploads"),
+    chatProcessor: processLocalChatRun
   });
 });
 

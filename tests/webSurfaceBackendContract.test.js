@@ -62,7 +62,7 @@ const FEATURE_PROOF = [
   {
     feature: "human-readable Markdown, named sources, source preview, and answer-details panel",
     ui: "src/answerPresentation.js",
-    backend: "server/tcarEngine.js",
+    backend: "server/routeResultNormalizer.js",
     tests: ["tests/answerPresentation.test.js", "tests/productFeatures.test.js", "tests/runtimeStreaming.test.js"]
   },
   {
@@ -74,7 +74,7 @@ const FEATURE_PROOF = [
   {
     feature: "Runtime health, models, adoption, audit proof, validation, and metrics",
     ui: "src/App.jsx",
-    backend: "server/runtimeClient.js",
+    backend: "server/agentRuntimeClient.js",
     tests: ["tests/runtimeClient.test.js", "tests/runtimeAdoption.test.js", "tests/runtimeAuditReconciliation.test.js"]
   },
   {

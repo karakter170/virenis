@@ -17,7 +17,7 @@ import {
   CURATED_MARKETPLACE_TEAM_IDS,
   curatedMarketplaceTeams
 } from "../server/curatedMarketplace.js";
-import { configuredPlanGaps, planRoutes } from "../server/tcarEngine.js";
+import { configuredPlanGaps, planRoutes } from "./fixtures/agentRuntimeSimulator.js";
 
 const TOKENS = {
   curated_alice: {

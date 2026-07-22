@@ -1,12 +1,15 @@
 import crypto from "node:crypto";
 import { assertStoredDocumentIntegrity } from "./documents.js";
 import { agentRevision, normalizeSha256Digest } from "./outcomes.js";
-import { runtimeApiKey } from "./runtimeClient.js";
+import { runtimeApiKey } from "./agentRuntimeClient.js";
+import { readAgentRuntimeEnv } from "./agentRuntimeConfig.js";
+import { agentRuntimeOutputModelId } from "./agentRuntimeResponseCompatibility.js";
 import { makeId, nowIso } from "./store.js";
 
 export const WORLD_GRAPH_SCHEMA_VERSION = "virenis-world-graph-v2";
 export const WORLD_GRAPH_ENGINE_REVISION = "world-graph-engine-v7";
 export const WORLD_GRAPH_ROUTE_OUTCOME_CONTRACT_VERSION = "world-graph-route-outcome-v2";
+const WORLD_GRAPH_REPLAY_PLAN_CONTRACT_VERSION = "world-graph-replay-plan-v1";
 
 const WORLD_GRAPH_DIGEST_DOMAIN = "worldgraph-digest-v2\n";
 const WORLD_GRAPH_CAPSULE_ENCODING = "json-utf8-exact-v1";
@@ -23,18 +26,6 @@ const MAX_CAPSULE_BYTES = 2 * 1024 * 1024;
 const STORAGE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const DEFAULT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const REMOTE_MAX_AGE_MS = 30 * 60 * 1000;
-const STRONG_FRESHNESS_QUERY = /\b(?:currently|today|tonight|latest|right\s+now|at\s+the\s+moment|as\s+of\s+(?:today|now)|this\s+(?:week|month|quarter|year)|recently|most\s+recent)\b/i;
-const FACTUAL_RELATIVE_EVENT_QUERY = /\b(?:last\s+night(?:['’]s)?|yesterday(?:['’]s)?|tomorrow(?:['’]s)?|this\s+(?:morning|afternoon|evening|weekend)(?:['’]s)?)\b.{0,60}\b(?:game|match|election|vote|poll|result|score|weather|forecast|traffic|news|headline|earnings|market|price|outage|incident|release|schedule|flight|train|bus|coach|ferry|tram|subway|metro|departure|arrival)\b|\b(?:game|match|election|vote|poll|result|score|weather|forecast|traffic|news|headline|earnings|market|price|outage|incident|release|schedule|flight|train|bus|coach|ferry|tram|subway|metro|departure|arrival)\b.{0,60}\b(?:last\s+night|yesterday|tomorrow|this\s+(?:morning|afternoon|evening|weekend))\b/i;
-const HISTORICAL_CHANGE_QUERY = /\b(?:change(?:d|s)?|different|difference|evolve(?:d|s)?|evolution|develop(?:ed|s)?|progress(?:ed|ion)?|update(?:d|s)?|new)\b.{0,60}\bsince\s+(?:19|20)\d{2}\b|\bsince\s+(?:19|20)\d{2}\b.{0,80}\b(?:change(?:d|s)?|different|difference|evolve(?:d|s)?|evolution|develop(?:ed|s)?|progress(?:ed|ion)?|update(?:d|s)?|new|today|now|current|latest)\b|\bas\s+of\s+(?:19|20)\d{2}\b.{0,100}\b(?:what|how)\b.{0,40}\b(?:change(?:d|s)?|different|evolve(?:d|s)?|develop(?:ed|s)?|progress(?:ed)?|update(?:d|s)?)\b|\b(?:compare|comparison|difference|versus|vs\.?).{0,80}\b(?:19|20)\d{2}\b.{0,80}\b(?:today|now|current|latest)\b/i;
-const CONTEXTUAL_FRESHNESS_QUERY = /\bnewest\s+(?:stable\s+)?(?:version|release|node(?:\.js)?|python|java|go|rust|npm|runtime|framework|library|package|sdk|api|browser|operating\s+system|model)\b|\bcurrent\b.{0,80}\b(?:president|prime\s+minister|ceo|mayor|governor|leader|office[- ]?holder|weather|forecast|price|cost|value|exchange\s+rate|share|stock\s+price|score|standings|news|sales|market\s+share|version|release|status|availability|traffic|delay|departure|arrival)\b|\bwho\s+is\b.{0,80}\b(?:president|prime\s+minister|ceo|mayor|governor|leader|office[- ]?holder)\b|\b(?:what(?:'s|\s+is)|tell\s+me|give\s+me|show\s+me|check|find|get)\b.{0,80}\b(?:weather|forecast|price|cost|exchange\s+rate|share\s+price|stock\s+price|score|standings|news\s+headlines?|current\s+version|traffic|transit\s+status)\b|\bhow\s+much\b.{0,100}\b(?:cost|worth|price)\b|\b(?:EUR|USD|GBP|JPY|TRY|CAD|AUD)[ /-](?:EUR|USD|GBP|JPY|TRY|CAD|AUD)\b.{0,40}\b(?:rate|value|quote)?\b|\b(?:share|stock)\s+(?:price|value|quote)\b|\bexchange\s+rate\b|\bwhen\s+is\b.{0,100}\bnext\b.{0,80}\b(?:earnings|call|release|event)\b|\bnext\s+(?:train|bus|coach|flight|ferry|tram|subway|metro|departure|arrival)\b|\b(?:is|are)\s+(?:(?:the|my|our|your)\s+)?(?:gmail|google|github|slack|shopify|salesforce|stripe|notion|dropbox|zoom|jira|confluence|teams|outlook|icloud|aws|azure|cloudflare|openai|chatgpt|anthropic|claude|service|website|site|api|server|platform|app)(?:\s+service)?\s+(?:currently\s+)?(?:working|up|available|reachable|operational|down|offline)\b|\b(?:gmail|google|github|slack|shopify|salesforce|stripe|notion|dropbox|zoom|jira|confluence|teams|outlook|icloud|aws|azure|cloudflare|openai|chatgpt|anthropic|claude|service|website|site|api|server|platform|app)(?:\s+service)?\s+(?:is|are)\s+(?:currently\s+)?(?:working|up|available|reachable|operational|down|offline)\b|\bis\b.{0,80}\b(?:down|offline|operational)\b|\b(?:live|real[- ]?time)\b.{0,50}\b(?:data|status|result|score|price|quote|traffic|weather|feed)\b|\b(?:last\s+night(?:['’]s)?|yesterday(?:['’]s)?|tomorrow(?:['’]s)?)\b.{0,60}\b(?:game|match|election|vote|poll|result|score|weather|forecast|traffic|news|headline|earnings|market|price|outage|incident|release|schedule)\b|\b(?:game|match|election|vote|poll|result|score|weather|forecast|traffic|news|headline|earnings|market|price|outage|incident|release|schedule)\b.{0,60}\b(?:last\s+night|yesterday|tomorrow)\b/i;
-const MULTILINGUAL_VOLATILE_QUERY = /(?<!\p{L})(?:güncel|bugün|bugünkü|yarın|şu\s*anda|en\s*son|gerçek\s*zamanlı|ne\s+kadar|cumhurbaşkanı\s+kim|actualmente|hoy|ahora|reciente|aujourd'hui|maintenant|dernier|aktuell|heute|jetzt|neueste|hoje|agora|últim[oa]|hari\s+ini|sekarang|terbaru|сегодня|сейчас|последние|последний|последняя|اليوم|الآن|أحدث|今天|现在|最新|实时|今日|現在|リアルタイム|오늘|현재|최신|실시간)(?!\p{L})/iu;
-const FRESHNESS_FALSE_SENSE = /\b(?:score\s+(?:this|the)\s+(?:essay|answer|response)|breaking\s+changes?|real[- ]?time\s+(?:chat|system|architecture|application)|live\s+(?:music|concert|event)|stock\s+management|inventory\s+stock|news\s+article\s+(?:I\s+|we\s+)?(?:pasted|provided|attached)|(?:yesterday|tomorrow|last\s+night).{0,50}(?:poem|theme|story|sentence)|(?:poem|theme|story|sentence).{0,50}(?:yesterday|tomorrow|last\s+night)|tiempo\s+verbal)\b/gis;
-const VOLATILE_TOOLS = new Set([
-  "web_search", "market_data", "earthquake_feed", "document_search", "document_read",
-  "search_index", "policy_lookup", "news_search", "weather", "http_get", "url_fetch",
-  "browser", "repo_inspector", "repo_search", "repo_read", "repo_diff", "repo_patch",
-  "test_runner"
-]);
 // Availability of these tools is input-complete and deterministic. Their
 // actual receipts are still never replayed in v1. Every unknown/dynamic tool
 // is treated as mutable so a newly added integration fails closed by default.
@@ -42,7 +33,9 @@ const REPLAY_SAFE_TOOL_AVAILABILITY = new Set([
   "calculator", "finance_calculator", "math_solver", "data_table", "sql_runner",
   "document_search", "document_read", "search_index", "policy_lookup"
 ]);
-const EFFECTFUL_TOOL = /^(?:mcp_|gmail|shopify|send_|delete_|create_|update_|publish_|purchase_|write_)/i;
+const EVIDENCE_REQUIREMENTS = new Set([
+  "live_external", "supplied_context", "none", "unknown"
+]);
 
 function assertUnicodeScalarString(value) {
   const text = String(value);
@@ -448,44 +441,25 @@ function dependencyState(step, outputsByStep) {
   });
 }
 
-function queryRequestsFreshInformation(query, task = "") {
-  const rawValue = `${String(query || "")} ${String(task || "")}`
-    .replace(/\s+/g, " ")
-    .trim();
-  const value = rawValue.replace(FRESHNESS_FALSE_SENSE, " ");
-  return FACTUAL_RELATIVE_EVENT_QUERY.test(rawValue)
-    || HISTORICAL_CHANGE_QUERY.test(rawValue)
-    || STRONG_FRESHNESS_QUERY.test(value)
-    || CONTEXTUAL_FRESHNESS_QUERY.test(value)
-    || MULTILINGUAL_VOLATILE_QUERY.test(value);
-}
-
-function effectPolicy({ query, task = "", evidenceRequirement = "", agent, output = null }) {
-  const allowedTools = normalizedStrings(agent?.tools || output?.allowed_tools);
+function effectPolicy({ evidenceRequirement = "", agent, output = null }) {
+  const allowedTools = normalizedStrings([
+    ...(Array.isArray(agent?.tools) ? agent.tools : []),
+    ...(Array.isArray(output?.allowed_tools) ? output.allowed_tools : [])
+  ]);
   const executions = Array.isArray(output?.tool_executions) ? output.tool_executions : [];
-  const executedNames = executions.map((item) => String(item?.name || "")).filter(Boolean);
   const reasons = [];
-  const agentIdentity = [agent?.id, agent?.title, ...(agent?.routing_cues || [])].join(" ").toLowerCase();
-  const queryText = String(query || "");
-  const volatileSubject = queryText.toLowerCase().match(/\b(weather|price|stock|score|news|current|latest|live|recent)\b/)?.[1];
   const mutableToolAvailable = allowedTools.some((tool) => !REPLAY_SAFE_TOOL_AVAILABILITY.has(tool));
-  const evidenceClass = String(evidenceRequirement || "").trim().toLowerCase();
-  const explicitlyTimeSensitive = evidenceClass === "live_external"
-    || queryRequestsFreshInformation(queryText, task);
-  // A session controller marks uncertain external-state work explicitly. A
-  // mutable-tool route then fails closed without a second classifier/model
-  // call; stable or supplied-context work remains reusable.
-  const languageFreshnessUnknown = evidenceClass === "unknown" && mutableToolAvailable;
+  const rawEvidenceClass = String(evidenceRequirement || "").trim().toLowerCase();
+  const evidenceClass = EVIDENCE_REQUIREMENTS.has(rawEvidenceClass)
+    ? rawEvidenceClass
+    : "unknown";
+  // Natural-language intent belongs exclusively to the semantic controller.
+  // WorldGraph validates its evidence enum against declared tool capability
+  // metadata; it never reclassifies the request or task text.
   if (
-    (explicitlyTimeSensitive || languageFreshnessUnknown)
-    && (
-      mutableToolAvailable
-      || allowedTools.some((tool) => VOLATILE_TOOLS.has(tool))
-      || (volatileSubject && agentIdentity.includes(volatileSubject))
-    )
+    mutableToolAvailable
+    && (evidenceClass === "live_external" || evidenceClass === "unknown")
   ) reasons.push("time_sensitive_request");
-  if (executedNames.some((tool) => VOLATILE_TOOLS.has(tool))) reasons.push("live_or_mutable_tool_used");
-  if (executedNames.some((tool) => EFFECTFUL_TOOL.test(tool))) reasons.push("external_or_effectful_tool_used");
   if (executions.some((execution) => execution?.result?.approval_required === true)) reasons.push("approval_bound_action");
   if (executions.length && !reasons.includes("tool_result_requires_fresh_execution")) {
     // V1 intentionally does not replay even deterministic tool receipts. A
@@ -502,8 +476,8 @@ function effectPolicy({ query, task = "", evidenceRequirement = "", agent, outpu
   };
 }
 
-function replayPolicy({ query, task = "", evidenceRequirement = "", agent, output = null, documents = [] }) {
-  const policy = effectPolicy({ query, task, evidenceRequirement, agent, output });
+function replayPolicy({ evidenceRequirement = "", agent, output = null, documents = [] }) {
+  const policy = effectPolicy({ evidenceRequirement, agent, output });
   if (!sourceStateReplayable(agent, documents)) {
     policy.class = "volatile";
     policy.replayable = false;
@@ -570,8 +544,7 @@ function replayOutput(output = {}) {
     agent_content_digest: normalizeSha256Digest(output.agent_content_digest || output.adapter_digest),
     adapter_content_digest: normalizeSha256Digest(output.adapter_content_digest || output.adapter_digest),
     manifest_contract_digest: normalizeSha256Digest(output.manifest_contract_digest),
-    model_id: output.model_id || output.vllmModel || null,
-    vllmModel: output.vllmModel || output.model_id || null,
+    model_id: agentRuntimeOutputModelId(output),
     output_contract: output.output_contract || null
   };
   if (Buffer.byteLength(JSON.stringify(safe), "utf8") > MAX_REPLAY_BYTES) return null;
@@ -663,8 +636,6 @@ function inputEnvelope({ run, plan, step, agent, documents, sharedMemory, option
   const sourceState = sourceStateForAgent(agent, documents);
   const effectiveMemory = exactRepeatAntecedentMemory(query, sharedMemory);
   const routeEffectPolicy = replayPolicy({
-    query,
-    task: step?.task,
     evidenceRequirement: step?.evidence_requirement,
     agent,
     documents
@@ -821,7 +792,7 @@ function contestedArtifactIds(data) {
 }
 
 function maxAgeFor(_options = {}) {
-  return String(process.env.TCAR_ENGINE_MODE || "simulator").toLowerCase() === "real"
+  return String(readAgentRuntimeEnv(process.env, "AGENT_RUNTIME_MODE", "simulator")).toLowerCase() === "real"
     ? REMOTE_MAX_AGE_MS
     : DEFAULT_MAX_AGE_MS;
 }
@@ -1052,7 +1023,7 @@ export function recordWorldGraphRun({
   const outputByStep = new Map((outputs || []).map((output) => [output.step_id || output.id, output]));
   const decisionsByStep = new Map(decisions.map((item) => [item.step_id, item]));
   const recorded = [];
-  const realRuntime = String(process.env.TCAR_ENGINE_MODE || "simulator").toLowerCase() === "real";
+  const realRuntime = String(readAgentRuntimeEnv(process.env, "AGENT_RUNTIME_MODE", "simulator")).toLowerCase() === "real";
   const permittedReplayIds = new Set(Array.isArray(replayCandidateIds) ? replayCandidateIds : []);
   const recordTime = Date.parse(createdAt);
 
@@ -1095,8 +1066,6 @@ export function recordWorldGraphRun({
       runtimeComponentProvenance: runtimeComponentState
     });
     let actualEffect = replayPolicy({
-      query: run.query,
-      task: step?.task,
       evidenceRequirement: step?.evidence_requirement,
       agent,
       output,
@@ -1575,6 +1544,137 @@ function finalizeReplayPreparation(preparation, counts, agentReasons, eligibleAd
   return replayPreparationSummary(preparation);
 }
 
+function replayPlanStringList(value, maximum = 32, maxChars = 160) {
+  if (!Array.isArray(value) || value.length > maximum) return null;
+  const rows = [];
+  for (const item of value) {
+    if (typeof item !== "string") return null;
+    const normalized = boundedText(item, maxChars);
+    if (normalized && !rows.includes(normalized)) rows.push(normalized);
+  }
+  return rows;
+}
+
+function replayPlanCandidatesComplete(replayPlan, candidates) {
+  const steps = Array.isArray(replayPlan?.steps) ? replayPlan.steps : [];
+  if (!steps.length) return false;
+  const originRunId = String(replayPlan.origin_run_id || "");
+  return steps.every((step) => candidates.some((candidate) => (
+    String(candidate?.origin_run_id || "") === originRunId
+    && String(candidate?.origin_step_id || candidate?.replay_output?.step_id || candidate?.replay_output?.id || "") === String(step.id || "")
+    && String(candidate?.input_envelope?.adapter || "") === String(step.adapter || "")
+  )));
+}
+
+function replayPlanForCandidates(data, candidates) {
+  const runs = Array.isArray(data?.runs) ? data.runs : [];
+  const originIds = [...new Set(candidates.map((candidate) => String(candidate?.origin_run_id || "")).filter(Boolean))];
+  for (const originRunId of originIds) {
+    const originRun = runs.find((run) => String(run?.run_id || "") === originRunId);
+    const plan = originRun?.plan;
+    const steps = Array.isArray(plan?.steps) ? plan.steps : [];
+    const orchestrator = plan?.routing?.orchestrator;
+    const outcome = orchestrator?.outcome_contract;
+    if (
+      originRun?.status !== "completed"
+      || !steps.length
+      || steps.length > 16
+      || orchestrator?.decision !== "delegate"
+      || outcome?.compiler_authority !== "runtime"
+      || outcome?.status !== "covered"
+      || outcome?.route_admission_contract_version !== "session-route-admission-v1"
+    ) continue;
+    const projectedSteps = [];
+    let valid = true;
+    for (const rawStep of steps) {
+      if (!rawStep || typeof rawStep !== "object" || Array.isArray(rawStep)) {
+        valid = false;
+        break;
+      }
+      const id = boundedText(rawStep.id, 120);
+      const adapter = boundedText(rawStep.adapter, 300);
+      const task = boundedText(rawStep.task, 900);
+      const dependsOn = replayPlanStringList(rawStep.depends_on || [], 48, 120);
+      const expectedOutputs = replayPlanStringList(rawStep.expected_outputs || [], 32, 160);
+      const fulfills = replayPlanStringList(rawStep.fulfills || [], 24, 120);
+      const requiredTools = replayPlanStringList(rawStep.required_tools || [], 16, 120);
+      const evidenceRequirement = String(rawStep.evidence_requirement || "").trim().toLowerCase();
+      if (
+        !id || !adapter || !task
+        || !dependsOn || !expectedOutputs || !fulfills || !requiredTools
+        || !["live_external", "supplied_context", "none", "unknown"].includes(evidenceRequirement)
+      ) {
+        valid = false;
+        break;
+      }
+      const candidate = candidates.find((item) => (
+        String(item?.origin_run_id || "") === originRunId
+        && String(item?.origin_step_id || item?.replay_output?.step_id || item?.replay_output?.id || "") === id
+        && String(item?.input_envelope?.adapter || "") === adapter
+      ));
+      const routeContract = worldGraphRouteOutcomeContract(plan, rawStep);
+      if (
+        !candidate
+        || worldGraphDigest(candidate.input_envelope?.route_outcome_contract || null) !== worldGraphDigest(routeContract)
+        || String(candidate.input_envelope?.route_outcome_contract_digest || "") !== worldGraphDigest(routeContract)
+        || !worldGraphRouteOutputMatchesOutcomeContract(candidate.replay_output, plan, rawStep)
+      ) {
+        valid = false;
+        break;
+      }
+      const allowedSentinel = String(rawStep.allowed_terminal_sentinel || "").trim().toLowerCase();
+      projectedSteps.push({
+        id,
+        adapter,
+        task,
+        depends_on: dependsOn,
+        evidence_requirement: evidenceRequirement,
+        expected_outputs: expectedOutputs,
+        fulfills,
+        required_tools: requiredTools,
+        ...(allowedSentinel ? { allowed_terminal_sentinel: allowedSentinel } : {})
+      });
+    }
+    if (!valid || new Set(projectedSteps.map((step) => step.id)).size !== projectedSteps.length) continue;
+    const deliverables = (Array.isArray(outcome.deliverables) ? outcome.deliverables : []).slice(0, 24).map((row) => ({
+      id: boundedText(row?.id, 120),
+      title: boundedText(row?.title, 160),
+      description: boundedText(row?.description, 600),
+      required: row?.required !== false,
+      evidence_requirement: boundedText(row?.evidence_requirement || "unknown", 40),
+      required_outputs: replayPlanStringList(row?.required_outputs || [], 32, 160) || [],
+      controller_can_synthesize: row?.controller_can_synthesize === true
+    }));
+    if (deliverables.some((row) => !row.id)) continue;
+    const presentationMode = ["integrated", "role_labeled", "owner_verbatim"].includes(orchestrator.presentation_mode)
+      ? orchestrator.presentation_mode
+      : "integrated";
+    const requestedItemCount = Number.isInteger(orchestrator.requested_item_count)
+      ? Math.max(0, Math.min(orchestrator.requested_item_count, 100))
+      : 0;
+    const body = {
+      contract_version: WORLD_GRAPH_REPLAY_PLAN_CONTRACT_VERSION,
+      origin_run_id: originRunId,
+      decision: "delegate",
+      steps: projectedSteps,
+      orchestrator: {
+        intent: boundedText(orchestrator.intent, 600),
+        evidence_requirement: boundedText(orchestrator.evidence_requirement || "unknown", 40),
+        presentation_mode: presentationMode,
+        requested_item_count: requestedItemCount,
+        synthesis_brief: boundedText(orchestrator.synthesis_brief, 1200),
+        outcome_contract_version: boundedText(outcome.contract_version, 120),
+        compiler_authority: "runtime",
+        outcome_status: "covered",
+        route_admission_contract_version: "session-route-admission-v1",
+        deliverables
+      }
+    };
+    return { ...body, plan_digest: worldGraphDigest(body) };
+  }
+  return null;
+}
+
 export function prepareWorldGraphReplay({
   data,
   run,
@@ -1652,7 +1752,7 @@ export function prepareWorldGraphReplay({
       continue;
     }
     if (
-      String(process.env.TCAR_ENGINE_MODE || "simulator").toLowerCase() === "real"
+      String(readAgentRuntimeEnv(process.env, "AGENT_RUNTIME_MODE", "simulator")).toLowerCase() === "real"
       && !normalizedRuntimeComponentState(artifact.runtime_component_state)
     ) {
       addReplayExclusion(exclusionCounts, agentReasons, "runtime_revision_changed_or_unverified", adapter);
@@ -1694,6 +1794,7 @@ export function prepareWorldGraphReplay({
     const candidate = {
       artifact_id: artifact.artifact_id,
       origin_run_id: artifact.origin_run_id,
+      origin_step_id: artifact.origin_step_id,
       created_at: artifact.created_at,
       freshness_anchor_at: artifact.freshness_anchor_at || artifact.created_at,
       input_envelope: artifact.input_envelope,
@@ -1713,6 +1814,7 @@ export function prepareWorldGraphReplay({
     eligibleAdapters.add(adapter);
   }
   const issuedAt = new Date(now).toISOString();
+  const replayPlan = replayPlanForCandidates(data, candidates);
   const capsule = {
     schema_version: WORLD_GRAPH_SCHEMA_VERSION,
     engine_revision: WORLD_GRAPH_ENGINE_REVISION,
@@ -1727,7 +1829,8 @@ export function prepareWorldGraphReplay({
       agent_workspace_id: scope.agent_workspace_id
     },
     query_digest: queryDigest,
-    candidates
+    candidates,
+    ...(replayPlan ? { replay_plan: replayPlan } : {})
   };
   // Candidate-byte accounting alone omits the signed capsule's scope,
   // timestamps, separators, and field names. Enforce the documented limit on
@@ -1736,6 +1839,9 @@ export function prepareWorldGraphReplay({
   while (candidates.length && Buffer.byteLength(JSON.stringify(capsule), "utf8") > MAX_CAPSULE_BYTES) {
     const removed = candidates.pop();
     addReplayExclusion(exclusionCounts, agentReasons, "replay_payload_too_large", removed?.replay_output?.adapter);
+  }
+  if (capsule.replay_plan && !replayPlanCandidatesComplete(capsule.replay_plan, candidates)) {
+    delete capsule.replay_plan;
   }
   eligibleAdapters.clear();
   for (const candidate of candidates) {

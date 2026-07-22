@@ -2,6 +2,13 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
+import {
+  PERSISTED_AGENT_SOURCE_ROOT,
+  PERSISTED_DOCUMENT_SOURCE_ROOT,
+  persistedDocumentChunkPath,
+  persistedDocumentIndexPath,
+  persistedDocumentRoot
+} from "./persistedStorageCompatibility.js";
 
 const allowedExtensions = new Set([".pdf", ".md", ".markdown", ".txt", ".csv"]);
 const DEFAULT_MAX_DOCUMENT_TEXT_CHARS = 2_000_000;
@@ -24,9 +31,10 @@ export function slugify(value) {
 
 export function assertSafeSourcePath(sourcePath) {
   const normalized = sourcePath.replaceAll("\\", "/");
-  const allowed = normalized.startsWith("sources/tcar_documents/") || normalized.startsWith("sources/router_agents/");
+  const allowed = normalized.startsWith(`${PERSISTED_DOCUMENT_SOURCE_ROOT}/`)
+    || normalized.startsWith(`${PERSISTED_AGENT_SOURCE_ROOT}/`);
   if (!allowed || normalized.includes("..")) {
-    const error = new Error("Source path must stay under approved TCAR source roots.");
+    const error = new Error("Source path must stay under approved document or agent source roots.");
     error.status = 400;
     throw error;
   }
@@ -285,7 +293,7 @@ export function chunkDocument({ text, pages = [], slug, maxWords = 350, overlapW
         page_start: segment.pageStart,
         page_end: segment.pageEnd,
         tags: inferTags(`${title} ${body}`),
-        path: `sources/tcar_documents/${slug}/chunks/${chunkId}.md`,
+        path: persistedDocumentChunkPath(slug, chunkId),
         summary: summarize(body),
         token_count_approx: Math.ceil(chunkWords.length * 1.3),
         content_digest: contentDigest,
@@ -384,8 +392,8 @@ export function validateRuntimeDocumentResult(result, {
     throw runtimeDocumentContractError("chunk_records must match the declared chunk count");
   }
 
-  const documentRoot = `sources/tcar_documents/${slug}`;
-  const indexPath = `${documentRoot}/index.jsonl`;
+  const documentRoot = persistedDocumentRoot(slug);
+  const indexPath = persistedDocumentIndexPath(slug);
   if (result.document_root !== documentRoot || result.index_path !== indexPath) {
     throw runtimeDocumentContractError("document paths do not match the managed source root");
   }
@@ -577,7 +585,7 @@ function canonicalJson(value) {
 }
 
 function runtimeDocumentContractError(detail) {
-  const error = new Error(`TCAR runtime returned an invalid document registration: ${detail}.`);
+  const error = new Error(`Agent Runtime returned an invalid document registration: ${detail}.`);
   error.status = 502;
   error.code = "runtime_document_contract_invalid";
   return error;
@@ -652,7 +660,7 @@ export function scoreChunks(chunks, query, limit = 4) {
 }
 
 export async function writeDocumentFiles({ uploadRoot, slug, chunks }) {
-  const docRoot = path.join(uploadRoot, "sources", "tcar_documents", slug);
+  const docRoot = path.join(uploadRoot, persistedDocumentRoot(slug));
   const chunkRoot = path.join(docRoot, "chunks");
   await fs.mkdir(chunkRoot, { recursive: true, mode: 0o700 });
   for (const privateDirectory of [path.resolve(uploadRoot), docRoot, chunkRoot]) {
@@ -684,13 +692,13 @@ export async function writeDocumentFiles({ uploadRoot, slug, chunks }) {
     indexRows.push(indexRow);
   }
 
-  const indexPath = path.join(uploadRoot, "sources", "tcar_documents", slug, "index.jsonl");
+  const indexPath = path.join(uploadRoot, persistedDocumentIndexPath(slug));
   const indexBytes = indexRows.map((row) => JSON.stringify(row)).join("\n") + "\n";
   await fs.writeFile(indexPath, indexBytes, { encoding: "utf8", mode: 0o600 });
   await fs.chmod(indexPath, 0o600);
   return {
-    document_root: `sources/tcar_documents/${slug}`,
-    index_path: `sources/tcar_documents/${slug}/index.jsonl`,
+    document_root: persistedDocumentRoot(slug),
+    index_path: persistedDocumentIndexPath(slug),
     index_digest: `sha256:${crypto.createHash("sha256").update(indexBytes, "utf8").digest("hex")}`
   };
 }

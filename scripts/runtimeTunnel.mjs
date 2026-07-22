@@ -3,35 +3,51 @@ import fs from "node:fs";
 import { spawn } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { readAgentRuntimeEnv } from "../server/agentRuntimeConfig.js";
 
 export function runtimeTunnelConfig(env = process.env) {
   const config = {
-    sshBinary: requiredAbsolutePath(env.GPU_SSH_BINARY || "/usr/bin/ssh", "GPU_SSH_BINARY"),
-    sshHost: requiredText(env.GPU_SSH_HOST, "GPU_SSH_HOST"),
-    sshPort: portNumber(env.GPU_SSH_PORT || 22, "GPU_SSH_PORT"),
-    sshUser: String(env.GPU_SSH_USER || "ubuntu").trim(),
-    identityFile: requiredAbsolutePath(env.GPU_SSH_IDENTITY_FILE, "GPU_SSH_IDENTITY_FILE"),
-    knownHostsFile: requiredAbsolutePath(
-      env.GPU_SSH_KNOWN_HOSTS_FILE,
-      "GPU_SSH_KNOWN_HOSTS_FILE"
+    sshBinary: requiredAbsolutePath(
+      readAgentRuntimeEnv(env, "AGENT_RUNTIME_SSH_BINARY", "/usr/bin/ssh"),
+      "AGENT_RUNTIME_SSH_BINARY"
     ),
-    localHost: String(env.TCAR_TUNNEL_LOCAL_HOST || "127.0.0.1").trim(),
-    localPort: portNumber(env.TCAR_TUNNEL_LOCAL_PORT || 19000, "TCAR_TUNNEL_LOCAL_PORT"),
-    runtimeHost: String(env.TCAR_TUNNEL_RUNTIME_HOST || "127.0.0.1").trim(),
-    runtimePort: portNumber(env.TCAR_TUNNEL_RUNTIME_PORT || 9000, "TCAR_TUNNEL_RUNTIME_PORT")
+    sshHost: requiredText(
+      readAgentRuntimeEnv(env, "AGENT_RUNTIME_SSH_HOST"),
+      "AGENT_RUNTIME_SSH_HOST"
+    ),
+    sshPort: portNumber(
+      readAgentRuntimeEnv(env, "AGENT_RUNTIME_SSH_PORT", 22),
+      "AGENT_RUNTIME_SSH_PORT"
+    ),
+    sshUser: requiredText(
+      readAgentRuntimeEnv(env, "AGENT_RUNTIME_SSH_USER"),
+      "AGENT_RUNTIME_SSH_USER"
+    ),
+    identityFile: requiredAbsolutePath(
+      readAgentRuntimeEnv(env, "AGENT_RUNTIME_SSH_IDENTITY_FILE"),
+      "AGENT_RUNTIME_SSH_IDENTITY_FILE"
+    ),
+    knownHostsFile: requiredAbsolutePath(
+      readAgentRuntimeEnv(env, "AGENT_RUNTIME_SSH_KNOWN_HOSTS_FILE"),
+      "AGENT_RUNTIME_SSH_KNOWN_HOSTS_FILE"
+    ),
+    localHost: String(readAgentRuntimeEnv(env, "AGENT_RUNTIME_TUNNEL_LOCAL_HOST", "127.0.0.1")).trim(),
+    localPort: portNumber(readAgentRuntimeEnv(env, "AGENT_RUNTIME_TUNNEL_LOCAL_PORT", 19000), "AGENT_RUNTIME_TUNNEL_LOCAL_PORT"),
+    runtimeHost: String(readAgentRuntimeEnv(env, "AGENT_RUNTIME_TUNNEL_RUNTIME_HOST", "127.0.0.1")).trim(),
+    runtimePort: portNumber(readAgentRuntimeEnv(env, "AGENT_RUNTIME_TUNNEL_RUNTIME_PORT", 9000), "AGENT_RUNTIME_TUNNEL_RUNTIME_PORT")
   };
 
   if (!/^[a-z_][a-z0-9_-]*$/i.test(config.sshUser)) {
-    throw new Error("GPU_SSH_USER contains unsupported characters.");
+    throw new Error("AGENT_RUNTIME_SSH_USER contains unsupported characters.");
   }
   if (!/^[a-z0-9.-]+$/i.test(config.sshHost) || config.sshHost.startsWith("-")) {
-    throw new Error("GPU_SSH_HOST must be an IPv4 address or DNS hostname.");
+    throw new Error("AGENT_RUNTIME_SSH_HOST must be an IPv4 address or DNS hostname.");
   }
   if (config.localHost !== "127.0.0.1") {
-    throw new Error("TCAR_TUNNEL_LOCAL_HOST must remain 127.0.0.1.");
+    throw new Error("AGENT_RUNTIME_TUNNEL_LOCAL_HOST must remain 127.0.0.1.");
   }
   if (config.runtimeHost !== "127.0.0.1") {
-    throw new Error("TCAR_TUNNEL_RUNTIME_HOST must remain 127.0.0.1.");
+    throw new Error("AGENT_RUNTIME_TUNNEL_RUNTIME_HOST must remain 127.0.0.1.");
   }
   return config;
 }
@@ -54,8 +70,8 @@ export function buildRuntimeTunnelArgs(config) {
 }
 
 export function validateRuntimeTunnelFiles(config) {
-  assertProtectedRegularFile(config.identityFile, "GPU_SSH_IDENTITY_FILE", true);
-  assertProtectedRegularFile(config.knownHostsFile, "GPU_SSH_KNOWN_HOSTS_FILE", false);
+  assertProtectedRegularFile(config.identityFile, "AGENT_RUNTIME_SSH_IDENTITY_FILE", true);
+  assertProtectedRegularFile(config.knownHostsFile, "AGENT_RUNTIME_SSH_KNOWN_HOSTS_FILE", false);
 }
 
 function assertProtectedRegularFile(filePath, name, privateFile) {
@@ -104,12 +120,12 @@ async function run() {
   process.once("SIGINT", () => forwardSignal("SIGINT"));
   process.once("SIGTERM", () => forwardSignal("SIGTERM"));
   child.once("error", (error) => {
-    console.error(`TCAR SSH tunnel failed to start: ${error.message}`);
+    console.error(`Agent Runtime SSH tunnel failed to start: ${error.message}`);
     process.exitCode = 1;
   });
   child.once("exit", (code, signal) => {
     if (signal) {
-      console.error(`TCAR SSH tunnel stopped after ${signal}.`);
+      console.error(`Agent Runtime SSH tunnel stopped after ${signal}.`);
       process.exitCode = 1;
       return;
     }

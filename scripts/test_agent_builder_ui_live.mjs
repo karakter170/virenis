@@ -17,8 +17,8 @@ import express from "express";
 import { createApp } from "../server/app.js";
 
 const PROJECT_ROOT = path.resolve(import.meta.dirname, "../../..");
-const RUNTIME_URL = process.env.TCAR_RUNTIME_API_URL || "http://127.0.0.1:9000";
-const RUNTIME_KEY_FILE = process.env.TCAR_RUNTIME_API_KEY_FILE
+const RUNTIME_URL = process.env.AGENT_RUNTIME_API_URL || "http://127.0.0.1:9000";
+const RUNTIME_KEY_FILE = process.env.AGENT_RUNTIME_API_KEY_FILE
   || path.join(PROJECT_ROOT, "outputs", "tcar_api_key.txt");
 const TOKEN = `agent_builder_live_${crypto.randomBytes(24).toString("hex")}`;
 const AUTHORIZATION = `Bearer ${TOKEN}`;
@@ -35,12 +35,12 @@ const MANAGED_ENV = [
   "APP_API_TOKENS_JSON",
   "APP_PUBLIC_ORIGIN",
   "APP_BILLING_WELCOME_CREDITS",
-  "TCAR_ENGINE_MODE",
-  "TCAR_RUNTIME_API_URL",
-  "TCAR_RUNTIME_API_KEY",
-  "TCAR_RUNTIME_API_KEY_FILE",
-  "TCAR_RUNTIME_ADMIN_TIMEOUT_MS",
-  "TCAR_RUNTIME_HEALTH_TIMEOUT_MS",
+  "AGENT_RUNTIME_MODE",
+  "AGENT_RUNTIME_API_URL",
+  "AGENT_RUNTIME_API_KEY",
+  "AGENT_RUNTIME_API_KEY_FILE",
+  "AGENT_RUNTIME_ADMIN_TIMEOUT_MS",
+  "AGENT_RUNTIME_HEALTH_TIMEOUT_MS",
   "APP_MCP_ALLOW_TEST_HTTP",
   "APP_MCP_GATEWAY_KEY"
 ];
@@ -157,6 +157,7 @@ async function directApi(baseURL, endpoint, { method = "GET", body, headers = {}
 
 async function runtimeAgent(agentId, runtimeKey) {
   const response = await fetch(`${RUNTIME_URL}/agents/${encodeURIComponent(agentId)}`, {
+    // The deployed Runtime transport still requires this compatibility header.
     headers: { "X-TCAR-API-Key": runtimeKey }
   });
   const payload = await response.json();
@@ -198,12 +199,12 @@ async function main() {
     process.env.NODE_ENV = "test";
     process.env.WEB_STORE_DRIVER = "json";
     process.env.APP_API_TOKENS_JSON = JSON.stringify({ [TOKEN]: ACTOR });
-    process.env.TCAR_ENGINE_MODE = "real";
-    process.env.TCAR_RUNTIME_API_URL = RUNTIME_URL;
-    delete process.env.TCAR_RUNTIME_API_KEY;
-    process.env.TCAR_RUNTIME_API_KEY_FILE = RUNTIME_KEY_FILE;
-    process.env.TCAR_RUNTIME_ADMIN_TIMEOUT_MS = "300000";
-    process.env.TCAR_RUNTIME_HEALTH_TIMEOUT_MS = "300000";
+    process.env.AGENT_RUNTIME_MODE = "real";
+    process.env.AGENT_RUNTIME_API_URL = RUNTIME_URL;
+    delete process.env.AGENT_RUNTIME_API_KEY;
+    process.env.AGENT_RUNTIME_API_KEY_FILE = RUNTIME_KEY_FILE;
+    process.env.AGENT_RUNTIME_ADMIN_TIMEOUT_MS = "300000";
+    process.env.AGENT_RUNTIME_HEALTH_TIMEOUT_MS = "300000";
     process.env.APP_BILLING_WELCOME_CREDITS = "1000";
     process.env.APP_MCP_ALLOW_TEST_HTTP = "1";
     process.env.APP_MCP_GATEWAY_KEY = `agent-builder-gateway-${crypto.randomBytes(24).toString("hex")}`;

@@ -80,7 +80,7 @@ describe("same-session run admission", () => {
     const idempotencyKey = "active-turn-retry-0001";
     const body = {
       content: "Prepare an incident follow-up with owners and deadlines.",
-      options: { planner_mode: "cue", parallel_workers: 2 }
+      options: { parallel_workers: 2 }
     };
 
     const accepted = await request(app)

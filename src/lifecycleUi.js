@@ -68,18 +68,18 @@ export function canManageDocument(document, agents, auth) {
     && String(agent.workspace_id || "") === String(auth.workspace_id || ""));
 }
 
-export function realityRankTieBreak(routing, adapter) {
+export function realityRankTieBreak(routing, agentId) {
   const selected = (Array.isArray(routing?.selected) ? routing.selected : [])
-    .find((item) => item?.adapter === adapter);
+    .find((item) => item?.adapter === agentId);
   if (selected?.source !== "cue+reality_rank") return null;
 
   const candidates = Array.isArray(routing?.candidate_trace) ? routing.candidate_trace : [];
-  const selectedCandidate = candidates.find((candidate) => candidate?.adapter === adapter) || {};
+  const selectedCandidate = candidates.find((candidate) => candidate?.adapter === agentId) || {};
   const cueScore = finiteNumber(selectedCandidate.cue_score);
   const selectedRank = finiteNumber(selected.reality_rank) ?? finiteNumber(selectedCandidate.reality_rank) ?? 0.5;
   const selectedSamples = sampleCount(selectedCandidate.rank_sample_size);
   const tied = cueScore === null ? [] : candidates
-    .filter((candidate) => candidate?.adapter && candidate.adapter !== adapter)
+    .filter((candidate) => candidate?.adapter && candidate.adapter !== agentId)
     .filter((candidate) => finiteNumber(candidate.cue_score) === cueScore)
     .map((candidate) => ({
       adapter: candidate.adapter,

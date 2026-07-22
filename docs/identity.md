@@ -110,7 +110,7 @@ CLERK_AUTHORIZED_PARTIES=https://app.your-domain.example
 APP_MCP_OAUTH_REDIRECT_ORIGIN=https://app.your-domain.example
 VITE_CLERK_PUBLISHABLE_KEY=pk_live_same-production-application
 CLERK_PUBLISHABLE_KEY=pk_live_same-production-application
-APP_AUTH_ADMIN_EMAILS=meteyesil@virenis.com
+APP_AUTH_ADMIN_EMAILS=admin@your-domain.example
 ```
 
 Use the matching `sk_live_` backend key and webhook signing secret from the same
@@ -119,23 +119,50 @@ and DNS in Clerk, then build and start from the remote environment:
 
 ```bash
 cp .env.remote.example .env.remote.local
+cp .env.runtime-tunnel.example .env.runtime-tunnel.local
 npm run preflight:auth:remote -- https://app.your-domain.example
 npm run build:remote
 npm run preflight:remote
 ```
 
-For the supplied production deployment, install the completed environment as
-`/etc/tcar/web-remote.env` and start `tcar-web-tunneled.service`; its
-`StateDirectory=` contract creates the private data, upload, and generated
-secret roots before Node starts. If you intentionally run a foreground smoke
-with `npm run start:remote`, first provision those same roots for the service
-user (the environment points at `/var/lib`, which an ordinary user cannot
-create):
+The production deployment uses two unprivileged identities and two disjoint
+environment files:
+
+- `virenis-web` runs `virenis-web-tunneled.service` with
+  `/etc/virenis/web-remote.env`. It can read only the web-owned secret files
+  under `/etc/virenis/secrets/web` and can write only the three explicit
+  `/var/lib/virenis-web-*` state directories.
+- `virenis-tunnel` runs `virenis-runtime-tunnel.service` with
+  `/etc/virenis/runtime-tunnel.env`. It alone can read
+  `/etc/virenis/runtime-tunnel/id_ed25519` and `known_hosts`; it has no access to
+  the Clerk, database, MCP, Basic Auth, or Agent Runtime API credentials.
+
+Install `.env.remote.local` as `/etc/virenis/web-remote.env`, install
+`.env.runtime-tunnel.local` as `/etc/virenis/runtime-tunnel.env`, and keep each
+file readable only by root and its matching service group. The units use exact
+`ReadWritePaths=` entries for web state, exact `ReadOnlyPaths=` entries for the
+application and process-owned configuration, and `InaccessiblePaths=` for the
+other service's secret root. Do not merge the two environment files: systemd
+loads `EnvironmentFile=` before applying its filesystem sandbox.
+
+`virenis-web-tunneled.service` creates the private data, upload, and generated
+secret roots through `StateDirectory=` before Node starts:
 
 ```bash
-sudo install -d -o ubuntu -g ubuntu -m 0700 \
-  /var/lib/tcar-web-data /var/lib/tcar-web-uploads /var/lib/tcar-web-secrets
-npm run start:remote
+sudo systemctl enable --now virenis-runtime-tunnel.service
+sudo systemctl enable --now virenis-web-tunneled.service
+```
+
+If you intentionally run a foreground smoke with `npm run start:remote`, first
+provision those same roots for the web service identity (the environment points
+at `/var/lib`, which an ordinary user cannot create):
+
+```bash
+sudo install -d -o virenis-web -g virenis-web -m 0700 \
+  /var/lib/virenis-web-data \
+  /var/lib/virenis-web-uploads \
+  /var/lib/virenis-web-secrets
+sudo -u virenis-web npm run start:remote
 ```
 
 Do not use `npm run dev` for the public deployment. Do not build the hosted

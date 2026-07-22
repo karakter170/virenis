@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { LEGACY_PERSISTED_PLANNER_MODE_V1 } from "./agentRuntimeResponseCompatibility.js";
 import {
   agentRevision,
   agentRevisionSnapshot,
@@ -546,7 +547,10 @@ async function syncExecutionLedger(client, data) {
       runtime_execution_id: record.runtime_execution_id || null,
       runtime_record_hash: record.runtime_record_hash || null
     };
-    const plannerSnapshot = { mode: record.planner_mode || null, routing: run.plan?.routing || null };
+    const plannerSnapshot = {
+      mode: LEGACY_PERSISTED_PLANNER_MODE_V1,
+      routing: run.plan?.routing || null
+    };
     const executionEventId = stableUuid("execution-event", workspaceId, record.execution_id);
     await client.query(
       `INSERT INTO tcar_ledger.execution_runs(

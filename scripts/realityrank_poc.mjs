@@ -1196,7 +1196,6 @@ async function executeProof({ api, adminApi, secondaryApi, proofId, pollTimeoutM
     content: evidenceQuery,
     options: {
       ...POC_DOCUMENT_CHAT_LIMITS,
-      planner_mode: "tcandon",
       max_routing_adapters: 2,
       parallel_workers: 2
     },
@@ -1214,12 +1213,12 @@ async function executeProof({ api, adminApi, secondaryApi, proofId, pollTimeoutM
     && evidenceRun?.parallel?.parallelizable === true
     && Number(evidenceRun?.parallel?.maxBatchWidth) >= 2
     && (health.runtime_mode !== "real" || includesFacts(evidenceRun?.final_answer, ["28", "10.4", "quarantine"]))
-    && (health.runtime_mode !== "real" || evidenceRun?.plan?.routing?.mode === "tcandon")
+    && (health.runtime_mode !== "real" || evidenceRun?.plan?.routing?.mode === "session")
   ), {
     run_id: evidenceRun.run_id,
     plan_adapters: evidencePlanAdapters,
     executed_adapters: evidenceExecutedAdapters,
-    planner_mode: evidenceRun?.plan?.routing?.mode || null,
+    semantic_routing_mode: evidenceRun?.plan?.routing?.mode || null,
     acyclic: planIsAcyclic(evidenceRun?.plan),
     edges: evidenceRun?.plan?.edges || [],
     parallel: evidenceRun?.parallel || null,
@@ -1314,7 +1313,7 @@ async function executeProof({ api, adminApi, secondaryApi, proofId, pollTimeoutM
     }
   });
   const evidenceRuntimeAudit = await runtimeExecutionProof(adminApi, evidenceExecution, runtimeReceiptsRequired);
-  prove(assertions, "the evidence run has a recomputed persisted TCAR Runtime receipt", (
+  prove(assertions, "the evidence run has a recomputed persisted Agent Runtime receipt", (
     !runtimeReceiptsRequired || evidenceRuntimeAudit.valid === true
   ), {
     runtime_mode: health?.runtime_mode,
@@ -1432,7 +1431,6 @@ async function executeProof({ api, adminApi, secondaryApi, proofId, pollTimeoutM
     content: historicalQuery,
     options: {
       ...POC_CHAT_LIMITS,
-      planner_mode: "cue",
       max_routing_adapters: 2,
       parallel_workers: 2
     },
@@ -1478,7 +1476,7 @@ async function executeProof({ api, adminApi, secondaryApi, proofId, pollTimeoutM
   const historicalRuntimeProofValid = runtimeReceiptsRequired
     ? runtimeExecutionAuditProofValid(historicalRuntimeProof, historicalExecution)
     : null;
-  prove(assertions, "the persisted TCAR Runtime execution receipt and workspace chain independently verify against virenis", (
+  prove(assertions, "the persisted Agent Runtime execution receipt and workspace chain independently verify against virenis", (
     !runtimeReceiptsRequired || historicalRuntimeProofValid === true
   ), {
     runtime_mode: health?.runtime_mode,
@@ -1809,7 +1807,6 @@ async function executeProof({ api, adminApi, secondaryApi, proofId, pollTimeoutM
     content: implicitQuery,
     options: {
       ...POC_CHAT_LIMITS,
-      planner_mode: "cue",
       max_routing_adapters: 1,
       parallel_workers: 1
     },
@@ -1865,7 +1862,7 @@ async function executeProof({ api, adminApi, secondaryApi, proofId, pollTimeoutM
     participant: compactParticipant(implicitParticipant)
   });
   const implicitRuntimeAudit = await runtimeExecutionProof(adminApi, implicitExecution, runtimeReceiptsRequired);
-  prove(assertions, "the implicit RealityRank route has a recomputed persisted TCAR Runtime receipt", (
+  prove(assertions, "the implicit RealityRank route has a recomputed persisted Agent Runtime receipt", (
     !runtimeReceiptsRequired || implicitRuntimeAudit.valid === true
   ), {
     runtime_mode: health?.runtime_mode,
@@ -1883,7 +1880,6 @@ async function executeProof({ api, adminApi, secondaryApi, proofId, pollTimeoutM
     content: explicitQuery,
     options: {
       ...POC_CHAT_LIMITS,
-      planner_mode: "cue",
       max_routing_adapters: 1,
       parallel_workers: 1
     },
@@ -1921,7 +1917,7 @@ async function executeProof({ api, adminApi, secondaryApi, proofId, pollTimeoutM
     participant: compactParticipant(explicitParticipant)
   });
   const explicitRuntimeAudit = await runtimeExecutionProof(adminApi, explicitExecution, runtimeReceiptsRequired);
-  prove(assertions, "the explicit override has a recomputed persisted TCAR Runtime receipt", (
+  prove(assertions, "the explicit override has a recomputed persisted Agent Runtime receipt", (
     !runtimeReceiptsRequired || explicitRuntimeAudit.valid === true
   ), {
     runtime_mode: health?.runtime_mode,

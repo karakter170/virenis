@@ -2,14 +2,18 @@ import { describe, expect, it } from "vitest";
 
 import {
   assertRuntimePlan,
-  buildParallelBatches,
-  configuredPlanGaps,
-  normalizeRuntimeRouting,
-  planRoutes,
+  buildParallelBatches
+} from "../server/runtimePlanValidator.js";
+import { normalizeRuntimeRouting } from "../server/routeResultNormalizer.js";
+import {
   routeOutputCanEnterSharedMemory,
-  routeOutputSharedMemoryEntries,
+  routeOutputSharedMemoryEntries
+} from "../server/chatRunCoordinator.js";
+import {
+  configuredPlanGaps,
+  planRoutes,
   resolveAgentContext
-} from "../server/tcarEngine.js";
+} from "./fixtures/agentRuntimeSimulator.js";
 
 
 function artifact({ name, value, producer, stepId, contentType = "application/json" }) {
@@ -565,6 +569,16 @@ describe("canonical Agent Studio execution contract", () => {
 
     expect(() => assertRuntimePlan({
       ...plan,
+      routing: { ...plan.routing, mode: "cue" }
+    }, {
+      allowedAdapters: ["knowledge", "writer"],
+      maxSteps: 1,
+      maxResourceSupportSteps: 1,
+      agents
+    })).toThrow(/fixed semantic session/i);
+
+    expect(() => assertRuntimePlan({
+      ...plan,
       routing: {
         selected: plan.routing.selected.map((selection) => ({ ...selection, source: "explicit" }))
       }
@@ -989,7 +1003,7 @@ describe("canonical Agent Studio execution contract", () => {
           ...plan.routing.orchestrator,
           outcome_contract: {
             ...plan.routing.orchestrator.outcome_contract,
-            semantic_authority: "qwen_model_led",
+            semantic_authority: "semantic_model_led",
             steps: proofRows.map((row) => ({
               ...row,
               route_admission: {
@@ -1007,8 +1021,30 @@ describe("canonical Agent Studio execution contract", () => {
     };
     expect(
       normalizedSemantic.routing.orchestrator.outcome_contract.semantic_authority
-    ).toBe("qwen_model_led");
+    ).toBe("semantic_model_led");
     expect(validate(normalizedSemantic).steps).toHaveLength(2);
+    const legacySemantic = {
+      ...semanticPlan,
+      routing: {
+        ...semanticPlan.routing,
+        orchestrator: {
+          ...semanticPlan.routing.orchestrator,
+          outcome_contract: {
+            ...semanticPlan.routing.orchestrator.outcome_contract,
+            semantic_authority: "qwen_model_led"
+          }
+        }
+      }
+    };
+    expect(validate(legacySemantic).steps).toHaveLength(2);
+    const normalizedLegacySemantic = {
+      ...legacySemantic,
+      routing: normalizeRuntimeRouting(legacySemantic.routing)
+    };
+    expect(
+      normalizedLegacySemantic.routing.orchestrator.outcome_contract.semantic_authority
+    ).toBe("semantic_model_led");
+    expect(validate(normalizedLegacySemantic).steps).toHaveLength(2);
     expect(() => validate({
       ...normalizedSemantic,
       routing: {

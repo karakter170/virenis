@@ -15,9 +15,9 @@ import request from "supertest";
 import { createApp } from "../server/app.js";
 
 const PROJECT_ROOT = path.resolve(import.meta.dirname, "../../..");
-const RUNTIME_KEY_FILE = process.env.TCAR_RUNTIME_API_KEY_FILE
+const RUNTIME_KEY_FILE = process.env.AGENT_RUNTIME_API_KEY_FILE
   || path.join(PROJECT_ROOT, "outputs", "tcar_api_key.txt");
-const RUNTIME_URL = process.env.TCAR_RUNTIME_API_URL || "http://127.0.0.1:9000";
+const RUNTIME_URL = process.env.AGENT_RUNTIME_API_URL || "http://127.0.0.1:9000";
 const RUN_EVIDENCE_FILE = path.join(PROJECT_ROOT, "outputs", "workflow_commands_live_run.json");
 const LIVE_TOKEN = `workflow_live_${crypto.randomBytes(24).toString("hex")}`;
 const AUTH = { Authorization: `Bearer ${LIVE_TOKEN}` };
@@ -26,13 +26,13 @@ const MANAGED_ENV = [
   "NODE_ENV",
   "WEB_STORE_DRIVER",
   "APP_API_TOKENS_JSON",
-  "TCAR_ENGINE_MODE",
-  "TCAR_RUNTIME_API_URL",
-  "TCAR_RUNTIME_API_KEY",
-  "TCAR_RUNTIME_API_KEY_FILE",
-  "TCAR_RUNTIME_WORKFLOW_TIMEOUT_MS",
-  "TCAR_RUNTIME_CHAT_TIMEOUT_MS",
-  "TCAR_RUNTIME_ADMIN_TIMEOUT_MS",
+  "AGENT_RUNTIME_MODE",
+  "AGENT_RUNTIME_API_URL",
+  "AGENT_RUNTIME_API_KEY",
+  "AGENT_RUNTIME_API_KEY_FILE",
+  "AGENT_RUNTIME_WORKFLOW_TIMEOUT_MS",
+  "AGENT_RUNTIME_CHAT_TIMEOUT_MS",
+  "AGENT_RUNTIME_ADMIN_TIMEOUT_MS",
   "APP_BILLING_WELCOME_CREDITS",
   "APP_BILLING_PROMPT_CREDITS_PER_1K",
   "APP_BILLING_COMPLETION_CREDITS_PER_1K",
@@ -180,13 +180,13 @@ async function main() {
     process.env.NODE_ENV = "development";
     process.env.WEB_STORE_DRIVER = "json";
     process.env.APP_API_TOKENS_JSON = JSON.stringify({ [LIVE_TOKEN]: ACTOR });
-    process.env.TCAR_ENGINE_MODE = "real";
-    process.env.TCAR_RUNTIME_API_URL = RUNTIME_URL;
-    delete process.env.TCAR_RUNTIME_API_KEY;
-    process.env.TCAR_RUNTIME_API_KEY_FILE = RUNTIME_KEY_FILE;
-    process.env.TCAR_RUNTIME_WORKFLOW_TIMEOUT_MS = "1200000";
-    process.env.TCAR_RUNTIME_CHAT_TIMEOUT_MS = "1200000";
-    process.env.TCAR_RUNTIME_ADMIN_TIMEOUT_MS = "300000";
+    process.env.AGENT_RUNTIME_MODE = "real";
+    process.env.AGENT_RUNTIME_API_URL = RUNTIME_URL;
+    delete process.env.AGENT_RUNTIME_API_KEY;
+    process.env.AGENT_RUNTIME_API_KEY_FILE = RUNTIME_KEY_FILE;
+    process.env.AGENT_RUNTIME_WORKFLOW_TIMEOUT_MS = "1200000";
+    process.env.AGENT_RUNTIME_CHAT_TIMEOUT_MS = "1200000";
+    process.env.AGENT_RUNTIME_ADMIN_TIMEOUT_MS = "300000";
     process.env.APP_BILLING_WELCOME_CREDITS = "1000";
     process.env.APP_BILLING_PROMPT_CREDITS_PER_1K = "0.10";
     process.env.APP_BILLING_COMPLETION_CREDITS_PER_1K = "0.20";

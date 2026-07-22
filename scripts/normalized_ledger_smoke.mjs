@@ -140,7 +140,7 @@ const execution = {
   router_chat_template_digest: sha("template"),
   executor_code_digest: sha("executor"),
   component_provenance_digest: sha("components"),
-  planner_mode: "cue",
+  planner_mode: "session",
   started_at: createdAt,
   completed_at: settledAt,
   recorded_at: settledAt,

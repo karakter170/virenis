@@ -14,9 +14,9 @@ const QUERY = "@writing_synthesis_lora prepare the same concise note.";
 const ENV_KEYS = [
   "APP_API_TOKENS_JSON",
   "APP_IDENTITY_PROVIDER",
-  "TCAR_ENGINE_MODE",
-  "TCAR_RUNTIME_API_URL",
-  "TCAR_RUNTIME_API_KEY",
+  "AGENT_RUNTIME_MODE",
+  "AGENT_RUNTIME_API_URL",
+  "AGENT_RUNTIME_API_KEY",
   "WEB_STORE_DRIVER"
 ];
 
@@ -44,9 +44,9 @@ beforeEach(async () => {
   previousEnv = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]]));
   process.env.APP_IDENTITY_PROVIDER = "configured";
   process.env.WEB_STORE_DRIVER = "json";
-  process.env.TCAR_ENGINE_MODE = "real";
-  process.env.TCAR_RUNTIME_API_URL = "http://runtime.worldgraph.test";
-  process.env.TCAR_RUNTIME_API_KEY = "worldgraph-remote-runtime-key-0123456789";
+  process.env.AGENT_RUNTIME_MODE = "real";
+  process.env.AGENT_RUNTIME_API_URL = "http://runtime.worldgraph.test";
+  process.env.AGENT_RUNTIME_API_KEY = "worldgraph-remote-runtime-key-0123456789";
   process.env.APP_API_TOKENS_JSON = JSON.stringify({
     [TOKEN]: { user_id: "remote_owner", workspace_id: "remote_workspace", role: "user" }
   });
@@ -79,7 +79,7 @@ beforeEach(async () => {
       agent_content_digest: runtimeAgent.agent_content_digest,
       adapter_content_digest: runtimeAgent.adapter_content_digest,
       manifest_contract_digest: runtimeAgent.manifest_contract_digest,
-      model_id: "qwen-test",
+      modelId: "qwen-test",
       base_model_content_digest: runtimeBaseDigest,
       task: "Prepare the concise note.",
       depends_on: [],
@@ -149,7 +149,13 @@ beforeEach(async () => {
       }
     ];
     const runtimePlan = {
-      steps: [{ id: "s1", adapter: "writing_synthesis_lora", task: "Prepare the concise note.", depends_on: [] }],
+      steps: [{
+        id: "s1",
+        adapter: "writing_synthesis_lora",
+        task: "Prepare the concise note.",
+        depends_on: [],
+        evidence_requirement: "none"
+      }],
       adapters: ["writing_synthesis_lora"],
       edges: [],
       routing: {
@@ -168,9 +174,10 @@ beforeEach(async () => {
     }
     return Response.json({
       ok: true,
-      mode: "session_delegated_vllm_execute",
-      plannerMode: "session",
+      mode: "session_delegated_model_execute",
+      modelProviderBaseUrl: "https://model-provider.internal/v1",
       baseModel: "qwen-test",
+      agentModelMap: { writing_synthesis_lora: "qwen-test" },
       manifestRevision: "1".repeat(64),
       componentProvenance: {
         revision_authority: "runtime",

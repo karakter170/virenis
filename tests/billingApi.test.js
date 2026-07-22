@@ -17,9 +17,9 @@ const auth = (name) => ({ Authorization: `Bearer ${TOKENS[name]}` });
 const MANAGED_ENV = [
   "APP_API_TOKENS_JSON",
   "WEB_STORE_DRIVER",
-  "TCAR_ENGINE_MODE",
-  "TCAR_RUNTIME_API_URL",
-  "TCAR_RUNTIME_API_KEY",
+  "AGENT_RUNTIME_MODE",
+  "AGENT_RUNTIME_API_URL",
+  "AGENT_RUNTIME_API_KEY",
   "APP_BILLING_WELCOME_CREDITS",
   "APP_BILLING_PROMPT_CREDITS_PER_1K",
   "APP_BILLING_COMPLETION_CREDITS_PER_1K",
@@ -42,7 +42,7 @@ beforeEach(async () => {
   previousFetch = globalThis.fetch;
   restoreRuntimeFetch = setRuntimeFetchForTests((...args) => globalThis.fetch(...args));
   process.env.WEB_STORE_DRIVER = "json";
-  process.env.TCAR_ENGINE_MODE = "simulator";
+  process.env.AGENT_RUNTIME_MODE = "simulator";
   process.env.APP_BILLING_WELCOME_CREDITS = "1000";
   process.env.APP_BILLING_PROMPT_CREDITS_PER_1K = "0.1";
   process.env.APP_BILLING_COMPLETION_CREDITS_PER_1K = "0.2";
@@ -220,9 +220,9 @@ describe("run charging and transparency", () => {
   });
 
   it("charges only server-reported Runtime calls and returns totals for every agent and output", async () => {
-    process.env.TCAR_ENGINE_MODE = "real";
-    process.env.TCAR_RUNTIME_API_URL = "http://runtime.internal:9000";
-    process.env.TCAR_RUNTIME_API_KEY = "billing-runtime-test-key";
+    process.env.AGENT_RUNTIME_MODE = "real";
+    process.env.AGENT_RUNTIME_API_URL = "http://runtime.internal:9000";
+    process.env.AGENT_RUNTIME_API_KEY = "billing-runtime-test-key";
     let runtimeRequests = 0;
     globalThis.fetch = async (url) => {
       expect(String(url)).toContain("/chat/execute");
@@ -297,9 +297,9 @@ describe("run charging and transparency", () => {
   });
 
   it("returns the full reservation after a Runtime failure", async () => {
-    process.env.TCAR_ENGINE_MODE = "real";
-    process.env.TCAR_RUNTIME_API_URL = "http://runtime.internal:9000";
-    process.env.TCAR_RUNTIME_API_KEY = "billing-runtime-test-key";
+    process.env.AGENT_RUNTIME_MODE = "real";
+    process.env.AGENT_RUNTIME_API_URL = "http://runtime.internal:9000";
+    process.env.AGENT_RUNTIME_API_KEY = "billing-runtime-test-key";
     globalThis.fetch = async () => jsonResponse({ detail: "provider unavailable" }, 503);
     await startApp();
     const session = await request(app).post("/api/chat/sessions").set(auth("alice")).send({ title: "Failed metered run" }).expect(201);
@@ -399,8 +399,13 @@ async function waitForRun(runId, identity) {
 function runtimeExecutionResponse() {
   return {
     ok: true,
-    mode: "session_controller_vllm_execute",
+    mode: "agent_dag_model_execute",
+    modelProviderBaseUrl: "https://model-provider.internal/v1",
     baseModel: "qwen36-awq",
+    agentModelMap: {
+      product_strategy_lora: "qwen36-awq",
+      writing_synthesis_lora: "qwen36-awq"
+    },
     manifestRevision: "1".repeat(64),
     plan: {
       steps: [
@@ -413,8 +418,8 @@ function runtimeExecutionResponse() {
     },
     parallel: { workers: 1, batches: [{ batch: 1, steps: ["step_strategy"], width: 1 }, { batch: 2, steps: ["step_writer"], width: 1 }], maxBatchWidth: 1, parallelizable: false },
     expertOutputs: [
-      { id: "step_strategy", adapter: "product_strategy_lora", task: "Outline the launch", domain_answer: "Launch outline", text: "DOMAIN_ANSWER: Launch outline", elapsed_sec: 0.1 },
-      { id: "step_writer", adapter: "writing_synthesis_lora", task: "Write the note", domain_answer: "Draft note", text: "DOMAIN_ANSWER: Draft note", elapsed_sec: 0.1 }
+      { id: "step_strategy", adapter: "product_strategy_lora", modelId: "qwen36-awq", task: "Outline the launch", domain_answer: "Launch outline", text: "DOMAIN_ANSWER: Launch outline", elapsed_sec: 0.1 },
+      { id: "step_writer", adapter: "writing_synthesis_lora", modelId: "qwen36-awq", task: "Write the note", domain_answer: "Draft note", text: "DOMAIN_ANSWER: Draft note", elapsed_sec: 0.1 }
     ],
     finalAnswer: "A concise product launch note.",
     tokenAccounting: {

@@ -8,7 +8,7 @@ import {
   canonicalAgentContract,
   ensureCanonicalAgentContract
 } from "../server/agentContract.js";
-import { scopedRoutingContext } from "../server/tcarEngine.js";
+import { scopedRoutingContext } from "../server/chatRunCoordinator.js";
 
 
 const expectedMemory = {

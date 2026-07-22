@@ -10,6 +10,8 @@ import { normalizePublicMarketplaceRatings } from "./marketplaceRatingIdentity.j
 import { normalizeMarketplacePublisherIdentities } from "./marketplacePublisherIdentity.js";
 import { validateProductionDatabaseTransport } from "./databaseTransport.js";
 import { ensureCuratedMarketplaceCatalog } from "./curatedMarketplace.js";
+import { isLegacyManagedCatalogSeed } from "./legacyCatalogCompatibility.js";
+import { PERSISTED_WEB_STORE_TABLE } from "./persistedStorageCompatibility.js";
 
 const { Client, Pool } = pg;
 
@@ -60,14 +62,9 @@ function mergeSeedCatalog(agents, seedAgents) {
       indexes.set(seedAgent.id, agents.length - 1);
       continue;
     }
-    if (
-      seedAgent.system_managed === true
-      && seedAgent.base_lora === true
-      && seedAgent.library_origin === "tcar_base_lora_library"
-    ) {
-      // Base-library definitions are runtime-controlled product configuration,
-      // not user-owned records. Refresh them on startup so policy and receipt
-      // revisions cannot remain stale in an existing JSON or PostgreSQL store.
+    if (isLegacyManagedCatalogSeed(seedAgent)) {
+      // This refresh behavior is retained only for the isolated simulator
+      // fixture. Production API-agent definitions do not carry these fields.
       agents[existingIndex] = clone(seedAgent);
     }
   }
@@ -192,7 +189,7 @@ export class JsonStore {
 export class PostgresStore {
   constructor({
     connectionString = process.env.DATABASE_URL,
-    tableName = process.env.WEB_DB_TABLE || "tcar_app_store",
+    tableName = process.env.WEB_DB_TABLE || PERSISTED_WEB_STORE_TABLE,
     storeKey = process.env.WEB_DB_STORE_KEY || "default",
     seedAgents,
     clientConstructor = Client

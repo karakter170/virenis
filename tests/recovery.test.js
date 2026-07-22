@@ -14,12 +14,12 @@ beforeEach(async () => {
   previousEnv = {
     NODE_ENV: process.env.NODE_ENV,
     WEB_STORE_DRIVER: process.env.WEB_STORE_DRIVER,
-    TCAR_ENGINE_MODE: process.env.TCAR_ENGINE_MODE,
+    AGENT_RUNTIME_MODE: process.env.AGENT_RUNTIME_MODE,
     APP_API_TOKENS_JSON: process.env.APP_API_TOKENS_JSON
   };
   delete process.env.NODE_ENV;
   process.env.WEB_STORE_DRIVER = "json";
-  process.env.TCAR_ENGINE_MODE = "simulator";
+  process.env.AGENT_RUNTIME_MODE = "simulator";
   tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "virenis-recovery-"));
 });
 
@@ -174,7 +174,6 @@ describe("durable background recovery", () => {
     const dbPath = path.join(tmpDir, "db.json");
     app = await createApp({ dbPath, uploadRoot: tmpDir, autoRun: false });
     const { runId } = await seedQueuedChat(app, {
-      planner_mode: "session",
       parallel_workers: 3,
       max_routing_adapters: 7,
       max_tokens: 173,
@@ -183,6 +182,9 @@ describe("durable background recovery", () => {
     });
     const validationRunId = "val_recovery_queued";
     await app.locals.store.mutate((data) => {
+      const legacyRun = data.runs.find((item) => item.run_id === runId);
+      legacyRun.planner_mode = "cue";
+      legacyRun.execution_options.planner_mode = "cue";
       data.validationRuns.push({
         validation_run_id: validationRunId,
         suite: "mock_smoke",
@@ -200,6 +202,7 @@ describe("durable background recovery", () => {
     await app.locals.store.close();
     app = null;
 
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const chatCalls = vi.fn();
     const validationCalls = vi.fn();
     app = await createApp({
@@ -224,19 +227,26 @@ describe("durable background recovery", () => {
     expect(chatCalls).toHaveBeenCalledTimes(1);
     expect(validationCalls).toHaveBeenCalledTimes(1);
     expect(chatCalls.mock.calls[0][0].options).toMatchObject({
-      planner_mode: "session",
       parallel_workers: 3,
       max_routing_adapters: 7,
       max_tokens: 173,
       refiner_max_tokens: 311,
       temperature: 0.2
     });
+    expect(chatCalls.mock.calls[0][0].options).not.toHaveProperty("planner_mode");
+    expect(warn).toHaveBeenCalledWith("agent_runtime.response_alias_deprecated", {
+      legacy_name: "planner_mode",
+      canonical_name: "fixed-semantic-session"
+    });
+    warn.mockRestore();
 
     const recoveredRun = app.locals.store.read((data) => data.runs.find((item) => item.run_id === runId));
     const recoveredValidation = app.locals.store.read((data) =>
       data.validationRuns.find((item) => item.validation_run_id === validationRunId)
     );
     expect(recoveredRun.status).toBe("completed");
+    expect(recoveredRun.planner_mode).toBe("session");
+    expect(recoveredRun.execution_options).not.toHaveProperty("planner_mode");
     expect(recoveredRun.dispatch).toMatchObject({ state: "finished", recovered: true });
     expect(recoveredRun.events.some((event) => event.type === "run.recovered")).toBe(true);
     expect(recoveredValidation.status).toBe("completed");
@@ -398,18 +408,18 @@ describe("lifecycle timeout configuration", () => {
       shutdownTimeoutMs: 960000
     });
     expect(resolveLifecycleTimeouts({
-      TCAR_RUNTIME_CHAT_TIMEOUT_MS: "1200000",
-      TCAR_RUNTIME_ADMIN_TIMEOUT_MS: "600000",
-      TCAR_RUNTIME_VALIDATION_TIMEOUT_SEC: "900"
+      AGENT_RUNTIME_CHAT_TIMEOUT_MS: "1200000",
+      AGENT_RUNTIME_ADMIN_TIMEOUT_MS: "600000",
+      AGENT_RUNTIME_VALIDATION_TIMEOUT_SEC: "900"
     })).toEqual({
       runtimeOperationTimeoutMs: 1200000,
       backgroundDrainTimeoutMs: 1230000,
       shutdownTimeoutMs: 1260000
     });
     expect(resolveLifecycleTimeouts({
-      TCAR_RUNTIME_CHAT_TIMEOUT_MS: "900000",
-      TCAR_RUNTIME_WORKFLOW_TIMEOUT_MS: "1500000",
-      TCAR_RUNTIME_CONTINUATION_TIMEOUT_MS: "1000000"
+      AGENT_RUNTIME_CHAT_TIMEOUT_MS: "900000",
+      AGENT_RUNTIME_WORKFLOW_TIMEOUT_MS: "1500000",
+      AGENT_RUNTIME_CONTINUATION_TIMEOUT_MS: "1000000"
     })).toEqual({
       runtimeOperationTimeoutMs: 1500000,
       backgroundDrainTimeoutMs: 1530000,

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { computeMetrics } from "../server/tcarEngine.js";
+import { computeMetrics } from "../server/runtimeObservability.js";
 
 function validStep(overrides = {}) {
   return {

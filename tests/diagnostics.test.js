@@ -5,7 +5,7 @@ import {
   projectValidationResult,
   safeDiagnosticLog
 } from "../server/diagnostics.js";
-import { classifyRunFailure } from "../server/tcarEngine.js";
+import { classifyRunFailure } from "../server/chatRunCoordinator.js";
 
 const SENTINEL = "private-customer-token-super-secret-value";
 

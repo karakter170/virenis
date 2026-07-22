@@ -20,21 +20,21 @@ afterEach(() => {
 describe("production transport security", () => {
   it("rejects plaintext remote Runtime endpoints without the private-network override", () => {
     expect(() => validateProductionRuntimeApiUrl({
-      TCAR_RUNTIME_API_URL: "http://gpu-runtime.example.net:9000"
+      AGENT_RUNTIME_API_URL: "http://gpu-runtime.example.net:9000"
     })).toThrow(/must use HTTPS/);
 
     expect(() => validateProductionRuntimeApiUrl({
-      TCAR_RUNTIME_API_URL: "http://gpu-runtime.internal:9000",
-      TCAR_ALLOW_INSECURE_PRIVATE_RUNTIME_HTTP: "1"
+      AGENT_RUNTIME_API_URL: "http://gpu-runtime.internal:9000",
+      AGENT_RUNTIME_ALLOW_INSECURE_PRIVATE_RUNTIME_HTTP: "1"
     })).not.toThrow();
 
     expect(() => validateProductionRuntimeApiUrl({
-      TCAR_RUNTIME_API_URL: "http://127.0.0.1:19000",
-      TCAR_ALLOW_LOOPBACK_RUNTIME_TUNNEL: "1"
+      AGENT_RUNTIME_API_URL: "http://127.0.0.1:19000",
+      AGENT_RUNTIME_ALLOW_LOOPBACK_RUNTIME_TUNNEL: "1"
     })).not.toThrow();
 
     expect(() => validateProductionRuntimeApiUrl({
-      TCAR_RUNTIME_API_URL: "https://gpu-runtime.example.net"
+      AGENT_RUNTIME_API_URL: "https://gpu-runtime.example.net"
     })).not.toThrow();
   });
 

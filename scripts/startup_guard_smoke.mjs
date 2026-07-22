@@ -30,7 +30,13 @@ const child = spawn(process.execPath, ["server/index.js"], {
     WEB_DIST_DIR: missingDist,
     WEB_STORE_DRIVER: "json",
     APP_ALLOW_JSON_STORE: "1",
-    TCAR_ENGINE_MODE: "simulator",
+    // Satisfy the production runtime guard so this focused smoke reaches the
+    // missing-build assertion it owns. No runtime request is made because
+    // startup stops at WEB_DIST_DIR first.
+    AGENT_RUNTIME_MODE: "real",
+    AGENT_RUNTIME_API_URL: "http://127.0.0.1:9000",
+    AGENT_RUNTIME_API_KEY: "startupguardsmokeruntimekey0123456789",
+    AGENT_RUNTIME_ALLOW_LOCAL_RUNTIME_URL: "1",
     APP_API_TOKENS_JSON: JSON.stringify({
       [smokeToken]: {
         user_id: "startup_guard_smoke",

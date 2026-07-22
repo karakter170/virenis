@@ -192,6 +192,7 @@ function admissionBoundPlan({
 function fixture({
   query = "Prepare a clear launch recommendation.",
   agentPatches = {},
+  evidenceRequirements = {},
   plan = null,
   options = { max_tokens: 1024, temperature: 0 }
 } = {}) {
@@ -205,9 +206,27 @@ function fixture({
   ];
   const resolvedPlan = plan || {
     steps: [
-      { id: "s1", adapter: "research_agent", task: "Collect the relevant evidence.", depends_on: [] },
-      { id: "s2", adapter: "safety_agent", task: "Review the relevant safeguards.", depends_on: [] },
-      { id: "s3", adapter: "writer_agent", task: "Combine the validated findings.", depends_on: ["s1", "s2"] }
+      {
+        id: "s1",
+        adapter: "research_agent",
+        task: "Collect the relevant evidence.",
+        depends_on: [],
+        evidence_requirement: evidenceRequirements.research_agent || "none"
+      },
+      {
+        id: "s2",
+        adapter: "safety_agent",
+        task: "Review the relevant safeguards.",
+        depends_on: [],
+        evidence_requirement: evidenceRequirements.safety_agent || "none"
+      },
+      {
+        id: "s3",
+        adapter: "writer_agent",
+        task: "Combine the validated findings.",
+        depends_on: ["s1", "s2"],
+        evidence_requirement: evidenceRequirements.writer_agent || "none"
+      }
     ]
   };
   const run = {
@@ -229,7 +248,7 @@ function fixture({
     created_by: run.created_by,
     shared_memory: []
   };
-  const data = { worldGraphArtifacts: [], worldGraphEvents: [] };
+  const data = { runs: [run], worldGraphArtifacts: [], worldGraphEvents: [] };
   const outputs = resolvedPlan.steps.map((step) => routeOutput(step, "v1", {}, resolvedPlan));
   recordWorldGraphRun({
     data,
@@ -298,8 +317,8 @@ describe("WorldGraph validity and selective replay", () => {
   });
 
   it("MAC-binds production artifacts so a database-only writer cannot forge a checksum", () => {
-    const previousKey = process.env.TCAR_RUNTIME_API_KEY;
-    process.env.TCAR_RUNTIME_API_KEY = "worldgraph-artifact-mac-test-key-0123456789";
+    const previousKey = process.env.AGENT_RUNTIME_API_KEY;
+    process.env.AGENT_RUNTIME_API_KEY = "worldgraph-artifact-mac-test-key-0123456789";
     try {
       const base = fixture();
       const artifact = base.data.worldGraphArtifacts[0];
@@ -311,8 +330,8 @@ describe("WorldGraph validity and selective replay", () => {
       ));
       expect(verifyWorldGraphArtifact(artifact)).toBe(false);
     } finally {
-      if (previousKey === undefined) delete process.env.TCAR_RUNTIME_API_KEY;
-      else process.env.TCAR_RUNTIME_API_KEY = previousKey;
+      if (previousKey === undefined) delete process.env.AGENT_RUNTIME_API_KEY;
+      else process.env.AGENT_RUNTIME_API_KEY = previousKey;
     }
   });
 
@@ -442,41 +461,33 @@ describe("WorldGraph validity and selective replay", () => {
   it("does not replay creative-variation or live-information routes", () => {
     const varied = replayFixture(fixture(), { options: { max_tokens: 1024, temperature: 0.7 } });
     expect(Object.values(varied.actions).every((value) => value === "refreshed")).toBe(true);
-    const live = fixture({ query: "Give me the latest live launch status today.", agentPatches: { research_agent: { tools: ["web_search"] } } });
+    const live = fixture({
+      query: "Give me the latest live launch status today.",
+      evidenceRequirements: { research_agent: "live_external" },
+      agentPatches: { research_agent: { tools: ["web_search"] } }
+    });
     expect(replayFixture(live).actions).toEqual({ research_agent: "refreshed", safety_agent: "kept", writer_agent: "kept" });
     const earthquake = fixture({ agentPatches: { research_agent: { tools: ["earthquake_feed"] } } });
     expect(replayFixture(earthquake).actions.research_agent).toBe("kept");
     const futureDynamicTool = fixture({ agentPatches: { research_agent: { tools: ["future_external_connector"] } } });
     expect(replayFixture(futureDynamicTool).actions.research_agent).toBe("kept");
     const currentFutureTool = fixture({
-      query: "Give me the current status.",
+      query: "Summarize the supplied release note.",
+      evidenceRequirements: { research_agent: "unknown" },
       agentPatches: { research_agent: { tools: ["future_external_connector"] } }
     });
     expect(replayFixture(currentFutureTool).actions.research_agent).toBe("refreshed");
     expect(replayFixture(currentFutureTool).reasons.research_agent).toBe("time_sensitive_request");
   });
 
-  it("applies the same bounded freshness contract to relative events, service status, transit, and false senses", () => {
-    const mutableQueries = [
-      "Tell me what happened in last night's game.",
-      "Summarize yesterday's election result.",
-      "Explain this quarter's earnings.",
-      "What is the newest stable Node release?",
-      "Is Gmail working?",
-      "Show the current traffic near the airport.",
-      "When is the next train?",
-      "Who is the current leader?",
-      "Explain real-time chat architecture and check whether Gmail is working.",
-      "Write a poem about yesterday's election result.",
-      "Write a story inspired by last night's game score.",
-      "Summarize this morning's traffic near the airport.",
-      "What time is my flight tomorrow?",
-      "What has changed since 2020?",
-      "As of 2021, how has Python changed?"
-    ];
-    for (const query of mutableQueries) {
+  it("takes freshness solely from the semantic evidence contract, independent of request wording", () => {
+    for (const { query, evidenceRequirement } of [
+      { query: "Describe the blue object.", evidenceRequirement: "live_external" },
+      { query: "Ürün durumunu açıkla.", evidenceRequirement: "unknown" }
+    ]) {
       const base = fixture({
         query,
+        evidenceRequirements: { research_agent: evidenceRequirement },
         agentPatches: { research_agent: { tools: ["web_search"] } }
       });
       const repeated = replayFixture(base);
@@ -484,24 +495,14 @@ describe("WorldGraph validity and selective replay", () => {
       expect(repeated.reasons.research_agent, query).toBe("time_sensitive_request");
     }
 
-    const timelessQueries = [
-      "Score this essay.",
-      "Explain a real-time chat architecture.",
-      "Design a stock management workflow.",
-      "Write a poem about yesterday.",
-      "Write a story about tomorrow.",
-      "Write a sentence about last night.",
-      "Use yesterday as the theme of a poem.",
-      "Explain the Python release cycle.",
-      "Is this Python function working?",
-      "The API design is working well.",
-      "Describe the newest character in this story.",
-      "Analyze the report as of 2020.",
-      "Continue with the Python release cycle as of 2021."
-    ];
-    for (const query of timelessQueries) {
+    for (const { query, evidenceRequirement } of [
+      { query: "Give me the latest live launch status today.", evidenceRequirement: "none" },
+      { query: "Bugünkü hava durumunu söyle.", evidenceRequirement: "supplied_context" },
+      { query: "Explain real-time chat architecture.", evidenceRequirement: "none" }
+    ]) {
       const base = fixture({
         query,
+        evidenceRequirements: { research_agent: evidenceRequirement },
         agentPatches: { research_agent: { tools: ["web_search"] } }
       });
       const repeated = replayFixture(base);
@@ -538,10 +539,11 @@ describe("WorldGraph validity and selective replay", () => {
     expect(changed.reasons.research_agent).toBe("inputs_and_evidence_unchanged");
   });
 
-  it("fails closed for multilingual current-information requests", () => {
+  it("fails closed for an invalid evidence enum without inspecting request language", () => {
     const base = fixture({
-      query: "Bugünkü hava durumunu söyle.",
-      agentPatches: { research_agent: { tools: ["web_search"], routing_cues: ["hava"] } }
+      query: "A timeless-looking sentence.",
+      evidenceRequirements: { research_agent: "not-a-contract-value" },
+      agentPatches: { research_agent: { tools: ["web_search"] } }
     });
     const repeated = replayFixture(base);
     expect(repeated.actions.research_agent).toBe("refreshed");
@@ -581,6 +583,33 @@ describe("WorldGraph validity and selective replay", () => {
       primary_reason: "inputs_and_evidence_unchanged"
     });
     expect(signedCapsulePayload(prepared.capsule).candidates).toHaveLength(3);
+  });
+
+  it("signs a complete prior delegated route plan for exact-repeat restoration", () => {
+    const base = fixture({ plan: admissionBoundPlan() });
+    const prepared = prepareWorldGraphReplay({
+      data: base.data,
+      run: { ...base.run, run_id: "run_replay_plan_target" },
+      session: base.session,
+      agents: base.agents,
+      documents: [],
+      sharedMemory: [],
+      options: { max_tokens: 1024, temperature: 0 },
+      signingKey: "a-runtime-key-long-enough-for-hmac",
+      now: Date.parse("2026-07-15T10:05:00.000Z")
+    });
+    const payload = signedCapsulePayload(prepared.capsule);
+    expect(payload.candidates).toHaveLength(2);
+    expect(payload.replay_plan).toMatchObject({
+      contract_version: "world-graph-replay-plan-v1",
+      origin_run_id: "run_cold",
+      decision: "delegate",
+      steps: [
+        expect.objectContaining({ id: "s1", adapter: "research_agent" }),
+        expect.objectContaining({ id: "s2", adapter: "writer_agent", depends_on: ["s1"] })
+      ]
+    });
+    expect(payload.replay_plan.plan_digest).toMatch(/^sha256:[a-f0-9]{64}$/);
   });
 
   it("binds each route task without unnecessarily waking unchanged siblings", () => {

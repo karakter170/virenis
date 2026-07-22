@@ -13,7 +13,7 @@ import { createApp } from "../server/app.js";
 import { activeSessionViewReady } from "../e2e/pipelineSessionBinding.js";
 
 const PROJECT_ROOT = path.resolve(import.meta.dirname, "../../..");
-const RUNTIME_KEY_FILE = process.env.TCAR_RUNTIME_API_KEY_FILE
+const RUNTIME_KEY_FILE = process.env.AGENT_RUNTIME_API_KEY_FILE
   || path.join(PROJECT_ROOT, "outputs", "tcar_api_key.txt");
 const INITIAL_PROMPT_BODY = "Use only this supplied hypothetical context; no current facts or web research are needed: a neighborhood library with a fixed small budget wants more teenagers to participate after school. Frame the challenge and explain the core users, constraints, assumptions, and success criteria.";
 const FOLLOWUP_PROMPT = "Look the other perspectives. And explain more.";
@@ -27,9 +27,9 @@ const APP_BOOT_TIMEOUT_MS = Number(process.env.BRAINSTORM_UI_BOOT_TIMEOUT_MS || 
 const CLERK_TEST_USER_ID = process.env.BRAINSTORM_UI_CLERK_USER_ID || "";
 const CAPABILITY_ERROR = /selected team cannot yet produce every required outcome|enable a compatible capability|could not complete/i;
 const MANAGED_ENV = [
-  "NODE_ENV", "WEB_STORE_DRIVER", "APP_API_TOKENS_JSON", "TCAR_ENGINE_MODE",
-  "TCAR_RUNTIME_API_URL", "TCAR_RUNTIME_API_KEY", "TCAR_RUNTIME_API_KEY_FILE",
-  "TCAR_RUNTIME_CHAT_TIMEOUT_MS", "TCAR_RUNTIME_ADMIN_TIMEOUT_MS",
+  "NODE_ENV", "WEB_STORE_DRIVER", "APP_API_TOKENS_JSON", "AGENT_RUNTIME_MODE",
+  "AGENT_RUNTIME_API_URL", "AGENT_RUNTIME_API_KEY", "AGENT_RUNTIME_API_KEY_FILE",
+  "AGENT_RUNTIME_CHAT_TIMEOUT_MS", "AGENT_RUNTIME_ADMIN_TIMEOUT_MS",
   "APP_BILLING_WELCOME_CREDITS", "APP_PUBLIC_ORIGIN"
 ];
 
@@ -100,12 +100,12 @@ async function main() {
       // .env.local belongs to the long-running development server and would
       // correctly reject this browser's state-changing requests.
       delete process.env.APP_PUBLIC_ORIGIN;
-      process.env.TCAR_ENGINE_MODE = "real";
-      process.env.TCAR_RUNTIME_API_URL = process.env.TCAR_RUNTIME_API_URL || "http://127.0.0.1:9000";
-      delete process.env.TCAR_RUNTIME_API_KEY;
-      process.env.TCAR_RUNTIME_API_KEY_FILE = RUNTIME_KEY_FILE;
-      process.env.TCAR_RUNTIME_CHAT_TIMEOUT_MS = "1800000";
-      process.env.TCAR_RUNTIME_ADMIN_TIMEOUT_MS = "300000";
+      process.env.AGENT_RUNTIME_MODE = "real";
+      process.env.AGENT_RUNTIME_API_URL = process.env.AGENT_RUNTIME_API_URL || "http://127.0.0.1:9000";
+      delete process.env.AGENT_RUNTIME_API_KEY;
+      process.env.AGENT_RUNTIME_API_KEY_FILE = RUNTIME_KEY_FILE;
+      process.env.AGENT_RUNTIME_CHAT_TIMEOUT_MS = "1800000";
+      process.env.AGENT_RUNTIME_ADMIN_TIMEOUT_MS = "300000";
       process.env.APP_BILLING_WELCOME_CREDITS = "2500";
 
       app = await createApp({

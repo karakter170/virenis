@@ -98,13 +98,12 @@ describe("workspace model output settings", () => {
     })).toThrow("change reason");
   });
 
-  it("derives safe output ceilings from worker and session context windows", () => {
+  it("derives safe output ceilings from execution and orchestration context windows", () => {
     expect(modelOutputSettingsForWorkspace({}, "workspace_a", {
-      TCAR_PLANNER_MODE: "session",
-      TCAR_MODEL_CONTEXT_TOKENS: "16384",
-      ROUTER_SESSION_CONTEXT_TOKENS: "32768",
-      TCAR_CLIENT_MAX_TOKENS: "16384",
-      TCAR_CLIENT_MAX_REFINER_TOKENS: "32768"
+      AGENT_RUNTIME_MODEL_CONTEXT_TOKENS: "16384",
+      AGENT_RUNTIME_ORCHESTRATION_MODEL_CONTEXT_TOKENS: "32768",
+      AGENT_RUNTIME_CLIENT_MAX_TOKENS: "16384",
+      AGENT_RUNTIME_CLIENT_MAX_REFINER_TOKENS: "32768"
     }).bounds).toMatchObject({
       agent_output_tokens: { max: 7936, context_tokens: 16384 },
       final_output_tokens: { max: 16128, context_tokens: 32768 }

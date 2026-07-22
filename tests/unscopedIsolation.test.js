@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { scopedRoutingContext } from "../server/tcarEngine.js";
+import { scopedRoutingContext } from "../server/chatRunCoordinator.js";
 import { buildWorkflowCompositionInput } from "../server/workflows.js";
 
 function agent(id, overrides = {}) {

@@ -62,15 +62,11 @@ export function compileWorkflowAgentConfiguration({
   const candidateComposition = candidate?.policies?.composition || {};
   const responseSpecified = hasAnyOwn(rawNode, ["response_style", "tone", "tones"])
     || hasAnyOwn(rawNode.response, ["style", "tone", "tones"]);
-  const semanticResponseRequired = workflowNeedsSpecialResponse(task, capability);
-  const inheritCandidateResponse = Boolean(candidate && !responseSpecified && !semanticResponseRequired);
+  const inheritCandidateResponse = Boolean(candidate && !responseSpecified);
   const responseStyle = normalizeResponseStyle(
     rawNode.response_style
       ?? rawNode.response?.style
-      ?? (inheritCandidateResponse ? candidateResponse.style : null),
-    task,
-    capability,
-    candidate?.boundary
+      ?? (inheritCandidateResponse ? candidateResponse.style : null)
   );
   const tones = normalizeTones(
     rawNode.tone
@@ -78,24 +74,17 @@ export function compileWorkflowAgentConfiguration({
       ?? rawNode.response?.tone
       ?? rawNode.response?.tones
       ?? (inheritCandidateResponse ? candidateResponse.tones : null),
-    {
-      responseStyle,
-      task,
-      capability
-    }
+    { responseStyle }
   );
   const memorySpecified = hasOwn(rawNode, "memory")
     || normalizeList(rawNode.consumes, 20, 120)
       .some((item) => ["shared_memory", "conversation_context"].includes(item));
-  const semanticMemoryRequired = workflowNeedsConversationMemory(task, capability);
   const memoryMode = normalizeMemoryMode(
-    rawNode.memory ?? (candidate && !memorySpecified && !semanticMemoryRequired ? candidateMemory.mode : null),
-    rawNode.consumes ?? candidate?.consumes,
-    `${task || ""} ${capability || ""}`
+    rawNode.memory ?? (candidate && !memorySpecified ? candidateMemory.mode : null),
+    rawNode.consumes ?? candidate?.consumes
   );
   const knowledgeRequirements = normalizeKnowledgeRequirements(
     rawNode,
-    task,
     tools,
     candidateKnowledge.requirements
   );
@@ -163,9 +152,9 @@ export function compileWorkflowAgentConfiguration({
     policies,
     stage: boundedStage(rawNode.stage ?? candidate?.stage, defaultStage),
     decisions: {
-      response: responseSpecified ? "requested" : semanticResponseRequired ? "task_inferred" : candidate ? "candidate_inherited" : "safe_default",
-      memory: memorySpecified ? "requested" : semanticMemoryRequired ? "task_inferred" : candidate ? "candidate_inherited" : "safe_default",
-      knowledge: hasKnowledgeConfiguration(rawNode, tools) ? "requested_or_inferred" : candidate ? "candidate_inherited" : "safe_default"
+      response: responseSpecified ? "requested" : candidate ? "candidate_inherited" : "safe_default",
+      memory: memorySpecified ? "requested" : candidate ? "candidate_inherited" : "safe_default",
+      knowledge: hasKnowledgeConfiguration(rawNode, tools) ? "requested" : candidate ? "candidate_inherited" : "safe_default"
     }
   };
 }
@@ -206,31 +195,21 @@ export function sanitizeReusableAgentText(value, maxChars = 600) {
     .trim();
 }
 
-function normalizeResponseStyle(value, ...context) {
+function normalizeResponseStyle(value) {
   const normalized = String(value || "").trim().toLowerCase();
   if (RESPONSE_STYLES.has(normalized)) return normalized;
-  const text = context.join(" ").toLowerCase();
-  if (/\b(evidence|verify|careful|compliance|legal|medical|risk|uncertain|audit)\b/.test(text)) return "careful";
-  if (/\b(thorough|detailed|deep|comprehensive|explain|trade-?offs?)\b/.test(text)) return "thorough";
   return "direct";
 }
 
-function normalizeTones(value, { responseStyle, task, capability }) {
+function normalizeTones(value, { responseStyle }) {
   const requested = normalizeList(value, 8, 40)
     .flatMap((item) => item.toLowerCase().split(/[^a-z]+/))
     .filter((item) => SAFE_TONES.has(item));
   if (requested.length) return [...new Set(requested)].slice(0, 3);
-  const text = `${task || ""} ${capability || ""}`.toLowerCase();
-  const inferred = [];
-  if (/\b(apology|complaint|support|distress|patient|care)\b/.test(text)) inferred.push("empathetic", "calm");
-  if (/\b(executive|business|client|proposal|report)\b/.test(text)) inferred.push("professional");
-  if (/\b(tutor|teach|student|lesson|explain)\b/.test(text)) inferred.push("patient", "educational");
-  if (/\b(code|engineering|technical|repository)\b/.test(text)) inferred.push("technical", "clear");
-  if (!inferred.length) inferred.push(responseStyle === "careful" ? "objective" : "clear");
-  return [...new Set(inferred)].slice(0, 3);
+  return [responseStyle === "careful" ? "objective" : "clear"];
 }
 
-function normalizeMemoryMode(value, consumes, task) {
+function normalizeMemoryMode(value, consumes) {
   const explicit = typeof value === "object" && value !== null
     ? value.mode ?? value.enabled ?? value.use_conversation
     : value;
@@ -241,37 +220,23 @@ function normalizeMemoryMode(value, consumes, task) {
   if (["none", "false", "off", "disabled"].includes(normalized) || explicit === false) return "none";
   const requestedContexts = normalizeList(consumes, 20, 120);
   if (requestedContexts.some((item) => ["shared_memory", "conversation_context"].includes(item))) return "conversation";
-  return /\b(ongoing|remember|previous|follow[- ]?up|monitor|over time|recurring)\b/i.test(String(task || ""))
-    ? "conversation"
-    : "none";
+  return "none";
 }
 
-function workflowNeedsSpecialResponse(...values) {
-  return /\b(apology|complaint|support|distress|patient|care|tutor|teach|student|lesson|executive|client|proposal|formal|friendly|empathetic|diplomatic|persuasive|evidence|verify|careful|compliance|legal|medical|risk|uncertain|audit|thorough|detailed|deep|comprehensive|trade-?offs?)\b/i
-    .test(values.filter(Boolean).join(" "));
-}
-
-function workflowNeedsConversationMemory(...values) {
-  return /\b(ongoing|remember|previous|follow[- ]?up|monitor|over time|recurring|weekly|daily|each time|future matching|preference|relationship history)\b/i
-    .test(values.filter(Boolean).join(" "));
-}
-
-function normalizeKnowledgeRequirements(rawNode, task, tools, candidateRequirements = []) {
+function normalizeKnowledgeRequirements(rawNode, tools, candidateRequirements = []) {
   const rawKnowledge = rawNode.knowledge && typeof rawNode.knowledge === "object"
     ? rawNode.knowledge.requirements
     : rawNode.knowledge_requirements;
   const requirements = normalizeList(rawKnowledge ?? candidateRequirements, 12, 80)
     .map((item) => item.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, ""))
     .filter((item) => KNOWLEDGE_REQUIREMENTS.has(item));
-  const text = String(task || "").toLowerCase();
   const toolSet = new Set(normalizeList(tools, 30, 128));
-  // Freshness words alone may refer to a connected inbox, CRM, calendar, or
-  // attached document. Only an actual compiled web tool or explicit public
-  // web request should widen the role to public-web knowledge.
-  if (toolSet.has("web_search") || /\b(public web|web search|search the web|internet sources?|public sources?)\b/.test(text)) requirements.push("current_web");
-  if (toolSet.has("document_search") || toolSet.has("document_read") || /\b(attached|uploaded|supplied)\s+(?:file|document|pdf|report)/.test(text)) requirements.push("attached_documents");
-  if (toolSet.has("data_table") || /\b(csv|spreadsheet|table|dataset|records?)\b/.test(text)) requirements.push("structured_data");
-  if (toolSet.has("repo_inspector") || /\b(codebase|repository|pull request|source code)\b/.test(text)) requirements.push("repository");
+  // Tool and knowledge ids are structured model output. Cross-bind those ids
+  // here without reinterpreting task prose.
+  if (toolSet.has("web_search")) requirements.push("current_web");
+  if (toolSet.has("document_search") || toolSet.has("document_read")) requirements.push("attached_documents");
+  if (toolSet.has("data_table")) requirements.push("structured_data");
+  if (toolSet.has("repo_inspector")) requirements.push("repository");
   if (normalizeList(rawNode.provider_ids, 8, 64).length) requirements.push("connected_app");
   if (!requirements.length) requirements.push("user_provided_context");
   return [...new Set(requirements)].slice(0, 8);

@@ -9,7 +9,7 @@ import {
   clerkPublishableKey
 } from "./clerkIdentity.js";
 import { assertFrontendClerkPublishableKey } from "./productionBuild.js";
-import { requireRuntimeConfigured } from "./runtimeClient.js";
+import { requireRuntimeConfigured } from "./agentRuntimeClient.js";
 import { safeDiagnosticLog } from "./diagnostics.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));

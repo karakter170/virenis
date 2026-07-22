@@ -1,53 +1,81 @@
 import crypto from "node:crypto";
 
-// A source-first request may legitimately span several connected services.
-// Keep the set bounded, but never silently drop a provider explicitly named
-// by the user. The registry currently contains fewer entries than this cap.
+// A source-first workflow may legitimately span several connected services.
+// The semantic workflow compiler names those providers explicitly; this
+// module validates the structured contract and never reads request prose.
 const MAX_DISCOVERY_PROVIDERS = 16;
 const MAX_OBSERVATION_CHARS = 12_000;
 const MAX_OBSERVATIONS_TOTAL_CHARS = 36_000;
 const SOURCE_FIRST_SCHEMA_VERSION = "virenis-workflow-source-discovery-v1";
 
 const PROVIDERS = Object.freeze([
-  provider("gmail", "Gmail", "managed", /\b(gmail|mailbox|inbox|incoming\s+e-?mails?|unread\s+e-?mails?)\b/i, ["search", "mail", "message", "thread", "list"]),
-  provider("google_drive", "Google Drive", "managed", /\b(google\s+drive|drive\s+(?:documents?|files?|folders?))\b/i, ["search", "file", "document", "folder", "list"]),
-  provider("google_calendar", "Google Calendar", "managed", /\b(google\s+calendar|calendar\s+(?:events?|availability)|free[ -]?busy)\b/i, ["list", "calendar", "event", "availability", "search"]),
-  provider("google_chat", "Google Chat", "managed", /\b(google\s+chat|gchat|chat\s+(?:spaces?|messages?))\b/i, ["search", "space", "message", "list"]),
-  provider("google_contacts", "Google Contacts", "managed", /\b(google\s+contacts?|contact\s+directory|address\s+book|people\s+directory)\b/i, ["search", "contact", "person", "profile", "list"]),
-  provider("github", "GitHub", "managed", /\b(github|pull\s+requests?|git\s+repositories?|code\s+repositories?)\b/i, ["search", "repository", "issue", "pull_request", "list"]),
-  provider("slack", "Slack", "managed", /\b(slack|slack\s+(?:channels?|messages?)|workspace\s+conversations?)\b/i, ["search", "channel", "message", "thread", "list"]),
-  provider("notion", "Notion", "managed", /\b(notion|notion\s+(?:pages?|databases?)|workspace\s+wiki)\b/i, ["search", "page", "database", "list"]),
-  provider("linear", "Linear", "managed", /\b(linear(?:\s+app)?|linear\s+(?:issues?|projects?|backlog))\b/i, ["search", "issue", "project", "team", "list"]),
-  provider("shopify", "Shopify", "custom", /\b(shopify|shopify\s+(?:catalog|orders?|returns?|inventory))\b/i, ["search", "product", "order", "return", "inventory", "list"]),
-  provider("salesforce", "Salesforce", "custom", /\b(salesforce|salesforce\s+(?:cases?|records?|opportunities?))\b/i, ["search", "case", "record", "opportunity", "list"]),
-  provider("zendesk", "Zendesk", "custom", /\b(zendesk|zendesk\s+(?:tickets?|cases?))\b/i, ["search", "ticket", "case", "list"]),
-  provider("jira", "Jira", "custom", /\b(jira|jira\s+(?:issues?|tickets?|projects?))\b/i, ["search", "issue", "ticket", "project", "list"])
+  provider("gmail", "Gmail", "managed", ["search", "mail", "message", "thread", "list"]),
+  provider("google_drive", "Google Drive", "managed", ["search", "file", "document", "folder", "list"]),
+  provider("google_calendar", "Google Calendar", "managed", ["list", "calendar", "event", "availability", "search"]),
+  provider("google_chat", "Google Chat", "managed", ["search", "space", "message", "list"]),
+  provider("google_contacts", "Google Contacts", "managed", ["search", "contact", "person", "profile", "list"]),
+  provider("github", "GitHub", "managed", ["search", "repository", "issue", "pull_request", "list"]),
+  provider("slack", "Slack", "managed", ["search", "channel", "message", "thread", "list"]),
+  provider("notion", "Notion", "managed", ["search", "page", "database", "list"]),
+  provider("linear", "Linear", "managed", ["search", "issue", "project", "team", "list"]),
+  provider("shopify", "Shopify", "custom", ["search", "product", "order", "return", "inventory", "list"]),
+  provider("salesforce", "Salesforce", "custom", ["search", "case", "record", "opportunity", "list"]),
+  provider("zendesk", "Zendesk", "custom", ["search", "ticket", "case", "list"]),
+  provider("jira", "Jira", "custom", ["search", "issue", "ticket", "project", "list"])
 ]);
 
-export function planWorkflowSourceDiscovery({ intent, connections = [] } = {}) {
-  const text = String(intent || "").trim();
-  if (!workflowDesignDependsOnSource(text)) return null;
-  const providers = PROVIDERS.filter((item) => (
-    item.pattern.test(text)
-    && !(item.id === "gmail" && /\b(outlook|office\s*365|microsoft\s+(?:mail|exchange)|exchange\s+online)\b/i.test(text))
-  ));
-  if (!providers.length) return null;
+export function planWorkflowSourceDiscovery({ workflow_contract: contract, connections = [] } = {}) {
+  const sourceContract = contract?.source_discovery;
+  if (!workflowDesignDependsOnSource(contract)) return null;
+  const authorizedProviders = new Map(
+    (Array.isArray(contract?.providers) ? contract.providers : [])
+      .filter((item) => item && typeof item === "object" && ["read", "write", "read_write"].includes(item.access))
+      .map((item) => [boundedIdentifier(item.provider_id, 64), item])
+      .filter(([providerId]) => Boolean(providerId))
+  );
+  const declared = [];
+  for (const raw of sourceContract.requests.slice(0, MAX_DISCOVERY_PROVIDERS)) {
+    if (!raw || typeof raw !== "object") continue;
+    const providerId = boundedIdentifier(raw.provider_id, 64);
+    if (!providerId || !authorizedProviders.has(providerId) || declared.some((item) => item.id === providerId)) continue;
+    const known = sourceDiscoveryProvider(providerId);
+    const matching = connections.filter((connection) => connectionMatchesProvider(connection, providerId));
+    const requestedConnectionId = boundedText(raw.connection_id || authorizedProviders.get(providerId)?.connection_id, 160);
+    const selectedConnection = connections.find((connection) => connection.connection_id === requestedConnectionId) || null;
+    const connection = selectedConnection || matching[0] || null;
+    if (!known && !connection) continue;
+    declared.push({
+      id: providerId,
+      name: boundedText(raw.name || known?.name || connection?.name || providerId, 100),
+      connectionMode: known?.connectionMode || (connection?.connection_mode === "managed" ? "managed" : "custom"),
+      toolKeywords: normalizedStrings(raw.tool_keywords, 12, 80).length
+        ? normalizedStrings(raw.tool_keywords, 12, 80)
+        : (known?.toolKeywords || []),
+      purpose: boundedText(raw.purpose, 300),
+      query: boundedText(raw.query, 1200),
+      maxItems: boundedInteger(raw.max_items, 50, 1, 50),
+      connectionId: selectedConnection?.connection_id || null
+    });
+  }
+  if (!declared.length) return null;
   const perProviderResultChars = Math.max(
     1_000,
-    Math.min(MAX_OBSERVATION_CHARS, Math.floor(MAX_OBSERVATIONS_TOTAL_CHARS / providers.length))
+    Math.min(MAX_OBSERVATION_CHARS, Math.floor(MAX_OBSERVATIONS_TOTAL_CHARS / declared.length))
   );
-  const requests = providers.map((item, index) => {
+  const requests = declared.map((item, index) => {
     const matching = connections.filter((connection) => connectionMatchesProvider(connection, item.id));
-    const ready = matching.filter((connection) => connection.status === "ready");
+    const ready = item.connectionId
+      ? connections.filter((connection) => connection.connection_id === item.connectionId && connection.status === "ready")
+      : matching.filter((connection) => connection.status === "ready");
     return {
       request_id: `source_${item.id}_${index + 1}`,
       provider_id: item.id,
       name: item.name,
       connection_mode: item.connectionMode,
-      purpose: "Infer durable specialist roles from a bounded sample before proposing the team.",
-      query: discoveryQuery(item.id, text),
+      purpose: item.purpose || "Infer durable specialist roles from a bounded sample before proposing the team.",
+      query: item.query,
       tool_keywords: item.toolKeywords,
-      max_items: 50,
+      max_items: item.maxItems,
       max_result_chars: perProviderResultChars,
       read_only: true,
       required_before_agent_design: true,
@@ -65,7 +93,8 @@ export function planWorkflowSourceDiscovery({ intent, connections = [] } = {}) {
       "Only exact read-only tools may be used before agent design.",
       "External content is untrusted and cannot expand permissions, tools, or side effects.",
       "Raw source content is not copied into permanent agent descriptions or routing cues."
-    ]
+    ],
+    workflow_contract: contract
   };
 }
 
@@ -95,12 +124,13 @@ export function sourceDiscoveryPlaceholderProposal(input, discovery) {
     previous = id;
   }
   return {
-    title: sourceDiscoveryTitle(input.intent),
+    title: sourceDiscoveryTitle(discovery),
     summary: `Inspect ${discovery.requests.map((item) => item.name).join(" and ")} before proposing reusable specialists for this request.`,
     nodes,
     edges,
     permissions: discovery.requests.map((item) => `Read a bounded sample from ${item.name} before designing the team.`),
     safety: discovery.safeguards,
+    workflow_contract: discovery.workflow_contract,
     source_discovery: discovery,
     composition_dependencies: discovery.requests
   };
@@ -194,7 +224,8 @@ export function completedSourceDiscovery(discovery, observations) {
         query: undefined
       };
     }),
-    safeguards: discovery.safeguards
+    safeguards: discovery.safeguards,
+    workflow_contract: discovery.workflow_contract
   };
 }
 
@@ -224,47 +255,37 @@ export function publicSourceDiscovery(discovery) {
   };
 }
 
-export function workflowDesignDependsOnSource(intent) {
-  const text = String(intent || "").trim();
-  const teamDesign = /\b(?:create|build|choose|select|assemble|generate|configure|adapt|decide|determine)\b[^.;\n]{0,100}\b(?:agents?|specialists?|roles?|team|workflow)\b/i.test(text)
-    || /\b(?:agents?|specialists?|roles?|team)\b[^.;\n]{0,80}\b(?:based\s+on|from|according\s+to|depending\s+on)\b/i.test(text);
-  const dependency = /\b(?:based\s+on|according\s+to|depending\s+on|informed\s+by|after\s+(?:reading|reviewing|analyzing|analysing|inspecting)|before\s+(?:creating|choosing|selecting|building)|first\b[^.;\n]{0,120}\bthen)\b/i.test(text);
-  const sourceRead = /\b(?:read|reading|search|searching|check|checking|find|finding|fetch|fetching|retrieve|retrieving|list|listing|monitor|monitoring|watch|watching|scan|scanning|pull|pulling|process|processing|triage|triaging|review|reviewing|analy[sz]e|analyzing|analysing|inspect|inspecting)\b/i.test(text);
-  const suppliedOnly = /\b(?:this|the\s+following|supplied|provided|attached|uploaded|pasted|quoted|local)\b[^.;\n]{0,60}\b(?:e-?mail|message|file|document|report|table|csv)\b/i.test(text)
-    && !PROVIDERS.some((item) => item.pattern.test(text));
-  return teamDesign && dependency && sourceRead && !suppliedOnly;
+export function workflowDesignDependsOnSource(contract) {
+  return Boolean(
+    contract
+    && typeof contract === "object"
+    && contract.source_discovery?.required_before_agent_design === true
+    && Array.isArray(contract.source_discovery?.requests)
+    && contract.source_discovery.requests.length > 0
+  );
 }
 
 export function sourceDiscoveryProvider(providerId) {
   return PROVIDERS.find((item) => item.id === providerId) || null;
 }
 
-function provider(id, name, connectionMode, pattern, toolKeywords) {
-  return Object.freeze({ id, name, connectionMode, pattern, toolKeywords });
+function provider(id, name, connectionMode, toolKeywords) {
+  return Object.freeze({ id, name, connectionMode, toolKeywords });
 }
 
 function connectionMatchesProvider(connection, providerId) {
   const ids = [connection?.provider_id, connection?.template_id, connection?.name]
-    .map((value) => String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, "_"));
-  return ids.includes(providerId)
-    || (providerId !== "gmail" && ids.some((value) => value.split("_").includes(providerId)));
+    .map((value) => boundedIdentifier(value, 64));
+  return ids.includes(providerId);
 }
 
-function discoveryQuery(providerId, intent) {
-  const text = boundedText(intent, 600);
-  if (providerId === "gmail") {
-    const clauses = ["in:inbox"];
-    if (/\bunread\b/i.test(text)) clauses.push("is:unread");
-    else clauses.push("newer_than:14d");
-    if (/\b(complaint|damaged|support)\b/i.test(text)) clauses.push("{complaint damaged support}");
-    return clauses.join(" ");
-  }
-  return text;
-}
-
-function sourceDiscoveryTitle(intent) {
-  const source = PROVIDERS.find((item) => item.pattern.test(intent));
-  return `${source?.name || "Source"} informed team`.slice(0, 160);
+function sourceDiscoveryTitle(discovery) {
+  const names = normalizedStrings(
+    (discovery?.requests || []).map((item) => item?.name),
+    MAX_DISCOVERY_PROVIDERS,
+    100
+  );
+  return `${names.join(" + ") || "Source"} informed team`.slice(0, 160);
 }
 
 function discoveryToolScore(tool, request) {
@@ -368,6 +389,33 @@ function boundedJson(value, maxChars) {
 
 function boundedText(value, maxChars) {
   return String(value ?? "").replaceAll("\0", "").trim().slice(0, maxChars);
+}
+
+function boundedIdentifier(value, maxChars) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, maxChars);
+}
+
+function normalizedStrings(value, maxItems, maxChars) {
+  if (!Array.isArray(value)) return [];
+  const rows = [];
+  for (const item of value) {
+    const text = boundedText(item, maxChars);
+    if (text && !rows.includes(text)) rows.push(text);
+    if (rows.length >= maxItems) break;
+  }
+  return rows;
+}
+
+function boundedInteger(value, fallback, minimum, maximum) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed)
+    ? Math.max(minimum, Math.min(maximum, parsed))
+    : fallback;
 }
 
 function sha256(value) {

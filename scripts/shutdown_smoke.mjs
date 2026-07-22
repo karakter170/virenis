@@ -124,7 +124,13 @@ const child = spawn(process.execPath, ["server/index.js"], {
     PORT: String(port),
     WEB_STORE_DRIVER: "json",
     APP_ALLOW_JSON_STORE: "1",
-    TCAR_ENGINE_MODE: "simulator",
+    // Exercise the real production branch without touching a live Runtime.
+    // The closed loopback port fails immediately after the queued/SSE events
+    // are emitted, which is sufficient for graceful-drain verification.
+    AGENT_RUNTIME_MODE: "real",
+    AGENT_RUNTIME_API_URL: "http://127.0.0.1:1",
+    AGENT_RUNTIME_API_KEY: "shutdownsmokeruntimekey0123456789",
+    AGENT_RUNTIME_ALLOW_LOCAL_RUNTIME_URL: "1",
     APP_API_TOKENS_JSON: JSON.stringify({
       [smokeToken]: {
         user_id: "shutdown_smoke",

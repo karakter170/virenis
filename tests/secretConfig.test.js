@@ -20,7 +20,7 @@ describe("file-backed server secrets", () => {
     const secretFile = await createSecretFile("0123456789abcdef0123456789abcdef");
     const env = {
       NODE_ENV: "production",
-      TCAR_RUNTIME_API_KEY_FILE: secretFile,
+      AGENT_RUNTIME_API_KEY_FILE: secretFile,
       APP_BASIC_AUTH_USER: "admin",
       APP_BASIC_AUTH_PASSWORD_FILE: secretFile
     };
@@ -44,7 +44,7 @@ describe("file-backed server secrets", () => {
 
     expect(() => runtimeApiKey({
       NODE_ENV: "production",
-      TCAR_RUNTIME_API_KEY_FILE: secretFile
+      AGENT_RUNTIME_API_KEY_FILE: secretFile
     })).toThrow(/group- or world-accessible/);
   });
 

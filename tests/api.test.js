@@ -6,7 +6,22 @@ import request from "supertest";
 import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createApp } from "../server/app.js";
 import { requireRuntimeConfigured, setRuntimeFetchForTests } from "../server/runtimeClient.js";
-import { buildParallelBatches, enrichRuntimeRoutingTrace, normalizeRuntimeRouting, normalizeSharedMemory, planRoutes, sanitizeRuntimeFinalAnswer, sanitizeToolCalls, scopedRoutingContext } from "../server/tcarEngine.js";
+import { buildParallelBatches } from "../server/runtimePlanValidator.js";
+import {
+  enrichRuntimeRoutingTrace,
+  normalizeRuntimeRouting,
+  sanitizeRuntimeFinalAnswer
+} from "../server/routeResultNormalizer.js";
+import {
+  normalizeSharedMemory,
+  scopedRoutingContext
+} from "../server/chatRunCoordinator.js";
+import {
+  planRoutes,
+  processLocalChatRun,
+  processLocalValidationRun,
+  sanitizeToolCalls
+} from "./fixtures/agentRuntimeSimulator.js";
 import { chunkDocument, runtimeDocumentRevision } from "../server/documents.js";
 import { appendAgentEvent } from "../server/outcomes.js";
 
@@ -32,7 +47,9 @@ beforeEach(async () => {
   tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "tcar-chat-"));
   app = await createApp({
     dbPath: path.join(tmpDir, "db.json"),
-    uploadRoot: tmpDir
+    uploadRoot: tmpDir,
+    chatProcessor: processLocalChatRun,
+    validationProcessor: processLocalValidationRun
   });
 });
 
@@ -338,6 +355,8 @@ describe("runtime and catalog", () => {
       clarification_question: "",
       direct_answer: "",
       synthesis_brief: "Return one concise recommendation.",
+      presentation_mode: "integrated",
+      requested_item_count: 0,
       discovery_method: "authorized_manifest_index",
       mentioned_agent_adapters: [],
       authorized_agent_count: 12,
@@ -381,9 +400,9 @@ describe("runtime and catalog", () => {
   it("fails closed for production real-mode runtime and auth configuration", () => {
     const previous = {
       NODE_ENV: process.env.NODE_ENV,
-      TCAR_ENGINE_MODE: process.env.TCAR_ENGINE_MODE,
-      TCAR_RUNTIME_API_URL: process.env.TCAR_RUNTIME_API_URL,
-      TCAR_RUNTIME_API_KEY: process.env.TCAR_RUNTIME_API_KEY,
+      AGENT_RUNTIME_MODE: process.env.AGENT_RUNTIME_MODE,
+      AGENT_RUNTIME_API_URL: process.env.AGENT_RUNTIME_API_URL,
+      AGENT_RUNTIME_API_KEY: process.env.AGENT_RUNTIME_API_KEY,
       APP_BASIC_AUTH_USER: process.env.APP_BASIC_AUTH_USER,
       APP_BASIC_AUTH_PASSWORD: process.env.APP_BASIC_AUTH_PASSWORD,
       APP_API_TOKENS_JSON: process.env.APP_API_TOKENS_JSON,
@@ -397,20 +416,20 @@ describe("runtime and catalog", () => {
       APP_UNAUTHENTICATED_USER_ID: process.env.APP_UNAUTHENTICATED_USER_ID,
       APP_UNAUTHENTICATED_WORKSPACE_ID: process.env.APP_UNAUTHENTICATED_WORKSPACE_ID,
       APP_UNAUTHENTICATED_ROLE: process.env.APP_UNAUTHENTICATED_ROLE,
-      TCAR_ALLOW_LOCAL_RUNTIME_URL: process.env.TCAR_ALLOW_LOCAL_RUNTIME_URL,
-      TCAR_ALLOW_LOOPBACK_RUNTIME_TUNNEL: process.env.TCAR_ALLOW_LOOPBACK_RUNTIME_TUNNEL,
-      TCAR_ALLOW_SAME_ORIGIN_RUNTIME_URL: process.env.TCAR_ALLOW_SAME_ORIGIN_RUNTIME_URL,
-      TCAR_ALLOW_INSECURE_PRIVATE_RUNTIME_HTTP: process.env.TCAR_ALLOW_INSECURE_PRIVATE_RUNTIME_HTTP,
+      AGENT_RUNTIME_ALLOW_LOCAL_RUNTIME_URL: process.env.AGENT_RUNTIME_ALLOW_LOCAL_RUNTIME_URL,
+      AGENT_RUNTIME_ALLOW_LOOPBACK_RUNTIME_TUNNEL: process.env.AGENT_RUNTIME_ALLOW_LOOPBACK_RUNTIME_TUNNEL,
+      AGENT_RUNTIME_ALLOW_SAME_ORIGIN_RUNTIME_URL: process.env.AGENT_RUNTIME_ALLOW_SAME_ORIGIN_RUNTIME_URL,
+      AGENT_RUNTIME_ALLOW_INSECURE_PRIVATE_RUNTIME_HTTP: process.env.AGENT_RUNTIME_ALLOW_INSECURE_PRIVATE_RUNTIME_HTTP,
       WEB_ALLOW_INSECURE_PRIVATE_POSTGRES: process.env.WEB_ALLOW_INSECURE_PRIVATE_POSTGRES,
       HOST: process.env.HOST
     };
 
     try {
       process.env.NODE_ENV = "production";
-      process.env.TCAR_ENGINE_MODE = "real";
-      process.env.TCAR_RUNTIME_API_URL = "https://gpu-runtime.example.com";
+      process.env.AGENT_RUNTIME_MODE = "real";
+      process.env.AGENT_RUNTIME_API_URL = "https://gpu-runtime.example.com";
       process.env.HOST = "127.0.0.1";
-      delete process.env.TCAR_RUNTIME_API_KEY;
+      delete process.env.AGENT_RUNTIME_API_KEY;
       delete process.env.APP_BASIC_AUTH_USER;
       delete process.env.APP_BASIC_AUTH_PASSWORD;
       delete process.env.APP_API_TOKENS_JSON;
@@ -424,14 +443,14 @@ describe("runtime and catalog", () => {
       delete process.env.APP_UNAUTHENTICATED_USER_ID;
       delete process.env.APP_UNAUTHENTICATED_WORKSPACE_ID;
       delete process.env.APP_UNAUTHENTICATED_ROLE;
-      delete process.env.TCAR_ALLOW_LOCAL_RUNTIME_URL;
-      delete process.env.TCAR_ALLOW_LOOPBACK_RUNTIME_TUNNEL;
-      delete process.env.TCAR_ALLOW_SAME_ORIGIN_RUNTIME_URL;
-      delete process.env.TCAR_ALLOW_INSECURE_PRIVATE_RUNTIME_HTTP;
+      delete process.env.AGENT_RUNTIME_ALLOW_LOCAL_RUNTIME_URL;
+      delete process.env.AGENT_RUNTIME_ALLOW_LOOPBACK_RUNTIME_TUNNEL;
+      delete process.env.AGENT_RUNTIME_ALLOW_SAME_ORIGIN_RUNTIME_URL;
+      delete process.env.AGENT_RUNTIME_ALLOW_INSECURE_PRIVATE_RUNTIME_HTTP;
       delete process.env.WEB_ALLOW_INSECURE_PRIVATE_POSTGRES;
-      expect(() => requireRuntimeConfigured()).toThrow(/TCAR_RUNTIME_API_KEY/);
+      expect(() => requireRuntimeConfigured()).toThrow(/AGENT_RUNTIME_API_KEY/);
 
-      process.env.TCAR_RUNTIME_API_KEY = "0123456789abcdef0123456789abcdef";
+      process.env.AGENT_RUNTIME_API_KEY = "0123456789abcdef0123456789abcdef";
       expect(() => requireRuntimeConfigured()).toThrow(/Basic Auth|APP_API_TOKENS/);
 
       process.env.APP_API_TOKENS_JSON = "{bad";
@@ -485,35 +504,35 @@ describe("runtime and catalog", () => {
       delete process.env.WEB_ALLOW_INSECURE_PRIVATE_POSTGRES;
       process.env.DATABASE_URL = "postgres://user:pass@localhost:5432/tcar";
 
-      process.env.TCAR_RUNTIME_API_URL = "http://gpu-runtime.prod.test:9000";
+      process.env.AGENT_RUNTIME_API_URL = "http://gpu-runtime.prod.test:9000";
       expect(() => requireRuntimeConfigured()).toThrow(/must use HTTPS/);
 
-      process.env.TCAR_ALLOW_INSECURE_PRIVATE_RUNTIME_HTTP = "1";
+      process.env.AGENT_RUNTIME_ALLOW_INSECURE_PRIVATE_RUNTIME_HTTP = "1";
       expect(() => requireRuntimeConfigured()).not.toThrow();
-      delete process.env.TCAR_ALLOW_INSECURE_PRIVATE_RUNTIME_HTTP;
+      delete process.env.AGENT_RUNTIME_ALLOW_INSECURE_PRIVATE_RUNTIME_HTTP;
 
-      process.env.TCAR_RUNTIME_API_URL = "http://127.0.0.1:9000";
+      process.env.AGENT_RUNTIME_API_URL = "http://127.0.0.1:9000";
       expect(() => requireRuntimeConfigured()).toThrow(/private GPU runtime host/);
 
-      process.env.TCAR_ALLOW_LOCAL_RUNTIME_URL = "1";
+      process.env.AGENT_RUNTIME_ALLOW_LOCAL_RUNTIME_URL = "1";
       expect(() => requireRuntimeConfigured()).not.toThrow();
 
-      delete process.env.TCAR_ALLOW_LOCAL_RUNTIME_URL;
-      process.env.TCAR_ALLOW_LOOPBACK_RUNTIME_TUNNEL = "1";
+      delete process.env.AGENT_RUNTIME_ALLOW_LOCAL_RUNTIME_URL;
+      process.env.AGENT_RUNTIME_ALLOW_LOOPBACK_RUNTIME_TUNNEL = "1";
       expect(() => requireRuntimeConfigured()).not.toThrow();
 
-      process.env.TCAR_RUNTIME_API_URL = "http://0.0.0.0:19000";
+      process.env.AGENT_RUNTIME_API_URL = "http://0.0.0.0:19000";
       expect(() => requireRuntimeConfigured()).toThrow(/loopback hostname/);
 
-      delete process.env.TCAR_ALLOW_LOOPBACK_RUNTIME_TUNNEL;
-      process.env.TCAR_RUNTIME_API_URL = "https://app.prod.test/runtime";
+      delete process.env.AGENT_RUNTIME_ALLOW_LOOPBACK_RUNTIME_TUNNEL;
+      process.env.AGENT_RUNTIME_API_URL = "https://app.prod.test/runtime";
       expect(() => requireRuntimeConfigured()).toThrow(/different host/);
 
-      process.env.TCAR_ALLOW_SAME_ORIGIN_RUNTIME_URL = "1";
+      process.env.AGENT_RUNTIME_ALLOW_SAME_ORIGIN_RUNTIME_URL = "1";
       expect(() => requireRuntimeConfigured()).not.toThrow();
 
-      delete process.env.TCAR_ALLOW_SAME_ORIGIN_RUNTIME_URL;
-      process.env.TCAR_RUNTIME_API_URL = "https://gpu-runtime.prod.test";
+      delete process.env.AGENT_RUNTIME_ALLOW_SAME_ORIGIN_RUNTIME_URL;
+      process.env.AGENT_RUNTIME_API_URL = "https://gpu-runtime.prod.test";
       process.env.HOST = "0.0.0.0";
       expect(() => requireRuntimeConfigured()).toThrow(/APP_ALLOW_PUBLIC_BIND/);
 
@@ -710,9 +729,9 @@ describe("runtime and catalog", () => {
 
   it("fails readiness when the required runtime is live but reports ready false", async () => {
     const previous = {
-      TCAR_ENGINE_MODE: process.env.TCAR_ENGINE_MODE,
-      TCAR_RUNTIME_API_URL: process.env.TCAR_RUNTIME_API_URL,
-      TCAR_RUNTIME_API_KEY: process.env.TCAR_RUNTIME_API_KEY,
+      AGENT_RUNTIME_MODE: process.env.AGENT_RUNTIME_MODE,
+      AGENT_RUNTIME_API_URL: process.env.AGENT_RUNTIME_API_URL,
+      AGENT_RUNTIME_API_KEY: process.env.AGENT_RUNTIME_API_KEY,
       WEB_READY_REQUIRE_RUNTIME: process.env.WEB_READY_REQUIRE_RUNTIME
     };
     const previousFetch = globalThis.fetch;
@@ -728,9 +747,9 @@ describe("runtime and catalog", () => {
     };
 
     try {
-      process.env.TCAR_ENGINE_MODE = "real";
-      process.env.TCAR_RUNTIME_API_URL = "http://gpu-runtime.internal:9000";
-      process.env.TCAR_RUNTIME_API_KEY = "runtime0123456789abcdef0123456789abcdef";
+      process.env.AGENT_RUNTIME_MODE = "real";
+      process.env.AGENT_RUNTIME_API_URL = "http://gpu-runtime.internal:9000";
+      process.env.AGENT_RUNTIME_API_KEY = "runtime0123456789abcdef0123456789abcdef";
       process.env.WEB_READY_REQUIRE_RUNTIME = "1";
       globalThis.fetch = async () => Response.json({
         ok: true,
@@ -822,8 +841,8 @@ describe("runtime and catalog", () => {
     const previous = {
       NODE_ENV: process.env.NODE_ENV,
       APP_ALLOW_JSON_STORE: process.env.APP_ALLOW_JSON_STORE,
-      TCAR_ENGINE_MODE: process.env.TCAR_ENGINE_MODE,
-      TCAR_RUNTIME_API_URL: process.env.TCAR_RUNTIME_API_URL
+      AGENT_RUNTIME_MODE: process.env.AGENT_RUNTIME_MODE,
+      AGENT_RUNTIME_API_URL: process.env.AGENT_RUNTIME_API_URL
     };
     const previousFetch = globalThis.fetch;
     const previousConsoleError = console.error;
@@ -833,8 +852,8 @@ describe("runtime and catalog", () => {
     try {
       process.env.NODE_ENV = "production";
       process.env.APP_ALLOW_JSON_STORE = "1";
-      process.env.TCAR_ENGINE_MODE = "real";
-      process.env.TCAR_RUNTIME_API_URL = "http://gpu-runtime.internal:9000";
+      process.env.AGENT_RUNTIME_MODE = "real";
+      process.env.AGENT_RUNTIME_API_URL = "http://gpu-runtime.internal:9000";
       globalThis.fetch = async () => {
         throw new Error("database password leaked in stack");
       };
@@ -878,9 +897,9 @@ describe("runtime and catalog", () => {
       APP_API_TOKENS_JSON: process.env.APP_API_TOKENS_JSON,
       APP_BASIC_AUTH_USER: process.env.APP_BASIC_AUTH_USER,
       APP_BASIC_AUTH_PASSWORD: process.env.APP_BASIC_AUTH_PASSWORD,
-      TCAR_ENGINE_MODE: process.env.TCAR_ENGINE_MODE,
-      TCAR_RUNTIME_API_URL: process.env.TCAR_RUNTIME_API_URL,
-      TCAR_RUNTIME_API_KEY: process.env.TCAR_RUNTIME_API_KEY
+      AGENT_RUNTIME_MODE: process.env.AGENT_RUNTIME_MODE,
+      AGENT_RUNTIME_API_URL: process.env.AGENT_RUNTIME_API_URL,
+      AGENT_RUNTIME_API_KEY: process.env.AGENT_RUNTIME_API_KEY
     };
     const previousFetch = globalThis.fetch;
     const prodTmp = await fs.mkdtemp(path.join(os.tmpdir(), "tcar-chat-health-redaction-"));
@@ -915,12 +934,6 @@ describe("runtime and catalog", () => {
       executor: {
         reload_per_request: true,
         parallel_workers: 2
-      },
-      router: {
-        mode: "tcandon",
-        base_url: "http://127.0.0.1:8010/v1",
-        model: "tcandon-router",
-        models_endpoint_ok: true
       }
     };
     let prodApp;
@@ -934,9 +947,9 @@ describe("runtime and catalog", () => {
         [userToken]: { user_id: "alice", workspace_id: "workspace_a", role: "user" },
         [adminToken]: { user_id: "ops", workspace_id: "workspace_ops", role: "admin" }
       });
-      process.env.TCAR_ENGINE_MODE = "real";
-      process.env.TCAR_RUNTIME_API_URL = "http://gpu-runtime.internal:9000";
-      process.env.TCAR_RUNTIME_API_KEY = "runtime0123456789abcdef0123456789abcdef";
+      process.env.AGENT_RUNTIME_MODE = "real";
+      process.env.AGENT_RUNTIME_API_URL = "http://gpu-runtime.internal:9000";
+      process.env.AGENT_RUNTIME_API_KEY = "runtime0123456789abcdef0123456789abcdef";
       globalThis.fetch = async () =>
         new Response(JSON.stringify(runtimePayload), {
           status: 200,
@@ -959,12 +972,7 @@ describe("runtime and catalog", () => {
       expect(userHealth.body.model_api.base_model).toBe("qwen36-awq");
       expect(userHealth.body.model_api.base_url).toBeUndefined();
       expect(userHealth.body.model_api.health).toEqual({ ok: true, status: 200 });
-      expect(userHealth.body.router).toEqual({
-        mode: "tcandon",
-        model: "tcandon-router",
-        models_endpoint_ok: true
-      });
-      expect(userHealth.body.router.base_url).toBeUndefined();
+      expect(userHealth.body).not.toHaveProperty("router");
       expect(userHealth.body.project_root).toBeUndefined();
       expect(userHealth.body.executor).toBeUndefined();
       expect(JSON.stringify(userHealth.body)).not.toContain("127.0.0.1");
@@ -978,7 +986,7 @@ describe("runtime and catalog", () => {
       expect(adminHealth.body.project_root).toBe("/srv/tcar-runtime");
       expect(adminHealth.body.manifest.path).toContain("dummy_tcar_lora_suite.json");
       expect(adminHealth.body.vllm.base_url).toBe("http://127.0.0.1:8000/v1");
-      expect(adminHealth.body.router.base_url).toBe("http://127.0.0.1:8010/v1");
+      expect(adminHealth.body).not.toHaveProperty("router");
       expect(adminHealth.body.executor.parallel_workers).toBe(2);
     } finally {
       await prodApp?.locals?.store?.close?.();
@@ -1090,9 +1098,9 @@ describe("runtime and catalog", () => {
       APP_API_TOKENS_JSON: process.env.APP_API_TOKENS_JSON,
       APP_ALLOW_JSON_STORE: process.env.APP_ALLOW_JSON_STORE,
       APP_PUBLIC_ORIGIN: process.env.APP_PUBLIC_ORIGIN,
-      TCAR_ENGINE_MODE: process.env.TCAR_ENGINE_MODE,
-      TCAR_RUNTIME_API_URL: process.env.TCAR_RUNTIME_API_URL,
-      TCAR_RUNTIME_API_KEY: process.env.TCAR_RUNTIME_API_KEY
+      AGENT_RUNTIME_MODE: process.env.AGENT_RUNTIME_MODE,
+      AGENT_RUNTIME_API_URL: process.env.AGENT_RUNTIME_API_URL,
+      AGENT_RUNTIME_API_KEY: process.env.AGENT_RUNTIME_API_KEY
     };
     const prodTmp = await fs.mkdtemp(path.join(os.tmpdir(), "tcar-chat-bearer-"));
     const token = "abcdef0123456789abcdef0123456789";
@@ -1100,7 +1108,6 @@ describe("runtime and catalog", () => {
       JSON.stringify({
         ok: true,
         ready: true,
-        planner_mode: "session",
         manifest: { valid: true },
         vllm: { health: { ok: true } }
       }),
@@ -1116,9 +1123,9 @@ describe("runtime and catalog", () => {
       });
       process.env.APP_ALLOW_JSON_STORE = "1";
       process.env.APP_PUBLIC_ORIGIN = "https://app.example.com";
-      process.env.TCAR_ENGINE_MODE = "real";
-      process.env.TCAR_RUNTIME_API_URL = "https://semantic-runtime.prod.test";
-      process.env.TCAR_RUNTIME_API_KEY = "test_semantic_runtime_key_2026_strong";
+      process.env.AGENT_RUNTIME_MODE = "real";
+      process.env.AGENT_RUNTIME_API_URL = "https://semantic-runtime.prod.test";
+      process.env.AGENT_RUNTIME_API_KEY = "test_semantic_runtime_key_2026_strong";
       const prodApp = await createApp({
         dbPath: path.join(prodTmp, "db.json"),
         uploadRoot: prodTmp,
@@ -1170,14 +1177,14 @@ describe("runtime and catalog", () => {
       APP_UNAUTHENTICATED_WORKSPACE_ID: process.env.APP_UNAUTHENTICATED_WORKSPACE_ID,
       APP_UNAUTHENTICATED_ROLE: process.env.APP_UNAUTHENTICATED_ROLE,
       APP_PUBLIC_ORIGIN: process.env.APP_PUBLIC_ORIGIN,
-      TCAR_ENGINE_MODE: process.env.TCAR_ENGINE_MODE,
-      TCAR_RUNTIME_API_URL: process.env.TCAR_RUNTIME_API_URL,
-      TCAR_RUNTIME_API_KEY: process.env.TCAR_RUNTIME_API_KEY
+      AGENT_RUNTIME_MODE: process.env.AGENT_RUNTIME_MODE,
+      AGENT_RUNTIME_API_URL: process.env.AGENT_RUNTIME_API_URL,
+      AGENT_RUNTIME_API_KEY: process.env.AGENT_RUNTIME_API_KEY
     };
     const prodTmp = await fs.mkdtemp(path.join(os.tmpdir(), "tcar-chat-public-identity-"));
     let prodApp;
     const restoreRuntimeFetch = setRuntimeFetchForTests(async () => new Response(
-      JSON.stringify({ ok: true, ready: true, planner_mode: "session" }),
+      JSON.stringify({ ok: true, ready: true }),
       { status: 200, headers: { "Content-Type": "application/json" } }
     ));
 
@@ -1193,9 +1200,9 @@ describe("runtime and catalog", () => {
       process.env.APP_UNAUTHENTICATED_WORKSPACE_ID = "workspace_public_chat";
       process.env.APP_UNAUTHENTICATED_ROLE = "user";
       process.env.APP_PUBLIC_ORIGIN = "https://public-chat.prod.test";
-      process.env.TCAR_ENGINE_MODE = "real";
-      process.env.TCAR_RUNTIME_API_URL = "https://semantic-runtime.prod.test";
-      process.env.TCAR_RUNTIME_API_KEY = "test_semantic_runtime_key_2026_strong";
+      process.env.AGENT_RUNTIME_MODE = "real";
+      process.env.AGENT_RUNTIME_API_URL = "https://semantic-runtime.prod.test";
+      process.env.AGENT_RUNTIME_API_KEY = "test_semantic_runtime_key_2026_strong";
       expect(() => requireRuntimeConfigured()).not.toThrow();
       prodApp = await createApp({
         dbPath: path.join(prodTmp, "db.json"),
@@ -2221,9 +2228,9 @@ describe("runtime and catalog", () => {
   });
 
   it("proxies real-mode agent detail, edits, and archive to the GPU runtime", async () => {
-    const previousMode = process.env.TCAR_ENGINE_MODE;
-    const previousUrl = process.env.TCAR_RUNTIME_API_URL;
-    const previousKey = process.env.TCAR_RUNTIME_API_KEY;
+    const previousMode = process.env.AGENT_RUNTIME_MODE;
+    const previousUrl = process.env.AGENT_RUNTIME_API_URL;
+    const previousKey = process.env.AGENT_RUNTIME_API_KEY;
     const previousFetch = globalThis.fetch;
     const calls = [];
     const realTmp = await fs.mkdtemp(path.join(os.tmpdir(), "tcar-chat-real-"));
@@ -2233,9 +2240,9 @@ describe("runtime and catalog", () => {
         headers: { "Content-Type": "application/json" }
       });
 
-    process.env.TCAR_ENGINE_MODE = "real";
-    process.env.TCAR_RUNTIME_API_URL = "http://gpu-runtime.internal:9000";
-    process.env.TCAR_RUNTIME_API_KEY = "test-runtime-secret";
+    process.env.AGENT_RUNTIME_MODE = "real";
+    process.env.AGENT_RUNTIME_API_URL = "http://gpu-runtime.internal:9000";
+    process.env.AGENT_RUNTIME_API_KEY = "test-runtime-secret";
     globalThis.fetch = async (url, options = {}) => {
       const method = options.method || "GET";
       const pathName = new URL(url).pathname;
@@ -2370,12 +2377,12 @@ describe("runtime and catalog", () => {
         memory: { mode: "conversation" }
       });
     } finally {
-      process.env.TCAR_ENGINE_MODE = previousMode;
-      process.env.TCAR_RUNTIME_API_URL = previousUrl;
-      process.env.TCAR_RUNTIME_API_KEY = previousKey;
-      if (previousMode === undefined) delete process.env.TCAR_ENGINE_MODE;
-      if (previousUrl === undefined) delete process.env.TCAR_RUNTIME_API_URL;
-      if (previousKey === undefined) delete process.env.TCAR_RUNTIME_API_KEY;
+      process.env.AGENT_RUNTIME_MODE = previousMode;
+      process.env.AGENT_RUNTIME_API_URL = previousUrl;
+      process.env.AGENT_RUNTIME_API_KEY = previousKey;
+      if (previousMode === undefined) delete process.env.AGENT_RUNTIME_MODE;
+      if (previousUrl === undefined) delete process.env.AGENT_RUNTIME_API_URL;
+      if (previousKey === undefined) delete process.env.AGENT_RUNTIME_API_KEY;
       globalThis.fetch = previousFetch;
       await fs.rm(realTmp, { recursive: true, force: true });
     }
@@ -2383,9 +2390,9 @@ describe("runtime and catalog", () => {
 
   it("rejects retired runtime mount operations without contacting the model API", async () => {
     const previous = {
-      mode: process.env.TCAR_ENGINE_MODE,
-      url: process.env.TCAR_RUNTIME_API_URL,
-      key: process.env.TCAR_RUNTIME_API_KEY,
+      mode: process.env.AGENT_RUNTIME_MODE,
+      url: process.env.AGENT_RUNTIME_API_URL,
+      key: process.env.AGENT_RUNTIME_API_KEY,
       tokens: process.env.APP_API_TOKENS_JSON
     };
     const previousFetch = globalThis.fetch;
@@ -2393,9 +2400,9 @@ describe("runtime and catalog", () => {
     const calls = [];
     let realApp;
 
-    process.env.TCAR_ENGINE_MODE = "real";
-    process.env.TCAR_RUNTIME_API_URL = "http://gpu-runtime.internal:9000";
-    process.env.TCAR_RUNTIME_API_KEY = "test-runtime-secret";
+    process.env.AGENT_RUNTIME_MODE = "real";
+    process.env.AGENT_RUNTIME_API_URL = "http://gpu-runtime.internal:9000";
+    process.env.AGENT_RUNTIME_API_KEY = "test-runtime-secret";
     process.env.APP_API_TOKENS_JSON = JSON.stringify({
       token_alice: { user_id: "alice", workspace_id: "workspace_a", role: "user" },
       token_bob: { user_id: "bob", workspace_id: "workspace_a", role: "user" }
@@ -2461,9 +2468,9 @@ describe("runtime and catalog", () => {
       await realApp?.locals?.store?.close?.();
       globalThis.fetch = previousFetch;
       for (const [name, value] of Object.entries({
-        TCAR_ENGINE_MODE: previous.mode,
-        TCAR_RUNTIME_API_URL: previous.url,
-        TCAR_RUNTIME_API_KEY: previous.key,
+        AGENT_RUNTIME_MODE: previous.mode,
+        AGENT_RUNTIME_API_URL: previous.url,
+        AGENT_RUNTIME_API_KEY: previous.key,
         APP_API_TOKENS_JSON: previous.tokens
       })) {
         if (value === undefined) delete process.env[name];
@@ -2476,9 +2483,9 @@ describe("runtime and catalog", () => {
   it("redacts runtime agent internals from non-admin catalog readers", async () => {
     const previous = {
       APP_API_TOKENS_JSON: process.env.APP_API_TOKENS_JSON,
-      TCAR_ENGINE_MODE: process.env.TCAR_ENGINE_MODE,
-      TCAR_RUNTIME_API_URL: process.env.TCAR_RUNTIME_API_URL,
-      TCAR_RUNTIME_API_KEY: process.env.TCAR_RUNTIME_API_KEY
+      AGENT_RUNTIME_MODE: process.env.AGENT_RUNTIME_MODE,
+      AGENT_RUNTIME_API_URL: process.env.AGENT_RUNTIME_API_URL,
+      AGENT_RUNTIME_API_KEY: process.env.AGENT_RUNTIME_API_KEY
     };
     const previousFetch = globalThis.fetch;
     const realTmp = await fs.mkdtemp(path.join(os.tmpdir(), "tcar-chat-agent-redaction-"));
@@ -2503,9 +2510,9 @@ describe("runtime and catalog", () => {
         [tokenUser]: { user_id: "alice", workspace_id: "workspace_a", role: "user" },
         [tokenAdmin]: { user_id: "ops", workspace_id: "workspace_ops", role: "admin" }
       });
-      process.env.TCAR_ENGINE_MODE = "real";
-      process.env.TCAR_RUNTIME_API_URL = "http://gpu-runtime.internal:9000";
-      process.env.TCAR_RUNTIME_API_KEY = "test-runtime-secret";
+      process.env.AGENT_RUNTIME_MODE = "real";
+      process.env.AGENT_RUNTIME_API_URL = "http://gpu-runtime.internal:9000";
+      process.env.AGENT_RUNTIME_API_KEY = "test-runtime-secret";
       globalThis.fetch = async (url) => {
         const pathName = new URL(url).pathname;
         if (pathName === "/agents") {
@@ -2584,7 +2591,7 @@ describe("runtime and catalog", () => {
   it("rejects oversized custom agent source text before runtime writes", async () => {
     const previous = {
       APP_MAX_SOURCE_TEXT_CHARS: process.env.APP_MAX_SOURCE_TEXT_CHARS,
-      TCAR_ENGINE_MODE: process.env.TCAR_ENGINE_MODE
+      AGENT_RUNTIME_MODE: process.env.AGENT_RUNTIME_MODE
     };
 
     try {
@@ -2601,7 +2608,7 @@ describe("runtime and catalog", () => {
         })
         .expect(413);
 
-      process.env.TCAR_ENGINE_MODE = "real";
+      process.env.AGENT_RUNTIME_MODE = "real";
       await request(app)
         .patch("/api/agents/legal_privacy_lora")
         .send({
@@ -3561,20 +3568,20 @@ describe("chat execution", () => {
       })
       .expect(400);
 
-    await request(app)
+    const retiredMode = await request(app)
       .post(`/api/chat/sessions/${session.session_id}/messages`)
       .send({
         content: "Plan a support workflow.",
-        options: { planner_mode: "deterministic" }
+        options: { planner_mode: "session" }
       })
       .expect(400);
+    expect(retiredMode.body.message).toContain("Unknown chat option(s): planner_mode");
 
     const queued = await request(app)
       .post(`/api/chat/sessions/${session.session_id}/messages`)
       .send({
         content: "Plan a support workflow with privacy and customer FAQ.",
         options: {
-          planner_mode: "cue",
           parallel_workers: 999,
           max_routing_adapters: 999,
           max_tokens: 999,
@@ -3586,28 +3593,10 @@ describe("chat execution", () => {
     const run = await waitForRun(queued.body.run_id);
     expect(run.status).toBe("completed");
     expect(run.parallel.workers).toBe(4);
-
-    const tcandonQueued = await request(app)
-      .post(`/api/chat/sessions/${session.session_id}/messages`)
-      .send({
-        content: "Use the TCAndon planner for this support workflow.",
-        options: { planner_mode: "tcandon" }
-      })
-      .expect(202);
-    const tcandonRun = await waitForRun(tcandonQueued.body.run_id);
-    expect(tcandonRun.status).toBe("completed");
-    expect(app.locals.store.read().runs.find((item) => item.run_id === tcandonQueued.body.run_id).planner_mode).toBe("session");
-
-    const sessionQueued = await request(app)
-      .post(`/api/chat/sessions/${session.session_id}/messages`)
-      .send({
-        content: "Let the main session model coordinate this support workflow.",
-        options: { planner_mode: "session" }
-      })
-      .expect(202);
-    const sessionRun = await waitForRun(sessionQueued.body.run_id);
-    expect(sessionRun.status).toBe("completed");
-    expect(app.locals.store.read().runs.find((item) => item.run_id === sessionQueued.body.run_id).planner_mode).toBe("session");
+    const persistedRun = app.locals.store.read().runs.find((item) => item.run_id === queued.body.run_id);
+    expect(persistedRun.planner_mode).toBe("session");
+    expect(persistedRun.execution_options).not.toHaveProperty("planner_mode");
+    expect(run.execution_options).not.toHaveProperty("planner_mode");
   });
 
   it("redacts route raw text and prompt previews for non-admin run readers", async () => {
@@ -3667,9 +3656,9 @@ describe("chat execution", () => {
   it("redacts async runtime failure details from non-admin run readers", async () => {
     const previous = {
       APP_API_TOKENS_JSON: process.env.APP_API_TOKENS_JSON,
-      TCAR_ENGINE_MODE: process.env.TCAR_ENGINE_MODE,
-      TCAR_RUNTIME_API_URL: process.env.TCAR_RUNTIME_API_URL,
-      TCAR_RUNTIME_API_KEY: process.env.TCAR_RUNTIME_API_KEY
+      AGENT_RUNTIME_MODE: process.env.AGENT_RUNTIME_MODE,
+      AGENT_RUNTIME_API_URL: process.env.AGENT_RUNTIME_API_URL,
+      AGENT_RUNTIME_API_KEY: process.env.AGENT_RUNTIME_API_KEY
     };
     const previousFetch = globalThis.fetch;
     const realTmp = await fs.mkdtemp(path.join(os.tmpdir(), "tcar-chat-runtime-fail-"));
@@ -3682,9 +3671,9 @@ describe("chat execution", () => {
         [tokenUser]: { user_id: "runtime_user", workspace_id: "workspace_runtime_fail", role: "user" },
         [tokenAdmin]: { user_id: "runtime_admin", workspace_id: "workspace_runtime_fail", role: "admin" }
       });
-      process.env.TCAR_ENGINE_MODE = "real";
-      process.env.TCAR_RUNTIME_API_URL = "http://gpu-runtime.internal:9000";
-      process.env.TCAR_RUNTIME_API_KEY = "runtime-secret-for-tests";
+      process.env.AGENT_RUNTIME_MODE = "real";
+      process.env.AGENT_RUNTIME_API_URL = "http://gpu-runtime.internal:9000";
+      process.env.AGENT_RUNTIME_API_KEY = "runtime-secret-for-tests";
       globalThis.fetch = async () =>
         new Response(JSON.stringify({ detail: { stderr: "GPU traceback with database password super-secret-value" } }), {
           status: 502,
@@ -3762,9 +3751,9 @@ describe("chat execution", () => {
   it("keeps a synthesized real-runtime answer completed while exposing failed route truth", async () => {
     const previous = {
       APP_API_TOKENS_JSON: process.env.APP_API_TOKENS_JSON,
-      TCAR_ENGINE_MODE: process.env.TCAR_ENGINE_MODE,
-      TCAR_RUNTIME_API_URL: process.env.TCAR_RUNTIME_API_URL,
-      TCAR_RUNTIME_API_KEY: process.env.TCAR_RUNTIME_API_KEY
+      AGENT_RUNTIME_MODE: process.env.AGENT_RUNTIME_MODE,
+      AGENT_RUNTIME_API_URL: process.env.AGENT_RUNTIME_API_URL,
+      AGENT_RUNTIME_API_KEY: process.env.AGENT_RUNTIME_API_KEY
     };
     const previousFetch = globalThis.fetch;
     const realTmp = await fs.mkdtemp(path.join(os.tmpdir(), "tcar-chat-route-fail-"));
@@ -3777,13 +3766,15 @@ describe("chat execution", () => {
         [tokenUser]: { user_id: "route_user", workspace_id: "workspace_route_fail", role: "user" },
         [tokenAdmin]: { user_id: "route_admin", workspace_id: "workspace_route_fail", role: "admin" }
       });
-      process.env.TCAR_ENGINE_MODE = "real";
-      process.env.TCAR_RUNTIME_API_URL = "http://gpu-runtime.internal:9000";
-      process.env.TCAR_RUNTIME_API_KEY = "runtime-secret-for-tests";
+      process.env.AGENT_RUNTIME_MODE = "real";
+      process.env.AGENT_RUNTIME_API_URL = "http://gpu-runtime.internal:9000";
+      process.env.AGENT_RUNTIME_API_KEY = "runtime-secret-for-tests";
       globalThis.fetch = async () => new Response(JSON.stringify({
         ok: true,
-        mode: "session_delegated_vllm_execute",
+        mode: "session_delegated_model_execute",
+        modelProviderBaseUrl: "https://model-provider.internal/v1",
         baseModel: "qwen36-awq",
+        agentModelMap: { writing_synthesis_lora: "qwen36-awq" },
         manifestRevision: "1".repeat(64),
         componentProvenance: {
           revision_authority: "runtime",
@@ -3876,7 +3867,7 @@ describe("chat execution", () => {
           adapter: "writing_synthesis_lora",
           agent_revision: "6".repeat(64),
           adapter_content_digest: "8".repeat(64),
-          model_id: "qwen36-awq",
+          modelId: "qwen36-awq",
           task: "Prepare the requested draft.",
           domain_answer: "provider-secret partial worker text",
           raw_text: "provider-secret raw worker response",
@@ -3983,6 +3974,12 @@ describe("chat execution", () => {
       }));
       expect(run.expert_outputs[0].failure_observability_admin_only).toBeUndefined();
       expect(JSON.stringify(run)).not.toContain("provider-secret");
+      const persistedRun = realApp.locals.store.read().runs.find((item) => item.run_id === queued.body.run_id);
+      expect(persistedRun.runtime_result_admin_only).toMatchObject({
+        mode: "session_delegated_model_execute",
+        modelProviderBaseUrl: "https://model-provider.internal/v1",
+        baseModel: "qwen36-awq"
+      });
 
       const adminRun = await request(realApp)
         .get(`/api/chat/runs/${queued.body.run_id}`)
@@ -4058,9 +4055,9 @@ describe("chat execution", () => {
   it("sends only session-visible adapters to the GPU runtime planner", async () => {
     const previous = {
       APP_API_TOKENS_JSON: process.env.APP_API_TOKENS_JSON,
-      TCAR_ENGINE_MODE: process.env.TCAR_ENGINE_MODE,
-      TCAR_RUNTIME_API_URL: process.env.TCAR_RUNTIME_API_URL,
-      TCAR_RUNTIME_API_KEY: process.env.TCAR_RUNTIME_API_KEY
+      AGENT_RUNTIME_MODE: process.env.AGENT_RUNTIME_MODE,
+      AGENT_RUNTIME_API_URL: process.env.AGENT_RUNTIME_API_URL,
+      AGENT_RUNTIME_API_KEY: process.env.AGENT_RUNTIME_API_KEY
     };
     const previousFetch = globalThis.fetch;
     const realTmp = await fs.mkdtemp(path.join(os.tmpdir(), "tcar-chat-runtime-scope-"));
@@ -4072,16 +4069,18 @@ describe("chat execution", () => {
       process.env.APP_API_TOKENS_JSON = JSON.stringify({
         [tokenBob]: { user_id: "bob", workspace_id: "workspace_shared", role: "user" }
       });
-      process.env.TCAR_ENGINE_MODE = "real";
-      process.env.TCAR_RUNTIME_API_URL = "http://gpu-runtime.internal:9000";
-      process.env.TCAR_RUNTIME_API_KEY = "runtime-secret-for-tests";
+      process.env.AGENT_RUNTIME_MODE = "real";
+      process.env.AGENT_RUNTIME_API_URL = "http://gpu-runtime.internal:9000";
+      process.env.AGENT_RUNTIME_API_KEY = "runtime-secret-for-tests";
       globalThis.fetch = async (_url, options = {}) => {
         chatBody = JSON.parse(options.body);
         return new Response(
           JSON.stringify({
             ok: true,
-            mode: "real",
+            mode: "agent_dag_model_execute",
+            modelProviderBaseUrl: "https://model-provider.internal/v1",
             baseModel: "qwen36-awq",
+            agentModelMap: { writing_synthesis_lora: "qwen36-awq" },
             manifestRevision: "1".repeat(64),
             componentProvenance: {
               revision_authority: "runtime",
@@ -4118,12 +4117,12 @@ describe("chat execution", () => {
               adapters: ["writing_synthesis_lora"],
               edges: [],
               routing: {
-                mode: "tcandon",
+                mode: "session",
                 candidate_count: 3,
                 candidate_adapters: ["writing_synthesis_lora"],
                 selected: [{
                   adapter: "writing_synthesis_lora",
-                  source: "tcandon",
+                  source: "semantic_session",
                   confidence: 0.88,
                   reason: "Explicit synthesis request."
                 }],
@@ -4142,7 +4141,7 @@ describe("chat execution", () => {
               revision_authority: "runtime",
               manifest_contract_digest: "7".repeat(64),
               adapter_content_digest: "8".repeat(64),
-              model_id: "qwen36-awq",
+              modelId: "qwen36-awq",
               task: "Synthesize.",
               domain_answer: "Structured runtime answer.",
               approved_sources: ["sources/router_agents/writing_synthesis/source.md"],
@@ -4234,6 +4233,7 @@ describe("chat execution", () => {
       expect(chatBody.options.allowed_adapters).toContain("writing_synthesis_lora");
       expect(chatBody.options.allowed_adapters).toContain("finance_reasoning_lora");
       expect(chatBody.options.allowed_adapters).not.toContain("alice_private_manual_lora");
+      expect(chatBody.options).not.toHaveProperty("planner_mode");
       expect(chatBody.options.max_tokens).toBe(4096);
       expect(chatBody.options.refiner_max_tokens).toBe(8192);
       expect(chatBody.query).toBe("Use @alice_private_manual if available, then preserve this mention.");
@@ -4257,7 +4257,7 @@ describe("chat execution", () => {
         })
       ]);
       expect(completedRun.plan.routing).toMatchObject({
-        mode: "tcandon",
+        mode: "session",
         selected: [expect.objectContaining({ adapter: "writing_synthesis_lora", confidence: 0.88 })],
         unresolved_mentions: ["@alice_private_manual"],
         out_of_scope: false,
@@ -4299,9 +4299,9 @@ describe("chat execution", () => {
   it("falls back to the session model when every agent is off in the chat", async () => {
     const previous = {
       APP_API_TOKENS_JSON: process.env.APP_API_TOKENS_JSON,
-      TCAR_ENGINE_MODE: process.env.TCAR_ENGINE_MODE,
-      TCAR_RUNTIME_API_URL: process.env.TCAR_RUNTIME_API_URL,
-      TCAR_RUNTIME_API_KEY: process.env.TCAR_RUNTIME_API_KEY
+      AGENT_RUNTIME_MODE: process.env.AGENT_RUNTIME_MODE,
+      AGENT_RUNTIME_API_URL: process.env.AGENT_RUNTIME_API_URL,
+      AGENT_RUNTIME_API_KEY: process.env.AGENT_RUNTIME_API_KEY
     };
     const previousFetch = globalThis.fetch;
     const realTmp = await fs.mkdtemp(path.join(os.tmpdir(), "tcar-chat-no-agents-"));
@@ -4313,16 +4313,18 @@ describe("chat execution", () => {
       process.env.APP_API_TOKENS_JSON = JSON.stringify({
         [token]: { user_id: "alice", workspace_id: "workspace_no_agents", role: "user" }
       });
-      process.env.TCAR_ENGINE_MODE = "real";
-      process.env.TCAR_RUNTIME_API_URL = "http://gpu-runtime.internal:9000";
-      process.env.TCAR_RUNTIME_API_KEY = "runtime-secret-for-tests";
+      process.env.AGENT_RUNTIME_MODE = "real";
+      process.env.AGENT_RUNTIME_API_URL = "http://gpu-runtime.internal:9000";
+      process.env.AGENT_RUNTIME_API_KEY = "runtime-secret-for-tests";
       globalThis.fetch = async (url, options = {}) => {
         expect(String(url)).toContain("/chat/execute");
         chatBody = JSON.parse(options.body);
         return new Response(JSON.stringify({
           ok: true,
-          mode: "session_direct_vllm_execute",
+          mode: "session_direct_model_execute",
+          modelProviderBaseUrl: "https://model-provider.internal/v1",
           baseModel: "qwen36-awq",
+          agentModelMap: {},
           manifestRevision: "1".repeat(64),
           componentProvenance: {
             revision_authority: "runtime",
@@ -4438,9 +4440,9 @@ describe("chat execution", () => {
   it("filters runtime model listings by requester-visible agents", async () => {
     const previous = {
       APP_API_TOKENS_JSON: process.env.APP_API_TOKENS_JSON,
-      TCAR_ENGINE_MODE: process.env.TCAR_ENGINE_MODE,
-      TCAR_RUNTIME_API_URL: process.env.TCAR_RUNTIME_API_URL,
-      TCAR_RUNTIME_API_KEY: process.env.TCAR_RUNTIME_API_KEY
+      AGENT_RUNTIME_MODE: process.env.AGENT_RUNTIME_MODE,
+      AGENT_RUNTIME_API_URL: process.env.AGENT_RUNTIME_API_URL,
+      AGENT_RUNTIME_API_KEY: process.env.AGENT_RUNTIME_API_KEY
     };
     const previousFetch = globalThis.fetch;
     const realTmp = await fs.mkdtemp(path.join(os.tmpdir(), "tcar-chat-model-scope-"));
@@ -4453,9 +4455,9 @@ describe("chat execution", () => {
         [tokenBob]: { user_id: "bob", workspace_id: "workspace_models", role: "user" },
         [tokenAdmin]: { user_id: "admin", workspace_id: "workspace_models", role: "admin" }
       });
-      process.env.TCAR_ENGINE_MODE = "real";
-      process.env.TCAR_RUNTIME_API_URL = "http://gpu-runtime.internal:9000";
-      process.env.TCAR_RUNTIME_API_KEY = "runtime-secret-for-tests";
+      process.env.AGENT_RUNTIME_MODE = "real";
+      process.env.AGENT_RUNTIME_API_URL = "http://gpu-runtime.internal:9000";
+      process.env.AGENT_RUNTIME_API_KEY = "runtime-secret-for-tests";
       globalThis.fetch = async () =>
         new Response(
           JSON.stringify({
@@ -4908,15 +4910,15 @@ describe("documents and sources", () => {
     await request(app).delete(`/api/documents/${upload.body.document_id}`).expect(200);
 
     const previous = {
-      TCAR_ENGINE_MODE: process.env.TCAR_ENGINE_MODE,
-      TCAR_RUNTIME_API_URL: process.env.TCAR_RUNTIME_API_URL,
-      TCAR_RUNTIME_API_KEY: process.env.TCAR_RUNTIME_API_KEY
+      AGENT_RUNTIME_MODE: process.env.AGENT_RUNTIME_MODE,
+      AGENT_RUNTIME_API_URL: process.env.AGENT_RUNTIME_API_URL,
+      AGENT_RUNTIME_API_KEY: process.env.AGENT_RUNTIME_API_KEY
     };
     const previousFetch = globalThis.fetch;
     try {
-      process.env.TCAR_ENGINE_MODE = "real";
-      process.env.TCAR_RUNTIME_API_URL = "http://gpu-runtime.internal:9000";
-      process.env.TCAR_RUNTIME_API_KEY = "runtime-tombstone-test-key";
+      process.env.AGENT_RUNTIME_MODE = "real";
+      process.env.AGENT_RUNTIME_API_URL = "http://gpu-runtime.internal:9000";
+      process.env.AGENT_RUNTIME_API_KEY = "runtime-tombstone-test-key";
       globalThis.fetch = async () => Response.json({ detail: "not found" }, { status: 404 });
       const detail = await request(app).get(`/api/agents/${upload.body.agent_id}`).expect(200);
       expect(detail.body).toMatchObject({
@@ -4936,17 +4938,17 @@ describe("documents and sources", () => {
 
   it("preserves PDF pages in chunks and in the GPU registration payload", async () => {
     const previous = {
-      TCAR_ENGINE_MODE: process.env.TCAR_ENGINE_MODE,
-      TCAR_RUNTIME_API_URL: process.env.TCAR_RUNTIME_API_URL,
-      TCAR_RUNTIME_API_KEY: process.env.TCAR_RUNTIME_API_KEY
+      AGENT_RUNTIME_MODE: process.env.AGENT_RUNTIME_MODE,
+      AGENT_RUNTIME_API_URL: process.env.AGENT_RUNTIME_API_URL,
+      AGENT_RUNTIME_API_KEY: process.env.AGENT_RUNTIME_API_KEY
     };
     const previousFetch = globalThis.fetch;
     let runtimeBody;
     let runtimeReceiptChunk;
     try {
-      process.env.TCAR_ENGINE_MODE = "real";
-      process.env.TCAR_RUNTIME_API_URL = "http://gpu-runtime.internal:9000";
-      process.env.TCAR_RUNTIME_API_KEY = "runtime-secret-for-pdf-test";
+      process.env.AGENT_RUNTIME_MODE = "real";
+      process.env.AGENT_RUNTIME_API_URL = "http://gpu-runtime.internal:9000";
+      process.env.AGENT_RUNTIME_API_KEY = "runtime-secret-for-pdf-test";
       globalThis.fetch = async (_url, options = {}) => {
         if (options.method === "DELETE") {
           return new Response(JSON.stringify({ ok: true, status: "deleted", purged: true }), {
@@ -5048,16 +5050,16 @@ describe("documents and sources", () => {
 
   it("rejects a tampered Runtime chunk receipt and compensates the remote registration", async () => {
     const previous = {
-      TCAR_ENGINE_MODE: process.env.TCAR_ENGINE_MODE,
-      TCAR_RUNTIME_API_URL: process.env.TCAR_RUNTIME_API_URL,
-      TCAR_RUNTIME_API_KEY: process.env.TCAR_RUNTIME_API_KEY
+      AGENT_RUNTIME_MODE: process.env.AGENT_RUNTIME_MODE,
+      AGENT_RUNTIME_API_URL: process.env.AGENT_RUNTIME_API_URL,
+      AGENT_RUNTIME_API_KEY: process.env.AGENT_RUNTIME_API_KEY
     };
     const previousFetch = globalThis.fetch;
     const calls = [];
     try {
-      process.env.TCAR_ENGINE_MODE = "real";
-      process.env.TCAR_RUNTIME_API_URL = "http://gpu-runtime.internal:9000";
-      process.env.TCAR_RUNTIME_API_KEY = "runtime-secret-for-tamper-test";
+      process.env.AGENT_RUNTIME_MODE = "real";
+      process.env.AGENT_RUNTIME_API_URL = "http://gpu-runtime.internal:9000";
+      process.env.AGENT_RUNTIME_API_KEY = "runtime-secret-for-tamper-test";
       globalThis.fetch = async (url, options = {}) => {
         const pathName = new URL(url).pathname;
         calls.push({ method: options.method || "GET", pathName });
@@ -5442,7 +5444,7 @@ describe("documents and sources", () => {
 });
 
 describe("runtime registration atomicity", () => {
-  const runtimeEnvNames = ["TCAR_ENGINE_MODE", "TCAR_RUNTIME_API_URL", "TCAR_RUNTIME_API_KEY"];
+  const runtimeEnvNames = ["AGENT_RUNTIME_MODE", "AGENT_RUNTIME_API_URL", "AGENT_RUNTIME_API_KEY"];
 
   function ownedPurgeResponse(agentId) {
     return {
@@ -5459,9 +5461,9 @@ describe("runtime registration atomicity", () => {
 
   function enableRealRuntime() {
     const previous = Object.fromEntries(runtimeEnvNames.map((name) => [name, process.env[name]]));
-    process.env.TCAR_ENGINE_MODE = "real";
-    process.env.TCAR_RUNTIME_API_URL = "http://gpu-runtime.internal:9000";
-    process.env.TCAR_RUNTIME_API_KEY = "atomicity-test-runtime-key";
+    process.env.AGENT_RUNTIME_MODE = "real";
+    process.env.AGENT_RUNTIME_API_URL = "http://gpu-runtime.internal:9000";
+    process.env.AGENT_RUNTIME_API_KEY = "atomicity-test-runtime-key";
     return () => {
       for (const [name, value] of Object.entries(previous)) {
         if (value === undefined) delete process.env[name];
@@ -6088,8 +6090,8 @@ describe("Runtime audit proof proxy", () => {
   it("allows a same-workspace admin to verify locally bound execution and user-agent receipts", async () => {
     const previous = {
       APP_API_TOKENS_JSON: process.env.APP_API_TOKENS_JSON,
-      TCAR_ENGINE_MODE: process.env.TCAR_ENGINE_MODE,
-      TCAR_RUNTIME_API_URL: process.env.TCAR_RUNTIME_API_URL
+      AGENT_RUNTIME_MODE: process.env.AGENT_RUNTIME_MODE,
+      AGENT_RUNTIME_API_URL: process.env.AGENT_RUNTIME_API_URL
     };
     const previousFetch = globalThis.fetch;
     const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "virenis-runtime-proof-"));
@@ -6101,8 +6103,8 @@ describe("Runtime audit proof proxy", () => {
         [creatorToken]: { user_id: "creator", workspace_id: "workspace_proof", role: "user" },
         [adminToken]: { user_id: "resolver", workspace_id: "workspace_proof", role: "admin" }
       });
-      process.env.TCAR_ENGINE_MODE = "real";
-      process.env.TCAR_RUNTIME_API_URL = "http://gpu-runtime.internal:9000";
+      process.env.AGENT_RUNTIME_MODE = "real";
+      process.env.AGENT_RUNTIME_API_URL = "http://gpu-runtime.internal:9000";
       const requestFingerprint = "a".repeat(64);
       const executionActor = runtimeAuditDigest(JSON.stringify({
         role: "user",

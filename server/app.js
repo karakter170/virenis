@@ -6,6 +6,11 @@ import express from "express";
 import multer from "multer";
 import { basicAuthPassword, parseConfiguredApiTokens, secretConfigured } from "./authConfig.js";
 import { readConfiguredSecret } from "./secretConfig.js";
+import { readAgentRuntimeEnv } from "./agentRuntimeConfig.js";
+import {
+  LEGACY_PERSISTED_PLANNER_MODE_V1,
+  normalizePersistedAgentRuntimeOptions
+} from "./agentRuntimeResponseCompatibility.js";
 import {
   CANONICAL_AGENT_SCHEMA_VERSION,
   ensureCanonicalAgentContract
@@ -59,16 +64,12 @@ import {
   publicPublisher
 } from "./marketplacePublisherIdentity.js";
 import {
-  buildParallelBatches,
-  computeMetrics,
   normalizeSharedMemory,
-  planRoutes,
   processChatRun,
-  runtimeHealth,
-  sanitizeToolCalls,
-  scopedRoutingContext,
-  validateUserMessage
-} from "./tcarEngine.js";
+  scopedRoutingContext
+} from "./chatRunCoordinator.js";
+import { validateUserMessage } from "./chatRequestValidation.js";
+import { computeMetrics, runtimeHealth } from "./runtimeObservability.js";
 import {
   agentRevision,
   appendAgentEvent,
@@ -107,7 +108,7 @@ import {
   updateRuntimeAgent,
   verifyRuntimeAuditSubject,
   verifyRuntimeExecutionSubject
-} from "./runtimeClient.js";
+} from "./agentRuntimeClient.js";
 import {
   assertWorkflowAccess,
   composeWorkflowFallback,
@@ -749,11 +750,11 @@ export async function createApp({
       if (process.env.WEB_READY_REQUIRE_RUNTIME === "1" && realRuntimeEnabled()) {
         const runtime = await fetchRuntimeHealth();
         if (runtime?.ok !== true || runtime?.ready !== true) {
-          throw new Error("TCAR runtime is reachable but not ready.");
+          throw new Error("Agent Runtime is reachable but not ready.");
         }
         runtimeProtocol = runtimeProtocolCompatibility(runtime);
         if (!runtimeProtocol.compatible) {
-          throw new Error("TCAR runtime protocol is incompatible with this web deployment.");
+          throw new Error("Agent Runtime protocol is incompatible with this web deployment.");
         }
       }
       const readiness = {
@@ -1958,7 +1959,7 @@ export async function createApp({
         user_message_id: message.message_id,
         assistant_message_id: null,
         status: "queued",
-        planner_mode: runOptions.planner_mode,
+        planner_mode: LEGACY_PERSISTED_PLANNER_MODE_V1,
         base_model: BASE_MODEL,
         parallel_workers: runOptions.parallel_workers,
         max_routing_adapters: runOptions.max_routing_adapters,
@@ -2240,7 +2241,7 @@ export async function createApp({
       const runtimeExecutionId = String(record.runtime_execution_id || "");
       const subjectId = String(record.workspace_id || "runtime");
       if (!runtimeExecutionId || !record.runtime_record_hash || !record.runtime_request_fingerprint) {
-        throwStatus(409, "Execution has no bound TCAR Runtime receipt.");
+        throwStatus(409, "Execution has no bound Agent Runtime receipt.");
       }
       const [receiptResponse, subjectChain] = await Promise.all([
         fetchRuntimeExecutionReceipt(runtimeExecutionId),
@@ -2266,7 +2267,7 @@ export async function createApp({
         && subjectChain?.subject_id === subjectId
         && Number(subjectChain?.receipts) >= Number(receipt.subject_sequence);
       if (!bindingValid) {
-        const error = new Error("TCAR Runtime execution receipt did not match the persisted virenis execution binding.");
+        const error = new Error("Agent Runtime execution receipt did not match the persisted virenis execution binding.");
         error.status = 502;
         error.code = "runtime_execution_proof_invalid";
         throw error;
@@ -2299,11 +2300,11 @@ export async function createApp({
       const agent = findAccessibleAgent(store.read(), req.params.agent_id, req);
       const binding = agent.runtime_registration_audit_binding;
       const agentSpec = agent.runtime_registration_agent_spec;
-      if (!binding) throwStatus(409, "Agent has no bound TCAR Runtime registration receipt.");
+      if (!binding) throwStatus(409, "Agent has no bound Agent Runtime registration receipt.");
       const runtimeResultBefore = await fetchRuntimeAgent(agent.id);
       const runtimeAgentBefore = stripRuntimeRegistrationMetadata(runtimeResultBefore?.agent);
       if (!runtimeAgentBefore?.id || runtimeAgentBefore.id !== agent.id) {
-        throwStatus(502, "TCAR Runtime did not return the audited agent.");
+        throwStatus(502, "Agent Runtime did not return the audited agent.");
       }
       const receiptResponse = await fetchRuntimeSubjectReceipts("agent", agent.id);
       const subjectChain = await verifyRuntimeAuditSubject("agent", agent.id, {
@@ -2312,7 +2313,7 @@ export async function createApp({
       const runtimeResultAfter = await fetchRuntimeAgent(agent.id);
       const runtimeAgent = stripRuntimeRegistrationMetadata(runtimeResultAfter?.agent);
       if (!runtimeAgentSameAuditState(runtimeAgentBefore, runtimeAgent)) {
-        throwStatus(409, "TCAR Runtime agent changed while its audit history was being verified. Retry the request.");
+        throwStatus(409, "Agent Runtime agent changed while its audit history was being verified. Retry the request.");
       }
       const receipts = Array.isArray(receiptResponse?.receipts)
         ? [...receiptResponse.receipts].sort((left, right) => Number(left.subject_sequence) - Number(right.subject_sequence))
@@ -2347,7 +2348,7 @@ export async function createApp({
         ))
         && runtimeReceiptMatchesRuntimeAgent(latestReceipt, runtimeAgent);
       if (!bindingValid) {
-        const error = new Error("TCAR Runtime agent receipts did not match the persisted virenis registration binding.");
+        const error = new Error("Agent Runtime agent receipts did not match the persisted virenis registration binding.");
         error.status = 502;
         error.code = "runtime_agent_audit_invalid";
         throw error;
@@ -4540,6 +4541,7 @@ async function claimQueuedChatRun({
     }
     const claimedAt = nowIso();
     const durableOptions = durableChatOptions(run, options);
+    run.planner_mode = LEGACY_PERSISTED_PLANNER_MODE_V1;
     run.execution_options = durableOptions;
     run.dispatch = {
       attempt_id: attemptId,
@@ -4561,18 +4563,17 @@ async function claimQueuedChatRun({
 function durableChatOptions(run, suppliedOptions) {
   const stored = run.execution_options;
   if (stored && typeof stored === "object" && !Array.isArray(stored)) {
-    return { ...stored };
+    return normalizePersistedAgentRuntimeOptions(stored);
   }
   if (suppliedOptions && typeof suppliedOptions === "object" && !Array.isArray(suppliedOptions)) {
-    return { ...suppliedOptions };
+    return normalizePersistedAgentRuntimeOptions(suppliedOptions);
   }
   return {
-    planner_mode: run.planner_mode || process.env.TCAR_PLANNER_MODE || "session",
-    parallel_workers: Number(run.parallel_workers) || Number(process.env.TCAR_PARALLEL_WORKERS || 2),
-    max_routing_adapters: Number(run.max_routing_adapters) || Number(process.env.TCAR_MAX_ROUTING_ADAPTERS || 16),
-    max_tokens: Number(process.env.TCAR_MAX_TOKENS || 4096),
-    refiner_max_tokens: Number(process.env.TCAR_REFINER_MAX_TOKENS || 8192),
-    temperature: Number(process.env.TCAR_TEMPERATURE || 0)
+    parallel_workers: Number(run.parallel_workers) || Number(runtimeSetting("AGENT_RUNTIME_PARALLEL_WORKERS", 2)),
+    max_routing_adapters: Number(run.max_routing_adapters) || Number(runtimeSetting("AGENT_RUNTIME_MAX_ROUTING_AGENTS", 16)),
+    max_tokens: Number(runtimeSetting("AGENT_RUNTIME_MAX_TOKENS", 4096)),
+    refiner_max_tokens: Number(runtimeSetting("AGENT_RUNTIME_REFINER_MAX_TOKENS", 8192)),
+    temperature: Number(runtimeSetting("AGENT_RUNTIME_TEMPERATURE", 0))
   };
 }
 
@@ -4616,53 +4617,22 @@ async function processValidationRun({ store, validation_run_id: validationRunId,
     return;
   }
 
-  if (realRuntimeEnabled()) {
-    const result = await runRuntimeValidation({
-      suite: validation.suite,
-      case_filter: validation.case_filter
-    });
-    await store.mutate((data) => {
-      const run = (data.validationRuns || []).find((item) => item.validation_run_id === validationRunId);
-      if (!activeValidationDispatch(run, attemptId)) {
-        return null;
-      }
-      run.status = "completed";
-      run.ok = Boolean(result.ok);
-      run.completed_at = nowIso();
-      const diagnosticResult = projectValidationResult(result);
-      run.summary = diagnosticResult.summary || null;
-      run.runtime = diagnosticResult;
-      run.events.push({ type: "validation.completed", ok: run.ok, at: run.completed_at });
-      return run;
-    });
-    return;
-  }
-
-  const data = store.read();
-  const samplePlan = planRoutes({
-    query: "Review clinic patient newsletter consent, health-safe wording, and support FAQ.",
-    agents: data.agents,
-    documents: data.documents
+  const result = await runRuntimeValidation({
+    suite: validation.suite,
+    case_filter: validation.case_filter
   });
-  const parallel = buildParallelBatches(samplePlan.steps, 2);
-  await store.mutate((mutable) => {
-    const run = (mutable.validationRuns || []).find((item) => item.validation_run_id === validationRunId);
+  await store.mutate((data) => {
+    const run = (data.validationRuns || []).find((item) => item.validation_run_id === validationRunId);
     if (!activeValidationDispatch(run, attemptId)) {
       return null;
     }
     run.status = "completed";
-    run.ok = true;
+    run.ok = Boolean(result.ok);
     run.completed_at = nowIso();
-    run.summary = {
-      cases: 10,
-      adapterRoutePrecision: 0.975,
-      adapterRouteRecall: 1,
-      expectedEdgeRecall: 1,
-      casesParallelizable: parallel.parallelizable ? 2 : 0,
-      maxParallelBatchWidth: parallel.maxBatchWidth,
-      toolPolicyCheck: sanitizeToolCalls("<tool_call>{\"name\":\"bad_tool\"}</tool_call>", []).violations.length === 1
-    };
-    run.events.push({ type: "validation.completed", ok: true, at: run.completed_at });
+    const diagnosticResult = projectValidationResult(result);
+    run.summary = diagnosticResult.summary || null;
+    run.runtime = diagnosticResult;
+    run.events.push({ type: "validation.completed", ok: run.ok, at: run.completed_at });
     return run;
   });
 }
@@ -4756,14 +4726,14 @@ function elapsedSeconds(startedAt, completedAt) {
 }
 
 export function resolveLifecycleTimeouts(env = process.env) {
-  const chatTimeoutMs = positiveLifecycleInteger(env, "TCAR_RUNTIME_CHAT_TIMEOUT_MS", 900000);
-  const workflowTimeoutMs = positiveLifecycleInteger(env, "TCAR_RUNTIME_WORKFLOW_TIMEOUT_MS", chatTimeoutMs);
-  const continuationTimeoutMs = positiveLifecycleInteger(env, "TCAR_RUNTIME_CONTINUATION_TIMEOUT_MS", chatTimeoutMs);
-  const adminTimeoutMs = positiveLifecycleInteger(env, "TCAR_RUNTIME_ADMIN_TIMEOUT_MS", 600000);
-  const validationTimeoutSec = positiveLifecycleInteger(env, "TCAR_RUNTIME_VALIDATION_TIMEOUT_SEC", 900);
+  const chatTimeoutMs = positiveLifecycleInteger(env, "AGENT_RUNTIME_CHAT_TIMEOUT_MS", 900000);
+  const workflowTimeoutMs = positiveLifecycleInteger(env, "AGENT_RUNTIME_WORKFLOW_TIMEOUT_MS", chatTimeoutMs);
+  const continuationTimeoutMs = positiveLifecycleInteger(env, "AGENT_RUNTIME_CONTINUATION_TIMEOUT_MS", chatTimeoutMs);
+  const adminTimeoutMs = positiveLifecycleInteger(env, "AGENT_RUNTIME_ADMIN_TIMEOUT_MS", 600000);
+  const validationTimeoutSec = positiveLifecycleInteger(env, "AGENT_RUNTIME_VALIDATION_TIMEOUT_SEC", 900);
   const validationTimeoutMs = validationTimeoutSec * 1000;
   if (!Number.isSafeInteger(validationTimeoutMs)) {
-    throw new Error("TCAR_RUNTIME_VALIDATION_TIMEOUT_SEC is too large.");
+    throw new Error("AGENT_RUNTIME_VALIDATION_TIMEOUT_SEC is too large.");
   }
   const runtimeOperationTimeoutMs = Math.max(
     chatTimeoutMs,
@@ -4795,7 +4765,9 @@ export function resolveLifecycleTimeouts(env = process.env) {
 }
 
 function positiveLifecycleInteger(env, name, defaultValue) {
-  const raw = env?.[name];
+  const raw = name.startsWith("AGENT_RUNTIME_")
+    ? readAgentRuntimeEnv(env, name)
+    : env?.[name];
   if (raw === undefined || raw === null || String(raw).trim() === "") {
     return defaultValue;
   }
@@ -6350,7 +6322,6 @@ function redactRuntimeHealthForRequest(payload = {}, req) {
     : payload.vllm && typeof payload.vllm === "object"
       ? payload.vllm
       : {};
-  const router = payload.router && typeof payload.router === "object" ? payload.router : null;
   const health = modelApi.health && typeof modelApi.health === "object" ? modelApi.health : null;
   const response = {
     ok: Boolean(payload.ok),
@@ -6375,13 +6346,6 @@ function redactRuntimeHealthForRequest(payload = {}, req) {
       ? payload.tool_readiness
       : undefined
   };
-  if (router) {
-    response.router = {
-      mode: router.mode,
-      model: router.model,
-      models_endpoint_ok: router.models_endpoint_ok
-    };
-  }
   if (health) {
     response.model_api.health = {
       ok: health.ok,
@@ -6567,7 +6531,7 @@ function currentWorldGraphPreview(data, run, { runtimeComponentProvenance = null
 
 function publicRunExecutionOptions(options = {}) {
   const allowed = [
-    "show_route_details", "planner_mode", "planner_max_tokens", "max_routing_adapters",
+    "show_route_details", "planner_max_tokens", "max_routing_adapters",
     "parallel_workers", "max_tokens", "refiner_max_tokens", "temperature"
   ];
   return Object.fromEntries(allowed
@@ -6962,7 +6926,7 @@ function validateRuntimeAgentRegistrationAudit(runtimeResult, { agentId, sourceT
   const runtimeAgent = runtimeResult?.agent;
   if (!receipt || !agentSpec) {
     if (process.env.NODE_ENV === "production") {
-      const error = new Error("TCAR Runtime did not return a durable agent registration audit receipt.");
+      const error = new Error("Agent Runtime did not return a durable agent registration audit receipt.");
       error.status = 502;
       error.code = "runtime_agent_audit_missing";
       throw error;
@@ -6973,7 +6937,7 @@ function validateRuntimeAgentRegistrationAudit(runtimeResult, { agentId, sourceT
     !agentSpec || typeof agentSpec !== "object" || Array.isArray(agentSpec)
     || Object.keys(agentSpec).some((key) => key.startsWith("registration_"))
   ) {
-    const error = new Error("TCAR Runtime audit specification contains registration cleanup metadata.");
+    const error = new Error("Agent Runtime audit specification contains registration cleanup metadata.");
     error.status = 502;
     error.code = "runtime_agent_audit_unsafe";
     throw error;
@@ -6998,7 +6962,7 @@ function validateRuntimeAgentRegistrationAudit(runtimeResult, { agentId, sourceT
     && digestTextEqual(receipt.payload?.adapter_content_digest, expectedAdapterDigest)
     && digestTextEqual(receipt.payload?.manifest_contract_digest, expectedManifestContractDigest);
   if (!valid) {
-    const error = new Error("TCAR Runtime returned an invalid agent registration audit receipt.");
+    const error = new Error("Agent Runtime returned an invalid agent registration audit receipt.");
     error.status = 502;
     error.code = "runtime_agent_audit_invalid";
     throw error;
@@ -7090,7 +7054,7 @@ function validateRuntimeAgentAdoptionAudit({ agentId, runtimeAgent, receiptRespo
     && Number(registrationReceipt.subject_sequence) <= Number(latestReceipt.subject_sequence)
     && runtimeReceiptMatchesRuntimeAgent(latestReceipt, runtimeAgent);
   if (!chainValid || !exactRevisionValid) {
-    const error = new Error("TCAR Runtime agent history is not a valid exact-revision registration chain.");
+    const error = new Error("Agent Runtime agent history is not a valid exact-revision registration chain.");
     error.status = 502;
     error.code = "runtime_agent_adoption_audit_invalid";
     throw error;
@@ -7165,7 +7129,7 @@ function runtimeAuditDigest(value) {
 
 function runtimeAuditCanonicalJson(value) {
   const json = JSON.stringify(runtimeAuditCanonicalValue(value));
-  if (json === undefined) throw new TypeError("TCAR Runtime audit values must be JSON serializable.");
+  if (json === undefined) throw new TypeError("Agent Runtime audit values must be JSON serializable.");
   return [...json].map((character) => {
     const code = character.codePointAt(0);
     if (code < 0x80) return character;
@@ -7229,7 +7193,6 @@ function normalizeChatOptions(options = {}, { outputSettings = null } = {}) {
   const clientKeys = new Set([
     "show_route_details",
     "run_fresh",
-    "planner_mode",
     "planner_max_tokens",
     "max_routing_adapters",
     "parallel_workers",
@@ -7256,34 +7219,32 @@ function normalizeChatOptions(options = {}, { outputSettings = null } = {}) {
   if (unknown.length > 0) {
     throwStatus(400, `Unknown chat option(s): ${unknown.join(", ")}.`);
   }
-  const requestedPlannerMode = String(options.planner_mode || process.env.TCAR_PLANNER_MODE || "session").toLowerCase();
-  if (!["cue", "llm", "session", "tcandon"].includes(requestedPlannerMode)) {
-    throwStatus(400, "planner_mode must be 'cue', 'llm', 'session', or 'tcandon'.");
-  }
-  const plannerMode = "session";
   const agentOutputTokens = Number(outputSettings?.agent_output_tokens)
-    || Number(process.env.TCAR_MAX_TOKENS || 4096);
+    || Number(runtimeSetting("AGENT_RUNTIME_MAX_TOKENS", 4096));
   const finalOutputTokens = Number(outputSettings?.final_output_tokens)
-    || Number(process.env.TCAR_REFINER_MAX_TOKENS || 8192);
+    || Number(runtimeSetting("AGENT_RUNTIME_REFINER_MAX_TOKENS", 8192));
   const maximumAgentOutputTokens = Math.min(
-    Number(outputSettings?.bounds?.agent_output_tokens?.max) || Number(process.env.TCAR_CLIENT_MAX_TOKENS || 8192),
+    Number(outputSettings?.bounds?.agent_output_tokens?.max) || Number(runtimeSetting("AGENT_RUNTIME_CLIENT_MAX_TOKENS", 8192)),
     agentOutputTokens
   );
   const maximumFinalOutputTokens = Math.min(
-    Number(outputSettings?.bounds?.final_output_tokens?.max) || Number(process.env.TCAR_CLIENT_MAX_REFINER_TOKENS || 12288),
+    Number(outputSettings?.bounds?.final_output_tokens?.max) || Number(runtimeSetting("AGENT_RUNTIME_CLIENT_MAX_REFINER_TOKENS", 12288)),
     finalOutputTokens
   );
   return {
     show_route_details: options.show_route_details !== false,
     run_fresh: options.run_fresh === true,
-    planner_mode: plannerMode,
-    planner_max_tokens: boundedInt(options.planner_max_tokens, Number(process.env.TCAR_PLANNER_MAX_TOKENS || 768), 256, Number(process.env.TCAR_CLIENT_MAX_PLANNER_TOKENS || 4096)),
-    max_routing_adapters: boundedInt(options.max_routing_adapters, Math.min(Number(process.env.TCAR_MAX_ROUTING_ADAPTERS || 16), 16), 1, Math.min(Number(process.env.TCAR_CLIENT_MAX_ROUTING_ADAPTERS || 16), 16)),
-    parallel_workers: boundedInt(options.parallel_workers, Number(process.env.TCAR_PARALLEL_WORKERS || 2), 1, Number(process.env.TCAR_CLIENT_MAX_PARALLEL_WORKERS || 4)),
+    planner_max_tokens: boundedInt(options.planner_max_tokens, Number(runtimeSetting("AGENT_RUNTIME_PLANNER_MAX_TOKENS", 768)), 256, Number(runtimeSetting("AGENT_RUNTIME_CLIENT_MAX_PLANNER_TOKENS", 4096))),
+    max_routing_adapters: boundedInt(options.max_routing_adapters, Math.min(Number(runtimeSetting("AGENT_RUNTIME_MAX_ROUTING_AGENTS", 16)), 16), 1, Math.min(Number(runtimeSetting("AGENT_RUNTIME_CLIENT_MAX_ROUTING_AGENTS", 16)), 16)),
+    parallel_workers: boundedInt(options.parallel_workers, Number(runtimeSetting("AGENT_RUNTIME_PARALLEL_WORKERS", 2)), 1, Number(runtimeSetting("AGENT_RUNTIME_CLIENT_MAX_PARALLEL_WORKERS", 4))),
     max_tokens: boundedInt(options.max_tokens, agentOutputTokens, 16, maximumAgentOutputTokens),
     refiner_max_tokens: boundedInt(options.refiner_max_tokens, finalOutputTokens, 32, maximumFinalOutputTokens),
-    temperature: boundedFloat(options.temperature, Number(process.env.TCAR_TEMPERATURE || 0), 0, Number(process.env.TCAR_CLIENT_MAX_TEMPERATURE || 1))
+    temperature: boundedFloat(options.temperature, Number(runtimeSetting("AGENT_RUNTIME_TEMPERATURE", 0)), 0, Number(runtimeSetting("AGENT_RUNTIME_CLIENT_MAX_TEMPERATURE", 1)))
   };
+}
+
+function runtimeSetting(name, fallback = undefined) {
+  return readAgentRuntimeEnv(process.env, name, fallback);
 }
 
 function normalizeRequestedAgentIds(value) {

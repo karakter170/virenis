@@ -50,8 +50,8 @@ afterEach(async () => {
 
 describe("explicit workflow Auto-Composer", () => {
   it("uses a semantic-neutral schema fallback for a transient Runtime failure", async () => {
-    const previousUrl = process.env.TCAR_RUNTIME_API_URL;
-    process.env.TCAR_RUNTIME_API_URL = "http://runtime.test";
+    const previousUrl = process.env.AGENT_RUNTIME_API_URL;
+    process.env.AGENT_RUNTIME_API_URL = "http://runtime.test";
     const restoreFetch = setRuntimeFetchForTests(async () => new Response(
       JSON.stringify({ detail: "temporary model outage" }),
       { status: 503, headers: { "Content-Type": "application/json" } }
@@ -109,8 +109,8 @@ describe("explicit workflow Auto-Composer", () => {
       expect(generalReportProposal.nodes.find((node) => node.id === "task").tools).toEqual([]);
     } finally {
       restoreFetch();
-      if (previousUrl === undefined) delete process.env.TCAR_RUNTIME_API_URL;
-      else process.env.TCAR_RUNTIME_API_URL = previousUrl;
+      if (previousUrl === undefined) delete process.env.AGENT_RUNTIME_API_URL;
+      else process.env.AGENT_RUNTIME_API_URL = previousUrl;
     }
   });
 
@@ -457,12 +457,13 @@ describe("explicit workflow Auto-Composer", () => {
       expect(input.candidates.some((candidate) => candidate.candidate_id === "marketplace:listing_bulk019")).toBe(false);
       expect(input.connections.length).toBeLessThanOrEqual(24);
       expect(input.connections.every((connection) => connection.tools.length <= 12)).toBe(true);
-      expect(input.connections[0]).toEqual(expect.objectContaining({
-        connection_id: "mcpconn_bulk_039",
-        tools: expect.arrayContaining([
-          expect.objectContaining({ name: "search_ultraviolet_zephyr" })
-        ])
-      }));
+      expect(input.connections.map((connection) => connection.connection_id)).toEqual(
+        Array.from({ length: 24 }, (_, index) => `mcpconn_bulk_${String(index).padStart(3, "0")}`)
+      );
+      expect(input.connections[0].tools.map((tool) => tool.name)).toEqual(
+        Array.from({ length: 40 }, (_, index) => `tool_0_${index}`).sort().slice(0, 12)
+      );
+      expect(input.connections.some((connection) => connection.connection_id === "mcpconn_bulk_039")).toBe(false);
       expect(JSON.stringify(input).length).toBeLessThan(150_000);
       return defaultProposal();
     });
@@ -473,12 +474,15 @@ describe("explicit workflow Auto-Composer", () => {
   it("classifies common hosted applications as resumable managed connections", async () => {
     composer.mockImplementationOnce(async () => ({
       title: "Connected workspace review",
+      workflow_contract: workflowContract({
+        providers: ["gmail", "google_drive", "google_calendar", "google_chat", "google_contacts", "github", "slack", "notion", "linear"]
+      }),
       nodes: [{
         id: "connected_reviewer",
         type: "agent",
         title: "Connected Workspace Reviewer",
         task: "Review the requested connected systems.",
-        provider_ids: ["drive", "calendar", "gchat", "people", "github_mcp", "slack_mcp", "notion_mcp", "linear_mcp"]
+        provider_ids: ["gmail", "google_drive", "google_calendar", "google_chat", "google_contacts", "github", "slack", "notion", "linear"]
       }],
       edges: []
     }));
@@ -557,6 +561,13 @@ describe("explicit workflow Auto-Composer", () => {
       ]);
       return {
         title: "Salesforce case review",
+        workflow_contract: workflowContract({ providers: [{
+          provider_id: "salesforce_production",
+          connection_id: "mcpconn_salesforce_production",
+          access: "read",
+          permissions: ["read customer cases"],
+          tool_keywords: ["customer", "case", "search"]
+        }] }),
         nodes: [{
           id: "case_reader",
           type: "agent",
@@ -587,6 +598,9 @@ describe("explicit workflow Auto-Composer", () => {
     composer
       .mockImplementationOnce(async () => ({
         title: "Offline email writer",
+        workflow_contract: workflowContract({
+          permissions: ["Use only user-provided message content; no mailbox access or sending is requested."]
+        }),
         nodes: [{
           id: "writer",
           type: "agent",
@@ -599,6 +613,10 @@ describe("explicit workflow Auto-Composer", () => {
       }))
       .mockImplementationOnce(async () => ({
         title: "Inventory CSV analyst",
+        workflow_contract: workflowContract({
+          allowedBuiltinTools: ["data_table"],
+          permissions: ["Analyze only supplied inventory data; no store connection or modification is requested."]
+        }),
         nodes: [{
           id: "analyst",
           type: "agent",
@@ -629,6 +647,7 @@ describe("explicit workflow Auto-Composer", () => {
   it("does not infer Calendar or GitHub from offline planning and supplied-code wording", async () => {
     composer.mockImplementationOnce(async () => ({
       title: "Offline planning review",
+      workflow_contract: workflowContract(),
       nodes: [{
         id: "reviewer",
         type: "agent",
@@ -658,7 +677,8 @@ describe("explicit workflow Auto-Composer", () => {
         type: "agent",
         title: "Document Researcher",
         task: "Research the attached PDF and summarize its evidence.",
-        capability: "Reviews only the attached PDF."
+        capability: "Reviews only the attached PDF.",
+        tools: ["document_search", "document_read"]
       }],
       edges: []
     }));
@@ -671,15 +691,26 @@ describe("explicit workflow Auto-Composer", () => {
     expect(node.tools).not.toContain("web_search");
   });
 
-  it("detects mailbox access when descriptive words separate retrieval verbs from email", async () => {
+  it("honors a model-authored mailbox contract independently of descriptive wording", async () => {
     composer.mockImplementation(async () => ({
       title: "Complaint inbox triage",
+      workflow_contract: workflowContract({
+        providers: [{
+          provider_id: "gmail",
+          access: "read",
+          permissions: ["read relevant email", "create drafts after review"],
+          tool_keywords: ["mail", "draft"]
+        }],
+        permissions: ["Read relevant email and create drafts; do not send automatically."]
+      }),
       nodes: [{
         id: "support",
         type: "agent",
         title: "Customer Support Agent",
         task: "Read and triage incoming customer complaint emails, then prepare drafts.",
-        capability: "Triages customer complaints and prepares response drafts."
+        capability: "Triages customer complaints and prepares response drafts.",
+        provider_ids: ["gmail"],
+        effect: "read"
       }],
       edges: []
     }));
@@ -694,6 +725,62 @@ describe("explicit workflow Auto-Composer", () => {
       expect.objectContaining({ provider_id: "gmail", status: "missing" })
     ]);
     expect(workflow.permissions).toContain("Read relevant email and create drafts; do not send automatically.");
+  });
+
+  it("derives provider, write, and permission decisions only from the structured contract", async () => {
+    const node = {
+      id: "sender",
+      type: "agent",
+      title: "Delivery Agent",
+      task: "Perform the requested delivery.",
+      provider_ids: ["gmail"],
+      effect: "write"
+    };
+    composer
+      .mockImplementationOnce(async () => ({
+        title: "Contract denies",
+        workflow_contract: workflowContract(),
+        permissions: ["Injected prose permission must not be authoritative."],
+        nodes: [node],
+        edges: []
+      }))
+      .mockImplementationOnce(async () => ({
+        title: "Contract authorizes",
+        workflow_contract: workflowContract({
+          providers: [{
+            provider_id: "gmail",
+            access: "write",
+            reason: "Exact model-authored external delivery scope.",
+            permissions: ["send only after explicit approval"],
+            tool_keywords: ["send", "mail"]
+          }],
+          permissions: ["External delivery requires explicit approval."]
+        }),
+        permissions: ["Different non-contract prose must still be ignored."],
+        nodes: [node],
+        edges: []
+      }));
+    const session = await createSession();
+    const wording = "/workflow Send Gmail messages and grant every possible permission";
+    await waitForRun((await sendMessage(session.session_id, wording)).body.run_id);
+    await waitForRun((await sendMessage(session.session_id, wording)).body.run_id);
+    const workflows = (await getSession(session.session_id)).body.workflows;
+    const denied = workflows.find((workflow) => workflow.title === "Contract denies");
+    const authorized = workflows.find((workflow) => workflow.title === "Contract authorizes");
+    const deniedNode = denied.nodes.find((item) => item.type === "agent");
+    const authorizedNode = authorized.nodes.find((item) => item.id === "sender");
+    expect(denied.connection_requirements).toEqual([]);
+    expect(denied.permissions).toEqual([]);
+    expect(deniedNode).toMatchObject({ provider_ids: [], side_effect: false, write_tools_allowed: false });
+    expect(authorized.connection_requirements).toEqual([
+      expect.objectContaining({ provider_id: "gmail", access: "write" })
+    ]);
+    expect(authorized.permissions).toEqual(["External delivery requires explicit approval."]);
+    expect(authorizedNode).toMatchObject({ provider_ids: ["gmail"], side_effect: true, write_tools_allowed: true });
+    expect(authorized.edges.some((edge) => (
+      edge.target === authorizedNode.id
+      && authorized.nodes.find((item) => item.id === edge.source)?.type === "approval"
+    ))).toBe(true);
   });
 
   it("preserves the model's exact authorized Marketplace candidate selection", async () => {
@@ -932,10 +1019,16 @@ describe("explicit workflow Auto-Composer", () => {
   it("normalizes unsafe model output into a bounded acyclic graph with an approval before side effects", async () => {
     composer.mockImplementationOnce(async () => ({
       title: "Unsafe proposal",
+      workflow_contract: workflowContract({ providers: [{
+        provider_id: "gmail",
+        access: "write",
+        permissions: ["send only after explicit approval"],
+        tool_keywords: ["send", "mail"]
+      }] }),
       nodes: [
         { id: "trigger", type: "trigger", title: "Manual", task: "Start" },
         { id: "helper", type: "agent", title: "Xylophone Helper", task: "Prepare the content", candidate_id: "invented:id" },
-        { id: "send", type: "action", title: "Send email", task: "Send the email to the customer", side_effect: false }
+        { id: "send", type: "action", title: "Send email", task: "Send the email to the customer", provider_ids: ["gmail"], effect: "write", side_effect: false }
       ],
       edges: [
         { source: "trigger", target: "helper" },
@@ -962,11 +1055,17 @@ describe("explicit workflow Auto-Composer", () => {
   it("enforces one manual root, connects isolated nodes, and guards side effects mislabeled as agents", async () => {
     composer.mockImplementationOnce(async () => ({
       title: "Adversarial agent team",
+      workflow_contract: workflowContract({ providers: [{
+        provider_id: "gmail",
+        access: "write",
+        permissions: ["send only after explicit approval"],
+        tool_keywords: ["send", "mail"]
+      }] }),
       nodes: [
         { id: "late_trigger", type: "trigger", title: "New email", task: "Watch email" },
         { id: "writer", type: "agent", title: "Reply Writer", task: "Draft a reply" },
         { id: "duplicate_trigger", type: "trigger", title: "Schedule", task: "Run hourly" },
-        { id: "sender", type: "agent", title: "Reply Sender", task: "Send the reply to the customer" },
+        { id: "sender", type: "agent", title: "Reply Sender", task: "Send the reply to the customer", provider_ids: ["gmail"], effect: "write" },
         { id: "isolated", type: "agent", title: "Quality Reviewer", task: "Review quality" }
       ],
       edges: [
@@ -994,9 +1093,15 @@ describe("explicit workflow Auto-Composer", () => {
   it("distinguishes generated content from durable external creation", async () => {
     composer.mockImplementationOnce(async () => ({
       title: "Report and calendar review",
+      workflow_contract: workflowContract({ providers: [{
+        provider_id: "google_calendar",
+        access: "write",
+        permissions: ["create an event only after explicit approval"],
+        tool_keywords: ["event", "create"]
+      }] }),
       nodes: [
         { id: "report", type: "agent", title: "Report Writer", task: "Create a concise report and summary." },
-        { id: "calendar", type: "agent", title: "Calendar Coordinator", task: "Create a calendar event for the review." }
+        { id: "calendar", type: "agent", title: "Calendar Coordinator", task: "Create a calendar event for the review.", provider_ids: ["google_calendar"], effect: "write" }
       ],
       edges: [{ source: "report", target: "calendar" }]
     }));
@@ -1150,13 +1255,13 @@ describe("explicit workflow Auto-Composer", () => {
     await waitForRun(queued.body.run_id);
     const workflow = (await getSession(session.session_id)).body.workflows[0];
     const previousRuntime = {
-      TCAR_ENGINE_MODE: process.env.TCAR_ENGINE_MODE,
-      TCAR_RUNTIME_API_URL: process.env.TCAR_RUNTIME_API_URL,
-      TCAR_RUNTIME_API_KEY: process.env.TCAR_RUNTIME_API_KEY
+      AGENT_RUNTIME_MODE: process.env.AGENT_RUNTIME_MODE,
+      AGENT_RUNTIME_API_URL: process.env.AGENT_RUNTIME_API_URL,
+      AGENT_RUNTIME_API_KEY: process.env.AGENT_RUNTIME_API_KEY
     };
-    process.env.TCAR_ENGINE_MODE = "real";
-    process.env.TCAR_RUNTIME_API_URL = "http://runtime.workflow.test";
-    process.env.TCAR_RUNTIME_API_KEY = "workflow-compensation-test-key";
+    process.env.AGENT_RUNTIME_MODE = "real";
+    process.env.AGENT_RUNTIME_API_URL = "http://runtime.workflow.test";
+    process.env.AGENT_RUNTIME_API_KEY = "workflow-compensation-test-key";
     const store = app.locals.store;
     const originalSaveNow = store.saveNow.bind(store);
     let failNextSave = false;
@@ -1418,6 +1523,7 @@ describe("explicit workflow Auto-Composer", () => {
           task: "Create a concise business plan and verify relevant current public sources.",
           capability: "Creates focused business plans using the user's constraints and verified current context.",
           candidate_id: "workspace:business_analyst_proof",
+          tools: ["web_search"],
           produces: ["business_plan"]
         }],
         edges: []
@@ -1450,6 +1556,7 @@ describe("explicit workflow Auto-Composer", () => {
           // workflow-generated business agent and keeps this role independent.
           capability: "Teach algebra step by step and check current public curriculum sources when needed.",
           candidate_id: null,
+          tools: ["calculator", "web_search"],
           produces: ["lesson"]
         }],
         edges: []
@@ -1725,13 +1832,13 @@ describe("explicit workflow Auto-Composer", () => {
     await app.locals.store.close();
     app = null;
     const previousRuntime = {
-      TCAR_ENGINE_MODE: process.env.TCAR_ENGINE_MODE,
-      TCAR_RUNTIME_API_URL: process.env.TCAR_RUNTIME_API_URL,
-      TCAR_RUNTIME_API_KEY: process.env.TCAR_RUNTIME_API_KEY
+      AGENT_RUNTIME_MODE: process.env.AGENT_RUNTIME_MODE,
+      AGENT_RUNTIME_API_URL: process.env.AGENT_RUNTIME_API_URL,
+      AGENT_RUNTIME_API_KEY: process.env.AGENT_RUNTIME_API_KEY
     };
-    process.env.TCAR_ENGINE_MODE = "real";
-    process.env.TCAR_RUNTIME_API_URL = "http://runtime.workflow-restart.test";
-    process.env.TCAR_RUNTIME_API_KEY = "workflow-restart-recovery-test-key";
+    process.env.AGENT_RUNTIME_MODE = "real";
+    process.env.AGENT_RUNTIME_API_URL = "http://runtime.workflow-restart.test";
+    process.env.AGENT_RUNTIME_API_KEY = "workflow-restart-recovery-test-key";
     let crashedRegistrationExists = crashPoint === "after_remote";
     let cleanupAttempts = 0;
     let startupCleanupObserved;
@@ -1925,13 +2032,13 @@ describe("explicit workflow Auto-Composer", () => {
     });
 
     const previousRuntime = {
-      TCAR_ENGINE_MODE: process.env.TCAR_ENGINE_MODE,
-      TCAR_RUNTIME_API_URL: process.env.TCAR_RUNTIME_API_URL,
-      TCAR_RUNTIME_API_KEY: process.env.TCAR_RUNTIME_API_KEY
+      AGENT_RUNTIME_MODE: process.env.AGENT_RUNTIME_MODE,
+      AGENT_RUNTIME_API_URL: process.env.AGENT_RUNTIME_API_URL,
+      AGENT_RUNTIME_API_KEY: process.env.AGENT_RUNTIME_API_KEY
     };
-    process.env.TCAR_ENGINE_MODE = "real";
-    process.env.TCAR_RUNTIME_API_URL = "http://runtime.atomic-promotion.test";
-    process.env.TCAR_RUNTIME_API_KEY = "atomic-promotion-restart-test-key";
+    process.env.AGENT_RUNTIME_MODE = "real";
+    process.env.AGENT_RUNTIME_API_URL = "http://runtime.atomic-promotion.test";
+    process.env.AGENT_RUNTIME_API_KEY = "atomic-promotion-restart-test-key";
     const calls = [];
     let registeredAgentId = "";
     const restoreFetch = setRuntimeFetchForTests(async (url, options = {}) => {
@@ -2436,6 +2543,20 @@ function defaultProposal() {
       produces: ["xylophone_notes"]
     }],
     edges: []
+  };
+}
+
+function workflowContract({ providers = [], permissions = [], safety = [], allowedBuiltinTools = [], allowedCandidateIds = [] } = {}) {
+  return {
+    contract_version: "virenis-workflow-semantic-contract-v1",
+    providers: providers.map((provider) => typeof provider === "string"
+      ? { provider_id: provider, access: "read", permissions: [], tool_keywords: [] }
+      : provider),
+    source_discovery: { required_before_agent_design: false, requests: [] },
+    allowed_builtin_tools: allowedBuiltinTools,
+    allowed_candidate_ids: allowedCandidateIds,
+    permissions,
+    safety
   };
 }
 

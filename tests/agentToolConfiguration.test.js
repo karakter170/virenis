@@ -38,11 +38,11 @@ function agentPayload(overrides = {}) {
 beforeEach(async () => {
   previousEnvironment = {
     APP_API_TOKENS_JSON: process.env.APP_API_TOKENS_JSON,
-    TCAR_ENGINE_MODE: process.env.TCAR_ENGINE_MODE,
+    AGENT_RUNTIME_MODE: process.env.AGENT_RUNTIME_MODE,
     WEB_STORE_DRIVER: process.env.WEB_STORE_DRIVER
   };
   process.env.APP_API_TOKENS_JSON = JSON.stringify(TOKENS);
-  process.env.TCAR_ENGINE_MODE = "mock";
+  process.env.AGENT_RUNTIME_MODE = "mock";
   process.env.WEB_STORE_DRIVER = "json";
   tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "virenis-agent-tool-config-"));
   app = await createApp({

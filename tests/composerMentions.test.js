@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { insertComposerAgentMention } from "../src/App.jsx";
-import { planRoutes } from "../server/tcarEngine.js";
+import { planRoutes } from "./fixtures/agentRuntimeSimulator.js";
 
 describe("composer specialist suggestions", () => {
   it("inserts the selected specialist id when two suggestions have the same title", () => {

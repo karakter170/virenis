@@ -152,8 +152,8 @@ setup and cannot start authorization.
 Runtime process:
 
 ```dotenv
-TCAR_MCP_GATEWAY_URL=https://app.example.com/api/internal/mcp/tools/call
-TCAR_MCP_GATEWAY_KEY_FILE=/run/secrets/mcp_gateway_key
+TOOL_GATEWAY_URL=https://app.example.com/api/internal/mcp/tools/call
+TOOL_GATEWAY_KEY_FILE=/run/secrets/tool_gateway_key
 ```
 
 The credential key exists only on the web host. The gateway key is shared only

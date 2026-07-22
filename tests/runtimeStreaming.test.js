@@ -11,11 +11,13 @@ import { createApp } from "../server/app.js";
 import {
   assertRuntimePlanStreamCommit,
   runtimePlanExactContractDigest,
+  runtimePlanSafeProjectionDigest
+} from "../server/runtimePlanValidator.js";
+import {
   runtimeRouteFailureObservability,
   runtimeRouteFailureDetails,
-  runtimePlanSafeProjectionDigest,
   validateRuntimeRouteResults
-} from "../server/tcarEngine.js";
+} from "../server/routeResultNormalizer.js";
 import {
   executeRuntimeChatStream,
   runtimeStreamTaskProjection,
@@ -33,14 +35,14 @@ const BLOCKED_CLARIFICATION_V5_DIGEST =
 const ENV_KEYS = [
   "APP_API_TOKENS_JSON",
   "APP_IDENTITY_PROVIDER",
-  "TCAR_ENGINE_MODE",
-  "TCAR_RUNTIME_API_URL",
-  "TCAR_RUNTIME_API_KEY",
-  "TCAR_RUNTIME_BODY_IDLE_TIMEOUT_MS",
-  "TCAR_RUNTIME_CHAT_TIMEOUT_MS",
-  "TCAR_RUNTIME_CONNECT_TIMEOUT_MS",
-  "TCAR_RUNTIME_HEADER_TIMEOUT_MS",
-  "TCAR_RUNTIME_TERMINAL_RECOVERY_MS",
+  "AGENT_RUNTIME_MODE",
+  "AGENT_RUNTIME_API_URL",
+  "AGENT_RUNTIME_API_KEY",
+  "AGENT_RUNTIME_BODY_IDLE_TIMEOUT_MS",
+  "AGENT_RUNTIME_CHAT_TIMEOUT_MS",
+  "AGENT_RUNTIME_CONNECT_TIMEOUT_MS",
+  "AGENT_RUNTIME_HEADER_TIMEOUT_MS",
+  "AGENT_RUNTIME_TERMINAL_RECOVERY_MS",
   "WEB_STORE_DRIVER"
 ];
 
@@ -360,9 +362,9 @@ beforeEach(async () => {
   previousEnv = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]]));
   process.env.APP_IDENTITY_PROVIDER = "configured";
   process.env.WEB_STORE_DRIVER = "json";
-  process.env.TCAR_ENGINE_MODE = "real";
-  process.env.TCAR_RUNTIME_API_URL = "http://runtime.stream.test";
-  process.env.TCAR_RUNTIME_API_KEY = "runtime-stream-api-key-0123456789";
+  process.env.AGENT_RUNTIME_MODE = "real";
+  process.env.AGENT_RUNTIME_API_URL = "http://runtime.stream.test";
+  process.env.AGENT_RUNTIME_API_KEY = "runtime-stream-api-key-0123456789";
   process.env.APP_API_TOKENS_JSON = JSON.stringify({
     [TOKEN]: { user_id: "stream_owner", workspace_id: "stream_workspace", role: "user" },
     [ADMIN_TOKEN]: { user_id: "stream_admin", workspace_id: "stream_workspace", role: "admin" }
@@ -913,7 +915,7 @@ describe.sequential("Runtime early-plan stream", () => {
         }, runId))}\n`);
       });
     });
-    process.env.TCAR_RUNTIME_API_URL = runtimeUrl;
+    process.env.AGENT_RUNTIME_API_URL = runtimeUrl;
     app = await createApp({
       dbPath: path.join(tmpDir, "blocked-clarification-app.json"),
       uploadRoot: path.join(tmpDir, "blocked-clarification-uploads")
@@ -1022,7 +1024,7 @@ describe.sequential("Runtime early-plan stream", () => {
         }, runId))}\n`);
       });
     });
-    process.env.TCAR_RUNTIME_API_URL = runtimeUrl;
+    process.env.AGENT_RUNTIME_API_URL = runtimeUrl;
     app = await createApp({
       dbPath: path.join(tmpDir, "raw-terminal-plan-app.json"),
       uploadRoot: path.join(tmpDir, "raw-terminal-plan-uploads")
@@ -1195,11 +1197,11 @@ describe.sequential("Runtime early-plan stream", () => {
         });
       });
     });
-    process.env.TCAR_RUNTIME_API_URL = runtimeUrl;
-    process.env.TCAR_RUNTIME_CONNECT_TIMEOUT_MS = "100";
-    process.env.TCAR_RUNTIME_HEADER_TIMEOUT_MS = "100";
-    process.env.TCAR_RUNTIME_BODY_IDLE_TIMEOUT_MS = "60";
-    process.env.TCAR_RUNTIME_CHAT_TIMEOUT_MS = "1000";
+    process.env.AGENT_RUNTIME_API_URL = runtimeUrl;
+    process.env.AGENT_RUNTIME_CONNECT_TIMEOUT_MS = "100";
+    process.env.AGENT_RUNTIME_HEADER_TIMEOUT_MS = "100";
+    process.env.AGENT_RUNTIME_BODY_IDLE_TIMEOUT_MS = "60";
+    process.env.AGENT_RUNTIME_CHAT_TIMEOUT_MS = "1000";
     let plannerCallbacks = 0;
 
     await expect(executeRuntimeChatStream({
@@ -1235,11 +1237,11 @@ describe.sequential("Runtime early-plan stream", () => {
         response.write(`${JSON.stringify(event("run.heartbeat", 1, {}, "run_real_idle"))}\n`);
       });
     });
-    process.env.TCAR_RUNTIME_API_URL = runtimeUrl;
-    process.env.TCAR_RUNTIME_CONNECT_TIMEOUT_MS = "100";
-    process.env.TCAR_RUNTIME_HEADER_TIMEOUT_MS = "100";
-    process.env.TCAR_RUNTIME_BODY_IDLE_TIMEOUT_MS = "40";
-    process.env.TCAR_RUNTIME_CHAT_TIMEOUT_MS = "500";
+    process.env.AGENT_RUNTIME_API_URL = runtimeUrl;
+    process.env.AGENT_RUNTIME_CONNECT_TIMEOUT_MS = "100";
+    process.env.AGENT_RUNTIME_HEADER_TIMEOUT_MS = "100";
+    process.env.AGENT_RUNTIME_BODY_IDLE_TIMEOUT_MS = "40";
+    process.env.AGENT_RUNTIME_CHAT_TIMEOUT_MS = "500";
 
     await expect(executeRuntimeChatStream({
       query: "Prepare a note.",
@@ -1279,11 +1281,11 @@ describe.sequential("Runtime early-plan stream", () => {
         }, runId))}\n`);
       });
     });
-    process.env.TCAR_RUNTIME_API_URL = runtimeUrl;
-    process.env.TCAR_RUNTIME_CONNECT_TIMEOUT_MS = "100";
-    process.env.TCAR_RUNTIME_HEADER_TIMEOUT_MS = "100";
-    process.env.TCAR_RUNTIME_BODY_IDLE_TIMEOUT_MS = "40";
-    process.env.TCAR_RUNTIME_CHAT_TIMEOUT_MS = "500";
+    process.env.AGENT_RUNTIME_API_URL = runtimeUrl;
+    process.env.AGENT_RUNTIME_CONNECT_TIMEOUT_MS = "100";
+    process.env.AGENT_RUNTIME_HEADER_TIMEOUT_MS = "100";
+    process.env.AGENT_RUNTIME_BODY_IDLE_TIMEOUT_MS = "40";
+    process.env.AGENT_RUNTIME_CHAT_TIMEOUT_MS = "500";
     app = await createApp({
       dbPath: path.join(tmpDir, "stream-idle-app.json"),
       uploadRoot: path.join(tmpDir, "stream-idle-uploads")
@@ -1376,12 +1378,12 @@ describe.sequential("Runtime early-plan stream", () => {
         response.end(JSON.stringify({ detail: { code: "not_found", retryable: false } }));
       });
     });
-    process.env.TCAR_RUNTIME_API_URL = runtimeUrl;
-    process.env.TCAR_RUNTIME_CONNECT_TIMEOUT_MS = "100";
-    process.env.TCAR_RUNTIME_HEADER_TIMEOUT_MS = "100";
-    process.env.TCAR_RUNTIME_BODY_IDLE_TIMEOUT_MS = "100";
-    process.env.TCAR_RUNTIME_CHAT_TIMEOUT_MS = "2000";
-    process.env.TCAR_RUNTIME_TERMINAL_RECOVERY_MS = "1000";
+    process.env.AGENT_RUNTIME_API_URL = runtimeUrl;
+    process.env.AGENT_RUNTIME_CONNECT_TIMEOUT_MS = "100";
+    process.env.AGENT_RUNTIME_HEADER_TIMEOUT_MS = "100";
+    process.env.AGENT_RUNTIME_BODY_IDLE_TIMEOUT_MS = "100";
+    process.env.AGENT_RUNTIME_CHAT_TIMEOUT_MS = "2000";
+    process.env.AGENT_RUNTIME_TERMINAL_RECOVERY_MS = "1000";
 
     await expect(executeRuntimeChatStream({
       query: "Prepare a note.",
@@ -1492,11 +1494,11 @@ describe.sequential("Runtime early-plan stream", () => {
         }, 180);
       });
     });
-    process.env.TCAR_RUNTIME_API_URL = runtimeUrl;
-    process.env.TCAR_RUNTIME_CONNECT_TIMEOUT_MS = "100";
-    process.env.TCAR_RUNTIME_HEADER_TIMEOUT_MS = "100";
-    process.env.TCAR_RUNTIME_BODY_IDLE_TIMEOUT_MS = "40";
-    process.env.TCAR_RUNTIME_CHAT_TIMEOUT_MS = "500";
+    process.env.AGENT_RUNTIME_API_URL = runtimeUrl;
+    process.env.AGENT_RUNTIME_CONNECT_TIMEOUT_MS = "100";
+    process.env.AGENT_RUNTIME_HEADER_TIMEOUT_MS = "100";
+    process.env.AGENT_RUNTIME_BODY_IDLE_TIMEOUT_MS = "40";
+    process.env.AGENT_RUNTIME_CHAT_TIMEOUT_MS = "500";
 
     await expect(executeRuntimeChatStream({
       query: "Prepare a note.",
@@ -1565,7 +1567,7 @@ describe.sequential("Runtime early-plan stream", () => {
         agent_content_digest: runtimeAgent.agent_content_digest,
         adapter_content_digest: runtimeAgent.adapter_content_digest,
         manifest_contract_digest: runtimeAgent.manifest_contract_digest,
-        model_id: "qwen-stream-test",
+        modelId: "qwen-stream-test",
         base_model_content_digest: baseDigest,
         task: exactTask,
         depends_on: [],
@@ -1603,9 +1605,10 @@ describe.sequential("Runtime early-plan stream", () => {
       ];
       const result = {
         ok: true,
-        mode: "session_delegated_vllm_execute",
-        plannerMode: "session",
+        mode: "session_delegated_model_execute",
+        modelProviderBaseUrl: "https://model-provider.internal/v1",
         baseModel: "qwen-stream-test",
+        agentModelMap: { [runtimeAgent.id]: "qwen-stream-test" },
         manifestRevision: "1".repeat(64),
         componentProvenance: {
           revision_authority: "runtime",

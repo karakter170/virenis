@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { readAgentRuntimeEnv } from "./agentRuntimeConfig.js";
 
 const MICROS_PER_CREDIT = 1_000_000;
 const TOKENS_PER_RATE_UNIT = 1_000;
@@ -1219,9 +1220,9 @@ function aggregateUsageComponents(components) {
 }
 
 function estimateReservation(pricing, options, kind) {
-  const contextTokens = boundedEnvInteger("ROUTER_SESSION_CONTEXT_TOKENS", boundedEnvInteger("TCAR_MODEL_CONTEXT_TOKENS", 32768, 2048, 2_000_000), 2048, 2_000_000);
-  const routeInput = boundedEnvInteger("TCAR_ROUTE_INPUT_MAX_TOKENS", 8192, 1500, 2_000_000);
-  const refinerInput = boundedEnvInteger("TCAR_REFINER_INPUT_MAX_TOKENS", 16384, 1500, 2_000_000);
+  const contextTokens = boundedEnvInteger("AGENT_RUNTIME_ORCHESTRATION_MODEL_CONTEXT_TOKENS", boundedEnvInteger("AGENT_RUNTIME_MODEL_CONTEXT_TOKENS", 32768, 2048, 2_000_000), 2048, 2_000_000);
+  const routeInput = boundedEnvInteger("AGENT_RUNTIME_ROUTE_INPUT_MAX_TOKENS", 8192, 1500, 2_000_000);
+  const refinerInput = boundedEnvInteger("AGENT_RUNTIME_REFINER_INPUT_MAX_TOKENS", 16384, 1500, 2_000_000);
   const defaultRule = pricingRuleForModel(pricing, "");
   let promptTokens;
   let completionTokens;
@@ -1234,7 +1235,7 @@ function estimateReservation(pricing, options, kind) {
   } else {
     const maximumSelected = boundedInteger(options.max_routing_adapters, 16, 1, 16);
     const routes = maximumSelected + 1;
-    const rounds = boundedEnvInteger("TCAR_TOOL_MAX_ROUNDS", 3, 0, 6) + 1;
+    const rounds = boundedEnvInteger("AGENT_RUNTIME_TOOL_MAX_ROUNDS", 3, 0, 6) + 1;
     const maxTokens = boundedInteger(options.max_tokens, 4096, 16, 8192);
     const requestedPlannerTokens = boundedInteger(options.planner_max_tokens, 768, 32, 4096);
     // Reservation cannot know the eventual active catalog size, so assume it
@@ -1436,7 +1437,10 @@ function boundedInteger(value, fallback, minimum, maximum) {
 }
 
 function boundedEnvInteger(name, fallback, minimum, maximum) {
-  return boundedInteger(process.env[name], fallback, minimum, maximum);
+  const value = name.startsWith("AGENT_RUNTIME_")
+    ? readAgentRuntimeEnv(process.env, name)
+    : process.env[name];
+  return boundedInteger(value, fallback, minimum, maximum);
 }
 
 function nonNegativeSafeInteger(value, fallback, maximum) {

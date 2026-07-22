@@ -10,6 +10,7 @@ import { chromium } from "@playwright/test";
 import express from "express";
 
 import { createApp } from "../server/app.js";
+import { processLocalChatRun } from "../tests/fixtures/agentRuntimeSimulator.js";
 
 const PROJECT_ROOT = path.resolve(import.meta.dirname, "../../..");
 const TOKEN = `discover_team_isolation_${crypto.randomBytes(24).toString("hex")}`;
@@ -31,7 +32,7 @@ const MANAGED_ENV = [
   "NODE_ENV",
   "WEB_STORE_DRIVER",
   "APP_API_TOKENS_JSON",
-  "TCAR_ENGINE_MODE",
+  "AGENT_RUNTIME_MODE",
   "APP_BILLING_WELCOME_CREDITS",
   "APP_PUBLIC_ORIGIN"
 ];
@@ -98,13 +99,14 @@ async function main() {
       [TOKEN]: ACTOR,
       [PUBLISHER_TOKEN]: PUBLISHER
     });
-    process.env.TCAR_ENGINE_MODE = "simulator";
+    process.env.AGENT_RUNTIME_MODE = "simulator";
     process.env.APP_BILLING_WELCOME_CREDITS = "2500";
     delete process.env.APP_PUBLIC_ORIGIN;
 
     app = await createApp({
       dbPath: path.join(tempRoot, "app-db.json"),
-      uploadRoot: path.join(tempRoot, "uploads")
+      uploadRoot: path.join(tempRoot, "uploads"),
+      chatProcessor: processLocalChatRun
     });
     const distRoot = path.join(PROJECT_ROOT, "web", "virenis", "dist");
     app.use(express.static(distRoot, { index: false }));

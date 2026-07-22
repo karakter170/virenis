@@ -165,7 +165,7 @@ Production checklist:
 - Synchronize clocks on the web and runtime hosts. The verifier tolerates only 30 seconds of future clock skew.
 - Deploy web and runtime support for a new WorldGraph schema/engine revision together. Unknown revisions fail closed.
 - Restart the runtime after changing executor code or dependencies. In-place source replacement is detected and fails closed because Python cannot truthfully relabel already-loaded bytecode.
-- Give embedding-backed retrieval a stable model revision (`TCAR_EMBEDDING_MODEL_REVISION`) and roll that revision whenever provider/model behavior changes. Retrieval weights, endpoint origin, model, declared revision, and non-secret behavior settings are included in worker provenance.
+- Give embedding-backed retrieval a stable declared model revision and roll it whenever provider/model behavior changes. Retrieval weights, endpoint origin, model, declared revision, and non-secret behavior settings are included in worker provenance.
 - Rotate the shared runtime secret on both sides in one controlled deployment; in-flight capsules and stored artifact MACs created under the old key will be rejected and safely rebuilt cold.
 - Monitor route `started` versus `reused` events, provider-reported call counts, contested events, and validation failures. Reused routes must have no agent provider-call component.
 

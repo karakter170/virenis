@@ -54,7 +54,11 @@ const REAL_WORLD_CONFIGURATION_SCENARIOS = [
   {
     name: "damaged-product complaint gets an empathetic, stateless response contract",
     input: {
-      rawNode: { produces: ["Apology Draft"] },
+      rawNode: {
+        response_style: "direct",
+        tones: ["empathetic", "calm"],
+        produces: ["Apology Draft"]
+      },
       title: "Customer Care Specialist",
       capability: "Draft an apology and resolution for a damaged-product complaint",
       task: "Respond to a damaged-product complaint with an apology"
@@ -72,7 +76,12 @@ const REAL_WORLD_CONFIGURATION_SCENARIOS = [
   {
     name: "recurring customer follow-up opts into conversation memory",
     input: {
-      rawNode: { produces: ["Follow-up Plan"] },
+      rawNode: {
+        response_style: "direct",
+        tones: ["empathetic", "calm"],
+        memory: { mode: "conversation" },
+        produces: ["Follow-up Plan"]
+      },
       title: "Relationship Support Specialist",
       capability: "Support customers using relevant relationship history",
       task: "Follow up weekly on ongoing support cases and remember previous resolutions"
@@ -90,6 +99,8 @@ const REAL_WORLD_CONFIGURATION_SCENARIOS = [
     name: "legal contract audit is careful and grounded in attached documents",
     input: {
       rawNode: {
+        response_style: "careful",
+        tones: ["objective"],
         knowledge: { requirements: ["attached_documents"] },
         produces: ["Contract Risk Memo"]
       },
@@ -111,7 +122,11 @@ const REAL_WORLD_CONFIGURATION_SCENARIOS = [
   {
     name: "patient report summarizer combines safety tone with document retrieval",
     input: {
-      rawNode: { produces: ["Patient Summary"] },
+      rawNode: {
+        response_style: "careful",
+        tones: ["empathetic", "calm", "professional"],
+        produces: ["Patient Summary"]
+      },
       title: "Patient Report Summarizer",
       capability: "Carefully summarize a patient medical report",
       task: "Summarize the attached document for the patient",
@@ -129,7 +144,11 @@ const REAL_WORLD_CONFIGURATION_SCENARIOS = [
   {
     name: "executive business-plan writer receives a thorough professional profile",
     input: {
-      rawNode: { produces: ["Business Plan"] },
+      rawNode: {
+        response_style: "thorough",
+        tones: ["professional"],
+        produces: ["Business Plan"]
+      },
       title: "Business Plan Writer",
       capability: "Create an executive-ready plan with assumptions and tradeoffs",
       task: "Create a comprehensive executive business plan for a textile company"
@@ -145,7 +164,11 @@ const REAL_WORLD_CONFIGURATION_SCENARIOS = [
   {
     name: "math tutor is patient, educational, and explains the work",
     input: {
-      rawNode: { produces: ["Lesson"] },
+      rawNode: {
+        response_style: "thorough",
+        tones: ["patient", "educational"],
+        produces: ["Lesson"]
+      },
       title: "Math Tutor",
       capability: "Teach algebra to a student",
       task: "Explain how to solve a quadratic equation for a student"
@@ -161,7 +184,11 @@ const REAL_WORLD_CONFIGURATION_SCENARIOS = [
   {
     name: "repository security review enables only its declared code tool",
     input: {
-      rawNode: { produces: ["Security Findings"] },
+      rawNode: {
+        response_style: "careful",
+        tones: ["technical", "clear"],
+        produces: ["Security Findings"]
+      },
       title: "Repository Security Reviewer",
       capability: "Review source code using approved repository access",
       task: "Audit the repository for security risk",
@@ -197,10 +224,14 @@ const REAL_WORLD_CONFIGURATION_SCENARIOS = [
   {
     name: "public market scout gets web search only from an explicit public-web request",
     input: {
-      rawNode: { produces: ["Market Brief"] },
+      rawNode: {
+        knowledge: { requirements: ["current_web"] },
+        produces: ["Market Brief"]
+      },
       title: "Public Market Scout",
       capability: "Research approved public sources",
-      task: "Search the public web for current automotive industry developments"
+      task: "Search the public web for current automotive industry developments",
+      tools: ["web_search"]
     },
     expected: {
       style: "direct",
@@ -214,6 +245,8 @@ const REAL_WORLD_CONFIGURATION_SCENARIOS = [
     name: "Gmail triage uses its connected app without widening to web search",
     input: {
       rawNode: {
+        response_style: "direct",
+        tones: ["empathetic", "calm"],
         provider_ids: ["gmail"],
         produces: ["Email Triage"]
       },
@@ -377,6 +410,8 @@ const REAL_WORLD_CONFIGURATION_SCENARIOS = [
     name: "task-specific tutor configuration replaces stale finance attributes",
     input: {
       rawNode: {
+        response_style: "thorough",
+        tones: ["patient", "educational"],
         memory: "none",
         knowledge: { requirements: ["user_provided_context"] },
         consumes: ["user_request"],
@@ -398,7 +433,7 @@ const REAL_WORLD_CONFIGURATION_SCENARIOS = [
       produces: ["algebra_lesson"],
       stage: 35,
       boundaryExclude: ["formal finance reviewer"],
-      decisions: { response: "task_inferred", memory: "requested" }
+      decisions: { response: "requested", memory: "requested" }
     }
   },
   {
@@ -443,7 +478,7 @@ const REAL_WORLD_CONFIGURATION_SCENARIOS = [
       toolsExclude: ["data_table"],
       consumesExclude: ["table_context"],
       produces: ["plain_language_answer"],
-      decisions: { knowledge: "requested_or_inferred" }
+      decisions: { knowledge: "requested" }
     }
   },
   {
@@ -652,7 +687,7 @@ describe("workflow agent configuration proof matrix", () => {
       task: "Explain this code"
     });
 
-    expect(config.response_style).toBe("thorough");
+    expect(config.response_style).toBe("direct");
     expect(config.tones).toEqual(["friendly", "technical"]);
     expect(config.policies).not.toHaveProperty("unrestricted_tools");
     expect(config.policies.composition.source_content_persisted).toBe(false);

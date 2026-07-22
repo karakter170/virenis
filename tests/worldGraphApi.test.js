@@ -6,13 +6,14 @@ import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { createApp } from "../server/app.js";
+import { processLocalChatRun } from "./fixtures/agentRuntimeSimulator.js";
 
 const OWNER_AUTH = "Bearer worldgraph_owner_token";
 const PEER_AUTH = "Bearer worldgraph_peer_token";
 const OUTSIDER_AUTH = "Bearer worldgraph_outsider_token";
 const PROMPT = "@wg_alpha_agent @wg_beta_agent handle this fixed request.";
 const EXPECTED_ADAPTERS = ["wg_alpha_agent", "wg_beta_agent", "writing_synthesis_lora"];
-const ENV_KEYS = ["APP_API_TOKENS_JSON", "APP_IDENTITY_PROVIDER", "TCAR_ENGINE_MODE", "WEB_STORE_DRIVER"];
+const ENV_KEYS = ["APP_API_TOKENS_JSON", "APP_IDENTITY_PROVIDER", "AGENT_RUNTIME_MODE", "WEB_STORE_DRIVER"];
 
 let app;
 let previousEnv;
@@ -21,7 +22,7 @@ let tmpDir;
 beforeEach(async () => {
   previousEnv = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]]));
   process.env.APP_IDENTITY_PROVIDER = "configured";
-  process.env.TCAR_ENGINE_MODE = "simulator";
+  process.env.AGENT_RUNTIME_MODE = "simulator";
   process.env.WEB_STORE_DRIVER = "json";
   process.env.APP_API_TOKENS_JSON = JSON.stringify({
     worldgraph_owner_token: { user_id: "wg_owner", workspace_id: "wg_workspace", role: "user" },
@@ -31,7 +32,8 @@ beforeEach(async () => {
   tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "virenis-worldgraph-api-"));
   app = await createApp({
     dbPath: path.join(tmpDir, "db.json"),
-    uploadRoot: path.join(tmpDir, "uploads")
+    uploadRoot: path.join(tmpDir, "uploads"),
+    chatProcessor: processLocalChatRun
   });
   await createTestAgent("wg_alpha_agent", "WorldGraph Alpha");
   await createTestAgent("wg_beta_agent", "WorldGraph Beta");
@@ -204,7 +206,6 @@ describe.sequential("WorldGraph app integration", () => {
   it("returns the safe original settings so a selective refresh uses the previewed contract", async () => {
     const session = await createSession();
     const options = {
-      planner_mode: "session",
       planner_max_tokens: 300,
       max_routing_adapters: 6,
       parallel_workers: 3,

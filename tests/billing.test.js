@@ -34,7 +34,7 @@ const BILLING_ENV = [
   "APP_MAX_ACTIVE_RUNS_PER_WORKSPACE",
   "APP_MAX_ACTIVE_RUNS_GLOBAL",
   "WORKFLOW_CONTINUATION_CLAIM_TTL_MS",
-  "TCAR_RUNTIME_CONTINUATION_TIMEOUT_MS"
+  "AGENT_RUNTIME_CONTINUATION_TIMEOUT_MS"
 ];
 
 let previousEnv;
@@ -525,7 +525,7 @@ describe("immutable balance lifecycle", () => {
 
   it("releases an interrupted continuation reservation after its claim expires", async () => {
     process.env.WORKFLOW_CONTINUATION_CLAIM_TTL_MS = "1000";
-    process.env.TCAR_RUNTIME_CONTINUATION_TIMEOUT_MS = "1000";
+    process.env.AGENT_RUNTIME_CONTINUATION_TIMEOUT_MS = "1000";
     const nowMs = Date.parse("2026-07-15T12:00:00.000Z");
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), "virenis-continuation-recovery-"));
     temporaryDirectories.push(directory);

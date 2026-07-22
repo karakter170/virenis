@@ -2,19 +2,19 @@
 import {
   fetchRuntimeHealth,
   requireRuntimeConfigured
-} from "../server/runtimeClient.js";
+} from "../server/agentRuntimeClient.js";
 import { modelOutputBounds } from "../server/modelSettings.js";
 
 requireRuntimeConfigured();
 
 const health = await fetchRuntimeHealth();
 if (health?.ok !== true || health?.ready === false) {
-  throw new Error("TCAR Runtime is reachable but not ready.");
+  throw new Error("Agent Runtime is reachable but not ready.");
 }
 const webOutputBounds = modelOutputBounds(process.env);
 const runtimeOutputLimits = health?.output_limits;
 if (!runtimeOutputLimits?.agent_output_tokens || !runtimeOutputLimits?.final_output_tokens) {
-  throw new Error("TCAR Runtime does not publish context-safe output limits. Deploy the current Runtime before serving web traffic.");
+  throw new Error("Agent Runtime does not publish context-safe output limits. Deploy the current Runtime before serving web traffic.");
 }
 for (const [webKey, runtimeKey] of [
   ["agent", "agent_output_tokens"],
@@ -27,7 +27,7 @@ for (const [webKey, runtimeKey] of [
     || Number(webLimit.context_tokens) !== Number(runtimeLimit.context_tokens)
   ) {
     throw new Error(
-      `Web and Runtime ${runtimeKey} context limits differ. Align TCAR_MODEL_CONTEXT_TOKENS and ROUTER_SESSION_CONTEXT_TOKENS before deployment.`
+      `Web and Runtime ${runtimeKey} context limits differ. Align AGENT_RUNTIME_MODEL_CONTEXT_TOKENS and AGENT_RUNTIME_ORCHESTRATION_MODEL_CONTEXT_TOKENS before deployment.`
     );
   }
 }
@@ -35,12 +35,14 @@ for (const [webKey, runtimeKey] of [
 console.log(JSON.stringify({
   ok: true,
   runtime: {
-    service: health.service || "tcar-runtime",
+    service: health.service || "agent-runtime",
     ready: health.ready ?? health.ok,
     manifest_valid: health.manifest?.valid ?? null,
     active_adapters: health.manifest?.active_adapters ?? null,
-    vllm_ready: health.vllm?.models_endpoint_ok ?? health.vllm?.health?.ok ?? null,
-    router_ready: health.router?.models_endpoint_ok ?? null
+    model_api_ready: health.model_api?.models_endpoint_ok
+      ?? health.vllm?.models_endpoint_ok
+      ?? health.vllm?.health?.ok
+      ?? null
   },
   output_limits: runtimeOutputLimits
 }, null, 2));

@@ -35,9 +35,10 @@ const SOURCE_SCENARIOS = [
 ];
 
 describe("source-first workflow discovery", () => {
-  it("recognizes the canonical incoming-email team-design request as Gmail source-first", () => {
+  it("uses an explicit Gmail source contract without reading request wording", () => {
     const plan = planWorkflowSourceDiscovery({
       intent: "Analyze my incoming emails and create agents based on their content to produce a result.",
+      workflow_contract: sourceContract(["gmail"]),
       connections: [readyConnection("gmail")]
     });
     expect(plan).toMatchObject({
@@ -47,11 +48,33 @@ describe("source-first workflow discovery", () => {
     });
   });
 
-  it.each(SOURCE_SCENARIOS)("plans the %s scenario before agent design", (_name, intent, expectedProviders) => {
-    const connections = expectedProviders.map(readyConnection);
-    expect(workflowDesignDependsOnSource(intent)).toBe(true);
+  it("produces the same source plan for unrelated wording under the same contract", () => {
+    const workflowContract = sourceContract(["gmail"]);
+    const connections = [readyConnection("gmail")];
+    const first = planWorkflowSourceDiscovery({
+      intent: "Send mail and inspect the inbox immediately.",
+      workflow_contract: workflowContract,
+      connections
+    });
+    const second = planWorkflowSourceDiscovery({
+      intent: "Ultraviolet xylophone quality review.",
+      workflow_contract: workflowContract,
+      connections
+    });
+    expect(first).toEqual(second);
+    expect(planWorkflowSourceDiscovery({
+      intent: "Send mail and inspect the inbox immediately.",
+      workflow_contract: sourceContract([], { required: false }),
+      connections
+    })).toBeNull();
+  });
 
-    const plan = planWorkflowSourceDiscovery({ intent, connections });
+  it.each(SOURCE_SCENARIOS)("plans the %s scenario before agent design", (_name, _intent, expectedProviders) => {
+    const connections = expectedProviders.map(readyConnection);
+    const workflowContract = sourceContract(expectedProviders);
+    expect(workflowDesignDependsOnSource(workflowContract)).toBe(true);
+
+    const plan = planWorkflowSourceDiscovery({ workflow_contract: workflowContract, connections });
 
     expect(plan).not.toBeNull();
     expect(plan.status).toBe("ready");
@@ -64,8 +87,11 @@ describe("source-first workflow discovery", () => {
   });
 
   it("does not silently truncate an explicit thirteen-service inspection", () => {
-    const intent = "Create an agent team based on connected work after reading Gmail, Google Drive, Google Calendar, Google Chat, Google Contacts, GitHub, Slack, Notion, Linear, Shopify, Salesforce, Zendesk, and Jira.";
-    const plan = planWorkflowSourceDiscovery({ intent, connections: [] });
+    const providers = [
+      "gmail", "google_drive", "google_calendar", "google_chat", "google_contacts",
+      "github", "slack", "notion", "linear", "shopify", "salesforce", "zendesk", "jira"
+    ];
+    const plan = planWorkflowSourceDiscovery({ workflow_contract: sourceContract(providers), connections: [] });
     expect(plan.requests.map((request) => request.provider_id)).toEqual([
       "gmail", "google_drive", "google_calendar", "google_chat", "google_contacts",
       "github", "slack", "notion", "linear", "shopify", "salesforce", "zendesk", "jira"
@@ -193,17 +219,20 @@ describe("source-first workflow discovery", () => {
     expect(selectWorkflowDiscoveryTool(readyConnection("github", [github]), request)).toBeNull();
   });
 
-  it("does not treat Slack or Google Chat messages, or Outlook mail, as Gmail", () => {
+  it("plans only exact provider ids declared by the contract", () => {
     expect(planWorkflowSourceDiscovery({
       intent: "Create agents based on incoming messages after reading Slack messages.",
+      workflow_contract: sourceContract(["slack"]),
       connections: []
     }).requests.map((item) => item.provider_id)).toEqual(["slack"]);
     expect(planWorkflowSourceDiscovery({
       intent: "Create agents based on unread messages after reading Google Chat messages.",
+      workflow_contract: sourceContract(["google_chat"]),
       connections: []
     }).requests.map((item) => item.provider_id)).toEqual(["google_chat"]);
     expect(planWorkflowSourceDiscovery({
       intent: "Create agents based on incoming Outlook emails after reading Microsoft Exchange.",
+      workflow_contract: sourceContract(["microsoft_exchange"]),
       connections: []
     })).toBeNull();
   });
@@ -267,7 +296,7 @@ describe("source-first workflow discovery", () => {
 
   it("keeps raw source content transient and exposes only bounded proof metadata", () => {
     const plan = planWorkflowSourceDiscovery({
-      intent: SOURCE_SCENARIOS[0][1],
+      workflow_contract: sourceContract(["gmail"]),
       connections: [readyConnection("gmail")]
     });
     const request = plan.requests[0];
@@ -297,15 +326,18 @@ describe("source-first workflow discovery", () => {
     expect(publicValue.requests[0]).not.toHaveProperty("content");
   });
 
-  it("does not trigger source-first mode for ordinary chat or supplied local documents", () => {
+  it("does not trigger source-first mode without an affirmative structured source contract", () => {
     for (const intent of [
       "Tell me what agents could help with email.",
       "Create an agent that summarizes the attached document.",
       "Analyze the following pasted email and propose a reply.",
       "Build a workflow for customer support."
     ]) {
-      expect(workflowDesignDependsOnSource(intent)).toBe(false);
+      expect(workflowDesignDependsOnSource(null)).toBe(false);
       expect(planWorkflowSourceDiscovery({ intent, connections: [] })).toBeNull();
+      const disabled = sourceContract([], { required: false });
+      expect(workflowDesignDependsOnSource(disabled)).toBe(false);
+      expect(planWorkflowSourceDiscovery({ intent, workflow_contract: disabled, connections: [] })).toBeNull();
     }
   });
 });
@@ -313,10 +345,34 @@ describe("source-first workflow discovery", () => {
 function sourceRequest(providerId) {
   const connection = readyConnection(providerId);
   const plan = planWorkflowSourceDiscovery({
-    intent: `Create agents based on connected work after reading ${providerLabel(providerId)}.`,
+    workflow_contract: sourceContract([providerId]),
     connections: [connection]
   });
   return plan.requests[0];
+}
+
+function sourceContract(providerIds, { required = true } = {}) {
+  return {
+    contract_version: "virenis-workflow-semantic-contract-v1",
+    providers: providerIds.map((providerId) => ({
+      provider_id: providerId,
+      access: "read",
+      reason: "Bounded source inspection",
+      permissions: ["read bounded records"],
+      tool_keywords: ["search", "list", "read"]
+    })),
+    source_discovery: {
+      required_before_agent_design: required,
+      requests: required ? providerIds.map((providerId) => ({
+        provider_id: providerId,
+        name: providerLabel(providerId),
+        purpose: "Infer durable roles from bounded source categories.",
+        query: providerId === "gmail" ? "in:inbox newer_than:14d" : "recent relevant records",
+        tool_keywords: ["search", "list", "read"],
+        max_items: 50
+      })) : []
+    }
+  };
 }
 
 function readyConnection(providerId, tools = [readTool(providerId)]) {

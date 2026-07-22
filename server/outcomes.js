@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { makeId, nowIso } from "./store.js";
+import { LEGACY_PERSISTED_PLANNER_MODE_V1 } from "./agentRuntimeResponseCompatibility.js";
 
 const OUTCOME_TYPES = new Set(["binary", "numeric", "categorical"]);
 const RESOLVER_TYPES = new Set(["human", "api", "document"]);
@@ -186,7 +187,7 @@ export function recordExecution(data, {
     router_chat_template_digest: normalizeSha256Digest(componentProvenance?.router_chat_template_digest),
     executor_code_digest: normalizeSha256Digest(componentProvenance?.executor_code_digest),
     component_provenance_digest: componentProvenance ? digestValue(componentProvenance) : null,
-    planner_mode: run.planner_mode || null,
+    planner_mode: LEGACY_PERSISTED_PLANNER_MODE_V1,
     started_at: run.started_at || null,
     completed_at: run.completed_at || recordedAt,
     recorded_at: recordedAt,

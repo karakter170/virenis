@@ -16,9 +16,9 @@ import request from "supertest";
 import { createApp } from "../server/app.js";
 
 const PROJECT_ROOT = path.resolve(import.meta.dirname, "../../..");
-const RUNTIME_KEY_FILE = process.env.TCAR_RUNTIME_API_KEY_FILE
+const RUNTIME_KEY_FILE = process.env.AGENT_RUNTIME_API_KEY_FILE
   || path.join(PROJECT_ROOT, "outputs", "tcar_api_key.txt");
-const RUNTIME_URL = process.env.TCAR_RUNTIME_API_URL || "http://127.0.0.1:9000";
+const RUNTIME_URL = process.env.AGENT_RUNTIME_API_URL || "http://127.0.0.1:9000";
 const LIVE_TOKEN = `curated_live_${crypto.randomBytes(24).toString("hex")}`;
 const AUTH = { Authorization: `Bearer ${LIVE_TOKEN}` };
 const ACTOR = {
@@ -67,12 +67,12 @@ const MANAGED_ENV = [
   "NODE_ENV",
   "WEB_STORE_DRIVER",
   "APP_API_TOKENS_JSON",
-  "TCAR_ENGINE_MODE",
-  "TCAR_RUNTIME_API_URL",
-  "TCAR_RUNTIME_API_KEY",
-  "TCAR_RUNTIME_API_KEY_FILE",
-  "TCAR_RUNTIME_CHAT_TIMEOUT_MS",
-  "TCAR_RUNTIME_ADMIN_TIMEOUT_MS",
+  "AGENT_RUNTIME_MODE",
+  "AGENT_RUNTIME_API_URL",
+  "AGENT_RUNTIME_API_KEY",
+  "AGENT_RUNTIME_API_KEY_FILE",
+  "AGENT_RUNTIME_CHAT_TIMEOUT_MS",
+  "AGENT_RUNTIME_ADMIN_TIMEOUT_MS",
   "APP_BILLING_WELCOME_CREDITS",
   "APP_BILLING_PROMPT_CREDITS_PER_1K",
   "APP_BILLING_COMPLETION_CREDITS_PER_1K",
@@ -151,12 +151,12 @@ async function main() {
     process.env.NODE_ENV = "development";
     process.env.WEB_STORE_DRIVER = "json";
     process.env.APP_API_TOKENS_JSON = JSON.stringify({ [LIVE_TOKEN]: ACTOR });
-    process.env.TCAR_ENGINE_MODE = "real";
-    process.env.TCAR_RUNTIME_API_URL = RUNTIME_URL;
-    delete process.env.TCAR_RUNTIME_API_KEY;
-    process.env.TCAR_RUNTIME_API_KEY_FILE = RUNTIME_KEY_FILE;
-    process.env.TCAR_RUNTIME_CHAT_TIMEOUT_MS = "1800000";
-    process.env.TCAR_RUNTIME_ADMIN_TIMEOUT_MS = "300000";
+    process.env.AGENT_RUNTIME_MODE = "real";
+    process.env.AGENT_RUNTIME_API_URL = RUNTIME_URL;
+    delete process.env.AGENT_RUNTIME_API_KEY;
+    process.env.AGENT_RUNTIME_API_KEY_FILE = RUNTIME_KEY_FILE;
+    process.env.AGENT_RUNTIME_CHAT_TIMEOUT_MS = "1800000";
+    process.env.AGENT_RUNTIME_ADMIN_TIMEOUT_MS = "300000";
     process.env.APP_BILLING_WELCOME_CREDITS = "2500";
     process.env.APP_BILLING_PROMPT_CREDITS_PER_1K = "0.10";
     process.env.APP_BILLING_COMPLETION_CREDITS_PER_1K = "0.20";
@@ -319,6 +319,32 @@ async function main() {
         }, null, 2));
       }
 
+      let followupProof = null;
+      if (scenario.team === "Engineering" && process.env.CURATED_LIVE_AWS_FOLLOWUP === "1") {
+        stage = "Engineering: reuse prior architecture context in an AWS follow-up";
+        const followupQueued = await auth(request(app).post(`/api/chat/sessions/${session.body.session_id}/messages`))
+          .set("Idempotency-Key", `curated-live-aws-followup-${crypto.randomBytes(12).toString("hex")}`)
+          .send({
+            content: "Now adapt that same passwordless-login architecture, migration sequence, security review, and rollback plan to AWS. Preserve the earlier no-downtime and no-forced-logout constraints instead of starting over."
+          })
+          .expect(202);
+        const followup = await waitForRun(app, followupQueued.body.run_id);
+        requireCondition(followup.status === "completed", `Engineering AWS follow-up failed: ${JSON.stringify(followup.error || {})}`);
+        requireCondition(followup.plan?.routing?.orchestrator?.all_primary_agents_visible === true, "AWS follow-up did not expose the complete active Engineering team to Qwen");
+        requireCondition((followup.route_failure_summary || []).length === 0, "AWS follow-up reported a route failure");
+        requireCondition(/\bAWS\b|Amazon Web Services/i.test(String(followup.final_answer || "")), "AWS follow-up omitted the requested provider context");
+        const memoryUsingOutputs = (followup.expert_outputs || []).filter((output) => (
+          Array.isArray(output.used_memory) && output.used_memory.length > 0
+        ));
+        requireCondition(memoryUsingOutputs.length > 0, "AWS follow-up did not admit any prior-session context into its selected specialists");
+        followupProof = {
+          selected_agents: (followup.plan?.steps || []).length,
+          memory_using_agents: memoryUsingOutputs.length,
+          total_tokens: followup.usage_receipt?.total_tokens || 0,
+          final_answer_chars: String(followup.final_answer || "").length
+        };
+      }
+
       proofs.push({
         team: scenario.team,
         agents_visible_to_qwen: run.plan.routing.orchestrator.active_primary_agent_count,
@@ -328,7 +354,8 @@ async function main() {
         agent_output_token_ceiling: run.execution_options.max_tokens,
         terminal_recovery_used: leadOutput?.terminal_fan_in_recovery?.valid === true,
         total_tokens: run.usage_receipt.total_tokens,
-        final_answer_chars: String(run.final_answer).length
+        final_answer_chars: String(run.final_answer).length,
+        ...(followupProof ? { aws_followup: followupProof } : {})
       });
       console.log(JSON.stringify({ stage: "team_complete", ...proofs.at(-1) }));
     }

@@ -65,7 +65,7 @@ try {
   process.env.WEB_DB_TABLE = tableName;
   process.env.WEB_DB_STORE_KEY = storeKey;
   process.env.APP_IDENTITY_PROVIDER = "clerk";
-  process.env.TCAR_ENGINE_MODE = "simulator";
+  process.env.AGENT_RUNTIME_MODE = "simulator";
   delete process.env.APP_BASIC_AUTH_USER;
   delete process.env.APP_BASIC_AUTH_PASSWORD;
   delete process.env.APP_API_TOKENS;

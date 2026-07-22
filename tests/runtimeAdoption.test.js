@@ -89,15 +89,15 @@ describe("runtime-only agent adoption", () => {
     previousFetch = globalThis.fetch;
     previousEnv = Object.fromEntries([
       "APP_API_TOKENS_JSON",
-      "TCAR_ENGINE_MODE",
-      "TCAR_RUNTIME_API_URL",
-      "TCAR_RUNTIME_API_KEY",
+      "AGENT_RUNTIME_MODE",
+      "AGENT_RUNTIME_API_URL",
+      "AGENT_RUNTIME_API_KEY",
       "WEB_STORE_DRIVER"
     ].map((name) => [name, process.env[name]]));
     process.env.WEB_STORE_DRIVER = "json";
-    process.env.TCAR_ENGINE_MODE = "real";
-    process.env.TCAR_RUNTIME_API_URL = "http://gpu-runtime.internal:9000";
-    process.env.TCAR_RUNTIME_API_KEY = "runtime-adoption-test-secret";
+    process.env.AGENT_RUNTIME_MODE = "real";
+    process.env.AGENT_RUNTIME_API_URL = "http://gpu-runtime.internal:9000";
+    process.env.AGENT_RUNTIME_API_KEY = "runtime-adoption-test-secret";
     process.env.APP_API_TOKENS_JSON = JSON.stringify({
       admin_adoption_token: { user_id: "admin", workspace_id: "workspace_a", role: "admin" },
       alice_adoption_token: { user_id: "alice", workspace_id: "workspace_a", role: "user" },

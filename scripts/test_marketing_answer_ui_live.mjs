@@ -14,7 +14,7 @@ import { createApp } from "../server/app.js";
 import { activeSessionViewReady } from "../e2e/pipelineSessionBinding.js";
 
 const PROJECT_ROOT = path.resolve(import.meta.dirname, "../../..");
-const RUNTIME_KEY_FILE = process.env.TCAR_RUNTIME_API_KEY_FILE
+const RUNTIME_KEY_FILE = process.env.AGENT_RUNTIME_API_KEY_FILE
   || path.join(PROJECT_ROOT, "outputs", "tcar_api_key.txt");
 const GREETING_PROMPT = "Hi, how are you?";
 const PROMPT = "Good thank you. I'm going to create a match 3 game. Advertising is crucial in match 3 games, so I wanted to ask for your help with the marketing and advertising aspects. What approach do you think I should take? What should I pay attention to?";
@@ -28,9 +28,9 @@ const EXTERNAL_BASE_URL = String(process.env.MARKETING_UI_BASE_URL || "").trim()
 const STORAGE_STATE = process.env.MARKETING_UI_STORAGE_STATE || "/tmp/virenis-auth-5174.json";
 const CLERK_TEST_USER_ID = process.env.MARKETING_UI_CLERK_USER_ID || "";
 const MANAGED_ENV = [
-  "NODE_ENV", "WEB_STORE_DRIVER", "APP_API_TOKENS_JSON", "TCAR_ENGINE_MODE",
-  "TCAR_RUNTIME_API_URL", "TCAR_RUNTIME_API_KEY", "TCAR_RUNTIME_API_KEY_FILE",
-  "TCAR_RUNTIME_CHAT_TIMEOUT_MS", "TCAR_RUNTIME_ADMIN_TIMEOUT_MS",
+  "NODE_ENV", "WEB_STORE_DRIVER", "APP_API_TOKENS_JSON", "AGENT_RUNTIME_MODE",
+  "AGENT_RUNTIME_API_URL", "AGENT_RUNTIME_API_KEY", "AGENT_RUNTIME_API_KEY_FILE",
+  "AGENT_RUNTIME_CHAT_TIMEOUT_MS", "AGENT_RUNTIME_ADMIN_TIMEOUT_MS",
   "APP_BILLING_WELCOME_CREDITS", "APP_PUBLIC_ORIGIN"
 ];
 
@@ -95,12 +95,12 @@ async function main() {
       process.env.NODE_ENV = "development";
       process.env.WEB_STORE_DRIVER = "json";
       process.env.APP_API_TOKENS_JSON = JSON.stringify({ [TOKEN]: ACTOR });
-      process.env.TCAR_ENGINE_MODE = "real";
-      process.env.TCAR_RUNTIME_API_URL = process.env.TCAR_RUNTIME_API_URL || "http://127.0.0.1:9000";
-      delete process.env.TCAR_RUNTIME_API_KEY;
-      process.env.TCAR_RUNTIME_API_KEY_FILE = RUNTIME_KEY_FILE;
-      process.env.TCAR_RUNTIME_CHAT_TIMEOUT_MS = "1800000";
-      process.env.TCAR_RUNTIME_ADMIN_TIMEOUT_MS = "300000";
+      process.env.AGENT_RUNTIME_MODE = "real";
+      process.env.AGENT_RUNTIME_API_URL = process.env.AGENT_RUNTIME_API_URL || "http://127.0.0.1:9000";
+      delete process.env.AGENT_RUNTIME_API_KEY;
+      process.env.AGENT_RUNTIME_API_KEY_FILE = RUNTIME_KEY_FILE;
+      process.env.AGENT_RUNTIME_CHAT_TIMEOUT_MS = "1800000";
+      process.env.AGENT_RUNTIME_ADMIN_TIMEOUT_MS = "300000";
       process.env.APP_BILLING_WELCOME_CREDITS = "2500";
       delete process.env.APP_PUBLIC_ORIGIN;
 

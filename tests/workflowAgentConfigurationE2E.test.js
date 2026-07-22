@@ -6,6 +6,7 @@ import request from "supertest";
 import { describe, expect, it, vi } from "vitest";
 
 import { createApp } from "../server/app.js";
+import { processLocalChatRun } from "./fixtures/agentRuntimeSimulator.js";
 
 const TOKEN = "configuration_alice";
 const ACTOR = { user_id: "configuration_alice", workspace_id: "configuration_workspace", role: "user" };
@@ -313,16 +314,17 @@ async function withApp(compose, callback) {
   const previous = {
     WEB_STORE_DRIVER: process.env.WEB_STORE_DRIVER,
     APP_API_TOKENS_JSON: process.env.APP_API_TOKENS_JSON,
-    TCAR_ENGINE_MODE: process.env.TCAR_ENGINE_MODE
+    AGENT_RUNTIME_MODE: process.env.AGENT_RUNTIME_MODE
   };
   process.env.WEB_STORE_DRIVER = "json";
   process.env.APP_API_TOKENS_JSON = JSON.stringify({ [TOKEN]: ACTOR });
-  process.env.TCAR_ENGINE_MODE = "mock";
+  process.env.AGENT_RUNTIME_MODE = "mock";
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "virenis-config-e2e-"));
   const app = await createApp({
     dbPath: path.join(tmpDir, "db.json"),
     uploadRoot: tmpDir,
-    workflowComposer: compose
+    workflowComposer: compose,
+    chatProcessor: processLocalChatRun
   });
   try {
     await callback(app);

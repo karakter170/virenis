@@ -7168,8 +7168,8 @@ function AdminPanel({ runtime, metrics, agents, documents, onRefresh }) {
   );
 }
 
-function RankTieBreakNote({ tieBreak, adapter, agents }) {
-  const selectedName = formatAgentName(adapter, agents);
+function RankTieBreakNote({ tieBreak, agentId, agents }) {
+  const selectedName = formatAgentName(agentId, agents);
   const alternatives = tieBreak.tied_candidates.slice(0, 2);
   const comparison = alternatives.length
     ? `${selectedName} was preferred after equally relevant agents were compared using their verified result history.`
@@ -7612,7 +7612,7 @@ export function RunDetailsSheet({
                           {tieBreak && <em>Past results</em>}
                         </summary>
                         <div className="detail-row-content">
-                          {tieBreak && <RankTieBreakNote tieBreak={tieBreak} adapter={route.adapter} agents={agents} />}
+                          {tieBreak && <RankTieBreakNote tieBreak={tieBreak} agentId={route.adapter} agents={agents} />}
                           {route.task && <p><strong>Task</strong>{route.task}</p>}
                           {route.domain_answer && (
                             <div className="agent-full-output">
