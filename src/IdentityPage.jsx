@@ -452,7 +452,7 @@ export function AdminUsersPanel() {
             type="number"
             inputMode="numeric"
             min={outputSettings?.bounds?.agent_output_tokens?.min || 128}
-            max={outputSettings?.bounds?.agent_output_tokens?.max || 2304}
+            max={outputSettings?.bounds?.agent_output_tokens?.max || 8192}
             step="1"
             value={outputDraft.agent}
             onChange={(event) => setOutputDraft({ ...outputDraft, agent: event.target.value })}
@@ -466,7 +466,7 @@ export function AdminUsersPanel() {
             type="number"
             inputMode="numeric"
             min={outputSettings?.bounds?.final_output_tokens?.min || 256}
-            max={outputSettings?.bounds?.final_output_tokens?.max || 3072}
+            max={outputSettings?.bounds?.final_output_tokens?.max || 12288}
             step="1"
             value={outputDraft.final}
             onChange={(event) => setOutputDraft({ ...outputDraft, final: event.target.value })}
@@ -614,8 +614,8 @@ function pricingDraftFrom(pricing) {
 function outputSettingsDraftFrom(settings) {
   if (!settings) return null;
   return {
-    agent: String(settings?.agent_output_tokens ?? 1024),
-    final: String(settings?.final_output_tokens ?? 2048),
+    agent: String(settings?.agent_output_tokens ?? 4096),
+    final: String(settings?.final_output_tokens ?? 8192),
     reason: "Administrator output-limit update"
   };
 }

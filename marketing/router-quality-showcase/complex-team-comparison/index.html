@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="A same-model comparison of Standard Base Qwen and Agent-Team Qwen on a complex Match-3 launch brief."
+    />
+    <title>Virenis · Base Qwen vs Agent-Team Qwen</title>
+    <link rel="stylesheet" href="comparison.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to comparison</a>
+    <header class="site-header">
+      <a class="brand" href="../index.html" aria-label="Virenis Router showcase home">
+        <span class="brand-mark" aria-hidden="true">V</span>
+        <span>Virenis</span>
+      </a>
+      <p>Same-model field test</p>
+      <nav aria-label="Page sections">
+        <a href="#scorecard">Scorecard</a>
+        <a href="#answers">Answers</a>
+        <a href="#method">Method</a>
+      </nav>
+    </header>
+
+    <main id="main">
+      <section class="hero" aria-labelledby="hero-title">
+        <div class="hero-copy">
+          <p class="eyebrow">Complex launch brief · Predeclared checklist</p>
+          <h1 id="hero-title">More of the decision.<br /><em>Fewer words.</em></h1>
+          <p class="hero-deck">
+            On a cross-functional Match-3 launch brief, the expert team covered more required
+            outcomes than the same base Qwen model answering alone—while producing a shorter final answer.
+          </p>
+          <div class="hero-actions">
+            <a class="button button-primary" href="#answers">Compare the answers</a>
+            <a class="button button-quiet" href="#method">Inspect the test</a>
+          </div>
+          <ul class="test-facts" aria-label="Controlled comparison settings">
+            <li>Same Qwen checkpoint</li>
+            <li>Same user prompt</li>
+            <li>Temperature 0</li>
+            <li>Same final ceiling</li>
+          </ul>
+        </div>
+
+        <aside class="hero-score" aria-label="Match-3 launch comparison score">
+          <div class="score-kicker"><span></span> Decision coverage</div>
+          <div class="score-row score-row-team">
+            <div><strong>Agent-Team</strong><small>Six specialists + synthesis</small></div>
+            <b><span data-team-score>—</span><i>/12</i></b>
+          </div>
+          <div class="score-track"><span data-team-bar></span></div>
+          <div class="score-row">
+            <div><strong>Standard Base</strong><small>One general model call</small></div>
+            <b><span data-base-score>—</span><i>/12</i></b>
+          </div>
+          <div class="score-track score-track-base"><span data-base-bar></span></div>
+          <p class="score-delta"><strong data-outcome-lift>—</strong> more required outcomes covered</p>
+        </aside>
+      </section>
+
+      <section class="metric-band" id="scorecard" aria-label="Measured outcome summary">
+        <article>
+          <span class="metric-label">Coverage density</span>
+          <strong data-density-lift>—</strong>
+          <p>more checklist outcomes per 1,000 answer words</p>
+        </article>
+        <article>
+          <span class="metric-label">Final answer</span>
+          <strong data-word-change>—</strong>
+          <p>fewer words than Standard Base Qwen</p>
+        </article>
+        <article class="metric-tradeoff">
+          <span class="metric-label">Compute tradeoff</span>
+          <strong data-token-multiple>—</strong>
+          <p>more inference tokens; this is output efficiency, not compute efficiency</p>
+        </article>
+      </section>
+
+      <section class="section section-grid" aria-labelledby="difference-title">
+        <div class="section-heading">
+          <p class="eyebrow eyebrow-dark">What changed</p>
+          <h2 id="difference-title">A plan that knows when to stop.</h2>
+          <p>
+            Base Qwen produced a useful launch outline. The team added decision machinery that
+            turns a plausible plan into something operators can instrument, test, and halt safely.
+          </p>
+        </div>
+        <div class="difference-cards">
+          <article>
+            <span>01</span>
+            <h3>Instrumentation</h3>
+            <p>Names acquisition and revenue events so performance can be attributed to a creative and cohort.</p>
+          </article>
+          <article>
+            <span>02</span>
+            <h3>Experiments</h3>
+            <p>Turns audience, ad-frequency, and monetization assumptions into explicit tests.</p>
+          </article>
+          <article>
+            <span>03</span>
+            <h3>Stop / scale gates</h3>
+            <p>Pauses spend when internal targets fail instead of presenting invented industry benchmarks.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="team-section" aria-labelledby="team-title">
+        <div class="section-heading section-heading-light">
+          <p class="eyebrow">The expert path</p>
+          <h2 id="team-title">Six bounded roles. One answer.</h2>
+          <p>Each specialist produces a validated handoff. The final synthesizer sees the complete approved fan-in.</p>
+        </div>
+        <ol class="pipeline" data-agent-pipeline aria-label="Marketing expert pipeline"></ol>
+        <div class="pipeline-proof">
+          <span>6/6 routes valid</span>
+          <span>0 fallback promotions</span>
+          <span>Final synthesis validated</span>
+        </div>
+      </section>
+
+      <section class="section checklist-section" aria-labelledby="checklist-title">
+        <div class="section-heading row-heading">
+          <div>
+            <p class="eyebrow eyebrow-dark">Frozen before capture</p>
+            <h2 id="checklist-title">The 12-outcome scorecard</h2>
+          </div>
+          <p>Deterministic pattern checks—not a model grading another model.</p>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th scope="col">Required outcome</th><th scope="col">Base</th><th scope="col">Team</th></tr>
+            </thead>
+            <tbody data-checklist></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="answers-section" id="answers" aria-labelledby="answers-title">
+        <div class="section-heading section-heading-light row-heading">
+          <div>
+            <p class="eyebrow">Unedited captured answers</p>
+            <h2 id="answers-title">Read them side by side.</h2>
+          </div>
+          <p>Private runtime IDs are projected to human-readable specialist names.</p>
+        </div>
+        <div class="answer-grid">
+          <article class="answer-card">
+            <header><div><span>Standard Base Qwen</span><small>One model call</small></div><b data-base-answer-meta>—</b></header>
+            <div class="answer-body" data-base-answer tabindex="0" aria-label="Standard Base Qwen answer"></div>
+          </article>
+          <article class="answer-card answer-card-team">
+            <header><div><span>Agent-Team Qwen</span><small>Six specialists + final synthesis</small></div><b data-team-answer-meta>—</b></header>
+            <div class="answer-body" data-team-answer tabindex="0" aria-label="Agent-Team Qwen answer"></div>
+          </article>
+        </div>
+      </section>
+
+      <section class="section claim-boundary" aria-labelledby="boundary-title">
+        <div>
+          <p class="eyebrow eyebrow-dark">Claim boundary</p>
+          <h2 id="boundary-title">Strong example. Not a universal win.</h2>
+        </div>
+        <div class="boundary-copy">
+          <p>
+            The two scenarios are reported independently, with their latency and token costs visible. Across both
+            examples, Base covered <strong data-total-base>—</strong> outcomes and Team covered
+            <strong data-total-team>—</strong>.
+          </p>
+          <p>
+            The defensible marketing claim is scenario-specific: expert routing improved decision coverage density
+            on this multi-disciplinary launch brief. A broad superiority claim requires the governed 200-case benchmark.
+          </p>
+        </div>
+      </section>
+
+      <section class="method-section" id="method" aria-labelledby="method-title">
+        <div class="section-heading section-heading-light">
+          <p class="eyebrow">Reproducible method</p>
+          <h2 id="method-title">Same model. Different execution system.</h2>
+        </div>
+        <div class="method-grid">
+          <article><span>A</span><h3>Controlled inputs</h3><p>Identical natural-language prompt, checkpoint, temperature, and final-output ceiling.</p></article>
+          <article><span>B</span><h3>Predeclared rubric</h3><p>Twelve required outcomes were encoded before either answer was scored.</p></article>
+          <article><span>C</span><h3>Full cost disclosure</h3><p data-cost-disclosure>Latency and provider-reported inference tokens are shown, not hidden.</p></article>
+          <article><span>D</span><h3>Pipeline integrity</h3><p>Every route and final synthesis had to validate; partial fallbacks are rejected by the capture harness.</p></article>
+        </div>
+        <p class="method-note">Illustrative field evidence, not the confirmatory 200-case benchmark. Captured <time data-captured-at>—</time>.</p>
+      </section>
+    </main>
+
+    <footer>
+      <span>Virenis · Agent-Team Qwen comparison</span>
+      <a href="REPORT.md">Read the machine-generated report</a>
+    </footer>
+    <div class="load-error" data-load-error hidden role="alert">The comparison report could not be loaded.</div>
+    <script type="module" src="comparison.js"></script>
+  </body>
+</html>

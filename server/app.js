@@ -167,6 +167,7 @@ import {
   ensureGeneralAgentWorkspace,
   findAgentWorkspace,
   listAgentWorkspaces,
+  pruneSessionInactiveAgentIds,
   pruneAgentWorkspaceReservations,
   publicAgentWorkspace,
   releaseAgentWorkspaceReservation,
@@ -1655,6 +1656,7 @@ export async function createApp({
           throwStatus(409, workspace.copy_error || "This workspace is still being prepared.");
         }
         session.agent_workspace_id = workspace.agent_workspace_id;
+        pruneSessionInactiveAgentIds(session, workspace);
         session.updated_at = nowIso();
         return {
           session_id: session.session_id,
@@ -1681,16 +1683,25 @@ export async function createApp({
       if (!agent || !agentVisibleToRequest(agent, req) || !agentAvailableForSession(agent, session.session_id)) {
         throwStatus(404, "Agent not found.");
       }
+      const activeWorkspace = activeAgentWorkspaceForSession(snapshot, session);
+      if (activeWorkspace && !(activeWorkspace.agent_ids || []).includes(agent.id)) {
+        throwStatus(404, "Agent is not a member of the active team.");
+      }
       if (req.body.active && (agent.enabled === false || agent.mounted === false)) {
         throwStatus(409, "This agent is not currently available.");
       }
       const updated = await store.mutate((data) => {
         const mutableSession = data.sessions.find((item) => item.session_id === session.session_id);
         assertSessionExecutionInputsMutable(data, mutableSession?.session_id);
+        const mutableActiveWorkspace = activeAgentWorkspaceForSession(data, mutableSession);
+        if (mutableActiveWorkspace && !(mutableActiveWorkspace.agent_ids || []).includes(agent.id)) {
+          throwStatus(404, "Agent is not a member of the active team.");
+        }
         const inactive = new Set(Array.isArray(mutableSession.inactive_agent_ids) ? mutableSession.inactive_agent_ids : []);
         if (req.body.active) inactive.delete(agent.id);
         else inactive.add(agent.id);
         mutableSession.inactive_agent_ids = [...inactive].sort();
+        if (mutableActiveWorkspace) pruneSessionInactiveAgentIds(mutableSession, mutableActiveWorkspace);
         mutableSession.updated_at = nowIso();
         return {
           session_id: mutableSession.session_id,
@@ -2564,7 +2575,9 @@ export async function createApp({
             ? requestedAgentWorkspaceIds.has(agent.id)
             : null,
           session_active: requestedSession
-            ? !new Set(requestedSession.inactive_agent_ids || []).has(agent.id)
+            ? requestedAgentWorkspace && !requestedAgentWorkspaceIds.has(agent.id)
+              ? null
+              : !new Set(requestedSession.inactive_agent_ids || []).has(agent.id)
             : agent.enabled !== false && agent.mounted !== false,
           agent_revision: agentRevision(agent),
           reality_rank: realityRankForAgent(data, {
@@ -3132,7 +3145,16 @@ export async function createApp({
     let runtimeRegistrationCleanup = null;
     let agentWorkspaceReservation = null;
     try {
+      if (req.body?.tool_config !== undefined && !isAdmin(req)) {
+        throwStatus(403, "Only an administrator can approve Runtime repository roots.");
+      }
       const agent = normalizeAgentPayload(req.body);
+      if (
+        agent.tools.includes("repo_inspector")
+        && !(agent.tool_config?.repo_inspector?.roots || []).length
+      ) {
+        throwStatus(400, "Code and repository inspection requires an approved Runtime repository root.");
+      }
       const sourceText = normalizeSourceText(req.body.source_text);
       Object.assign(agent, agentOwnershipForRequest(req, req.body));
       applyAgentMcpBindings(
@@ -3344,7 +3366,26 @@ export async function createApp({
       }
       assertAgentMutationAccess(localAgent, req);
       assertAgentExecutionInputsMutable(store.read(), localAgent);
+      if (req.body?.tool_config !== undefined && !isAdmin(req)) {
+        throwStatus(403, "Only an administrator can approve Runtime repository roots.");
+      }
       const patch = normalizeAgentPatchPayload(req.body);
+      const effectiveTools = patch.tools || localAgent?.tools || [];
+      if (patch.tool_config !== undefined) {
+        patch.tool_config = normalizeAgentToolConfig(patch.tool_config, effectiveTools);
+      } else if (patch.tools && !patch.tools.includes("repo_inspector") && localAgent?.tool_config?.repo_inspector) {
+        patch.tool_config = {};
+      }
+      if (
+        effectiveTools.includes("repo_inspector")
+        && !(
+          patch.tool_config !== undefined
+            ? patch.tool_config?.repo_inspector?.roots || []
+            : localAgent?.tool_config?.repo_inspector?.roots || []
+        ).length
+      ) {
+        throwStatus(400, "Code and repository inspection requires an approved Runtime repository root.");
+      }
       if (patch.enabled !== undefined && patch.lifecycle === undefined) {
         patch.lifecycle = patch.enabled
           ? { state: "ready", health: "healthy" }
@@ -3368,7 +3409,13 @@ export async function createApp({
       if (!isAdmin(req) && patch.source_text && !(patch.sources || localAgent?.sources || []).length) {
         patch.sources = [ownedAgentSourcePath(localAgent.id)];
       }
-      assertOwnedAgentSources(req, req.params.agent_id, patch.sources || localAgent?.sources || [], localAgent);
+      // Existing catalog agents can legitimately carry historical or
+      // system-managed sources. Revalidate ownership only when this request
+      // changes source material; unrelated lifecycle/stage edits must remain
+      // possible without silently grandfathering a new source assignment.
+      if (patch.sources !== undefined || patch.source_text !== undefined) {
+        assertOwnedAgentSources(req, req.params.agent_id, patch.sources || localAgent?.sources || [], localAgent);
+      }
       const canonicalPatchedAgent = ensureCanonicalAgentContract({
         ...localAgent,
         ...patch,
@@ -3399,6 +3446,12 @@ export async function createApp({
           intent: lifecycleIntent,
           invoke: () => updateRuntimeAgent(req.params.agent_id, {
             ...patch,
+            ...(patch.policies === undefined && localAgent?.policies
+              ? { policies: structuredClone(localAgent.policies) }
+              : {}),
+            ...(patch.workflow_profile === undefined && localAgent?.workflow_profile
+              ? { workflow_profile: structuredClone(localAgent.workflow_profile) }
+              : {}),
             audit_context: runtimeAuditContext(req)
           })
         });
@@ -4532,8 +4585,8 @@ function durableChatOptions(run, suppliedOptions) {
     planner_mode: run.planner_mode || process.env.TCAR_PLANNER_MODE || "session",
     parallel_workers: Number(run.parallel_workers) || Number(process.env.TCAR_PARALLEL_WORKERS || 2),
     max_routing_adapters: Number(run.max_routing_adapters) || Number(process.env.TCAR_MAX_ROUTING_ADAPTERS || 16),
-    max_tokens: Number(process.env.TCAR_MAX_TOKENS || 1536),
-    refiner_max_tokens: Number(process.env.TCAR_REFINER_MAX_TOKENS || 2048),
+    max_tokens: Number(process.env.TCAR_MAX_TOKENS || 4096),
+    refiner_max_tokens: Number(process.env.TCAR_REFINER_MAX_TOKENS || 8192),
     temperature: Number(process.env.TCAR_TEMPERATURE || 0)
   };
 }
@@ -6101,9 +6154,6 @@ async function reconcileRuntimeLifecycleIntents({ store, intentId = null, intent
 }
 
 function assertOwnedAgentSources(req, agentId, sources, agent = null) {
-  if (isAdmin(req)) {
-    return;
-  }
   const prefixes = [
     `sources/router_agents/${agentId}/`
   ];
@@ -6113,7 +6163,7 @@ function assertOwnedAgentSources(req, agentId, sources, agent = null) {
   for (const sourcePath of sources || []) {
     const normalized = String(sourcePath).replaceAll("\\", "/");
     if (!prefixes.some((prefix) => normalized.startsWith(prefix))) {
-      throwStatus(403, "Private agents may use only sources owned by that agent.");
+      throwStatus(403, "Agents may use only sources owned by that agent. Upload shared documents as agent knowledge instead.");
     }
   }
 }
@@ -6157,9 +6207,22 @@ function mergeRuntimeAgentMetadata(agent, localById) {
       runtime_only: true
     };
   }
+  const runtimePolicies = plainMetadataRecord(agent.policies);
+  const localPolicies = plainMetadataRecord(local.policies);
+  const workflowProfile = plainMetadataRecord(agent.workflow_profile || local.workflow_profile);
+  const policies = { ...localPolicies, ...runtimePolicies };
+  for (const section of ["response", "memory", "knowledge", "composition"]) {
+    const localSection = plainMetadataRecord(localPolicies[section]);
+    const profileSection = plainMetadataRecord(workflowProfile[section]);
+    const runtimeSection = plainMetadataRecord(runtimePolicies[section]);
+    if (Object.keys(localSection).length || Object.keys(profileSection).length || Object.keys(runtimeSection).length) {
+      policies[section] = { ...localSection, ...profileSection, ...runtimeSection };
+    }
+  }
   return {
     ...local,
     ...agent,
+    policies,
     workspace_id: local.workspace_id,
     scope: storedDocumentScope(local),
     session_id: storedDocumentScope(local) === "chat" ? local.session_id : null,
@@ -6169,6 +6232,10 @@ function mergeRuntimeAgentMetadata(agent, localById) {
     ready: agent.ready ?? local.ready ?? true,
     runtime_only: false
   };
+}
+
+function plainMetadataRecord(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
 }
 
 function agentVisibleToRequest(agent, req) {
@@ -6243,6 +6310,7 @@ function redactAgentForRequest(agent = {}, req) {
   const {
     adapter_path: _adapterPath,
     skill_path: _skillPath,
+    tool_config: _toolConfig,
     runtime: _runtime,
     runtime_only: _runtimeOnly,
     runtime_sync_intent_id: _runtimeSyncIntentId,
@@ -7208,15 +7276,15 @@ function normalizeChatOptions(options = {}, { outputSettings = null } = {}) {
     throwStatus(400, "planner_mode must be 'cue', 'llm', 'session', or 'tcandon'.");
   }
   const agentOutputTokens = Number(outputSettings?.agent_output_tokens)
-    || Number(process.env.TCAR_MAX_TOKENS || 1536);
+    || Number(process.env.TCAR_MAX_TOKENS || 4096);
   const finalOutputTokens = Number(outputSettings?.final_output_tokens)
-    || Number(process.env.TCAR_REFINER_MAX_TOKENS || 2048);
+    || Number(process.env.TCAR_REFINER_MAX_TOKENS || 8192);
   const maximumAgentOutputTokens = Math.min(
-    Number(outputSettings?.bounds?.agent_output_tokens?.max) || Number(process.env.TCAR_CLIENT_MAX_TOKENS || 4096),
+    Number(outputSettings?.bounds?.agent_output_tokens?.max) || Number(process.env.TCAR_CLIENT_MAX_TOKENS || 8192),
     agentOutputTokens
   );
   const maximumFinalOutputTokens = Math.min(
-    Number(outputSettings?.bounds?.final_output_tokens?.max) || Number(process.env.TCAR_CLIENT_MAX_REFINER_TOKENS || 8192),
+    Number(outputSettings?.bounds?.final_output_tokens?.max) || Number(process.env.TCAR_CLIENT_MAX_REFINER_TOKENS || 12288),
     finalOutputTokens
   );
   return {
@@ -8067,6 +8135,7 @@ async function activateWorkflowDraft({
         routing_cues: patched.routing_cues,
         resources: patched.resources,
         tools: patched.tools,
+        tool_config: patched.tool_config,
         tool_contracts: patched.tool_contracts,
         policies: patched.policies,
         stage: patched.stage,
@@ -8100,6 +8169,7 @@ async function activateWorkflowDraft({
         stored.routing_cues = patched.routing_cues;
         stored.resources = patched.resources;
         stored.tools = patched.tools;
+        stored.tool_config = patched.tool_config;
         stored.tool_contracts = patched.tool_contracts;
         stored.mcp_bindings = patched.mcp_bindings;
         stored.policies = patched.policies;
@@ -8345,6 +8415,7 @@ function workflowAgentExecutionContractChanged(agent, patched) {
     routing_cues: agent.routing_cues || [],
     resources: agent.resources || [],
     tools: agent.tools || [],
+    tool_config: agent.tool_config || {},
     tool_contracts: agent.tool_contracts || {},
     mcp_bindings: agent.mcp_bindings || [],
     policies: agent.policies || {},
@@ -8358,6 +8429,7 @@ function workflowAgentExecutionContractChanged(agent, patched) {
     routing_cues: patched.routing_cues || [],
     resources: patched.resources || [],
     tools: patched.tools || [],
+    tool_config: patched.tool_config || {},
     tool_contracts: patched.tool_contracts || {},
     mcp_bindings: patched.mcp_bindings || [],
     policies: patched.policies || {},
@@ -8377,6 +8449,7 @@ function applyWorkflowNodeAgentConfiguration(agent, node) {
     routing_cues: [...new Set(config.routing_cues || agent.routing_cues || [node.title])].slice(0, 20),
     resources: [...new Set(config.resources || agent.resources || [])].slice(0, 20),
     tools: [...new Set(config.tools || node.tools || agent.tools || [])].slice(0, 30),
+    tool_config: structuredClone(config.tool_config || agent.tool_config || {}),
     policies: config.policies && typeof config.policies === "object"
       ? structuredClone(config.policies)
       : structuredClone(agent.policies || {}),
@@ -8481,6 +8554,7 @@ async function createWorkflowGeneratedAgent({
     routing_cues: spec.routing_cues || [node.title],
     resources: spec.resources || [],
     tools: spec.tools || node.tools || [],
+    tool_config: spec.tool_config || {},
     policies: spec.policies || {},
     stage: spec.stage || 50
   });
@@ -8686,6 +8760,7 @@ function workflowGeneratedSpec(workflow, node, source = null) {
     ])].slice(0, 20),
     resources: [...new Set([...(config.resources || []), ...sourceResources])].slice(0, 20),
     tools: [...new Set(config.tools || node.tools || [])].slice(0, 30),
+    tool_config: structuredClone(config.tool_config || source?.tool_config || {}),
     policies: structuredClone(config.policies || source?.policies || {}),
     stage: Math.max(1, Math.min(99, Math.round(Number(config.stage ?? source?.stage ?? 50)))),
     ...(source?.mcp_bindings?.length ? {
@@ -8798,6 +8873,55 @@ function splitList(value) {
     .slice(0, 20);
 }
 
+function normalizeAgentToolConfig(value, tools = []) {
+  if (value == null) return {};
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throwStatus(400, "tool_config must be an object.");
+  }
+  const allowedTools = new Set(splitList(tools));
+  const keys = Object.keys(value);
+  const unknown = keys.filter((key) => key !== "repo_inspector");
+  if (unknown.length) {
+    throwStatus(400, `Unsupported tool configuration: ${unknown.join(", ")}.`);
+  }
+  if (keys.some((key) => !allowedTools.has(key))) {
+    throwStatus(400, "tool_config can configure only an enabled agent ability.");
+  }
+  if (!("repo_inspector" in value)) return {};
+  const repository = value.repo_inspector;
+  if (!repository || typeof repository !== "object" || Array.isArray(repository)) {
+    throwStatus(400, "tool_config.repo_inspector must be an object.");
+  }
+  const unknownRepositoryFields = Object.keys(repository).filter((key) => key !== "roots");
+  if (unknownRepositoryFields.length) {
+    throwStatus(400, "Repository configuration accepts only roots.");
+  }
+  if (!Array.isArray(repository.roots) || repository.roots.length < 1 || repository.roots.length > 8) {
+    throwStatus(400, "Repository inspection requires between 1 and 8 approved roots.");
+  }
+  const roots = [...new Set(repository.roots.map((raw) => {
+    const root = String(raw || "").trim();
+    const portable = root.replaceAll("\\", "/");
+    const hasControlCharacter = Array.from(root).some((character) => {
+      const code = character.charCodeAt(0);
+      return code <= 31 || code === 127;
+    });
+    if (
+      !root
+      || root.length > 512
+      || hasControlCharacter
+      || path.posix.isAbsolute(portable)
+      || path.win32.isAbsolute(root)
+      || portable.split("/").includes("..")
+      || portable.startsWith("~/")
+    ) {
+      throwStatus(400, "Repository roots must be safe paths relative to the Runtime project root.");
+    }
+    return portable.replace(/^\.\//, "") || ".";
+  }))];
+  return { repo_inspector: { roots } };
+}
+
 function normalizeAgentPayload(body) {
   const id = String(body.id || "").trim();
   if (!/^[a-z0-9][a-z0-9_]{0,119}$/.test(id)) {
@@ -8814,6 +8938,7 @@ function normalizeAgentPayload(body) {
   }
   const provisioningRequired = body.provisioning_required === true
     || body.lifecycle?.state === "provisioning";
+  const tools = splitList(body.tools);
   return ensureCanonicalAgentContract({
     id,
     title: String(body.title).replace(/\s+/g, " ").trim().slice(0, 160),
@@ -8825,7 +8950,8 @@ function normalizeAgentPayload(body) {
       ? splitList(body.routing_cues).map((value) => value.slice(0, 160))
       : [String(body.title).replace(/\s+/g, " ").trim().slice(0, 160)],
     resources: splitList(body.resources),
-    tools: splitList(body.tools),
+    tools,
+    tool_config: normalizeAgentToolConfig(body.tool_config, tools),
     sources: splitList(body.sources),
     retrieval: body.retrieval || null,
     document: body.document || null,
@@ -8861,7 +8987,7 @@ function normalizeAgentPatchPayload(body = {}) {
   if (retired.some((key) => key in body) || (body.item_type && body.item_type !== "agent")) {
     throwStatus(410, "Model-adapter settings have been retired; configure the server-owned API provider instead.");
   }
-  const allowed = ["title", "capability", "boundary", "consumes", "produces", "routing_cues", "resources", "sources", "tools", "policies", "workflow_profile", "agent_contract", "routing", "memory", "permissions", "lifecycle", "stage", "enabled", "source_text", "item_type", "license"];
+  const allowed = ["title", "capability", "boundary", "consumes", "produces", "routing_cues", "resources", "sources", "tools", "tool_config", "policies", "workflow_profile", "agent_contract", "routing", "memory", "permissions", "lifecycle", "stage", "enabled", "source_text", "item_type", "license"];
   const patch = {};
   for (const key of allowed) {
     if (!(key in body)) {
@@ -8896,7 +9022,7 @@ function normalizeAgentPatchPayload(body = {}) {
       patch.source_text = normalizeSourceText(body.source_text);
       continue;
     }
-    if (["policies", "workflow_profile", "agent_contract", "routing", "memory", "permissions", "lifecycle"].includes(key)) {
+    if (["tool_config", "policies", "workflow_profile", "agent_contract", "routing", "memory", "permissions", "lifecycle"].includes(key)) {
       if (!body[key] || typeof body[key] !== "object" || Array.isArray(body[key])) {
         throwStatus(400, `${key} must be an object.`);
       }
@@ -8930,6 +9056,7 @@ function marketplaceAgentSnapshot(agent = {}) {
   const rawConsumes = splitList(agent.consumes);
   const rawTools = splitList(agent.tools);
   const omittedAgentConnections = rawConsumes.some((value) => /^agent:[a-z0-9_-]+:output$/i.test(value));
+  const omittedRepositoryAccess = rawTools.includes("repo_inspector") || Boolean(agent.tool_config?.repo_inspector);
   const omittedPrivateKnowledge = Boolean(
     agent.source_text_internal
     || agent.document
@@ -8943,7 +9070,7 @@ function marketplaceAgentSnapshot(agent = {}) {
     .filter((value) => value !== "document_context");
   if (!consumes.includes("user_request")) consumes.unshift("user_request");
   const tools = rawTools
-    .filter((value) => !["document_search", "document_read"].includes(value))
+    .filter((value) => !["document_search", "document_read", "repo_inspector"].includes(value))
     .filter((value) => !isMcpToolAlias(value));
   const connectorRequirements = Array.isArray(agent.connector_requirements)
     ? agent.connector_requirements.slice(0, 20).map((requirement) => ({
@@ -9017,6 +9144,7 @@ function marketplaceAgentSnapshot(agent = {}) {
     exclusions: {
       private_knowledge: omittedPrivateKnowledge,
       agent_connections: omittedAgentConnections,
+      ...(omittedRepositoryAccess ? { repository_access: true } : {}),
       ...(connectorRequirements.length > 0 ? { mcp_credentials_and_bindings: true } : {})
     }
   };
@@ -9031,11 +9159,16 @@ function publishedMarketplaceSnapshot(agent = {}) {
     stored.exclusions?.mcp_credentials_and_bindings
     ?? fallback.exclusions.mcp_credentials_and_bindings
   );
+  const omittedRepositoryAccess = Boolean(
+    stored.exclusions?.repository_access
+    ?? fallback.exclusions.repository_access
+  );
   return {
     ...normalized,
     exclusions: {
       private_knowledge: Boolean(stored.exclusions?.private_knowledge ?? fallback.exclusions.private_knowledge),
       agent_connections: Boolean(stored.exclusions?.agent_connections ?? fallback.exclusions.agent_connections),
+      ...(omittedRepositoryAccess ? { repository_access: true } : {}),
       ...(omittedMcpBindings ? { mcp_credentials_and_bindings: true } : {})
     }
   };

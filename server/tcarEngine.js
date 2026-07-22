@@ -1445,8 +1445,8 @@ async function processRemoteChatRun({ store, bus, run_id, options = {} }) {
         planner_mode: options.planner_mode || process.env.TCAR_PLANNER_MODE || "session",
         max_routing_adapters: routeLimit,
         parallel_workers: parallelWorkers,
-        max_tokens: Number(options.max_tokens) || Number(process.env.TCAR_MAX_TOKENS || 1536),
-        refiner_max_tokens: Number(options.refiner_max_tokens) || Number(process.env.TCAR_REFINER_MAX_TOKENS || 2048),
+        max_tokens: Number(options.max_tokens) || Number(process.env.TCAR_MAX_TOKENS || 4096),
+        refiner_max_tokens: Number(options.refiner_max_tokens) || Number(process.env.TCAR_REFINER_MAX_TOKENS || 8192),
         temperature: Number(options.temperature ?? process.env.TCAR_TEMPERATURE ?? 0),
         allowed_adapters: scoped.allowedAdapters,
         team_adapters: scoped.teamAdapters,
@@ -3047,6 +3047,20 @@ export function normalizeRuntimeRouting(routing) {
           ))
         }
         : null,
+      ...(rawOrchestrator.outcome_contract_fallback
+        && typeof rawOrchestrator.outcome_contract_fallback === "object"
+        && !Array.isArray(rawOrchestrator.outcome_contract_fallback)
+        ? { outcome_contract_fallback: {
+          applied: rawOrchestrator.outcome_contract_fallback.applied === true,
+          reason: boundedText(rawOrchestrator.outcome_contract_fallback.reason, 160),
+          violations: boundedStringList(rawOrchestrator.outcome_contract_fallback.violations, 32, 200),
+          advisories: boundedStringList(rawOrchestrator.outcome_contract_fallback.advisories, 32, 200),
+          selected_adapters: boundedStringList(rawOrchestrator.outcome_contract_fallback.selected_adapters, 16, 240),
+          diagnostic_contract: normalizeRuntimeOutcomeContract(
+            rawOrchestrator.outcome_contract_fallback.diagnostic_contract
+          )
+        } }
+        : {}),
       planning_call_performed: rawOrchestrator.planning_call_performed === true,
       final_synthesis_required: rawOrchestrator.final_synthesis_required === true,
       ...(outcomeContract ? { outcome_contract: outcomeContract } : {})
@@ -3116,6 +3130,7 @@ function normalizeRuntimeRouteAdmissionSteps(value) {
     const outputs = stringList(rawAdmission.expected_outputs, 32, 120);
     const constraints = stringList(rawAdmission.strict_constraints_checked, 24, 120);
     const violations = stringList(rawAdmission.violations, 64, 120);
+    const advisories = stringList(rawAdmission.advisories, 64, 160);
     const rawBindings = rawAdmission.downstream_bindings == null ? [] : rawAdmission.downstream_bindings;
     let bindingsValid = Array.isArray(rawBindings) && rawBindings.length <= 64;
     const downstreamBindings = (Array.isArray(rawBindings) ? rawBindings : []).slice(0, 64).flatMap((binding) => {
@@ -3132,7 +3147,8 @@ function normalizeRuntimeRouteAdmissionSteps(value) {
       if (Object.values(normalized).some((item) => !identifierPattern.test(item))) bindingsValid = false;
       return [normalized];
     });
-    const shapeValid = deliverables.valid && outputs.valid && constraints.valid && violations.valid && bindingsValid;
+    const shapeValid = deliverables.valid && outputs.valid && constraints.valid
+      && violations.valid && advisories.valid && bindingsValid;
     return {
       step_id: boundedText(rawStep.step_id, 120),
       route_admission_valid: rawStep.route_admission_valid === true && shapeValid,
@@ -3147,6 +3163,7 @@ function normalizeRuntimeRouteAdmissionSteps(value) {
         downstream_bindings: downstreamBindings,
         strict_constraints_checked: constraints.rows,
         violations: violations.rows,
+        advisories: advisories.rows,
         obligation: boundedText(rawAdmission.obligation, 1200)
       }
     };
@@ -3198,6 +3215,8 @@ function normalizeRuntimeOutcomeContract(raw) {
     steps: normalizeRuntimeRouteAdmissionSteps(raw.steps),
     coverage,
     violations: boundedStringList(raw.violations, 64, 200),
+    advisories: boundedStringList(raw.advisories, 64, 200),
+    semantic_authority: boundedText(raw.semantic_authority, 120),
     inferred_deliverables: raw.inferred_deliverables === true,
     inferred_fulfills: Array.isArray(raw.inferred_fulfills)
       ? raw.inferred_fulfills.slice(0, 64).flatMap((item) => {

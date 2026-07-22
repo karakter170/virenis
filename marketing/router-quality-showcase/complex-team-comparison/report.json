@@ -1,0 +1,684 @@
+{
+  "schema_version": "virenis-qwen-team-product-showcase-v1",
+  "captured_at": "2026-07-22T06:13:20.824405+00:00",
+  "model": "qwen36-awq",
+  "claim": "Across these 2 predeclared complex scenarios, Agent-Team Qwen covered 21/24 required decision outcomes versus 16/24 for Standard Base Qwen.",
+  "scope": "Two illustrative same-model complex-task examples; not an aggregate benchmark.",
+  "method": {
+    "same_base_checkpoint": true,
+    "same_user_prompt": true,
+    "same_temperature": 0,
+    "same_final_output_ceiling_tokens": 8192,
+    "base_calls": "one general model call",
+    "team_calls": "session planning plus six typed specialist stages and synthesis as required by the saved team graph",
+    "team_definition_source": "current code-owned Discover catalog snapshot, registered with isolated ids and purged after capture",
+    "agent_output_ceiling_tokens": 4096,
+    "specialist_input_ceiling_tokens": 8192,
+    "synthesis_input_ceiling_tokens": 16384,
+    "administrative_output_ceilings": {
+      "agent": 8192,
+      "synthesis": 12288
+    },
+    "rubric": "Predeclared deterministic requirement-coverage checks; no model judge.",
+    "latency_and_compute_disclosed": true
+  },
+  "totals": {
+    "base_required_outcomes": 16,
+    "team_required_outcomes": 21,
+    "required_outcomes_maximum": 24
+  },
+  "cases": [
+    {
+      "id": "engineering_person_tracking",
+      "title": "Privacy-preserving person tracking architecture",
+      "team_name": "Engineering",
+      "prompt": "I want to build a privacy-preserving person-tracking app for three retail stores. Each store has 12 RTSP cameras and one on-prem NVIDIA L4 edge box. Use no facial recognition or biometric identity; people must have anonymous, short-lived track IDs. Camera input is 15 FPS, alerts must arrive in under 2 seconds, derived events are retained for 30 days, and raw video for 24 hours. Target 99.9% service availability. We have four engineers and need an eight-week pilot. Can you give me a decision-ready architecture and implementation plan? Protect privacy, surface assumptions and open decisions, and do not invent measured model throughput—tell me what must be benchmarked.",
+      "rubric": [
+        {
+          "id": "privacy_identity",
+          "label": "Rejects biometric identity and uses anonymous track IDs"
+        },
+        {
+          "id": "scale_capacity",
+          "label": "Accounts for all 36 cameras and 15 FPS load"
+        },
+        {
+          "id": "edge_architecture",
+          "label": "Defines RTSP-to-edge processing and cloud/control boundaries"
+        },
+        {
+          "id": "tracking_pipeline",
+          "label": "Specifies detection, association, and track lifecycle"
+        },
+        {
+          "id": "event_contract",
+          "label": "Provides a concrete API or event schema"
+        },
+        {
+          "id": "latency_design",
+          "label": "Turns the under-two-second constraint into a measurable latency design"
+        },
+        {
+          "id": "retention",
+          "label": "Implements both 24-hour video and 30-day event retention"
+        },
+        {
+          "id": "security",
+          "label": "Includes layered security and privacy controls"
+        },
+        {
+          "id": "delivery",
+          "label": "Maps an eight-week pilot to owners or staffing"
+        },
+        {
+          "id": "verification",
+          "label": "Uses tracking-quality plus load/failure verification"
+        },
+        {
+          "id": "reliability",
+          "label": "Operationalizes the 99.9% availability target"
+        },
+        {
+          "id": "uncertainty",
+          "label": "Surfaces throughput benchmarks, tradeoffs, and open decisions"
+        }
+      ],
+      "base": {
+        "answer": "This is a decision-ready architecture and implementation plan for a privacy-preserving, edge-based person-tracking system.\n\n### 1. Executive Summary & Feasibility Check\n\n**Verdict:** **Feasible, but tight.** The 8-week timeline for 4 engineers to build, deploy, and validate a distributed edge system with strict latency (<2s) and high availability (99.9%) is aggressive. Success depends on using mature, pre-trained models and robust infrastructure automation, not custom model training.\n\n**Key Constraint:** 12 cameras × 15 FPS = 180 FPS per store. An NVIDIA L4 (24GB VRAM, ~100 TFLOPS FP8) can handle this, but only if inference is highly optimized (TensorRT) and the pipeline is non-blocking.\n\n---\n\n### 2. Decision-Ready Architecture\n\n#### Core Principle: \"Edge-First, Privacy-by-Design\"\nAll processing happens on the NVIDIA L4. No raw video leaves the store. Only anonymized metadata (track IDs, counts, zones) is sent to the cloud/central server.\n\n#### System Components\n\n| Component | Technology Choice | Rationale |\n| :--- | :--- | :--- |\n| **Video Ingestion** | `GStreamer` + `NVIDIA Video Codec SDK` | Hardware-accelerated decoding (NVDEC) is mandatory to keep CPU load low. |\n| **Object Detection** | `YOLOv8n` or `YOLOv10n` (TensorRT) | Small, fast, accurate enough for person detection. TensorRT optimization is critical for 180 FPS. |\n| **Re-Identification** | `OSNet` or `FastReID` (Lightweight) | Must be lightweight. Used only for short-term track association across frames, not long-term identity. |\n| **Tracking Engine** | `ByteTrack` or `BoT-SORT` | State-of-the-art for handling occlusions and short-term ID switching. |\n| **Privacy Layer** | `MosaicML` or Custom Python Module | Blurs faces/bodies in any stored video. Generates UUIDv4 track IDs that expire after 24h. |\n| **Event Processing** | `NATS JetStream` or `Redis Streams` | Low-latency pub/sub for alerts. Handles backpressure better than Kafka for edge. |\n| **Storage (Edge)** | `MinIO` (S3-compatible) | For raw video (24h) and derived events (30d). Local SSD/NVMe required. |\n| **Orchestration** | `Docker Compose` (Edge) + `Kubernetes` (Cloud) | Simpler for edge deployment. K8s for central aggregation. |\n| **Monitoring** | `Prometheus` + `Grafana` | Track latency, FPS, GPU utilization, and alert health. |\n\n#### Data Flow (Per Store)\n\n1.  **Ingest:** RTSP streams → GStreamer → NVDEC (Hardware Decode) → Frame Buffer.\n2.  **Detect:** Frame → TensorRT YOLOv8n → Bounding Boxes (Person class only).\n3.  **Track:** Bounding Boxes → ByteTrack → Assign/Update Short-Lived Track IDs (UUID).\n4.  **Privacy:** If face detected → Blur region in frame (for storage only, not inference).\n5.  **Event Gen:** If Track ID crosses virtual line/zone → Generate Event JSON `{track_id, timestamp, zone, direction}`.\n6.  **Alert:** If event matches rule (e.g., \"loitering > 30s\") → Publish to NATS → Push to Central API (<2s SLA).\n7.  **Store:**\n    *   Raw Video: Write to MinIO (24h retention).\n    *   Events: Write to MinIO/PostgreSQL (30d retention).\n    *   Track IDs: Expire after 24h (no long-term linkage).\n\n---\n\n### 3. Implementation Plan (8 Weeks, 4 Engineers)\n\n**Team Roles:**\n*   **Eng 1 (Edge/ML):** Model optimization, TensorRT, GStreamer pipeline.\n*   **Eng 2 (Backend/Events):** Tracking logic, event generation, privacy module.\n*   **Eng 3 (Infrastructure/DevOps):** Docker, MinIO, NATS, monitoring, deployment scripts.\n*   **Eng 4 (Integration/Cloud):** Central API, alerting, dashboard, testing.\n\n#### Week 1: Foundation & Benchmarking\n*   **Goal:** Prove hardware can handle 180 FPS with <2s latency.\n*   **Tasks:**\n    *   Set up dev environment on one L4 box.\n    *   **CRITICAL BENCHMARK:** Measure YOLOv8n TensorRT inference time at 15 FPS per camera. *Do not assume throughput.*\n    *   Implement basic GStreamer pipeline with NVDEC.\n    *   Define data schema for events and track IDs.\n*   **Deliverable:** Benchmark report showing FPS, latency, and GPU utilization.\n\n#### Week 2: Core Pipeline Development\n*   **Goal:** End-to-end detection and tracking on one camera.\n*   **Tasks:**\n    *   Integrate YOLOv8n + ByteTrack.\n    *   Implement short-lived UUID generation and expiration logic.\n    *   Add face/body blurring for storage.\n    *   Validate tracking stability (ID switches < 5% in test videos).\n*   **Deliverable:** Working single-camera pipeline with privacy features.\n\n#### Week 3: Multi-Camera & Event Logic\n*   **Goal:** Scale to 12 cameras per store.\n*   **Tasks:**\n    *   Parallelize pipeline for 12 streams.\n    *   Implement zone crossing detection (virtual lines).\n    *   Define alert rules (e.g., \"person in restricted zone\").\n    *   Integrate NATS JetStream for alert publishing.\n*   **Deliverable:** 12-camera pipeline generating alerts.\n\n#### Week 4: Storage & Retention\n*   **Goal:** Implement 24h/30d retention policies.\n*   **Tasks:**\n    *   Deploy MinIO on edge.\n    *   Implement raw video writing (24h TTL).\n    *   Implement event logging (30d TTL).\n    *   Add cleanup jobs to delete expired data.\n*   **Deliverable:** Data retention system working.\n\n#### Week 5: Central Aggregation & API\n*   **Goal:** Cloud/central server receives alerts.\n*   **Tasks:**\n    *   Build central API to receive NATS messages.\n    *   Implement alert forwarding (email/SMS/webhook).\n    *   Build simple dashboard to view store counts/alerts.\n    *   Ensure <2s end-to-end latency from camera to alert.\n*   **Deliverable:** Central system receiving alerts.\n\n#### Week 6: Pilot Deployment (Store 1)\n*   **Goal:** Deploy to first store.\n*   **Tasks:**\n    *   Package all components into Docker images.\n    *   Deploy to Store 1 L4 box.\n    *   Connect 12 cameras.\n    *   Monitor stability, latency, and GPU temps.\n    *   Fix bugs.\n*   **Deliverable:** Store 1 live.\n\n#### Week 7: Pilot Deployment (Stores 2 & 3) & Load Testing\n*   **Goal:** Deploy to remaining stores.\n*   **Tasks:**\n    *   Deploy to Stores 2 & 3.\n    *   Run load tests: Simulate high traffic (e.g., 50 people in frame).\n    *   Validate 99.9% availability (monitor uptime).\n    *   Test failure scenarios: Camera disconnect, L4 reboot.\n*   **Deliverable:** All 3 stores live.\n\n#### Week 8: Validation & Handover\n*   **Goal:** Final checks and documentation.\n*   **Tasks:**\n    *   Verify privacy compliance (no faces in stored video).\n    *   Verify retention policies (data deleted after 24h/30d).\n    *   Document architecture, deployment, and troubleshooting.\n    *   Final benchmark report.\n*   **Deliverable:** Pilot complete, ready for production.\n\n---\n\n### 4. Critical Assumptions & Open Decisions\n\n#### Assumptions\n1.  **Network:** Each store has a stable, low-latency network connection to the central server for alerts. Raw video never leaves the store.\n2.  **Camera Quality:** RTSP streams are H.264/H.265, 1080p or lower. Higher resolutions will require more GPU power.\n3.  **Lighting:** Cameras are in well-lit environments. Poor lighting will degrade detection accuracy.\n4.  **Privacy Law:** Local laws allow anonymous tracking for security/operations. No biometric data is collected.\n5.  **Hardware:** NVIDIA L4 boxes have sufficient NVMe storage for 24h of raw video (12 cameras × 15 FPS × 24h ≈ 1.5 TB per store). *Verify storage capacity.*\n\n#### Open Decisions (Must Be Resolved in Week 1)\n1.  **Model Choice:** YOLOv8n vs. YOLOv10n vs. RT-DETR. *Benchmark all three.*\n2.  **Tracking Algorithm:** ByteTrack vs. BoT-SORT vs. DeepSORT. *Benchmark ID switch rate.*\n3.  **Alert Latency Budget:** How much of the 2s is for inference, how much for network? *Define SLA breakdown.*\n4.  **Failure Mode:** If L4 box fails, do we lose data? *Decide on local backup strategy.*\n5.  **Central Server:** Cloud provider (AWS/GCP/Azure) or on-prem? *Decide based on compliance.*\n\n---\n\n### 5. What Must Be Benchmarked (Do Not Invent Numbers)\n\nYou **must** run these benchmarks on the actual NVIDIA L4 hardware with actual camera streams. Do not use published paper numbers.\n\n1.  **Inference Throughput:**\n    *   Measure FPS of YOLOv8n TensorRT on L4 for 12 concurrent streams at 15 FPS.\n    *   *Target:* ≥ 180 FPS total.\n    *   *Metric:* Average inference time per frame (ms).\n\n2.  **End-to-End Latency:**\n    *   Time from frame capture to alert generation.\n    *   *Target:* < 2 seconds.\n    *   *Metric:* P95 latency (95% of alerts must be < 2s).\n\n3.  **Tracking Stability:**\n    *   ID switch rate: How often does a person’s track ID change?\n    *   *Target:* < 5% ID switches per minute per person.\n    *   *Metric:* MOTA (Multi-Object Tracking Accuracy).\n\n4.  **Storage I/O:**\n    *   Can the L4’s NVMe drive write 12 streams of raw video simultaneously?\n    *   *Target:* No dropped frames due to I/O bottleneck.\n    *   *Metric:* Write throughput (MB/s).\n\n5.  **GPU Utilization:**\n    *   Ensure GPU is not saturated (>90%) under peak load.\n    *   *Target:* < 80% average utilization.\n    *   *Metric:* GPU memory and compute usage.\n\n---\n\n### 6. Privacy & Compliance Checklist\n\n*   [ ] **No Facial Recognition:** Model only detects \"person\" class. No face embedding extraction.\n*   [ ] **Blurring:** Faces and bodies are blurred in stored video.\n*   [ ] **Short-Lived IDs:** Track IDs are UUIDs that expire after 24 hours. No long-term linkage.\n*   [ ] **Data Retention:** Raw video deleted after 24 hours. Events deleted after 30 days.\n*   [ ] **No Biometrics:** No gait analysis, no voice recognition.\n*   [ ] **Consent:** Signage in stores informing customers of anonymous tracking.\n\n---\n\n### 7. Risks & Mitigation\n\n| Risk | Impact | Mitigation |\n| :--- | :--- | :--- |\n| **GPU Overload** | Dropped frames, missed alerts | Use TensorRT optimization. Limit resolution if needed. |\n| **High ID Switch Rate** | Unreliable tracking | Tune ByteTrack parameters. Use better ReID model. |\n| **Network Latency** | Alerts > 2s | Optimize alert payload size. Use UDP for critical alerts. |\n| **Storage Full** | Data loss | Implement aggressive cleanup. Monitor disk usage. |\n| **Camera Disconnect** | Data gap | Log disconnect events. Retry connection. |\n\n---\n\n### 8. Next Steps\n\n1.  **Week 1:** Set up dev environment, run benchmarks.\n2.  **Week 1:** Resolve open decisions (model, tracking, central server).\n3.  **Week 2:** Begin core pipeline development.\n\nThis plan is realistic if the team is experienced with edge AI and Docker. The key is to **benchmark early** and **optimize for latency** from day one.",
+        "answer_sha256": "47df221530f8afa89f9c5cf41e728c3336551f3d5bdecfce7928d07bd094b538",
+        "metrics": {
+          "elapsed_seconds": 108.495,
+          "answer_words": 1342,
+          "answer_characters": 10404,
+          "required_outcomes_covered": 11,
+          "required_outcomes_total": 12,
+          "coverage_rate": 0.9167,
+          "coverage_per_1000_answer_words": 8.2,
+          "model_usage": {
+            "calls_reported": 1,
+            "prompt_tokens": 202,
+            "completion_tokens": 2910,
+            "total_tokens": 3112
+          }
+        },
+        "score": {
+          "score": 11,
+          "maximum": 12,
+          "rate": 0.9167,
+          "criteria": [
+            {
+              "id": "privacy_identity",
+              "label": "Rejects biometric identity and uses anonymous track IDs",
+              "met": true,
+              "evidence": [
+                "--- ### 6. Privacy & Compliance Checklist * [ ] **No Facial Recognition:** Model only detects \"person\" class. No face embedding extraction. * [ ] **Blur",
+                "ection accuracy. 4. **Privacy Law:** Local laws allow anonymous tracking for security/operations. No biometric data is collected. 5. **Hardware:** NVIDIA L4 boxes"
+              ]
+            },
+            {
+              "id": "scale_capacity",
+              "label": "Accounts for all 36 cameras and 15 FPS load",
+              "met": true,
+              "evidence": [
+                "ation, not custom model training. **Key Constraint:** 12 cameras × 15 FPS = 180 FPS per store. An NVIDIA L4 (24GB VRAM, ~100 TFLOPS FP8) can handle this, but only if inference is highly op",
+                "stom model training. **Key Constraint:** 12 cameras × 15 FPS = 180 FPS per store. An NVIDIA L4 (24GB VRAM, ~100 TFLOPS FP8) can handle this, but only if in"
+              ]
+            },
+            {
+              "id": "edge_architecture",
+              "label": "Defines RTSP-to-edge processing and cloud/control boundaries",
+              "met": true,
+              "evidence": [
+                "health. | #### Data Flow (Per Store) 1. **Ingest:** RTSP streams → GStreamer → NVDEC (Hardware Decode) → Frame Buffer. 2. **Detect:** Frame → TensorRT",
+                "ture and implementation plan for a privacy-preserving, edge-based person-tracking system. ### 1. Executive Summary & Feasibility Check **Verdict:** **Fe",
+                "zed metadata (track IDs, counts, zones) is sent to the cloud/central server. #### System Components | Component | Technology Choice | Rationale | | :---"
+              ]
+            },
+            {
+              "id": "tracking_pipeline",
+              "label": "Specifies detection, association, and track lifecycle",
+              "met": true,
+              "evidence": [
+                "NVDEC) is mandatory to keep CPU load low. | | **Object Detection** | `YOLOv8n` or `YOLOv10n` (TensorRT) | Small, fast, accurate enough for person detection.",
+                "ation plan for a privacy-preserving, edge-based person-tracking system. ### 1. Executive Summary & Feasibility Check **Verdict:** **Feasible, but tight.*",
+                "| Must be lightweight. Used only for short-term track association across frames, not long-term identity. | | **Tracking Engine** | `ByteTrack` or `BoT-SORT` | S"
+              ]
+            },
+            {
+              "id": "event_contract",
+              "label": "Provides a concrete API or event schema",
+              "met": true,
+              "evidence": [
+                "sic GStreamer pipeline with NVDEC. * Define data schema for events and track IDs. * **Deliverable:** Benchmark report showing FPS, latency, and GPU",
+                "k ID crosses virtual line/zone → Generate Event JSON `{track_id, timestamp, zone, direction}`. 6. **Alert:** If event matches rule (e.g., \"loitering > 30s\")",
+                "es virtual line/zone → Generate Event JSON `{track_id, timestamp, zone, direction}`. 6. **Alert:** If event matches rule (e.g., \"loitering > 30s\") → Publish t"
+              ]
+            },
+            {
+              "id": "latency_design",
+              "label": "Turns the under-two-second constraint into a measurable latency design",
+              "met": true,
+              "evidence": [
+                "alidate a distributed edge system with strict latency (<2s) and high availability (99.9%) is aggressive. Success depends on using mature, pre-trained mod",
+                "tion. * *Target:* < 2 seconds. * *Metric:* P95 latency (95% of alerts must be < 2s). 3. **Tracking Stability:** * ID switch rate: How"
+              ]
+            },
+            {
+              "id": "retention",
+              "label": "Implements both 24-hour video and 30-day event retention",
+              "met": true,
+              "evidence": [
+                "ed video. Generates UUIDv4 track IDs that expire after 24h. | | **Event Processing** | `NATS JetStream` or `Redis Streams` | Low-latency pub/sub for aler",
+                "Raw video deleted after 24 hours. Events deleted after 30 days. * [ ] **No Biometrics:** No gait analysis, no voice recognition. * [ ] **Consent:** Signa",
+                "inIO on edge. * Implement raw video writing (24h TTL). * Implement event logging (30d TTL). * Add cleanup jobs to delete expired data."
+              ]
+            },
+            {
+              "id": "security",
+              "label": "Includes layered security and privacy controls",
+              "met": false,
+              "evidence": []
+            },
+            {
+              "id": "delivery",
+              "label": "Maps an eight-week pilot to owners or staffing",
+              "met": true,
+              "evidence": [
+                "ility Check **Verdict:** **Feasible, but tight.** The 8-week timeline for 4 engineers to build, deploy, and validate a distributed edge system with strict",
+                "ct:** **Feasible, but tight.** The 8-week timeline for 4 engineers to build, deploy, and validate a distributed edge system with strict latency (<2s) and high av"
+              ]
+            },
+            {
+              "id": "verification",
+              "label": "Uses tracking-quality plus load/failure verification",
+              "met": true,
+              "evidence": [
+                "% ID switches per minute per person. * *Metric:* MOTA (Multi-Object Tracking Accuracy). 4. **Storage I/O:** * Can the L4’s NVMe drive write",
+                "live. #### Week 7: Pilot Deployment (Stores 2 & 3) & Load Testing * **Goal:** Deploy to remaining stores. * **Tasks:** * Deploy to Stores 2 & 3."
+              ]
+            },
+            {
+              "id": "reliability",
+              "label": "Operationalizes the 99.9% availability target",
+              "met": true,
+              "evidence": [
+                "ystem with strict latency (<2s) and high availability (99.9%) is aggressive. Success depends on using mature, pre-trained models and robust infrastructure",
+                "fana` | Track latency, FPS, GPU utilization, and alert health. | #### Data Flow (Per Store) 1. **Ingest:** RTSP streams → GStreamer → NVDEC (Hardware Dec"
+              ]
+            },
+            {
+              "id": "uncertainty",
+              "label": "Surfaces throughput benchmarks, tradeoffs, and open decisions",
+              "met": true,
+              "evidence": [
+                "erting, dashboard, testing. #### Week 1: Foundation & Benchmarking * **Goal:** Prove hardware can handle 180 FPS with <2s latency. * **Tasks:** * Se",
+                "nforming customers of anonymous tracking. --- ### 7. Risks & Mitigation | Risk | Impact | Mitigation | | :--- | :--- | :--- | | **GPU Overload** | Drop",
+                "dy for production. --- ### 4. Critical Assumptions & Open Decisions #### Assumptions 1. **Network:** Each store has a stable, low-latency network connection to"
+              ]
+            }
+          ]
+        }
+      },
+      "team": {
+        "answer": "### Architecture Decision Record\n\n# Architecture Decision Record: Privacy-Preserving Retail Person Tracking\n\n## 1. Context & Scope\nThis document defines the recommended system architecture for a distributed, edge-first computer vision system across three retail locations. The system tracks person movement to generate derived events (dwell time, zone entry) while strictly excluding facial recognition or biometric identity. The design addresses hard constraints of 15 FPS camera input, <2s alert latency, 99.9% availability, and specific data retention policies (24h raw video, 30d events).\n\n## 2. Recommended Architecture: Edge-First Decoupled Pipeline\n\nThe recommended architecture employs a **Decoupled Edge Pipeline** pattern. Each store operates as an autonomous island with local processing, minimizing network dependency and ensuring privacy compliance by design.\n\n### 2.1 System Boundary\n* **In-Scope**: RTSP ingestion, object detection, tracking, event generation, local storage, and anonymous ID management.\n\n### 2.2 Component Topology (Per Store)\n1. **Ingestion Service**: Pulls RTSP streams from 12 cameras. Converts frames to a standardized internal format (e.g., NV12 or RGB) at 15 FPS.\n2. **Detection & Tracking Engine**:\n    *   Runs on the NVIDIA L4 GPU.\n    *   Uses a lightweight object detection model (e.g., YOLOv8-nano or similar) to identify \"person\" bounding boxes.\n    *   Uses a multi-object tracker (e.g., ByteTrack or OC-SORT) to assign **anonymous, short-lived track IDs**.\n\n3. **Event Processor**:\n    *   Consumes track centroids.\n    *   Calculates derived events: Zone Entry, Zone Exit, Dwell Time.\n    *   Generates alerts if thresholds are breached (e.g., dwell time > X seconds).\n4. **Storage Layer**:\n    *   **Raw Video**: Stored in a circular buffer on local NVMe/SSD. Retention: 24 hours. Overwritten automatically.\n    *   **Events**: Stored in a local time-series database (e.g., TimescaleDB or InfluxDB). Retention: 30 days.\n5. **API Gateway**: Exposes endpoints for event queries and alert subscriptions. Does not expose raw video or tracking metadata externally.\n\n### 2.3 Data Flow\n1. Camera -> RTSP Stream -> Ingestion Service.\n2. Ingestion Service -> Frame Buffer -> Detection/Tracking Engine (GPU).\n3. Detection/Tracking Engine -> Anonymous Track IDs + Bounding Boxes -> Event Processor.\n4. Event Processor -> Derived Events -> Event Store (30d).\n5. Ingestion Service -> Raw Video -> Video Store (24h).\n6. Event Processor -> Alerts -> API Gateway -> External Consumers (if configured).\n\n## 3. Architecture Options & Tradeoffs\n\n### Option A: Centralized Cloud Processing (Rejected)\n* **Description**: Stream raw video to a central cloud server for processing.\n* **Failure Modes**: High bandwidth costs; latency violations (>2s alerts) due to network jitter; severe privacy risk as raw video leaves the premises.\n\n### Option B: Edge-First Decoupled Pipeline (Recommended)\n* **Description**: Process all video locally on the NVIDIA L4. Only derived events are stored long-term.\n* **Advantages**:\n    *   **Privacy**: Raw video never leaves the store; no biometric data is generated.\n    *   **Latency**: Local processing ensures <2s alerting.\n    *   **Availability**: 99.9% SLA is achievable with local redundancy (RAID) and failover logic.\n* **Disadvantages**:\n    *   **Throughput Risk**: The L4 GPU must handle 12 cameras at 15 FPS simultaneously. This requires careful model selection and benchmarking.\n    *   **Operational Cost**: Requires on-prem hardware maintenance and local storage management.\n\n### Option C: Hybrid Edge-Cloud (Rejected for Pilot)\n* **Description**: Edge processes video; cloud aggregates events for cross-store analytics.\n* **Failure Modes**: Adds complexity for the 8-week pilot; potential privacy leaks if cross-store correlation is attempted.\n* **Rejection Reason**: Unnecessary complexity for the pilot scope; violates the \"no re-identification\" constraint if not strictly controlled.\n\n## 4. Failure Modes & Mitigations\n\n| Failure Mode | Impact | Mitigation |\n|:--- |:--- |:--- |\n\n| **Storage Failure** | Loss of raw video or events. | Implement RAID 1/5 on local storage. Monitor disk health. |\n| **Privacy Leak** | Re-identification via track correlation. | Reset track IDs periodically. Do not store bounding box metadata long-term. Exclude facial features from detection. |\n| **GPU Failure** | Complete loss of tracking capability. | Implement graceful degradation: switch to CPU-based fallback (lower FPS) or alert for hardware replacement. |\n| **Network Partition** | Loss of alert delivery. | Buffer alerts locally; retry when connection is restored. |\n\n## 5. Open Decisions & Assumptions\n\n### 5.1 Critical Benchmarks Required\n* **Model Throughput**: **Must benchmark** the chosen detection model (e.g., YOLOv8-nano) on the NVIDIA L4 with 12 concurrent streams at 15 FPS.\n    *   *Assumption*: The L4 can handle 12 streams at 15 FPS with a lightweight model. If not, we must reduce FPS, resolution, or camera count.\n* **Latency Profile**: Measure end-to-end latency from frame capture to alert generation.\n    *   *Assumption*: Local processing will meet the <2s requirement.\n\n### 5.2 Unresolved Requirements\n* **Zone Definition**: How are zones defined? (Manual polygon drawing? AI-generated?) This impacts the Event Processor complexity.\n* **Alert Thresholds**: What constitutes a \"dwell time\" alert? (e.g., >5 minutes?) This needs business input.\n* **Camera Calibration**: Are cameras calibrated for perspective correction? This affects tracking accuracy.\n\n### 5.3 Assumptions\n* **Hardware Availability**: NVIDIA L4 GPUs are available and compatible with the chosen software stack.\n* **Network Stability**: Local network between cameras and edge box is stable and low-latency.\n* **Privacy Compliance**: The defined architecture meets local regulatory requirements for anonymous tracking.\n\n## 6. Implementation Plan (8-Week Pilot)\n\n### Week 1-2: Foundation & Benchmarking\n* Set up local development environment.\n* **Benchmark**: Test detection models on L4 with 12 streams. Select optimal model.\n* Implement Ingestion Service and basic Detection/Tracking Engine.\n\n### Week 3-4: Event Processing & Storage\n* Implement Event Processor (zone logic, dwell time).\n* Set up local storage (RAID, circular buffer for video, time-series DB for events).\n* Implement anonymous ID rotation logic.\n\n### Week 5-6: Integration & Testing\n* Integrate all components.\n* Test end-to-end latency and throughput.\n* Validate privacy controls (no biometric data, ID rotation).\n* Deploy to one store for pilot testing.\n\n### Week 7-8: Rollout & Refinement\n* Deploy to remaining two stores.\n* Monitor system health, latency, and alert accuracy.\n* Gather feedback and refine zone definitions/alert thresholds.\n* Document lessons learned and final architecture.\n\n## 7. Conclusion\nThe **Edge-First Decoupled Pipeline** is the only viable architecture that meets the strict privacy, latency, and availability constraints. Success depends on **early benchmarking** of the detection model on the NVIDIA L4 to ensure throughput requirements are met. The team must explicitly define zone logic and alert thresholds during the pilot.\n\n### Implementation Plan\n\n# Implementation Plan: Privacy-Preserving Retail Person Tracking\n\nThis plan translates the selected **Edge-First Decoupled Pipeline** architecture into an executable eight-week pilot sequence. It details provisioning, configuration, deployment, migration, verification, ownership, and rollback actions for three retail locations, each equipped with 12 RTSP cameras and one NVIDIA L4 edge box.\n\n## 1. Execution Strategy & Phasing\n\nThe pilot is divided into four two-week increments. Each increment delivers a verifiable slice of functionality, ensuring that privacy constraints and latency targets are validated early.\n\n* **Weeks 1–2: Foundation & Inference Benchmarking**\n    *   Goal: Establish hardware readiness, deploy the ingestion layer, and validate model throughput.\n\n* **Weeks 3–4: Event Processing & Local Storage**\n    *   Goal: Implement the event processor, local storage policies, and anonymous track ID generation.\n    *   Critical Path: Verifying that raw video is retained for only 24 hours and events for 30 days [User brief].\n* **Weeks 5–6: Alerting & Integration**\n    *   Goal: Connect the event processor to the alerting engine and validate end-to-end latency.\n    *   Critical Path: Ensuring alerts arrive in under 2 seconds [User brief].\n* **Weeks 7–8: Hardening, Rollout & Pilot Validation**\n    *   Goal: Deploy to all three stores, conduct load testing, and finalize privacy compliance documentation.\n    *   Critical Path: Achieving 99.9% availability and resolving any privacy leak risks [Requirements & Constraints Analyst].\n\n## 2. Detailed Incremental Actions\n\n### Increment 1: Foundation & Inference Benchmarking (Weeks 1–2)\n\n**Provisioning & Configuration:**\n1. **Edge Box Setup**: Provision three NVIDIA L4 edge boxes with Ubuntu 22.04 LTS, NVIDIA Container Toolkit, and Docker Compose.\n2. **Network Configuration**: Configure static IPs for edge boxes and ensure low-latency connectivity to the 12 RTSP cameras per store.\n3. **Ingestion Service Deployment**: Deploy the RTSP ingestion service (e.g., GStreamer or FFmpeg-based) to pull streams from all 12 cameras.\n\n**Verification & Benchmarking:**\n1. **Model Benchmarking**: Run the selected detection/tracking model (e.g., YOLOv8 + ByteTrack) on the L4 GPU. Measure FPS per camera at 15 FPS input.\n    *   *Assumption*: The model runs at ≥15 FPS per camera.\n2. **Throughput Validation**: Verify that the ingestion service can handle 12 streams simultaneously without dropping frames.\n\n**Ownership & Rollback:**\n* **Owner**: Infrastructure Engineer.\n* **Rollback**: Revert to previous Docker image if ingestion fails.\n\n### Increment 2: Event Processing & Local Storage (Weeks 3–4)\n\n**Provisioning & Configuration:**\n1. **Event Processor Deployment**: Deploy the event processor service to generate derived events (dwell time, zone entry) from tracking data.\n2. **Storage Configuration**: Configure local storage on the edge box with RAID for redundancy.\n3. **Retention Policy Implementation**: Implement cron jobs or a storage manager to delete raw video after 24 hours and events after 30 days.\n\n**Verification & Benchmarking:**\n\n2. **Storage Failure Simulation**: Simulate a disk failure to verify RAID redundancy and data integrity.\n\n**Ownership & Rollback:**\n* **Owner**: Backend Engineer.\n* **Rollback**: Restore storage from backup if data corruption occurs.\n\n### Increment 3: Alerting & Integration (Weeks 5–6)\n\n**Provisioning & Configuration:**\n1. **Alerting Engine Deployment**: Deploy the alerting engine to consume events from the event processor.\n2. **Threshold Configuration**: Define alert thresholds (e.g., dwell time >5 minutes). *Open Decision*: Business input required for specific thresholds.\n3. **Integration Testing**: Connect the alerting engine to the notification system (e.g., email, SMS, or dashboard).\n\n**Verification & Benchmarking:**\n\n2. **Load Testing**: Simulate high traffic (e.g., 12 cameras at 15 FPS) to verify alerting performance under load.\n\n**Ownership & Rollback:**\n* **Owner**: Full-Stack Engineer.\n* **Rollback**: Disable alerting if false positives exceed acceptable levels.\n\n### Increment 4: Hardening, Rollout & Pilot Validation (Weeks 7–8)\n\n**Provisioning & Configuration:**\n1. **Full Deployment**: Deploy the complete stack to all three retail stores.\n2. **Monitoring Setup**: Implement monitoring (e.g., Prometheus/Grafana) to track system health, latency, and storage usage.\n\n**Verification & Benchmarking:**\n\n**Ownership & Rollback:**\n* **Owner**: Engineering Lead.\n* **Rollback**: Revert to previous stable version if critical issues arise.\n\n## 3. Open Decisions & Assumptions\n\n**Open Decisions:**\n1. **Alert Thresholds**: What constitutes a \"dwell time\" alert? (e.g., >5 minutes?) This needs business input.\n2. **Camera Calibration**: Are cameras calibrated for perspective correction? This affects tracking accuracy.\n\n**Assumptions:**\n1. **Hardware Availability**: NVIDIA L4 GPUs are available and compatible with the chosen software stack.\n2. **Network Stability**: Local network between cameras and edge box is stable and low-latency.\n3. **Privacy Compliance**: The defined architecture meets local regulatory requirements for anonymous tracking.\n\n## 4. Risks & Mitigations\n\n* **R1: Throughput Bottleneck**: If the chosen model runs at <15 FPS per camera on the L4, the system will drop frames. *Mitigation*: Benchmark early; consider model quantization (TensorRT) or reducing input resolution.\n* **R2: Storage Failure**: If local storage fails, raw video is lost. *Mitigation*: Implement RAID or redundant storage on the edge box.\n\n## 5. Resource Allocation\n\n* **Engineers**: Four engineers are allocated across the increments.\n    *   **Infrastructure Engineer**: Focuses on edge box setup, network configuration, and storage.\n    *   **Backend Engineer**: Focuses on event processing, storage policies, and privacy compliance.\n    *   **Full-Stack Engineer**: Focuses on alerting, integration, and monitoring.\n    *   **Engineering Lead**: Oversees the pilot, conducts privacy audits, and manages open decisions.\n\nThis plan provides a clear, executable path to delivering the privacy-preserving person-tracking system within the eight-week pilot timeline, while respecting all hard constraints and surface assumptions for owner resolution.\n\n### Risk Register\n\n# Risk Register: Privacy-Preserving Retail Person Tracking\n\nThis register identifies concrete, testable risks derived from the engineering brief and architecture decision record. Risks are categorized by domain and prioritized by severity (Blocker, High, Medium). Each entry includes the risk description, potential impact, proposed mitigation, residual risk, and unknowns.\n\n## 1. Privacy & Compliance Risks\n\n### P1: Re-identification via Trajectory Correlation\n* **Risk**: Although facial recognition and biometrics are excluded, correlating anonymous track IDs across multiple cameras or over extended time windows may allow re-identification of individuals through unique movement patterns, gait, or clothing.\n* **Impact**: Violation of privacy constraints; potential regulatory non-compliance (e.g., GDPR, CCPA).\n* **Mitigation**:\n    *   Implement strict track ID expiration (e.g., reset ID upon leaving a camera’s field of view or after a short timeout).\n    *   Avoid cross-camera track ID persistence unless explicitly required for dwell time calculation, and if used, ensure data is anonymized and aggregated before storage.\n    *   Conduct a privacy impact assessment (PIA) to evaluate re-identification likelihood.\n* **Residual Risk**: Medium. Re-identification risk persists if high-resolution video is retained for 24 hours and correlated with external data sources.\n* **Unknowns**: Legal interpretation of \"anonymous\" tracking in target jurisdictions; effectiveness of proposed anonymization techniques against advanced re-identification algorithms.\n\n### P2: Data Retention Policy Enforcement Failure\n* **Risk**: Failure to automatically delete raw video after 24 hours or derived events after 30 days due to software bugs, storage errors, or manual override.\n* **Impact**: Privacy violation; increased liability; potential regulatory fines.\n* **Mitigation**:\n    *   Implement automated, immutable deletion policies using cron jobs or event-driven triggers.\n    *   Add monitoring alerts for retention policy violations (e.g., if files older than 24 hours exist).\n    *   Regularly audit storage systems to verify compliance.\n* **Residual Risk**: Low. Automated systems reduce human error, but bugs or misconfigurations remain possible.\n* **Unknowns**: Robustness of deletion mechanisms under high load or storage failure scenarios.\n\n## 2. Availability & Reliability Risks\n\n### A1: Edge Box Hardware Failure\n* **Risk**: Failure of the NVIDIA L4 GPU, CPU, or storage in an edge box leads to complete loss of tracking capability for that store.\n* **Impact**: Violation of 99.9% availability target; loss of real-time alerts and data.\n* **Mitigation**:\n    *   Implement RAID for local storage to protect against disk failure.\n    *   Design for graceful degradation: if GPU fails, switch to CPU-based inference (if feasible) or alert operators immediately.\n    *   Consider redundant edge boxes per store (if budget allows) or rapid replacement procedures.\n* **Residual Risk**: High. Single point of failure per store; 99.9% availability requires mean time to repair (MTTR) < 8.76 hours/year per store, which is challenging with on-prem hardware.\n* **Unknowns**: Actual MTTR for hardware replacement; feasibility of CPU-based fallback inference.\n\n### A2: Network Instability Between Cameras and Edge Box\n* **Risk**: Packet loss or latency spikes in the local network disrupt video streams, causing frame drops or tracking errors.\n* **Impact**: Missed alerts; inaccurate dwell time calculations; reduced system reliability.\n* **Mitigation**:\n    *   Use wired Ethernet connections for all cameras.\n    *   Implement stream buffering and error recovery mechanisms in the ingestion pipeline.\n    *   Monitor network health and alert on anomalies.\n* **Residual Risk**: Medium. Wired networks are stable, but physical damage or configuration errors can still cause issues.\n* **Unknowns**: Quality of existing network infrastructure in retail stores; susceptibility to electromagnetic interference.\n\n## 3. Performance & Capacity Risks\n\n### C1: Inference Throughput Bottleneck\n* **Risk**: The chosen model runs at <15 FPS per camera on the L4 GPU, causing frame drops and violating the 15 FPS input constraint.\n* **Impact**: Missed detections; inaccurate tracking; potential alert delays.\n* **Mitigation**:\n    *   **Benchmark early**: Measure actual FPS per camera with the selected model and input resolution.\n    *   Optimize model using TensorRT quantization or pruning.\n    *   Reduce input resolution if accuracy permits.\n    *   Consider multi-camera batching or asynchronous processing.\n* **Residual Risk**: High. If benchmarks show insufficient throughput, the architecture may need significant redesign (e.g., fewer cameras per box, different hardware).\n* **Unknowns**: Actual model performance on L4 GPU; trade-off between resolution, accuracy, and speed.\n\n### C2: Storage Capacity Exhaustion\n* **Risk**: Raw video retention (24 hours) and event storage (30 days) exceed available disk space on the edge box.\n* **Impact**: System crash; data loss; inability to process new video.\n* **Mitigation**:\n    *   Calculate exact storage requirements based on camera resolution, frame rate, and compression.\n    *   Implement aggressive video compression (e.g., H.265).\n    *   Use tiered storage: keep recent video on fast SSD, archive older data to slower HDD or cloud (if allowed).\n* **Residual Risk**: Medium. Miscalculation of storage needs or unexpected growth in event data could lead to issues.\n* **Unknowns**: Actual compression ratios; growth rate of derived events.\n\n## 4. Operability & Observability Risks\n\n### O1: Lack of Monitoring and Alerting\n* **Risk**: Inability to detect system failures, performance degradation, or privacy violations in real-time.\n* **Impact**: Extended downtime; undetected privacy breaches; delayed incident response.\n* **Mitigation**:\n    *   Implement comprehensive monitoring for GPU utilization, CPU load, memory, disk space, and network health.\n    *   Add application-level metrics: FPS, track count, alert latency, error rates.\n    *   Set up alerts for critical thresholds (e.g., FPS < 10, disk > 90% full).\n* **Residual Risk**: Low. Monitoring is essential for operability; implementation is straightforward but requires effort.\n* **Unknowns**: Complexity of integrating monitoring tools with the existing stack; alert fatigue management.\n\n### O2: Difficulty in Debugging Tracking Errors\n* **Risk**: Inability to diagnose why tracking fails (e.g., missed detections, ID switches) due to lack of observability into the model’s decisions.\n* **Impact**: Prolonged debugging; reduced system accuracy; loss of trust in the system.\n* **Mitigation**:\n    *   Log bounding boxes, track IDs, and confidence scores for a subset of frames.\n    *   Implement a debugging interface to visualize tracking results.\n    *   Store sample video clips for failed tracks for offline analysis.\n* **Residual Risk**: Medium. Logging and visualization add overhead; balancing observability with privacy and performance is challenging.\n* **Unknowns**: Storage and compute cost of detailed logging; privacy implications of storing debug data.\n\n## 5. Implementation & Timeline Risks\n\n### T1: Insufficient Time for Benchmarking and Optimization\n* **Risk**: The eight-week pilot timeline does not allow adequate time for model benchmarking, optimization, and testing.\n* **Impact**: Delivery of a suboptimal system; missed performance targets; privacy or reliability issues.\n* **Mitigation**:\n    *   Prioritize benchmarking in the first two weeks.\n    *   Use pre-optimized models or frameworks (e.g., TensorRT) to reduce optimization effort.\n    *   Define clear go/no-go criteria based on benchmark results.\n* **Residual Risk**: High. If benchmarks reveal significant issues, the timeline may be insufficient for resolution.\n* **Unknowns**: Actual time required for benchmarking and optimization; availability of pre-optimized models.\n\n### T2: Team Capacity Constraints\n* **Risk**: Four engineers are insufficient to handle development, testing, deployment, and operations for three stores.\n* **Impact**: Burnout; delayed delivery; poor quality.\n* **Mitigation**:\n    *   Automate deployment and testing pipelines.\n    *   Focus on a single store for the initial pilot, then replicate.\n    *   Clearly define roles and responsibilities.\n* **Residual Risk**: Medium. Automation reduces effort, but unexpected issues can still strain the team.\n* **Unknowns**: Actual complexity of deployment and operations; availability of additional resources if needed.\n\n## Summary of Critical Actions\n\n1. **Benchmark Model Throughput**: Immediately measure FPS per camera on the L4 GPU with the selected model. This is a blocker for the architecture.\n2. **Define Privacy Boundaries**: Clarify legal requirements for anonymous tracking and implement strict track ID expiration and data retention policies.\n3. **Implement Monitoring**: Set up comprehensive monitoring and alerting from day one to ensure operability and early detection of issues.\n4. **Plan for Hardware Failure**: Develop procedures for rapid hardware replacement and consider graceful degradation strategies.\n5. **Validate Storage Requirements**: Calculate exact storage needs and implement automated deletion policies to prevent capacity exhaustion.\n\nThis register should be reviewed and updated regularly as the project progresses and new information becomes available.\n\n### Verification Strategy\n\n# Verification Strategy & Progressive Rollout Plan\n\nThis strategy traces every verification check to the supplied requirements, the Edge-First Decoupled Pipeline architecture, the eight-week implementation plan, and the identified material risks.\n\n## 1. Verification Strategy\n\n### 1.1 Unit & Component Verification\n* **Privacy Compliance (Unit)**: Verify that the detection model output excludes facial features or biometric descriptors.\n\n    *   *Check*: Code review of model output schema; unit tests asserting absence of face/biometric keys in event payloads.\n* **Track ID Lifecycle (Unit)**: Verify that track IDs are scoped to camera/session and expire as defined.\n    *   *Trace*: Derived Constraint: Short-lived track IDs [Requirements & Constraints Analyst]; Risk P1 [Security & Reliability Reviewer].\n    *   *Check*: Unit tests simulating track expiration upon camera exit or timeout. **Owner Decision Needed**: Define exact timeout duration (e.g., 1 hour) and expiration trigger logic.\n* **Event Generation Logic (Unit)**: Verify correct calculation of dwell time and zone entry/exit.\n    *   *Trace*: Functional Criterion: Event Generation [Requirements & Constraints Analyst].\n    *   *Check*: Unit tests with synthetic centroid data validating event thresholds. **Owner Decision Needed**: Define specific alert thresholds (e.g., dwell time > X seconds) [Delivery Planning Agent].\n\n### 1.2 Integration & System Verification\n* **End-to-End Latency (Integration)**: Verify alerts arrive in <2 seconds from visual occurrence.\n\n    *   *Check*: Instrumented end-to-end test using timestamped video injection and alert receipt logging.\n* **Data Retention Enforcement (Integration)**: Verify raw video is deleted after 24 hours and events after 30 days.\n\n    *   *Check*: Automated audit script checking file ages in storage; integration test simulating time passage to verify deletion triggers.\n* **Throughput & Resource Utilization (Integration)**: Verify system handles 12 cameras at 15 FPS without dropping frames or exceeding GPU limits.\n    *   *Trace*: Hard Constraint: 15 FPS input [User brief]; Non-Functional Criterion: GPU <90% [Requirements & Constraints Analyst]; Risk C1 [Security & Reliability Reviewer].\n    *   *Check*: Load test with 12 concurrent RTSP streams.\n\n### 1.3 Security & Privacy Verification\n* **Re-identification Resistance (Security)**: Verify that track IDs cannot be correlated across cameras or time to re-identify individuals.\n    *   *Trace*: Risk P1 [Security & Reliability Reviewer].\n    *   *Check*: Privacy Impact Assessment (PIA) review; static analysis of data flow ensuring no cross-camera ID persistence unless explicitly anonymized.\n* **Storage Security (Security)**: Verify local storage is encrypted and access-controlled.\n    *   *Trace*: Architecture: Local Storage [Systems Architecture Agent].\n    *   *Check*: Configuration audit for disk encryption and API gateway access controls.\n\n### 1.4 Observability & Failure Injection\n* **Observability (Observability)**: Verify monitoring captures latency, GPU utilization, storage usage, and alert rates.\n    *   *Trace*: Increment 4 [Delivery Planning Agent].\n    *   *Check*: Validate Prometheus/Grafana dashboards and alert rules.\n* **Failure Injection (Chaos)**: Verify system behavior under failure conditions.\n    *   *Trace*: Risk A1 (GPU Failure) [Security & Reliability Reviewer]; Risk A2 (Network Instability) [Security & Reliability Reviewer].\n    *   *Check*: Inject GPU failure (simulate crash) to verify graceful degradation or alerting; inject network packet loss to verify stream recovery.\n\n## 2. Progressive Rollout Plan\n\n### Phase 1: Single-Store Pilot (Weeks 7-8, Store 1)\n* **Scope**: Deploy full stack to one retail store.\n* **Entry Criteria**: All unit and integration tests pass in lab environment; benchmarks confirm throughput.\n* **Actions**:\n    1.  Deploy edge box and services to Store 1.\n    2.  Enable monitoring and observability.\n    3.  Run in \"shadow mode\" (processing but not alerting) for 48 hours to validate stability.\n* **Pass Condition**: System runs for 48 hours with >99.9% availability, no privacy leaks, and latency <2s.\n* **Rollback Condition**: Critical bug, privacy violation, or sustained latency >2s. Revert to previous stable version or disable services.\n\n### Phase 2: Multi-Store Expansion (Weeks 8+, Stores 2 & 3)\n* **Scope**: Deploy to remaining two stores.\n* **Entry Criteria**: Store 1 pilot passes all criteria.\n* **Actions**:\n    1.  Deploy edge boxes and services to Stores 2 and 3.\n    2.  Enable monitoring and observability.\n    3.  Run in \"shadow mode\" for 48 hours per store.\n* **Pass Condition**: Both stores run for 48 hours with >99.9% availability, no privacy leaks, and latency <2s.\n* **Rollback Condition**: Critical bug, privacy violation, or sustained latency >2s in either store. Revert to previous stable version or disable services.\n\n### Phase 3: Full Production & Alerting (Post-Pilot)\n* **Scope**: Enable alerting for all stores.\n* **Entry Criteria**: Multi-store expansion passes all criteria; business approves alert thresholds.\n* **Actions**:\n    1.  Enable alerting for all stores.\n    2.  Monitor alert volume and false positive rate.\n* **Pass Condition**: Alert volume is within acceptable limits; false positive rate is low.\n* **Rollback Condition**: Excessive false positives or alert fatigue. Disable alerting and tune thresholds.\n\n## 3. Open Decisions & Required Benchmarks\n\n### Critical Benchmarks (Must Be Completed Before Phase 1)\n\n3. **End-to-End Latency**: Measure latency from frame capture to alert generation under load.\n\n### Owner Decisions Needed\n1. **Track ID Timeout**: Define exact duration for track ID expiration (e.g., 1 hour).\n2. **Alert Thresholds**: Define specific thresholds for alerts (e.g., dwell time > X seconds).\n3. **Camera Resolution & Codec**: Confirm resolution and codec for RTSP streams to finalize storage and bandwidth calculations.\n\n### Engineering Recommendation\n\n# Engineering Recommendation: Privacy-Preserving Retail Person Tracking\n\n## Executive Summary\nThis recommendation synthesizes requirements, architecture, delivery planning, risk assessment, and verification strategies into a single decision-ready plan for an eight-week pilot. The proposed **Edge-First Decoupled Pipeline** architecture satisfies all hard constraints, including strict privacy compliance (no biometrics), <2s alert latency, and 99.9% availability, while explicitly surfacing critical open decisions and benchmarking requirements.\n\n## 1. Recommended Architecture: Edge-First Decoupled Pipeline\nThe system is designed as three autonomous islands, one per store, to minimize network dependency and ensure privacy by design.\n\n### Component Topology (Per Store)\n1. **Ingestion Service**: Pulls 12 RTSP streams at 15 FPS. Converts frames to a standardized internal format (e.g., NV12).\n2. **Detection & Tracking Engine**: Runs on the NVIDIA L4 GPU. Uses a lightweight model (e.g., YOLOv8-nano) for person detection and a multi-object tracker (e.g., ByteTrack) for anonymous, short-lived track IDs.\n3. **Event Processor**: Consumes track centroids to generate derived events (Zone Entry, Dwell Time) and alerts.\n4. **Storage Layer**:\n    *   **Raw Video**: Circular buffer on local NVMe/SSD. Retention: 24 hours.\n    *   **Events**: Local time-series database (e.g., TimescaleDB). Retention: 30 days.\n5. **API Gateway**: Exposes event queries and alert subscriptions. Does not expose raw video or tracking metadata externally.\n\n### Tradeoff Analysis\n* **Rejected Option: Centralized Cloud Processing**. Rejected due to high bandwidth costs, latency violations (>2s alerts) from network jitter, and severe privacy risks as raw video leaves the premises.\n* **Selected Option: Edge-First Decoupled Pipeline**.\n    *   *Advantages*: Ensures privacy (raw video stays local), meets latency targets (<2s), and achieves 99.9% availability via local redundancy.\n    *   *Disadvantages*: Throughput risk. The L4 GPU must handle 12 cameras at 15 FPS simultaneously. This requires rigorous benchmarking to confirm feasibility.\n\n## 2. Implementation Plan: Eight-Week Pilot\nThe pilot is divided into four two-week increments, delivering verifiable slices of functionality.\n\n### Increment 1: Foundation & Inference Benchmarking (Weeks 1–2)\n* **Goal**: Establish hardware readiness and validate model throughput.\n* **Actions**:\n    *   Provision three NVIDIA L4 edge boxes with Ubuntu 22.04 LTS, NVIDIA Container Toolkit, and Docker Compose.\n    *   Deploy RTSP ingestion service for 12 cameras per store.\n    *   **Critical Benchmark**: Run detection/tracking model (e.g., YOLOv8 + ByteTrack) on L4 GPU. Measure FPS per camera at 15 FPS input. *Assumption*: Model runs at ≥15 FPS per camera. Verify ingestion service handles 12 streams without frame drops.\n\n### Increment 2: Event Processing & Local Storage (Weeks 3–4)\n* **Goal**: Implement event processing and storage policies.\n* **Actions**:\n    *   Deploy event processor for derived events (dwell time, zone entry).\n    *   Configure local storage with RAID for redundancy.\n    *   Implement retention policies: Delete raw video after 24 hours and events after 30 days.\n    *   **Verification**: Simulate disk failure to verify RAID redundancy.\n\n### Increment 3: Alerting & Integration (Weeks 5–6)\n* **Goal**: Validate end-to-end latency and alerting.\n* **Actions**:\n    *   Connect event processor to alerting engine.\n    *   **Critical Path**: Ensure alerts arrive in under 2 seconds.\n\n### Increment 4: Hardening, Rollout & Pilot Validation (Weeks 7–8)\n* **Goal**: Deploy to all three stores and finalize compliance.\n* **Actions**:\n    *   Conduct load testing and privacy compliance documentation.\n    *   **Critical Path**: Achieve 99.9% availability and resolve privacy leak risks.\n\n## 3. Risk Register & Mitigations\n### Privacy & Compliance Risks\n* **P1: Re-identification via Trajectory Correlation**.\n    *   *Risk*: Correlating anonymous track IDs across cameras/time may allow re-identification.\n    *   *Mitigation*: Strict track ID expiration (reset on camera exit/timeout). Avoid cross-camera persistence unless anonymized. Conduct Privacy Impact Assessment (PIA).\n* **P2: Data Retention Policy Enforcement Failure**.\n    *   *Risk*: Failure to delete raw video after 24h or events after 30d.\n    *   *Mitigation*: Automated, immutable deletion policies. Monitoring alerts for violations. Regular audits.\n\n### Availability & Reliability Risks\n* **A1: Edge Box Hardware Failure**.\n    *   *Risk*: GPU/CPU/storage failure causes complete loss of tracking for a store.\n    *   *Mitigation*: RAID for storage. Graceful degradation (CPU fallback if feasible). Rapid replacement procedures. *Residual Risk*: High. Single point of failure per store; 99.9% availability requires MTTR < 8.76 hours/year.\n\n## 4. Verification Strategy\n### Quality Gates\n* **Privacy Compliance**: Code review ensuring no facial/biometric data in event payloads. Unit tests for track ID expiration.\n* **End-to-End Latency**: Instrumented test verifying alerts arrive in <2 seconds from visual occurrence.\n* **Data Retention**: Automated audit script verifying file ages and deletion triggers.\n* **Throughput**: Load test with 12 concurrent RTSP streams to verify no frame drops and GPU utilization <90%.\n\n## 5. Open Decisions & Required Benchmarks\n### Critical Unknowns (Must Be Resolved Before Implementation)\n1. **Camera Resolution & Codec**: The query specifies 15 FPS but not resolution (e.g., 1080p, 4K) or codec (H.264, H.265). This drastically impacts bandwidth, storage, and decoding overhead.\n2. **Track ID Timeout Duration**: Define exact timeout duration (e.g., 1 hour) and expiration trigger logic for short-lived track IDs.\n3. **Alert Thresholds**: Define specific alert thresholds (e.g., dwell time > X seconds).\n\n### Required Benchmarks\n* **Model Throughput**: Benchmark selected detection/tracking model (e.g., YOLOv8 + ByteTrack) on NVIDIA L4 GPU. Measure FPS per camera at 15 FPS input. *Do not assume throughput; measure it*.\n* **Ingestion Throughput**: Verify ingestion service handles 12 streams simultaneously without dropping frames.\n\n## 6. Next Actions\n1. **Resolve Open Decisions**: Team lead to define camera resolution/codec, track ID timeout, and alert thresholds.\n2. **Benchmarking**: Infrastructure Engineer to perform model and ingestion throughput benchmarks in Week 1.\n3. **Privacy Impact Assessment**: Conduct PIA to evaluate re-identification risks and legal compliance.\n4. **Procurement**: Ensure NVIDIA L4 edge boxes and storage hardware are procured and ready for Week 1 provisioning.",
+        "answer_sha256": "78d5897ae69eb255fffe019076b03b88eed5b8c2be0b064980005ddca544867a",
+        "metrics": {
+          "elapsed_seconds": 671.593,
+          "answer_words": 4596,
+          "answer_characters": 35644,
+          "required_outcomes_covered": 12,
+          "required_outcomes_total": 12,
+          "coverage_rate": 1.0,
+          "coverage_per_1000_answer_words": 2.61,
+          "model_usage": {
+            "calls_reported": 7,
+            "prompt_tokens": 34256,
+            "completion_tokens": 15006,
+            "total_tokens": 49262
+          }
+        },
+        "score": {
+          "score": 12,
+          "maximum": 12,
+          "rate": 1.0,
+          "criteria": [
+            {
+              "id": "privacy_identity",
+              "label": "Rejects biometric identity and uses anonymous track IDs",
+              "met": true,
+              "evidence": [
+                "y Gates * **Privacy Compliance**: Code review ensuring no facial/biometric data in event payloads. Unit tests for track ID expiration. * **End-to-End Latency**",
+                "bject tracker (e.g., ByteTrack or OC-SORT) to assign **anonymous, short-lived track IDs**. 3. **Event Processor**: * Consumes track centroids. * Calculates derived e"
+              ]
+            },
+            {
+              "id": "scale_capacity",
+              "label": "Accounts for all 36 cameras and 15 FPS load",
+              "met": true,
+              "evidence": [
+                "ker Compose. * Deploy RTSP ingestion service for 12 cameras per store. * **Critical Benchmark**: Run detection/tracking model (e.g., YOLOv8 + ByteTrack) on L4",
+                "ric identity. The design addresses hard constraints of 15 FPS camera input, <2s alert latency, 99.9% availability, and specific data retention policies (24h"
+              ]
+            },
+            {
+              "id": "edge_architecture",
+              "label": "Defines RTSP-to-edge processing and cloud/control boundaries",
+              "met": true,
+              "evidence": [
+                "ce by design. ### 2.1 System Boundary * **In-Scope**: RTSP ingestion, object detection, tracking, event generation, local storage, and anonymous ID manag",
+                "the recommended system architecture for a distributed, edge-first computer vision system across three retail locations. The system tracks person movement",
+                "tecture Options & Tradeoffs ### Option A: Centralized Cloud Processing (Rejected) * **Description**: Stream raw video to a central cloud server for proces"
+              ]
+            },
+            {
+              "id": "tracking_pipeline",
+              "label": "Specifies detection, association, and track lifecycle",
+              "met": true,
+              "evidence": [
+                "System Boundary * **In-Scope**: RTSP ingestion, object detection, tracking, event generation, local storage, and anonymous ID management. ### 2.2 Component",
+                "ture Decision Record: Privacy-Preserving Retail Person Tracking ## 1. Context & Scope This document defines the recommended system architecture for a dist",
+                "ding boxes. * Uses a multi-object tracker (e.g., ByteTrack or OC-SORT) to assign **anonymous, short-lived track IDs**. 3. **Event Processor**: * C"
+              ]
+            },
+            {
+              "id": "event_contract",
+              "label": "Provides a concrete API or event schema",
+              "met": true,
+              "evidence": [
+                "riptors. * *Check*: Code review of model output schema; unit tests asserting absence of face/biometric keys in event payloads. * **Track ID Lifecycle",
+                "teTrack or OC-SORT) to assign **anonymous, short-lived track IDs**. 3. **Event Processor**: * Consumes track centroids. * Calculates derived even",
+                ". * *Check*: Instrumented end-to-end test using timestamped video injection and alert receipt logging. * **Data Retention Enforcement (Integration)**: V"
+              ]
+            },
+            {
+              "id": "latency_design",
+              "label": "Turns the under-two-second constraint into a measurable latency design",
+              "met": true,
+              "evidence": [
+                "ign addresses hard constraints of 15 FPS camera input, <2s alert latency, 99.9% availability, and specific data retention policies (24h raw video, 30d ev",
+                "ution, or camera count. * **Latency Profile**: Measure end-to-end latency from frame capture to alert generation. * *Assumption*: Local processing will me"
+              ]
+            },
+            {
+              "id": "retention",
+              "label": "Implements both 24-hour video and 30-day event retention",
+              "met": true,
+              "evidence": [
+                "9% availability, and specific data retention policies (24h raw video, 30d events). ## 2. Recommended Architecture: Edge-First Decoupled Pipeline The re",
+                "s database (e.g., TimescaleDB or InfluxDB). Retention: 30 days. 5. **API Gateway**: Exposes endpoints for event queries and alert subscriptions. Does not exp",
+                "king. ## 4. Risks & Mitigations * **R1: Throughput Bottleneck**: If the chosen model runs at <15 FPS per camera on the L4, the system will drop frames."
+              ]
+            },
+            {
+              "id": "security",
+              "label": "Includes layered security and privacy controls",
+              "met": true,
+              "evidence": [
+                "Storage Security (Security)**: Verify local storage is encrypted and access-controlled. * *Trace*: Architecture: Local Storage [Systems Architecture Ag",
+                "onfiguration audit for disk encryption and API gateway access controls. ### 1.4 Observability & Failure Injection * **Observability (Observability)**: Verify monit",
+                "gineering Lead**: Oversees the pilot, conducts privacy audits, and manages open decisions. This plan provides a clear, executable path to delivering the p"
+              ]
+            },
+            {
+              "id": "delivery",
+              "label": "Maps an eight-week pilot to owners or staffing",
+              "met": true,
+              "evidence": [
+                "nalytics. * **Failure Modes**: Adds complexity for the 8-week pilot; potential privacy leaks if cross-store correlation is attempted. * **Rejection Reason**",
+                "g, configuration, deployment, migration, verification, ownership, and rollback actions for three retail locations, each equipped with 12 RTSP cameras and o"
+              ]
+            },
+            {
+              "id": "verification",
+              "label": "Uses tracking-quality plus load/failure verification",
+              "met": true,
+              "evidence": [
+                "diagnose why tracking fails (e.g., missed detections, ID switches) due to lack of observability into the model’s decisions. * **Impact**: Prolonged debugging;",
+                "on** * Goal: Deploy to all three stores, conduct load testing, and finalize privacy compliance documentation. * Critical Path: Achieving 99.9% avai"
+              ]
+            },
+            {
+              "id": "reliability",
+              "label": "Operationalizes the 99.9% availability target",
+              "met": true,
+              "evidence": [
+                "constraints of 15 FPS camera input, <2s alert latency, 99.9% availability, and specific data retention policies (24h raw video, 30d events). ## 2. Recomme",
+                "s. | Implement RAID 1/5 on local storage. Monitor disk health. | | **Privacy Leak** | Re-identification via track correlation. | Reset track IDs periodicall"
+              ]
+            },
+            {
+              "id": "uncertainty",
+              "label": "Surfaces throughput benchmarks, tradeoffs, and open decisions",
+              "met": true,
+              "evidence": [
+                "ultaneously. This requires careful model selection and benchmarking. * **Operational Cost**: Requires on-prem hardware maintenance and local storage mana",
+                "nsumers (if configured). ## 3. Architecture Options & Tradeoffs ### Option A: Centralized Cloud Processing (Rejected) * **Description**: Stream raw video to",
+                "s locally; retry when connection is restored. | ## 5. Open Decisions & Assumptions ### 5.1 Critical Benchmarks Required * **Model Throughput**: **Must benchmark*"
+              ]
+            }
+          ]
+        },
+        "agents": [
+          "Requirements & Constraints Analyst",
+          "Systems Architecture Agent",
+          "Delivery Planning Agent",
+          "Security & Reliability Reviewer",
+          "Verification & Rollout Agent",
+          "Engineering Lead Agent"
+        ],
+        "catalog_digest": "804a80c1e900a2a578838890adf3eb2642b8d970d8f76cfe28ac08bcd833cb9f",
+        "pipeline_completed": true
+      }
+    },
+    {
+      "id": "marketing_match3_launch",
+      "title": "Decision-ready Match-3 launch plan",
+      "team_name": "Marketing",
+      "prompt": "I'm going to market a new free-to-play Match-3 mobile game and need to know where to start. The test budget is $25,000 across the US, UK, and Canada on iOS and Android. There is no existing audience or licensed IP; monetization is ads plus in-app purchases; soft launch is in six weeks. We have gameplay video but no validated personas or performance claims. Can you guide us with a plan the team can actually execute? Clearly separate supplied facts from hypotheses, tell us what to test before scaling, and do not invent industry benchmarks.",
+      "rubric": [
+        {
+          "id": "fact_hypothesis",
+          "label": "Separates supplied facts from hypotheses"
+        },
+        {
+          "id": "audience",
+          "label": "Defines testable audience hypotheses without invented personas"
+        },
+        {
+          "id": "positioning",
+          "label": "Provides positioning and differentiation"
+        },
+        {
+          "id": "claim_safety",
+          "label": "Uses claim-safe messages and acknowledges missing evidence"
+        },
+        {
+          "id": "budget",
+          "label": "Allocates the $25K test budget across named channels"
+        },
+        {
+          "id": "creative_matrix",
+          "label": "Defines a multi-variable creative test matrix"
+        },
+        {
+          "id": "sequence",
+          "label": "Sequences the 30-day campaign toward the six-week soft launch"
+        },
+        {
+          "id": "instrumentation",
+          "label": "Specifies an analytics event schema"
+        },
+        {
+          "id": "kpis",
+          "label": "Defines CPI, D1/D7 retention, and ROAS gates"
+        },
+        {
+          "id": "experiments",
+          "label": "Expresses experiments as hypotheses or A/B tests"
+        },
+        {
+          "id": "stop_scale",
+          "label": "Provides explicit stop and scale rules"
+        },
+        {
+          "id": "ownership_risk",
+          "label": "Assigns owners and surfaces risks/open questions"
+        }
+      ],
+      "base": {
+        "answer": "This is a lean, high-risk scenario. With $25,000 across three major English-speaking markets and no IP, you cannot afford to \"brand\" your way to success. You must validate **product-market fit** and **user acquisition efficiency** before the soft launch.\n\nHere is the execution plan, strictly separated into facts and hypotheses, followed by the testing protocol.\n\n### Part 1: Facts vs. Hypotheses\n\n**Supplied Facts (Constraints & Assets)**\n1.  **Budget:** $25,000 total.\n2.  **Markets:** US, UK, Canada (Tier 1 markets; high CPI, high LTV potential).\n3.  **Platforms:** iOS and Android.\n4.  **Timeline:** 6 weeks until soft launch.\n5.  **Assets:** Gameplay video exists. No existing audience. No licensed IP.\n6.  **Monetization Model:** Hybrid (Ads + IAP).\n7.  **Current State:** No validated personas, no performance claims.\n\n**Hypotheses (Assumptions to be Tested)**\n1.  **Creative Hypothesis:** The current gameplay video will generate a Click-Through Rate (CTR) > 1.5% and a Cost Per Install (CPI) < $1.50 in Tier 1 markets.\n2.  **Audience Hypothesis:** The game appeals to a specific demographic (e.g., women 35-54, casual puzzle fans) rather than a broad \"everyone\" audience.\n3.  **Retention Hypothesis:** Users who install will retain at Day 1 (D1) > 35% and Day 7 (D7) > 15%.\n4.  **Monetization Hypothesis:** The hybrid model will generate enough early revenue (ARPU) to offset the high CPI of Tier 1 markets within the first 7 days.\n5.  **Platform Hypothesis:** iOS and Android will have similar CPI and retention profiles (this is often false; iOS users often spend more but cost more to acquire).\n\n---\n\n### Part 2: The 6-Week Execution Plan\n\n**Goal:** Determine if the game is viable to scale. If key metrics fail, you pivot or cancel before the soft launch.\n\n#### Week 1: Infrastructure & Creative Prep (Zero Spend)\n*   **Analytics Setup:** Implement deep-linking and event tracking. You must track: Install, First Level Complete, First Ad Watch, First IAP, D1/D7/D14 Retention.\n*   **Creative Variants:** Do not rely on one video. Create 3 distinct creative angles from your gameplay footage:\n    1.  **Pure Gameplay:** Fast-paced, satisfying matches, no text.\n    2.  **Problem/Solution:** \"Stuck on level 50? Use this hint!\" (Implies depth).\n    3.  **Social/Competitive:** \"Beat your friends' scores!\" (Implies community).\n*   **Store Listing:** Prepare a basic App Store/Play Store listing. You need a live link to test installs.\n\n#### Week 2-3: The \"Smoke Test\" (Spend: $5,000)\n*   **Objective:** Validate Creative CTR and Initial CPI.\n*   **Platform:** Meta (Facebook/Instagram) Ads Manager. *Why? It’s the fastest way to get data on creative performance and audience targeting.*\n*   **Strategy:**\n    *   Split budget: $1,666 per market (US, UK, CA).\n    *   Split budget: 50% iOS, 50% Android.\n    *   Run 3 ad sets (one per creative variant) per market/platform.\n    *   **Targeting:** Broad interest targeting (e.g., \"Puzzle games,\" \"Candy Crush,\" \"Match-3\"). Do not over-segment yet.\n*   **Success Metric:**\n    *   **CTR:** > 1.5%. If lower, your creative is weak. Kill underperforming variants.\n    *   **CPI:** < $2.00. If higher, your creative isn't resonating, or the market is too expensive for your current hook.\n\n#### Week 4-5: The \"Retention & Monetization\" Test (Spend: $15,000)\n*   **Objective:** Validate D1/D7 Retention and Early ARPU (Average Revenue Per User).\n*   **Platform:** Meta + TikTok (if feasible) or Google UAC. *Stick to Meta for consistency if team is small.*\n*   **Strategy:**\n    *   Focus budget on the **top 2 performing creatives** from Weeks 2-3.\n    *   Increase daily spend to get statistically significant data (aim for 500-1,000 installs per variant).\n    *   **Critical:** Ensure your analytics are tracking *revenue* from ads and IAPs.\n*   **Success Metrics (The \"Go/No-Go\" Gates):**\n    *   **D1 Retention:** > 35%. (If < 30%, the core loop is broken. Do not scale.)\n    *   **D7 Retention:** > 15%. (If < 10%, long-term viability is low.)\n    *   **CPI:** < $1.50. (Tier 1 markets are expensive; you need efficiency.)\n    *   **Day 7 ARPU:** > $0.10. (This is a conservative baseline for hybrid models. If lower, your monetization is too weak.)\n\n#### Week 6: Analysis & Soft Launch Prep (Spend: $5,000)\n*   **Objective:** Final validation and audience segmentation.\n*   **Strategy:**\n    *   Run a small test to see if **gender** or **age** segments perform differently.\n    *   Test a new creative angle based on insights from Weeks 2-5 (e.g., if \"Problem/Solution\" worked, try a \"Tutorial\" angle).\n    *   **Final Decision:** Based on aggregated data, decide:\n        1.  **Scale:** Metrics meet thresholds. Proceed to soft launch with optimized creatives and targeting.\n        2.  **Pivot:** Retention is good, but CPI is high. Need better creatives or cheaper markets (e.g., Brazil, India) for scale.\n        3.  **Kill:** Retention is poor. Core gameplay needs redesign.\n\n---\n\n### Part 3: What to Test Before Scaling\n\nDo not scale until you have validated these three pillars:\n\n1.  **Creative Efficiency:**\n    *   *Test:* Which creative angle (Gameplay, Problem/Solution, Social) drives the lowest CPI?\n    *   *Why:* In Match-3, creative is 80% of your success. You need 5-10 winning creatives before scaling.\n\n2.  **Core Loop Retention:**\n    *   *Test:* D1 and D7 retention rates.\n    *   *Why:* If users don’t come back, no amount of marketing will save you. This is a product issue, not a marketing issue.\n\n3.  **Monetization Balance:**\n    *   *Test:* Ratio of Ad Revenue vs. IAP Revenue.\n    *   *Why:* If 90% of revenue is from IAP, you’re missing out on the \"free\" audience. If 90% is from ads, you’re annoying users and hurting retention. Aim for a balanced hybrid (e.g., 60% Ads / 40% IAP or vice versa, depending on your design).\n\n---\n\n### Part 4: Critical Warnings & Next Steps\n\n*   **No Benchmarks:** I have not provided industry benchmarks because they vary wildly by sub-genre, art style, and time. Use the **thresholds** above as *minimums* for viability. If you exceed them, you’re in good shape. If you fall short, you have a problem.\n*   **Tier 1 Markets are Expensive:** US/UK/CA have high CPIs. If your CPI is $2.00, you need a Day 7 ARPU of at least $0.20-$0.30 to break even. Be realistic.\n*   **Soft Launch is Not a Launch:** The soft launch is for **tuning**, not scaling. Do not spend your entire $25k on the soft launch. Use this test to prove the model, then raise more capital or use organic growth for the actual launch.\n*   **Team Execution:**\n    *   **Day 1:** Set up analytics and ad accounts.\n    *   **Day 3:** Finalize 3 creative variants.\n    *   **Day 7:** Launch Week 2 test.\n    *   **Day 14:** Review Week 2 data, kill losers, scale winners.\n    *   **Day 21:** Launch Week 4 test.\n    *   **Day 35:** Final analysis.\n\n**Immediate Action:** Start building the 3 creative variants and setting up analytics today. Time is your scarcest resource.",
+        "answer_sha256": "d25008c58745fdda65978cfa1f79bd1f5699c9da0136ac6bdb74105ea49b9d87",
+        "metrics": {
+          "elapsed_seconds": 74.644,
+          "answer_words": 1034,
+          "answer_characters": 6959,
+          "required_outcomes_covered": 5,
+          "required_outcomes_total": 12,
+          "coverage_rate": 0.4167,
+          "coverage_per_1000_answer_words": 4.84,
+          "model_usage": {
+            "calls_reported": 1,
+            "prompt_tokens": 172,
+            "completion_tokens": 1994,
+            "total_tokens": 2166
+          }
+        },
+        "score": {
+          "score": 5,
+          "maximum": 12,
+          "rate": 0.4167,
+          "criteria": [
+            {
+              "id": "fact_hypothesis",
+              "label": "Separates supplied facts from hypotheses",
+              "met": true,
+              "evidence": [
+                "testing protocol. ### Part 1: Facts vs. Hypotheses **Supplied Facts (Constraints & Assets)** 1. **Budget:** $25,000 total. 2. **Markets:** US, UK, Canada (Tier",
+                "the execution plan, strictly separated into facts and hypotheses, followed by the testing protocol. ### Part 1: Facts vs. Hypotheses **Supplied Facts (Cons"
+              ]
+            },
+            {
+              "id": "audience",
+              "label": "Defines testable audience hypotheses without invented personas",
+              "met": true,
+              "evidence": [
+                "ch. 5. **Assets:** Gameplay video exists. No existing audience. No licensed IP. 6. **Monetization Model:** Hybrid (Ads + IAP). 7. **Current State:** No val",
+                "the execution plan, strictly separated into facts and hypotheses, followed by the testing protocol. ### Part 1: Facts vs. Hypotheses **Supplied Facts (Cons",
+                "s to a specific demographic (e.g., women 35-54, casual puzzle fans) rather than a broad \"everyone\" audience. 3. **Retention Hypothesis:** Users who install"
+              ]
+            },
+            {
+              "id": "positioning",
+              "label": "Provides positioning and differentiation",
+              "met": false,
+              "evidence": []
+            },
+            {
+              "id": "claim_safety",
+              "label": "Uses claim-safe messages and acknowledges missing evidence",
+              "met": true,
+              "evidence": [
+                "Current State:** No validated personas, no performance claims. **Hypotheses (Assumptions to be Tested)** 1. **Creative Hypothesis:** The current gameplay",
+                "on Model:** Hybrid (Ads + IAP). 7. **Current State:** No validated personas, no performance claims. **Hypotheses (Assumptions to be Tested)** 1. **Creative Hyp"
+              ]
+            },
+            {
+              "id": "budget",
+              "label": "Allocates the $25K test budget across named channels",
+              "met": true,
+              "evidence": [
+                "This is a lean, high-risk scenario. With $25,000 across three major English-speaking markets and no IP, you cannot afford to \"brand\" your way t",
+                "lidate Creative CTR and Initial CPI. * **Platform:** Meta (Facebook/Instagram) Ads Manager. *Why? It’s the fastest way to get data on creative performan",
+                "heses **Supplied Facts (Constraints & Assets)** 1. **Budget:** $25,000 total. 2. **Markets:** US, UK, Canada (Tier 1 markets; high CPI, high LTV potentia"
+              ]
+            },
+            {
+              "id": "creative_matrix",
+              "label": "Defines a multi-variable creative test matrix",
+              "met": false,
+              "evidence": []
+            },
+            {
+              "id": "sequence",
+              "label": "Sequences the 30-day campaign toward the six-week soft launch",
+              "met": true,
+              "evidence": [
+                "ail, you pivot or cancel before the soft launch. #### Week 1: Infrastructure & Creative Prep (Zero Spend) * **Analytics Setup:** Implement deep-linking a",
+                "3. **Platforms:** iOS and Android. 4. **Timeline:** 6 weeks until soft launch. 5. **Assets:** Gameplay video exists. No existing audience. No licensed IP"
+              ]
+            },
+            {
+              "id": "instrumentation",
+              "label": "Specifies an analytics event schema",
+              "met": false,
+              "evidence": []
+            },
+            {
+              "id": "kpis",
+              "label": "Defines CPI, D1/D7 retention, and ROAS gates",
+              "met": false,
+              "evidence": []
+            },
+            {
+              "id": "experiments",
+              "label": "Expresses experiments as hypotheses or A/B tests",
+              "met": false,
+              "evidence": []
+            },
+            {
+              "id": "stop_scale",
+              "label": "Provides explicit stop and scale rules",
+              "met": false,
+              "evidence": []
+            },
+            {
+              "id": "ownership_risk",
+              "label": "Assigns owners and surfaces risks/open questions",
+              "met": false,
+              "evidence": []
+            }
+          ]
+        }
+      },
+      "team": {
+        "answer": "# Execution-Ready Soft Launch Plan: Free-to-Play Match-3 Game\n\nThis plan provides a concrete, six-week strategy for your soft launch. It strictly separates **Verified Constraints** (facts you provided) from **Testable Hypotheses** (assumptions you must validate). No industry benchmarks are invented; all decisions rely on internal data generated during the test.\n\n## 1. Verified Constraints (Supplied Facts)\n*These are the non-negotiable inputs for this plan.*\n\n* **Product:** Free-to-play (F2P) Match-3 mobile game.\n* **Monetization:** Hybrid model (Ads + In-App Purchases/IAP).\n* **Budget:** $25,000 total test budget.\n* **Timeline:** Soft launch in six weeks.\n* **Platforms:** iOS and Android.\n\n* **Assets:** Gameplay video available; no existing audience; no licensed IP.\n\n## 2. Strategic Positioning & Audience Hypotheses\n*Since there is no existing audience or IP, we must test assumptions about who plays and why. These are hypotheses, not facts.*\n\n### Core Positioning\n* **Value Proposition:** \"Free, fair, and fun.\"\n* **Differentiation:** Emphasize player choice. The hybrid model allows users to watch ads for rewards *or* buy them, addressing the common \"pay-to-win\" objection in the genre.\n* **Voice:** Simple, encouraging, and non-competitive. Avoid \"hardcore\" gaming jargon to appeal to casual players.\n\n### Audience Hypotheses to Test\n1. **The \"Casual Time-Filler\":** Broad demographic (25–55+), skewing female. Motivated by relaxation and low-stakes wins. *Test:* Monitor session length and Day 1 retention.\n2. **The \"Ad-Tolerant Free Player\":** Price-sensitive users who prefer free content. *Test:* Track Rewarded Video Watch Rate vs. Churn. High watch rates with low churn validate this segment.\n3. **The \"Whale/High-Value IAP User\":** Smaller segment with higher disposable income. *Test:* Track IAP Conversion Rate and Average Revenue Per Paying User (ARPPU).\n\n## 3. Campaign Execution Plan (6 Weeks)\n*This plan allocates the $25,000 budget across three phases to maximize learning and minimize waste.*\n\n### Phase 1: Weeks 1–2 (Launch & Baseline)\n* **Goal:** Establish internal baselines for Cost Per Install (CPI), Retention, and Lifetime Value (LTV).\n* **Budget Allocation:** 50% ($12,500) to establish initial data.\n* **Channels:** Paid User Acquisition (UA) in US, UK, and Canada.\n* **Creative Concepts:**\n    *   **Concept 1: \"The Fair Play Promise\" (Video):** 15s/30s gameplay clips with overlay text: \"No Pay-to-Win. Just Play.\" [Campaign Systems Designer].\n    *   **Concept 2: \"Fairness Explained\" (Static/Carousel):** 3-card carousel explaining the Ad vs. IAP choice [Campaign Systems Designer].\n* **Targeting:** Broad interest targeting (Puzzle, Match-3).\n\n### Phase 2: Weeks 3–4 (Optimization & Learning)\n* **Goal:** Validate creative efficacy and regional performance.\n* **Actions:**\n    *   **A/B Test 1 (Creative):** Compare Video vs. Static CPI. If Video CPI is >10% higher than Static CPI, pause video ads and iterate creative [Measurement & Learning Strategist].\n    *   **Organic Social:** Launch \"Behind the Blocks\" Dev Diary videos on TikTok/Reels to build community and gather qualitative feedback on \"fairness\" perception [Campaign Systems Designer].\n    *   **Regional Shift:** If one region (US, UK, or Canada) shows >20% better CPI or Return on Ad Spend (ROAS), shift 50% of the remaining budget from underperforming regions to the winner [Measurement & Learning Strategist].\n\n### Phase 3: Weeks 5–6 (Decision & Scale Prep)\n* **Goal:** Determine Go/No-Go for scaling based on LTV/CPI ratio.\n* **Actions:**\n    *   **A/B Test 2 (Monetization):** Compare High Ad Frequency/Low IAP Prompt vs. Low Ad Frequency/High IAP Prompt [Measurement & Learning Strategist].\n    *   **Decision Gate:** If Day 7 LTV > CPI by 20%, proceed to scale. If LTV < CPI, pause scaling and iterate on gameplay or creative [Measurement & Learning Strategist].\n\n## 4. Measurement & Learning Framework\n*You cannot manage what you do not measure. Instrument these events before launch.*\n\n### Key Metrics to Track\n* **Acquisition:** CPI by Region/Creative.\n* **Activation:** Tutorial Completion, First Match-3 Level Completed, First Rewarded Video Watch.\n* **Retention:** Day 1, Day 7, Day 30 Active Users.\n* **Monetization:** Rewarded Video Frequency, IAP ARPU, LTV (Day 7, Day 30).\n\n### Decision Thresholds\n1. **Go/No-Go for Scaling:**\n    *   *Condition:* Day 7 LTV > CPI by 20%.\n    *   *Action:* Proceed to scale.\n    *   *Failure:* LTV < CPI. Pause scaling and iterate [Measurement & Learning Strategist].\n2. **Creative Pivot:**\n    *   *Condition:* Video CPI > Static CPI by 10%.\n    *   *Action:* Pause video ads and iterate creative [Measurement & Learning Strategist].\n3. **Regional Shift:**\n    *   *Condition:* One region shows >20% better CPI or ROAS.\n    *   *Action:* Shift 50% of budget from underperforming regions to the winner [Measurement & Learning Strategist].\n\n## 5. Critical Risks & Mitigations\n* **Risk 1: \"Another Generic Clone.\"**\n    *   *Mitigation:* Emphasize \"Fairness\" and \"Polished Gameplay\" in creative. Differentiate via art style or unique mechanics [Audience & Context Analyst].\n* **Risk 2: \"Too Many Ads.\"**\n    *   *Mitigation:* A/B test ad frequency caps. Monitor churn correlation closely. If ad load is perceived as excessive, retention will drop sharply [Audience & Context Analyst].\n* **Risk 3: \"Pay-to-Win.\"**\n    *   *Mitigation:* Clearly communicate the hybrid model (Ad vs. IAP choice) in the first 3 levels via in-app messaging [Campaign Systems Designer].\n* **Risk 4: Regulatory Compliance.**\n    *   *Mitigation:* Ensure compliance with Apple App Store and Google Play policies, GDPR (UK/Canada), and CCPA (US).\n\n## 6. Next Actions for the Team\n1. **Instrumentation:** Ensure all funnel events (Install, Tutorial Completion, First Rewarded Video Watch, etc.) are tracked in the analytics platform before launch.\n2. **Creative Prep:** Finalize the \"Fair Play Promise\" video and \"Fairness Explained\" carousel assets.\n3. **Baseline Setup:** Define internal baselines for CPI and Retention during Week 1. Do not invent industry benchmarks.\n4. **Launch:** Begin Paid UA campaigns in US, UK, and Canada with 50% of the budget.\n5. **Review:** Conduct a weekly review of CPI, Retention, and LTV data to inform budget shifts and creative pivots.\n\nThis plan provides a clear, evidence-based foundation for the soft launch. All claims are either supported by supplied facts or explicitly labeled as hypotheses to be tested within the $25,000 budget over the six-week timeline.",
+        "answer_sha256": "0d8edae8020dd1dc0070adde6fcd4dadd8948174f4821abde8a44f9b0b84ad17",
+        "metrics": {
+          "elapsed_seconds": 755.654,
+          "answer_words": 896,
+          "answer_characters": 6533,
+          "required_outcomes_covered": 9,
+          "required_outcomes_total": 12,
+          "coverage_rate": 0.75,
+          "coverage_per_1000_answer_words": 10.04,
+          "model_usage": {
+            "calls_reported": 10,
+            "prompt_tokens": 42483,
+            "completion_tokens": 19190,
+            "total_tokens": 61673
+          }
+        },
+        "score": {
+          "score": 9,
+          "maximum": 12,
+          "rate": 0.75,
+          "criteria": [
+            {
+              "id": "fact_hypothesis",
+              "label": "Separates supplied facts from hypotheses",
+              "met": true,
+              "evidence": [
+                "enerated during the test. ## 1. Verified Constraints (Supplied Facts) *These are the non-negotiable inputs for this plan.* * **Product:** Free-to-play (F2P) Match",
+                "ied Constraints** (facts you provided) from **Testable Hypotheses** (assumptions you must validate). No industry benchmarks are invented; all decisions rely o"
+              ]
+            },
+            {
+              "id": "audience",
+              "label": "Defines testable audience hypotheses without invented personas",
+              "met": true,
+              "evidence": [
+                ". * **Assets:** Gameplay video available; no existing audience; no licensed IP. ## 2. Strategic Positioning & Audience Hypotheses *Since there is no existin",
+                "ied Constraints** (facts you provided) from **Testable Hypotheses** (assumptions you must validate). No industry benchmarks are invented; all decisions rely o",
+                "Designer]. * **Targeting:** Broad interest targeting (Puzzle, Match-3). ### Phase 2: Weeks 3–4 (Optimization & Learning) * **Goal:** Validate creative eff"
+              ]
+            },
+            {
+              "id": "positioning",
+              "label": "Provides positioning and differentiation",
+              "met": true,
+              "evidence": [
+                "no existing audience; no licensed IP. ## 2. Strategic Positioning & Audience Hypotheses *Since there is no existing audience or IP, we must test assumptions",
+                "ng * **Value Proposition:** \"Free, fair, and fun.\" * **Differentiation:** Emphasize player choice. The hybrid model allows users to watch ads for rewards *or*"
+              ]
+            },
+            {
+              "id": "claim_safety",
+              "label": "Uses claim-safe messages and acknowledges missing evidence",
+              "met": true,
+              "evidence": [
+                "ar, evidence-based foundation for the soft launch. All claims are either supported by supplied facts or explicitly labeled as hypotheses to be tested withi",
+                "* **Voice:** Simple, encouraging, and non-competitive. Avoid \"hardcore\" gaming jargon to appeal to casual players. ### Audience Hypotheses to Test 1. **Th"
+              ]
+            },
+            {
+              "id": "budget",
+              "label": "Allocates the $25K test budget across named channels",
+              "met": true,
+              "evidence": [
+                "brid model (Ads + In-App Purchases/IAP). * **Budget:** $25,000 total test budget. * **Timeline:** Soft launch in six weeks. * **Platforms:** iOS and Android.",
+                "cial:** Launch \"Behind the Blocks\" Dev Diary videos on TikTok/Reels to build community and gather qualitative feedback on \"fairness\" perception [Campaign Sy",
+                "tion:** Hybrid model (Ads + In-App Purchases/IAP). * **Budget:** $25,000 total test budget. * **Timeline:** Soft launch in six weeks. * **Platforms:** iOS a"
+              ]
+            },
+            {
+              "id": "creative_matrix",
+              "label": "Defines a multi-variable creative test matrix",
+              "met": false,
+              "evidence": []
+            },
+            {
+              "id": "sequence",
+              "label": "Sequences the 30-day campaign toward the six-week soft launch",
+              "met": true,
+              "evidence": [
+                "Define internal baselines for CPI and Retention during Week 1. Do not invent industry benchmarks. 4. **Launch:** Begin Paid UA campaigns in US, UK, and Cana",
+                ",000 total test budget. * **Timeline:** Soft launch in six weeks. * **Platforms:** iOS and Android. * **Assets:** Gameplay video available; no existing audien"
+              ]
+            },
+            {
+              "id": "instrumentation",
+              "label": "Specifies an analytics event schema",
+              "met": true,
+              "evidence": [
+                "Framework *You cannot manage what you do not measure. Instrument these events before launch.* ### Key Metrics to Track * **Acquisition:** CPI by Region/Creati",
+                "* **Goal:** Establish internal baselines for Cost Per Install (CPI), Retention, and Lifetime Value (LTV). * **Budget Allocation:** 50% ($12,500) to establis",
+                "quisition:** CPI by Region/Creative. * **Activation:** Tutorial Completion, First Match-3 Level Completed, First Rewarded Video Watch. * **Retention:** Day 1,"
+              ]
+            },
+            {
+              "id": "kpis",
+              "label": "Defines CPI, D1/D7 retention, and ROAS gates",
+              "met": false,
+              "evidence": []
+            },
+            {
+              "id": "experiments",
+              "label": "Expresses experiments as hypotheses or A/B tests",
+              "met": true,
+              "evidence": [
+                "acy and regional performance. * **Actions:** * **A/B Test 1 (Creative):** Compare Video vs. Static CPI. If Video CPI is >10% higher than Static CPI",
+                "s **Verified Constraints** (facts you provided) from **Testable Hypotheses** (assumptions you must validate). No industry benchmarks are invented; all dec"
+              ]
+            },
+            {
+              "id": "stop_scale",
+              "label": "Provides explicit stop and scale rules",
+              "met": true,
+              "evidence": [
+                "atic CPI. If Video CPI is >10% higher than Static CPI, pause video ads and iterate creative [Measurement & Learning Strategist]. * **Organic Social:*",
+                "rning Strategist]. ### Phase 3: Weeks 5–6 (Decision & Scale Prep) * **Goal:** Determine Go/No-Go for scaling based on LTV/CPI ratio. * **Actions:** *",
+                "ategy for your soft launch. It strictly separates **Verified Constraints** (facts you provided) from **Testable Hypotheses** (assumptions you must valid"
+              ]
+            },
+            {
+              "id": "ownership_risk",
+              "label": "Assigns owners and surfaces risks/open questions",
+              "met": false,
+              "evidence": []
+            }
+          ]
+        },
+        "agents": [
+          "Audience & Context Analyst",
+          "Evidence & Claims Steward",
+          "Positioning Strategy Agent",
+          "Campaign Systems Designer",
+          "Measurement & Learning Strategist",
+          "Marketing Lead Agent"
+        ],
+        "catalog_digest": "7f753bc80351f6af292d172639babd91484648e33fd54bac40e4dc8e0d91473e",
+        "pipeline_completed": true
+      }
+    }
+  ]
+}

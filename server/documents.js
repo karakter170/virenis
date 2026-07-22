@@ -3,7 +3,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 
-const allowedExtensions = new Set([".pdf", ".md", ".markdown", ".txt"]);
+const allowedExtensions = new Set([".pdf", ".md", ".markdown", ".txt", ".csv"]);
 const DEFAULT_MAX_DOCUMENT_TEXT_CHARS = 2_000_000;
 const DEFAULT_MAX_PDF_PAGES = 500;
 const DEFAULT_PDF_EXTRACTION_TIMEOUT_MS = 60_000;
@@ -41,7 +41,7 @@ export async function extractDocumentFromUpload(file) {
 
   const extension = path.extname(file.originalname || "").toLowerCase();
   if (!allowedExtensions.has(extension)) {
-    const error = new Error("Unsupported document type. Upload PDF, Markdown, or text.");
+    const error = new Error("Unsupported document type. Upload PDF, Markdown, text, or CSV.");
     error.status = 400;
     throw error;
   }

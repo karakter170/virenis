@@ -26,6 +26,12 @@
     "test:watch": "vitest",
     "lint": "eslint .",
     "marketing:router-quality": "node marketing/router-quality-showcase/render.mjs",
+    "marketing:qwen-comparison:test": "node scripts/test_complex_team_comparison_ui.mjs",
+    "test:live:agent-builder": "node --env-file-if-exists=.env.local --env-file-if-exists=.env.runtime.local scripts/test_agent_builder_ui_live.mjs",
+    "test:live:discover-isolation": "node --env-file-if-exists=.env.local --env-file-if-exists=.env.runtime.local scripts/test_discover_team_isolation_ui_live.mjs",
+    "test:live:marketing": "node --env-file-if-exists=.env.local --env-file-if-exists=.env.runtime.local scripts/test_marketing_answer_ui_live.mjs",
+    "test:live:brainstorm": "node --env-file-if-exists=.env.local --env-file-if-exists=.env.runtime.local scripts/test_brainstorm_followup_ui_live.mjs",
+    "test:live:workflow-commands": "node --env-file-if-exists=.env.local --env-file-if-exists=.env.runtime.local scripts/test_workflow_commands_live.mjs",
     "poc": "node scripts/realityrank_poc.mjs",
     "poc:test": "node fixtures/realityrank_poc_simulator.mjs"
   },

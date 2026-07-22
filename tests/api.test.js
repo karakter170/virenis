@@ -2230,6 +2230,7 @@ describe("runtime and catalog", () => {
             boundary: "No legal advice.",
             tools: [],
             sources: [],
+            policies: { activation_policy: "Runtime-owned activation policy." },
             enabled: true,
             mounted: true
           }
@@ -2248,6 +2249,7 @@ describe("runtime and catalog", () => {
             routing_cues: patch.routing_cues,
             tools: [],
             sources: [],
+            policies: { activation_policy: "Runtime-owned activation policy." },
             enabled: true,
             mounted: true
           }
@@ -2279,6 +2281,15 @@ describe("runtime and catalog", () => {
         dbPath: path.join(realTmp, "db.json"),
         uploadRoot: realTmp
       });
+      await realApp.locals.store.mutate((data) => {
+        const policyAgent = data.agents.find((agent) => agent.id === "legal_privacy_lora");
+        policyAgent.policies = {
+          response: { style: "careful", tones: ["clear"] },
+          memory: { mode: "conversation" },
+          knowledge: { requirements: ["user_provided_context"] },
+          composition: { reusable_role: true, source_content_persisted: false }
+        };
+      });
 
       await request(realApp)
         .post("/api/agents")
@@ -2293,12 +2304,22 @@ describe("runtime and catalog", () => {
       const detail = await request(realApp).get("/api/agents/legal_privacy_lora").expect(200);
       expect(detail.body.runtime.ok).toBe(true);
       expect(detail.body.skill_markdown).toContain("Reviews consent and privacy.");
+      expect(detail.body.policies).toMatchObject({
+        activation_policy: "Runtime-owned activation policy.",
+        response: { style: "careful", tones: ["clear"] },
+        memory: { mode: "conversation" }
+      });
 
       const edited = await request(realApp)
         .patch("/api/agents/legal_privacy_lora")
         .send({ boundary: "Route jurisdiction-specific legal questions to counsel.", routing_cues: "privacy, consent" })
         .expect(200);
       expect(edited.body.boundary).toContain("counsel");
+      expect(edited.body.policies).toMatchObject({
+        activation_policy: "Runtime-owned activation policy.",
+        response: { style: "careful", tones: ["clear"] },
+        memory: { mode: "conversation" }
+      });
 
       const archived = await request(realApp).delete("/api/agents/legal_privacy_lora").expect(200);
       expect(archived.body.status).toBe("archived");
@@ -2315,6 +2336,10 @@ describe("runtime and catalog", () => {
           role: "admin"
         });
       }
+      expect(JSON.parse(calls[2].body).workflow_profile).toMatchObject({
+        response: { style: "careful", tones: ["clear"] },
+        memory: { mode: "conversation" }
+      });
     } finally {
       process.env.TCAR_ENGINE_MODE = previousMode;
       process.env.TCAR_RUNTIME_API_URL = previousUrl;
@@ -2569,7 +2594,8 @@ describe("runtime and catalog", () => {
   it("scopes user-authored source text to its private agent directory", async () => {
     const previousTokens = process.env.APP_API_TOKENS_JSON;
     process.env.APP_API_TOKENS_JSON = JSON.stringify({
-      private_source_user: { user_id: "source_owner", workspace_id: "workspace_sources", role: "user" }
+      private_source_user: { user_id: "source_owner", workspace_id: "workspace_sources", role: "user" },
+      private_source_admin: { user_id: "source_admin", workspace_id: "workspace_sources", role: "admin" }
     });
     try {
       await request(app)
@@ -2581,6 +2607,18 @@ describe("runtime and catalog", () => {
           capability: "Must not read another agent's source.",
           boundary: "Use owned sources only.",
           sources: "sources/router_agents/refund_policy/source.md"
+        })
+        .expect(403);
+
+      await request(app)
+        .post("/api/agents")
+        .set("Authorization", "Bearer private_source_admin")
+        .send({
+          id: "cross_source_admin",
+          title: "Cross source admin",
+          capability: "Must use document resources for shared sources.",
+          boundary: "Use owned sources only.",
+          sources: "sources/tcar_documents/someone_else/index.jsonl"
         })
         .expect(403);
 
@@ -4153,8 +4191,8 @@ describe("chat execution", () => {
       expect(chatBody.options.allowed_adapters).toContain("writing_synthesis_lora");
       expect(chatBody.options.allowed_adapters).toContain("finance_reasoning_lora");
       expect(chatBody.options.allowed_adapters).not.toContain("alice_private_manual_lora");
-      expect(chatBody.options.max_tokens).toBe(1536);
-      expect(chatBody.options.refiner_max_tokens).toBe(2048);
+      expect(chatBody.options.max_tokens).toBe(4096);
+      expect(chatBody.options.refiner_max_tokens).toBe(8192);
       expect(chatBody.query).toBe("Use @alice_private_manual if available, then preserve this mention.");
       expect(completedRun.sources).toHaveLength(1);
       expect(completedRun.sources[0]).toMatchObject({

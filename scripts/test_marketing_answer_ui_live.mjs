@@ -5,6 +5,7 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { createClerkClient } from "@clerk/backend";
 import { chromium } from "@playwright/test";
 import express from "express";
 import request from "supertest";
@@ -20,13 +21,15 @@ const TOKEN = `marketing_ui_${crypto.randomBytes(24).toString("hex")}`;
 const AUTHORIZATION = `Bearer ${TOKEN}`;
 const ACTOR = { user_id: "marketing_ui_user", workspace_id: "marketing_ui_workspace", role: "admin" };
 const SCREENSHOT = path.join(PROJECT_ROOT, "outputs", "marketing_answer_ui_proof.png");
+const RUN_EVIDENCE = path.join(PROJECT_ROOT, "outputs", "marketing_answer_ui_run.json");
 const EXTERNAL_BASE_URL = String(process.env.MARKETING_UI_BASE_URL || "").trim();
 const STORAGE_STATE = process.env.MARKETING_UI_STORAGE_STATE || "/tmp/virenis-auth-5174.json";
+const CLERK_TEST_USER_ID = process.env.MARKETING_UI_CLERK_USER_ID || "";
 const MANAGED_ENV = [
   "NODE_ENV", "WEB_STORE_DRIVER", "APP_API_TOKENS_JSON", "TCAR_ENGINE_MODE",
   "TCAR_RUNTIME_API_URL", "TCAR_RUNTIME_API_KEY", "TCAR_RUNTIME_API_KEY_FILE",
   "TCAR_RUNTIME_CHAT_TIMEOUT_MS", "TCAR_RUNTIME_ADMIN_TIMEOUT_MS",
-  "APP_BILLING_WELCOME_CREDITS"
+  "APP_BILLING_WELCOME_CREDITS", "APP_PUBLIC_ORIGIN"
 ];
 
 function requireCondition(condition, message) {
@@ -67,6 +70,8 @@ async function main() {
   let listener;
   let browser;
   let page;
+  let clerkClient;
+  let clerkSignInTokenId = "";
   let copiedWorkspaceId = "";
   let copiedAgentIds = [];
   try {
@@ -81,6 +86,7 @@ async function main() {
       process.env.TCAR_RUNTIME_CHAT_TIMEOUT_MS = "1800000";
       process.env.TCAR_RUNTIME_ADMIN_TIMEOUT_MS = "300000";
       process.env.APP_BILLING_WELCOME_CREDITS = "2500";
+      delete process.env.APP_PUBLIC_ORIGIN;
 
       app = await createApp({
         dbPath: path.join(tempRoot, "app-db.json"),
@@ -101,9 +107,35 @@ async function main() {
     browser = await chromium.launch({ headless: true });
     const context = await browser.newContext(EXTERNAL_BASE_URL
       ? { baseURL, viewport: { width: 1440, height: 1100 }, storageState: STORAGE_STATE }
-      : { baseURL, viewport: { width: 1440, height: 1100 }, extraHTTPHeaders: { Authorization: AUTHORIZATION } });
+      : { baseURL, viewport: { width: 1440, height: 1100 } });
+    if (!EXTERNAL_BASE_URL) {
+      const appOrigin = new URL(baseURL).origin;
+      await context.route("**/*", async (route) => {
+        const browserRequest = route.request();
+        if (new URL(browserRequest.url()).origin !== appOrigin) {
+          await route.continue();
+          return;
+        }
+        await route.continue({
+          headers: { ...browserRequest.headers(), Authorization: AUTHORIZATION }
+        });
+      });
+    }
     page = await context.newPage();
-    await page.goto(`${baseURL}/app`, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    let appEntryUrl = `${baseURL}/app`;
+    if (!EXTERNAL_BASE_URL && process.env.CLERK_SECRET_KEY) {
+      clerkClient = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY });
+      const clerkUserId = CLERK_TEST_USER_ID
+        || (await clerkClient.users.getUserList({ limit: 1 })).data?.[0]?.id;
+      requireCondition(clerkUserId, "No Clerk user is available for the Marketing browser sign-in proof");
+      const signInToken = await clerkClient.signInTokens.createSignInToken({
+        userId: clerkUserId,
+        expiresInSeconds: 300
+      });
+      clerkSignInTokenId = signInToken.id;
+      appEntryUrl = `${baseURL}/login?__clerk_ticket=${encodeURIComponent(signInToken.token)}`;
+    }
+    await page.goto(appEntryUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
     try {
       await page.locator('textarea[role="combobox"]').waitFor({ state: "visible", timeout: 60_000 });
     } catch {
@@ -178,18 +210,65 @@ async function main() {
     requireCondition(queuedResponse.ok(), `Submitting the Marketing prompt failed with ${queuedResponse.status()}`);
     const queued = await queuedResponse.json();
     const run = await waitForRun(page, queued.run_id);
+    // Persist the complete backend result before any UI assertion. Marketing
+    // runs are intentionally substantial; retaining this evidence makes a
+    // validation failure reproducible even though the isolated test database
+    // is removed during cleanup.
+    await fs.mkdir(path.dirname(RUN_EVIDENCE), { recursive: true });
+    await fs.writeFile(RUN_EVIDENCE, `${JSON.stringify(run, null, 2)}\n`, "utf8");
     requireCondition(run.status === "completed", `Marketing run failed: ${JSON.stringify(run.error || {})}`);
-    requireCondition(run.expert_outputs.length === 6, "The Marketing run did not complete all six agents");
+    requireCondition(
+      run.expert_outputs.length === 6,
+      `The Marketing run did not complete all six agents: ${JSON.stringify({
+        completed: run.expert_outputs.map((output) => output.adapter),
+        routing: run.routing,
+        route_plan: run.route_plan,
+        final_answer_preview: String(run.final_answer || "").slice(0, 500)
+      })}`
+    );
     const leadAgent = workspace.agents.find((agent) => agent.title === "Marketing Lead Agent");
     const leadOutput = run.expert_outputs.find((output) => output.adapter === leadAgent?.id);
     requireCondition(leadOutput, "The completed run omitted the Marketing lead output");
+    requireCondition(
+      (run.route_failure_summary || []).length === 0
+      && run.expert_outputs.every((output) => (
+        output.artifact_validation?.valid === true
+        && output.consumption_validation?.valid === true
+      )),
+      `The Marketing DAG completed with an invalid route: ${JSON.stringify({
+        route_failures: run.route_failure_summary || [],
+        outputs: run.expert_outputs.map((output) => ({
+          adapter: output.adapter,
+          status: output.status,
+          failure: output.failure,
+          artifact_validation: output.artifact_validation,
+          consumption_validation: output.consumption_validation,
+          source_validation: output.source_validation,
+          validation_retry: output.validation_retry,
+          execution_error: output.execution_error_admin_only,
+          answer_preview: String(output.domain_answer || "").slice(0, 800),
+          raw_preview: String(output.raw_text_admin_only || "").slice(0, 1600)
+        }))
+      })}`
+    );
     requireCondition(
       leadOutput.terminal_fan_in_recovery?.valid !== true,
       "The Marketing lead fell back to a stitched fan-in instead of producing a usable synthesis"
     );
     requireCondition(
       run.final_answer.length >= 300 && run.final_answer.length <= 12_000,
-      `The final synthesis is not a balanced UI-sized answer (${run.final_answer.length} characters)`
+      `The final synthesis is not a balanced UI-sized answer (${run.final_answer.length} characters): ${JSON.stringify({
+        final_answer: run.final_answer,
+        lead: {
+          status: leadOutput.status,
+          failure: leadOutput.failure,
+          artifact_validation: leadOutput.artifact_validation,
+          consumption_validation: leadOutput.consumption_validation,
+          source_validation: leadOutput.source_validation,
+          answer_preview: String(leadOutput.domain_answer || "").slice(0, 1500)
+        },
+        route_failures: run.route_failure_summary || []
+      })}`
     );
 
     const assistant = page.locator(".message.assistant").last();
@@ -246,6 +325,7 @@ async function main() {
       lead_synthesis_used: true,
       stitched_fan_in_fallback_used: false,
       raw_runtime_ids_visible: false,
+      run_evidence: RUN_EVIDENCE,
       screenshot: SCREENSHOT
     }, null, 2));
   } finally {
@@ -266,6 +346,9 @@ async function main() {
     await app?.locals?.drainBackgroundTasks?.({ timeoutMs: 60_000 }).catch(() => undefined);
     await app?.locals?.store?.close?.().catch(() => undefined);
     await new Promise((resolve) => listener ? listener.close(resolve) : resolve());
+    if (clerkClient && clerkSignInTokenId) {
+      await clerkClient.signInTokens.revokeSignInToken(clerkSignInTokenId).catch(() => undefined);
+    }
     if (tempRoot) await fs.rm(tempRoot, { recursive: true, force: true });
     for (const [name, value] of Object.entries(previousEnv)) {
       if (value === undefined) delete process.env[name];

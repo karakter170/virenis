@@ -324,16 +324,33 @@ describe("agent workspaces", () => {
     expect(firstResult.plan.steps.map((step) => step.adapter)).not.toContain("second_team_specialist");
 
     await request(app)
+      .patch(`/api/chat/sessions/${session.session_id}/agents/first_team_specialist`)
+      .set("Authorization", as("alice"))
+      .send({ active: false })
+      .expect(200);
+
+    const switched = await request(app)
       .patch(`/api/chat/sessions/${session.session_id}/agent-workspace`)
       .set("Authorization", as("alice"))
       .send({ agent_workspace_id: second.agent_workspace_id })
       .expect(200);
+    expect(switched.body.inactive_agent_ids).toEqual([]);
     const secondPicker = await request(app)
       .get(`/api/agents?session_id=${session.session_id}`)
       .set("Authorization", as("alice"))
       .expect(200);
     expect(secondPicker.body.agents.find((agent) => agent.id === "first_team_specialist").agent_workspace_member).toBe(false);
+    expect(secondPicker.body.agents.find((agent) => agent.id === "first_team_specialist").session_active).toBeNull();
     expect(secondPicker.body.agents.find((agent) => agent.id === "second_team_specialist").agent_workspace_member).toBe(true);
+    expect(secondPicker.body.agents.find((agent) => agent.id === "second_team_specialist").session_active).toBe(true);
+
+    await request(app)
+      .patch(`/api/chat/sessions/${session.session_id}/agents/first_team_specialist`)
+      .set("Authorization", as("alice"))
+      .send({ active: false })
+      .expect(404)
+      .expect((response) => expect(response.body.message).toBe("Agent is not a member of the active team."));
+
     const secondRun = await request(app)
       .post(`/api/chat/sessions/${session.session_id}/messages`)
       .set("Authorization", as("alice"))
@@ -348,6 +365,7 @@ describe("agent workspaces", () => {
       .set("Authorization", as("alice"))
       .expect(200);
     expect(sessionDetail.body.agent_workspace_id).toBe(second.agent_workspace_id);
+    expect(sessionDetail.body.inactive_agent_ids).toEqual([]);
     expect(sessionDetail.body.messages.filter((message) => message.role === "user")).toHaveLength(2);
   });
 

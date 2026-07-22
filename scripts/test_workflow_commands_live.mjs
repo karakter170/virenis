@@ -18,6 +18,7 @@ const PROJECT_ROOT = path.resolve(import.meta.dirname, "../../..");
 const RUNTIME_KEY_FILE = process.env.TCAR_RUNTIME_API_KEY_FILE
   || path.join(PROJECT_ROOT, "outputs", "tcar_api_key.txt");
 const RUNTIME_URL = process.env.TCAR_RUNTIME_API_URL || "http://127.0.0.1:9000";
+const RUN_EVIDENCE_FILE = path.join(PROJECT_ROOT, "outputs", "workflow_commands_live_run.json");
 const LIVE_TOKEN = `workflow_live_${crypto.randomBytes(24).toString("hex")}`;
 const AUTH = { Authorization: `Bearer ${LIVE_TOKEN}` };
 const ACTOR = { user_id: "workflow_live_user", workspace_id: "workflow_live_workspace", role: "admin" };
@@ -229,6 +230,12 @@ async function main() {
       "run_textile_team"
     );
     const textileExecution = await waitForRun(app, textileExecutionSubmission.run_id);
+    await fs.mkdir(path.dirname(RUN_EVIDENCE_FILE), { recursive: true });
+    await fs.writeFile(RUN_EVIDENCE_FILE, `${JSON.stringify({
+      captured_at: new Date().toISOString(),
+      stage: "activated_textile_team",
+      run: textileExecution
+    }, null, 2)}\n`, "utf8");
     requireCondition(textileExecution.status === "completed", `Activated textile team execution failed: ${JSON.stringify(textileExecution.error || {})}`);
     const textileExecutionSteps = textileExecution.plan?.steps || [];
     const executedTextileAgentIds = new Set(textileExecutionSteps.map((step) => step.adapter));
@@ -313,7 +320,13 @@ async function main() {
       && item.mounted !== false
       && item.runtime_only !== true
       && item.runtime_sync_pending !== true
-      && item.session_active !== false
+      // The catalog endpoint intentionally returns non-members with a null
+      // session state so Team Studio can offer them through explicit team
+      // management. Only true members are toggleable in the active chat; the
+      // browser applies the same workspace projection before rendering its
+      // switches.
+      && item.agent_workspace_member === true
+      && item.session_active === true
     ))) {
       stage = `disable agent ${agent.id} in live session`;
       await auth(request(app).patch(`/api/chat/sessions/${session.session_id}/agents/${encodeURIComponent(agent.id)}`))
@@ -372,6 +385,13 @@ async function main() {
         lifetime_debited_credits: billingSnapshot.lifetime_debited_credits
       }
     }, null, 2));
+    await fs.writeFile(RUN_EVIDENCE_FILE, `${JSON.stringify({
+      captured_at: new Date().toISOString(),
+      stage: "complete",
+      run: textileExecution,
+      normal_run: normalRun,
+      billing: billingSnapshot
+    }, null, 2)}\n`, "utf8");
   } catch (error) {
     throw new Error(`${stage}: ${error.message}`, { cause: error });
   } finally {

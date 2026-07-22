@@ -9,26 +9,26 @@ describe("workspace model output settings", () => {
   it("uses substantially larger safe defaults and publishes the administrator bounds", () => {
     const env = {};
     expect(defaultModelOutputSettings(env)).toEqual({
-      agent_output_tokens: 1536,
-      final_output_tokens: 2048
+      agent_output_tokens: 4096,
+      final_output_tokens: 8192
     });
     expect(modelOutputSettingsForWorkspace({}, "workspace_a", env)).toMatchObject({
       workspace_id: "workspace_a",
-      agent_output_tokens: 1536,
-      final_output_tokens: 2048,
+      agent_output_tokens: 4096,
+      final_output_tokens: 8192,
       bounds: {
         agent_output_tokens: {
           min: 128,
-          max: 4096,
+          max: 8192,
           context_tokens: 32768,
-          reserved_input_tokens: 1500,
+          reserved_input_tokens: 8192,
           safety_margin_tokens: 128
         },
         final_output_tokens: {
           min: 256,
-          max: 8192,
+          max: 12288,
           context_tokens: 32768,
-          reserved_input_tokens: 768,
+          reserved_input_tokens: 16384,
           safety_margin_tokens: 192
         }
       },
@@ -90,8 +90,8 @@ describe("workspace model output settings", () => {
     })).toThrow("agent_output_tokens must be a whole number");
     expect(() => updateModelOutputSettings({ workspaceModelSettings: [] }, {
       ...base,
-      finalOutputTokens: 9000
-    })).toThrow("final_output_tokens must be between 256 and 8192");
+      finalOutputTokens: 13000
+    })).toThrow("final_output_tokens must be between 256 and 12288");
     expect(() => updateModelOutputSettings({ workspaceModelSettings: [] }, {
       ...base,
       reason: ""
@@ -101,13 +101,13 @@ describe("workspace model output settings", () => {
   it("derives safe output ceilings from worker and session context windows", () => {
     expect(modelOutputSettingsForWorkspace({}, "workspace_a", {
       TCAR_PLANNER_MODE: "session",
-      TCAR_MODEL_CONTEXT_TOKENS: "8192",
-      ROUTER_SESSION_CONTEXT_TOKENS: "16384",
-      TCAR_CLIENT_MAX_TOKENS: "8192",
-      TCAR_CLIENT_MAX_REFINER_TOKENS: "16384"
+      TCAR_MODEL_CONTEXT_TOKENS: "16384",
+      ROUTER_SESSION_CONTEXT_TOKENS: "32768",
+      TCAR_CLIENT_MAX_TOKENS: "16384",
+      TCAR_CLIENT_MAX_REFINER_TOKENS: "32768"
     }).bounds).toMatchObject({
-      agent_output_tokens: { max: 6400, context_tokens: 8192 },
-      final_output_tokens: { max: 15360, context_tokens: 16384 }
+      agent_output_tokens: { max: 7936, context_tokens: 16384 },
+      final_output_tokens: { max: 16128, context_tokens: 32768 }
     });
   });
 });

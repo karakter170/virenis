@@ -112,6 +112,19 @@ describe("PDF document extraction", () => {
   });
 });
 
+describe("text document extraction", () => {
+  it("accepts CSV knowledge without changing its row and column content", async () => {
+    const csv = "product,region,launch_date\nMatch 3,EU,2026-09-12\nMatch 3,US,2026-10-03";
+
+    const result = await extractDocumentFromUpload({
+      originalname: "launch-plan.csv",
+      buffer: Buffer.from(csv, "utf8")
+    });
+
+    expect(result).toEqual({ text: csv, pages: [] });
+  });
+});
+
 describe("authoritative Runtime document chunks", () => {
   it("validates and normalizes the exact Runtime corpus", () => {
     const body = "Runtime canonical cold-chain disposition evidence for shipment CT-204.";

@@ -65,8 +65,8 @@ describe("administrator model output settings API", () => {
       .expect(200);
     expect(defaults.body.settings).toMatchObject({
       workspace_id: "workspace_a",
-      agent_output_tokens: 1536,
-      final_output_tokens: 2048,
+      agent_output_tokens: 4096,
+      final_output_tokens: 8192,
       revision: 0
     });
 
@@ -74,15 +74,15 @@ describe("administrator model output settings API", () => {
       .patch("/api/admin/model-output-settings")
       .set(authorization(TOKENS.adminA))
       .send({
-        agent_output_tokens: 1536,
-        final_output_tokens: 3072,
+        agent_output_tokens: 6144,
+        final_output_tokens: 10240,
         reason: "More complete workspace answers"
       })
       .expect(200);
     expect(updated.body.settings).toMatchObject({
       workspace_id: "workspace_a",
-      agent_output_tokens: 1536,
-      final_output_tokens: 3072,
+      agent_output_tokens: 6144,
+      final_output_tokens: 10240,
       revision: 1,
       updated_by: "admin_a"
     });
@@ -93,8 +93,8 @@ describe("administrator model output settings API", () => {
       .expect(200);
     expect(otherWorkspace.body.settings).toMatchObject({
       workspace_id: "workspace_b",
-      agent_output_tokens: 1536,
-      final_output_tokens: 2048,
+      agent_output_tokens: 4096,
+      final_output_tokens: 8192,
       revision: 0
     });
 
@@ -108,13 +108,13 @@ describe("administrator model output settings API", () => {
       .set(authorization(TOKENS.userA))
       .send({
         content: "Explain the topic in depth.",
-        options: { max_tokens: 9999, refiner_max_tokens: 9999 }
+        options: { max_tokens: 99999, refiner_max_tokens: 99999 }
       })
       .expect(202);
     const storedRun = app.locals.store.read((data) => data.runs.find((run) => run.run_id === queued.body.run_id));
     expect(storedRun.execution_options).toMatchObject({
-      max_tokens: 1536,
-      refiner_max_tokens: 3072
+      max_tokens: 6144,
+      refiner_max_tokens: 10240
     });
     expect(app.locals.store.read().identityAuditEvents).toContainEqual(expect.objectContaining({
       type: "model_output_settings.updated",
@@ -128,12 +128,12 @@ describe("administrator model output settings API", () => {
     await request(app)
       .patch("/api/admin/model-output-settings")
       .set(authorization(TOKENS.adminA))
-      .send({ agent_output_tokens: 127, final_output_tokens: 2048, reason: "Too low" })
+      .send({ agent_output_tokens: 127, final_output_tokens: 8192, reason: "Too low" })
       .expect(400);
     const unsafeContextSplit = await request(app)
       .patch("/api/admin/model-output-settings")
       .set(authorization(TOKENS.adminA))
-      .send({ agent_output_tokens: 2048, final_output_tokens: 9000, reason: "Exceeds the configured output ceiling" })
+      .send({ agent_output_tokens: 4096, final_output_tokens: 13000, reason: "Exceeds the configured output ceiling" })
       .expect(400);
     expect(unsafeContextSplit.body).toMatchObject({ error: "invalid_model_output_settings" });
     expect(unsafeContextSplit.body.message).toMatch(/final_output_tokens/i);

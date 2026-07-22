@@ -40,3 +40,32 @@ Verify naming, public evidence hashes, the USGS snapshot, campaign status, and a
 ```bash
 python scripts/verify_router_marketing_evidence.py
 ```
+
+## Same-model complex-team field test
+
+`complex-team-comparison/` is a separate, data-backed product page comparing
+Standard Base Qwen with Agent-Team Qwen on two predeclared complex scenarios.
+It intentionally distinguishes output efficiency from compute efficiency.
+
+The positive Marketing example is the publishable scenario-specific claim:
+the team covered 9/12 required outcomes versus 5/12 for Base, in 896 versus
+1,034 answer words. Engineering covered 12/12 versus Base's 11/12. Across the
+two predeclared examples the result is 21/24 versus 16/24, but the team used
+substantially more inference calls, tokens, and wall time. The page therefore
+makes no universal superiority, latency, or cost claim; those claims remain
+governed by the 200-case benchmark contract.
+
+Capture or rebuild the report from the project root:
+
+```bash
+python scripts/capture_qwen_team_product_showcase.py --resume
+python scripts/verify_qwen_team_product_showcase.py
+```
+
+Exercise the actual page in Chromium, run its accessibility audit, and create
+the full-page proof image:
+
+```bash
+cd web/virenis
+npm run marketing:qwen-comparison:test
+```

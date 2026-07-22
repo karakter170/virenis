@@ -288,7 +288,18 @@ function teamDefinitions() {
       teammateOutput(marketingMeasurement)
     ],
     produces: ["marketing_plan", "final_answer"],
-    routingCues: ["marketing plan", "campaign brief", "go to market message", "marketing recommendation", "marketing lead"],
+    routingCues: [
+      "marketing plan",
+      "marketing strategy",
+      "marketing guidance",
+      "where to start marketing",
+      "how to begin marketing",
+      "guide my marketing",
+      "campaign brief",
+      "go to market message",
+      "marketing recommendation",
+      "marketing lead"
+    ],
     avoidWhen: ["a single copy edit needing no team", "requests to fabricate market evidence", "non-marketing delivery plans"],
     stage: 90,
     style: "thorough",

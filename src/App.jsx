@@ -244,6 +244,22 @@ export function agentsForWorkspace(agents = [], workspace = null) {
   return agents.filter((agent) => memberIds.has(String(agent?.id || "")));
 }
 
+export function agentsWithWorkspaceSessionState(agents = [], workspace = null, inactiveAgentIds = []) {
+  if (!workspace || !Array.isArray(workspace.agent_ids)) return agents;
+  const memberIds = new Set(workspace.agent_ids.map((agentId) => String(agentId || "")).filter(Boolean));
+  const inactiveIds = new Set((Array.isArray(inactiveAgentIds) ? inactiveAgentIds : [])
+    .map((agentId) => String(agentId || ""))
+    .filter((agentId) => memberIds.has(agentId)));
+  return agents.map((agent) => {
+    const member = memberIds.has(String(agent?.id || ""));
+    return {
+      ...agent,
+      agent_workspace_member: member,
+      session_active: member ? !inactiveIds.has(String(agent.id)) : null
+    };
+  });
+}
+
 export function agentsForCatalog(agents = [], workspace = null, auth = null) {
   const workspaceAgents = agentsForWorkspace(agents, workspace)
     .filter((agent) => auth?.is_admin || agent?.runtime_only !== true);
@@ -1210,7 +1226,11 @@ function Workspace({ onHome, onSignedOut }) {
       setWorkflows(payload.workflows || []);
       setCheckpoints(payload.checkpoints || []);
       setChatDocuments(payload.chat_documents || []);
-      setAgents(agentList.agents || []);
+      setAgents(agentsWithWorkspaceSessionState(
+        agentList.agents || [],
+        payload.agent_workspace,
+        payload.inactive_agent_ids
+      ));
       if (navigation) {
         setMobileSidebarOpen(false);
         nearBottomRef.current = true;
@@ -1308,11 +1328,28 @@ function Workspace({ onHome, onSignedOut }) {
         mutationId !== teamMutationSequenceRef.current
         || !shouldRefreshOriginSession(originSessionId, displayedSessionIdRef.current, desiredSessionIdRef.current)
       ) return null;
+      setAgentWorkspaces((items) => {
+        if (!result.agent_workspace) return items;
+        const exists = items.some((workspace) => (
+          workspace.agent_workspace_id === result.agent_workspace.agent_workspace_id
+        ));
+        return exists
+          ? items.map((workspace) => workspace.agent_workspace_id === result.agent_workspace.agent_workspace_id
+            ? result.agent_workspace
+            : workspace)
+          : [...items, result.agent_workspace];
+      });
       setSession((current) => current?.session_id === originSessionId ? {
         ...current,
         agent_workspace_id: result.agent_workspace_id,
-        agent_workspace: result.agent_workspace
+        agent_workspace: result.agent_workspace,
+        inactive_agent_ids: result.inactive_agent_ids || []
       } : current);
+      setAgents((items) => agentsWithWorkspaceSessionState(
+        items,
+        result.agent_workspace,
+        result.inactive_agent_ids
+      ));
       setSessions((items) => items.map((item) => item.session_id === originSessionId
         ? { ...item, agent_workspace_id: result.agent_workspace_id }
         : item));
@@ -6418,10 +6455,10 @@ export function MarketplaceWorkspaceAgentDetails({
             </dl>
           </section>
 
-          {(exclusions.private_knowledge || exclusions.agent_connections || exclusions.mcp_credentials_and_bindings) && (
+          {(exclusions.private_knowledge || exclusions.agent_connections || exclusions.mcp_credentials_and_bindings || exclusions.repository_access) && (
             <div className="marketplace-sharing-boundary">
               <AlertCircle size={16} />
-              <span><strong>Safe independent copy</strong><small>A shared team never includes private knowledge, private handoffs, or connected-account access.</small></span>
+              <span><strong>Safe independent copy</strong><small>A shared team never includes private knowledge, private handoffs, connected-account access, or local repository roots.</small></span>
             </div>
           )}
         </main>
@@ -6641,7 +6678,7 @@ export function MarketplaceAgentDialog({
               })}
             </section>
           )}
-          <div className="marketplace-sharing-boundary"><AlertCircle size={16} /><span><strong>Independent, safe copy</strong><small>The team structure and share-safe role instructions are copied. Private knowledge, credentials, and connected account access are not.</small></span></div>
+          <div className="marketplace-sharing-boundary"><AlertCircle size={16} /><span><strong>Independent, safe copy</strong><small>The team structure and share-safe role instructions are copied. Private knowledge, credentials, connected account access, and local repository roots are not.</small></span></div>
           <footer className="builder-actions marketplace-detail-actions">
             <button type="button" className="text-button ghost" onClick={onClose} disabled={copying}>Close</button>
             <span><Star size={14} fill="currentColor" /> {detail.rating_count ? `${detail.rating_average.toFixed(1)} (${detail.rating_count})` : "New"}</span>
@@ -6703,10 +6740,10 @@ export function MarketplaceAgentDialog({
               </dl>
             </section>
 
-            {(exclusions.private_knowledge || exclusions.agent_connections || exclusions.mcp_credentials_and_bindings) && (
+            {(exclusions.private_knowledge || exclusions.agent_connections || exclusions.mcp_credentials_and_bindings || exclusions.repository_access) && (
               <div className="marketplace-sharing-boundary">
                 <AlertCircle size={16} />
-                <span><strong>Safe independent copy</strong><small>{[exclusions.private_knowledge ? "Private knowledge" : null, exclusions.agent_connections ? "private team handoffs" : null, exclusions.mcp_credentials_and_bindings ? "connected account access" : null].filter(Boolean).join(", ")} will not be copied. Required apps stay visible so you can connect your own account.</small></span>
+                <span><strong>Safe independent copy</strong><small>{[exclusions.private_knowledge ? "Private knowledge" : null, exclusions.agent_connections ? "private team handoffs" : null, exclusions.mcp_credentials_and_bindings ? "connected account access" : null, exclusions.repository_access ? "local repository access" : null].filter(Boolean).join(", ")} will not be copied. Required apps stay visible so you can connect your own account.</small></span>
               </div>
             )}
           </main>
@@ -7894,8 +7931,8 @@ const TOOL_OPTIONS = [
   { id: "calculate", title: "Calculations", detail: "Check arithmetic and formulas", icon: Calculator, values: ["calculator"] },
   { id: "tables", title: "Data tables", detail: "Read and analyze tabular data", icon: Table2, values: ["data_table"] },
   { id: "documents", title: "Documents", detail: "Search attached files", icon: FileSearch, values: ["document_search", "document_read"] },
-  { id: "code", title: "Code & repositories", detail: "Inspect approved project files", icon: Code2, values: ["repo_inspector"] },
-  { id: "data", title: "Workspace data", detail: "Run approved read-only queries", icon: Database, values: ["sql_runner"] }
+  { id: "code", title: "Code & repositories", detail: "Inspect files under an administrator-approved Runtime repository root", icon: Code2, values: ["repo_inspector"], requiresAdminConfiguration: true },
+  { id: "data", title: "Supplied SQL data", detail: "Run read-only SQL over structured rows supplied in the request or approved context", icon: Database, values: ["sql_runner"] }
 ];
 
 const CONTEXT_OPTIONS = [
@@ -7963,6 +8000,11 @@ export function agentPayloadFromForm(form, { isAdmin = false, hasDocumentResourc
     .map((value) => value.trim())
     .filter(Boolean)
     .slice(0, 20);
+  const repositoryRoots = String(form.repository_roots || "")
+    .split(/[\n,]+/)
+    .map((value) => value.trim())
+    .filter(Boolean)
+    .slice(0, 8);
   return {
     item_type: form.item_type,
     title: form.title.trim(),
@@ -7977,6 +8019,9 @@ export function agentPayloadFromForm(form, { isAdmin = false, hasDocumentResourc
     consumes,
     produces: form.produces?.length ? [...form.produces] : ["domain_outputs"],
     tools,
+    ...(isAdmin && tools.includes("repo_inspector") && repositoryRoots.length ? {
+      tool_config: { repo_inspector: { roots: repositoryRoots } }
+    } : {}),
     mcp_bindings: form.mcp_bindings || [],
     resources: form.resources || [],
     policies: {
@@ -8058,6 +8103,7 @@ export function createAgentForm(agent) {
       consumes: agent.consumes?.length ? [...agent.consumes] : ["user_request"],
       produces: agent.produces?.length ? [...agent.produces] : ["domain_outputs"],
       tools: (agent.tools || []).filter((tool) => !/^mcp_[a-f0-9]{8}_[a-z0-9_]+_[a-f0-9]{6}$/.test(tool)),
+      repository_roots: (agent.tool_config?.repo_inspector?.roots || []).join(", "),
       mcp_bindings: (agent.mcp_bindings || []).map((binding) => ({
         connection_id: binding.connection_id,
         tool_names: (binding.tools || []).map((tool) => tool.name)
@@ -8081,6 +8127,7 @@ export function createAgentForm(agent) {
     consumes: ["user_request"],
     produces: ["domain_outputs"],
     tools: [],
+    repository_roots: "",
     mcp_bindings: [],
     resources: [],
     sources: "",
@@ -8115,6 +8162,27 @@ function AgentDialog({ auth, runtime, agent, agents, documents, mcpConnections =
     .slice(0, 24);
   const unavailableCollaboratorTokens = unavailableCollaboratorHandoffs(form.consumes, allCollaboratorAgents);
   const selectedDocumentCount = knowledgeDocuments.filter((document) => form.resources.includes(resourceToken(document.agent_id))).length;
+  const repositoryRoots = String(form.repository_roots || "")
+    .split(/[\n,]+/)
+    .map((value) => value.trim())
+    .filter(Boolean);
+  const repositoryConfigurationMissing = Boolean(
+    auth?.is_admin
+    && form.tools.includes("repo_inspector")
+    && repositoryRoots.length === 0
+  );
+  const approvedSourcePrefix = `sources/router_agents/${form.id}/`;
+  const configuredSourcePaths = String(form.sources || "")
+    .split(/[\n,]+/)
+    .map((value) => value.replaceAll("\\", "/").trim())
+    .filter(Boolean);
+  const sourceConfigurationInvalid = Boolean(
+    auth?.is_admin
+    && configuredSourcePaths.some((sourcePath) => (
+      !sourcePath.startsWith(approvedSourcePrefix)
+      || sourcePath.includes("..")
+    ))
+  );
   const dirty = JSON.stringify(form) !== initialFormSignature.current || newFiles.length > 0 || Boolean(createdAgentId);
 
   function update(key, value) {
@@ -8133,7 +8201,9 @@ function AgentDialog({ auth, runtime, agent, agents, documents, mcpConnections =
   function toggleTool(option) {
     const selected = option.values.every((value) => form.tools.includes(value));
     const unavailable = option.values.some((value) => runtime?.tool_readiness?.[value]?.available === false);
+    const configurationUnavailable = option.requiresAdminConfiguration && !auth?.is_admin;
     if (unavailable && !selected) return;
+    if (configurationUnavailable && !selected) return;
     setForm((current) => {
       const values = new Set(current.tools);
       for (const value of option.values) {
@@ -8203,9 +8273,9 @@ function AgentDialog({ auth, runtime, agent, agents, documents, mcpConnections =
   }
 
   function addFiles(fileList) {
-    const accepted = Array.from(fileList || []).filter((file) => /\.(pdf|md|markdown|txt)$/i.test(file.name));
+    const accepted = Array.from(fileList || []).filter((file) => /\.(pdf|md|markdown|txt|csv)$/i.test(file.name));
     if (!accepted.length && fileList?.length) {
-      setError("Add a PDF, Markdown, or text file.");
+      setError("Add a PDF, Markdown, text, or CSV file.");
       return;
     }
     setError("");
@@ -8248,6 +8318,10 @@ function AgentDialog({ auth, runtime, agent, agents, documents, mcpConnections =
     }
     if (configurationBusy) {
       setError("This answer is using the current team. Keep drafting here and save when the answer finishes.");
+      return;
+    }
+    if (sourceConfigurationInvalid) {
+      setError(`Approved source paths for this specialist must stay under ${approvedSourcePrefix}`);
       return;
     }
     setBusy(true);
@@ -8326,7 +8400,9 @@ function AgentDialog({ auth, runtime, agent, agents, documents, mcpConnections =
   ];
   const canContinue = step === 0
     ? form.title.trim() && form.capability.trim()
-    : step === 1 ? form.produces.length > 0 && unavailableCollaboratorTokens.length === 0 : true;
+    : step === 1
+      ? form.produces.length > 0 && unavailableCollaboratorTokens.length === 0 && !repositoryConfigurationMissing
+      : !sourceConfigurationInvalid;
 
   return (
     <ModalSurface
@@ -8422,10 +8498,13 @@ function AgentDialog({ auth, runtime, agent, agents, documents, mcpConnections =
                       const readiness = option.values.map((value) => runtime?.tool_readiness?.[value]).filter(Boolean);
                       const unavailable = readiness.find((item) => item.available === false);
                       const setupRequired = readiness.find((item) => item.setup_required);
-                      const detail = unavailable?.message || setupRequired?.message || option.detail;
+                      const configurationUnavailable = option.requiresAdminConfiguration && !auth?.is_admin;
+                      const detail = configurationUnavailable
+                        ? "An administrator must approve a Runtime repository root before this ability can be added."
+                        : unavailable?.message || setupRequired?.message || option.detail;
                       return (
-                        <label className={[selected ? "selected" : "", unavailable ? "setup-needed" : ""].filter(Boolean).join(" ")} key={option.id}>
-                          <input type="checkbox" checked={selected} disabled={Boolean(unavailable && !selected)} onChange={() => toggleTool(option)} />
+                        <label className={[selected ? "selected" : "", unavailable || configurationUnavailable || setupRequired ? "setup-needed" : ""].filter(Boolean).join(" ")} key={option.id}>
+                          <input type="checkbox" checked={selected} disabled={Boolean((unavailable || configurationUnavailable) && !selected)} onChange={() => toggleTool(option)} />
                           <Icon size={18} />
                           <span><strong>{option.title}</strong><small>{detail}</small></span>
                           <i>{selected && <Check size={13} />}</i>
@@ -8433,6 +8512,21 @@ function AgentDialog({ auth, runtime, agent, agents, documents, mcpConnections =
                       );
                     })}
                   </div>
+                  {form.tools.includes("repo_inspector") && auth?.is_admin && (
+                    <div className="builder-field repository-root-field">
+                      <label htmlFor="agent-repository-roots">Approved Runtime repository roots</label>
+                      <input
+                        id="agent-repository-roots"
+                        value={form.repository_roots}
+                        onChange={(event) => update("repository_roots", event.target.value)}
+                        required
+                        placeholder="., repositories/product-api"
+                        autoCapitalize="none"
+                        spellCheck="false"
+                      />
+                      <small>Use paths relative to the GPU Runtime project root. The Runtime rejects absolute, missing, or out-of-scope directories.</small>
+                    </div>
+                  )}
                   {form.tools.includes("web_search") && <div className="live-tool-note"><Globe2 size={15} /><span><strong>Keeps current work current</strong><small>Public web information can change, so this specialist will check that part again on repeated requests.</small></span></div>}
                 </fieldset>
                 <details className="builder-details connected-app-details" open={(form.mcp_bindings || []).length > 0 || undefined}>
@@ -8545,9 +8639,9 @@ function AgentDialog({ auth, runtime, agent, agents, documents, mcpConnections =
                 >
                   <div className="dropzone-icon"><Upload size={19} /></div>
                   <strong>Drop reference files here</strong>
-                  <span>PDF, Markdown, or text · up to 8 files</span>
+                  <span>PDF, Markdown, text, or CSV · up to 8 files</span>
                   <label htmlFor={fileInputId}>Choose files</label>
-                  <input id={fileInputId} type="file" accept=".pdf,.md,.markdown,.txt" multiple onChange={(event) => addFiles(event.target.files)} />
+                  <input id={fileInputId} type="file" accept=".pdf,.md,.markdown,.txt,.csv" multiple onChange={(event) => addFiles(event.target.files)} />
                 </div>
                 {newFiles.length > 0 && (
                   <div className="pending-files" aria-label="Files to add">
@@ -8582,7 +8676,7 @@ function AgentDialog({ auth, runtime, agent, agents, documents, mcpConnections =
                   <div className="advanced-builder-grid">
                     <div className="builder-field"><label htmlFor="agent-cues">When should Virenis use it?</label><textarea id="agent-cues" value={form.routing_cues} onChange={(event) => update("routing_cues", event.target.value)} placeholder={`${form.title || "Agent name"}, related topics, common requests`} /></div>
                     <div className="builder-field"><label htmlFor="agent-avoid">When should Virenis avoid it?</label><textarea id="agent-avoid" value={form.routing_avoid} onChange={(event) => update("routing_avoid", event.target.value)} placeholder="Requests this role should not handle" /></div>
-                    {auth?.is_admin && <div className="builder-field"><label htmlFor="agent-sources">Approved source paths</label><input id="agent-sources" value={form.sources} onChange={(event) => update("sources", event.target.value)} /></div>}
+                    {auth?.is_admin && <div className="builder-field"><label htmlFor="agent-sources">Approved source paths</label><input id="agent-sources" value={form.sources} onChange={(event) => update("sources", event.target.value)} aria-invalid={sourceConfigurationInvalid || undefined} /><small className="agent-source-prefix">Only private files under <code>{approvedSourcePrefix}</code> are accepted. Upload shared documents above instead.</small>{sourceConfigurationInvalid && <small role="alert">One or more paths are outside this specialist&apos;s private source directory.</small>}</div>}
                   </div>
                 </details>
                 <div className="mobile-builder-review" aria-label="Specialist review">
@@ -8737,7 +8831,7 @@ function DocumentUploadDialog({ scope = "knowledge", sessionId = null, onClose, 
         {error && <div className="form-error" role="alert">{error}</div>}
         <label className="file-field">
           <span>File</span>
-          <input data-autofocus type="file" accept=".pdf,.md,.markdown,.txt" onChange={(event) => setFile(event.target.files?.[0] || null)} required />
+          <input data-autofocus type="file" accept=".pdf,.md,.markdown,.txt,.csv" onChange={(event) => setFile(event.target.files?.[0] || null)} required />
         </label>
         <label>
           <span>Name <small>optional</small></span>

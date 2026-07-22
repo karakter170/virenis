@@ -59,6 +59,30 @@ function uniqueWorkspaceAgent(data, id, workspace) {
   return candidates.length === 1 ? candidates[0] : null;
 }
 
+export function pruneSessionInactiveAgentIds(session, workspace) {
+  if (!session || !workspace) return [];
+  const memberIds = new Set(workspace.agent_ids || []);
+  const inactiveAgentIds = [...new Set(
+    (Array.isArray(session.inactive_agent_ids) ? session.inactive_agent_ids : [])
+      .map((id) => String(id || "").trim())
+      .filter((id) => id && memberIds.has(id))
+  )].sort();
+  session.inactive_agent_ids = inactiveAgentIds;
+  return inactiveAgentIds;
+}
+
+function pruneWorkspaceSessionInactiveAgentIds(data, workspace) {
+  for (const session of data.sessions || []) {
+    if (
+      session.agent_workspace_id === workspace.agent_workspace_id
+      && String(session.workspace_id || "") === String(workspace.workspace_id || "")
+      && session.created_by === workspace.created_by
+    ) {
+      pruneSessionInactiveAgentIds(session, workspace);
+    }
+  }
+}
+
 function defaultAgentIds(data, actor) {
   const candidates = (data.agents || []).filter((agent) => eligibleDefaultAgent(agent, actor));
   const counts = new Map();
@@ -136,6 +160,7 @@ export function normalizeAgentWorkspaceCollections(data) {
     workspace.agent_ids = (workspace.agent_ids || []).filter((id) => (
       (agentsById.get(id) || []).filter((agent) => agentCanJoinWorkspace(agent, workspace)).length === 1
     ));
+    pruneWorkspaceSessionInactiveAgentIds(data, workspace);
   }
   data.agentWorkspaceRatings = normalizePublicMarketplaceRatings(data.agentWorkspaceRatings, {
     subjects: data.agentWorkspaces,
@@ -333,6 +358,7 @@ export function setAgentWorkspaceMembers(data, workspaceId, actor, agentIds) {
   }
   workspace.agent_ids = ids;
   workspace.updated_at = nowIso();
+  pruneWorkspaceSessionInactiveAgentIds(data, workspace);
   return workspace;
 }
 
@@ -403,6 +429,7 @@ export function removeAgentFromAllWorkspaces(data, agentId) {
     if (next.length !== (workspace.agent_ids || []).length) {
       workspace.agent_ids = next;
       workspace.updated_at = nowIso();
+      pruneWorkspaceSessionInactiveAgentIds(data, workspace);
     }
   }
 }
@@ -427,6 +454,7 @@ export function deleteAgentWorkspace(data, workspaceId, actor) {
       && session.created_by === actor.user_id
     ) {
       session.agent_workspace_id = general.agent_workspace_id;
+      pruneSessionInactiveAgentIds(session, general);
       session.updated_at = nowIso();
     }
   }

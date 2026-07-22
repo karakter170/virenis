@@ -1604,6 +1604,7 @@ export async function registerRuntimeAgent(agent) {
     "routing_cues",
     "resources",
     "tools",
+    "tool_config",
     "tool_contracts",
     "sources",
     "policies",
@@ -1639,6 +1640,7 @@ export async function updateRuntimeAgent(agentId, patch) {
     "routing_cues",
     "resources",
     "tools",
+    "tool_config",
     "tool_contracts",
     "sources",
     "policies",
@@ -1702,6 +1704,7 @@ function restoreRuntimeWorkflowProfile(result, workflowProfile, flatPolicies) {
       ...result.agent,
       workflow_profile: workflowProfile,
       policies: {
+        ...runtimeFlatPolicies(result.agent.policies),
         ...runtimeFlatPolicies(flatPolicies),
         response: {
           style: workflowProfile.response.style,

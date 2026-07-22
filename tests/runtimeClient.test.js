@@ -460,6 +460,7 @@ describe("TCAR runtime HTTP transport", () => {
     });
 
     expect(registered.agent.policies).toEqual({
+      activation_policy: "Runtime-owned activation policy.",
       source_policy: "Use approved current sources.",
       response: { style: "careful", tones: ["professional", "objective"] },
       memory: { mode: "conversation" },
@@ -467,6 +468,7 @@ describe("TCAR runtime HTTP transport", () => {
       composition: { reusable_role: true, source_content_persisted: false }
     });
     expect(updated.agent.policies).toEqual({
+      activation_policy: "Runtime-owned activation policy.",
       source_policy: "Use evidence.",
       response: { style: "thorough", tones: ["clear"] },
       memory: { mode: "none" },

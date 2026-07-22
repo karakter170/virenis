@@ -35,6 +35,7 @@ import {
   approvalActivityPresentation,
   agentsForCatalog,
   agentsForWorkspace,
+  agentsWithWorkspaceSessionState,
   availableSessionAgents,
   chatDocumentMessageAttachments,
   graphConnectionInputs,
@@ -382,6 +383,41 @@ describe("Agent Studio product surfaces", () => {
       composition: { reusable_role: true, source_content_persisted: false }
     });
     expect(payload).not.toHaveProperty("sources");
+  });
+
+  it("round-trips an administrator-approved repository root without exposing it to ordinary creation", () => {
+    const form = {
+      item_type: "agent",
+      title: "Repository reviewer",
+      capability: "Inspect approved project files and explain defects.",
+      boundary: "Read only.",
+      response_style: "careful",
+      routing_cues: "repository review",
+      routing_avoid: "write production files",
+      consumes: ["user_request"],
+      produces: ["recommendations"],
+      tools: ["repo_inspector"],
+      repository_roots: "., repositories/product-api",
+      mcp_bindings: [],
+      resources: [],
+      source_text: "",
+      sources: "",
+      policies: {}
+    };
+
+    const adminPayload = agentPayloadFromForm(form, { isAdmin: true });
+    expect(adminPayload.tool_config).toEqual({
+      repo_inspector: { roots: [".", "repositories/product-api"] }
+    });
+    expect(adminPayload.policies.knowledge.requirements).toContain("repository");
+    expect(agentPayloadFromForm(form, { isAdmin: false })).not.toHaveProperty("tool_config");
+
+    const roundTrip = createAgentForm({
+      id: "repository_reviewer",
+      ...adminPayload,
+      routing_cues: ["repository review"]
+    });
+    expect(roundTrip.repository_roots).toBe("., repositories/product-api");
   });
 
   it("round-trips an Auto-Composer profile through the standard Agent Studio controls", () => {
@@ -1505,6 +1541,33 @@ describe("Agent Studio product surfaces", () => {
       "second_researcher"
     ]);
     expect(agentsForWorkspace(agents, null)).toEqual([]);
+  });
+
+  it("clears previous-team activation state when the active workspace changes", () => {
+    const agents = [
+      { id: "previous_writer", title: "Previous Writer", session_active: false, agent_workspace_member: true },
+      { id: "copied_planner", title: "Copied Planner", session_active: true, agent_workspace_member: false },
+      { id: "copied_reviewer", title: "Copied Reviewer", session_active: false, agent_workspace_member: false }
+    ];
+    const copiedWorkspace = {
+      agent_workspace_id: "team_copy",
+      agent_ids: ["copied_planner", "copied_reviewer"]
+    };
+
+    const rebound = agentsWithWorkspaceSessionState(agents, copiedWorkspace, [
+      "previous_writer",
+      "copied_reviewer"
+    ]);
+
+    expect(rebound).toEqual([
+      expect.objectContaining({ id: "previous_writer", agent_workspace_member: false, session_active: null }),
+      expect.objectContaining({ id: "copied_planner", agent_workspace_member: true, session_active: true }),
+      expect.objectContaining({ id: "copied_reviewer", agent_workspace_member: true, session_active: false })
+    ]);
+    expect(agentsForWorkspace(rebound, copiedWorkspace).map((agent) => agent.id)).toEqual([
+      "copied_planner",
+      "copied_reviewer"
+    ]);
   });
 
   it("adds unowned runtime inventory only to the admin catalog", () => {

@@ -1220,8 +1220,8 @@ function aggregateUsageComponents(components) {
 
 function estimateReservation(pricing, options, kind) {
   const contextTokens = boundedEnvInteger("ROUTER_SESSION_CONTEXT_TOKENS", boundedEnvInteger("TCAR_MODEL_CONTEXT_TOKENS", 32768, 2048, 2_000_000), 2048, 2_000_000);
-  const routeInput = boundedEnvInteger("TCAR_ROUTE_INPUT_MAX_TOKENS", 3000, 1500, 2_000_000);
-  const refinerInput = boundedEnvInteger("TCAR_REFINER_INPUT_MAX_TOKENS", 2800, 1500, 2_000_000);
+  const routeInput = boundedEnvInteger("TCAR_ROUTE_INPUT_MAX_TOKENS", 8192, 1500, 2_000_000);
+  const refinerInput = boundedEnvInteger("TCAR_REFINER_INPUT_MAX_TOKENS", 16384, 1500, 2_000_000);
   const defaultRule = pricingRuleForModel(pricing, "");
   let promptTokens;
   let completionTokens;
@@ -1235,7 +1235,7 @@ function estimateReservation(pricing, options, kind) {
     const maximumSelected = boundedInteger(options.max_routing_adapters, 16, 1, 16);
     const routes = maximumSelected + 1;
     const rounds = boundedEnvInteger("TCAR_TOOL_MAX_ROUNDS", 3, 0, 6) + 1;
-    const maxTokens = boundedInteger(options.max_tokens, 1536, 16, 4096);
+    const maxTokens = boundedInteger(options.max_tokens, 4096, 16, 8192);
     const requestedPlannerTokens = boundedInteger(options.planner_max_tokens, 768, 32, 4096);
     // Reservation cannot know the eventual active catalog size, so assume it
     // reaches Runtime's fan-out threshold and mirror the worst-case controller
@@ -1245,7 +1245,7 @@ function estimateReservation(pricing, options, kind) {
       512 + (maximumSelected * 160)
     );
     const plannerTokens = Math.max(requestedPlannerTokens, fanoutPlannerTokens);
-    const refinerTokens = boundedInteger(options.refiner_max_tokens, 2048, 32, 8192);
+    const refinerTokens = boundedInteger(options.refiner_max_tokens, 8192, 32, 12288);
     promptTokens = contextTokens + routes * rounds * routeInput + refinerInput;
     completionTokens = plannerTokens + routes * rounds * maxTokens + refinerTokens;
   }
