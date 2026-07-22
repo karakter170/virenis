@@ -102,6 +102,7 @@ describe("runtime and catalog", () => {
   it("routes an agent's attached knowledge before the parent agent", () => {
     const plan = planRoutes({
       query: "@launch_risk_lora assess the launch",
+      semanticAgentIds: ["launch_risk_lora"],
       agents: [
         {
           id: "launch_risk_lora",
@@ -129,6 +130,7 @@ describe("runtime and catalog", () => {
   it("turns an Agent Studio handoff into an upstream execution step", () => {
     const plan = planRoutes({
       query: "@business_plan_agent create a textile business plan",
+      semanticAgentIds: ["business_plan_agent"],
       agents: [
         {
           id: "textile_agent",
@@ -154,6 +156,7 @@ describe("runtime and catalog", () => {
   it("compiles handoffs and knowledge dependencies for valid hyphenated agent ids", () => {
     const plan = planRoutes({
       query: "@reply-writer prepare the final reply",
+      semanticAgentIds: ["reply-writer"],
       agents: [
         {
           id: "source-agent",
@@ -336,6 +339,7 @@ describe("runtime and catalog", () => {
       direct_answer: "",
       synthesis_brief: "Return one concise recommendation.",
       discovery_method: "authorized_manifest_index",
+      mentioned_agent_adapters: [],
       authorized_agent_count: 12,
       active_primary_agent_count: 2,
       all_primary_agents_visible: true,
@@ -369,6 +373,7 @@ describe("runtime and catalog", () => {
         }]
       },
       planning_call_performed: true,
+      semantic_adjudication: null,
       final_synthesis_required: true
     });
   });
@@ -1085,10 +1090,22 @@ describe("runtime and catalog", () => {
       APP_API_TOKENS_JSON: process.env.APP_API_TOKENS_JSON,
       APP_ALLOW_JSON_STORE: process.env.APP_ALLOW_JSON_STORE,
       APP_PUBLIC_ORIGIN: process.env.APP_PUBLIC_ORIGIN,
-      TCAR_ENGINE_MODE: process.env.TCAR_ENGINE_MODE
+      TCAR_ENGINE_MODE: process.env.TCAR_ENGINE_MODE,
+      TCAR_RUNTIME_API_URL: process.env.TCAR_RUNTIME_API_URL,
+      TCAR_RUNTIME_API_KEY: process.env.TCAR_RUNTIME_API_KEY
     };
     const prodTmp = await fs.mkdtemp(path.join(os.tmpdir(), "tcar-chat-bearer-"));
     const token = "abcdef0123456789abcdef0123456789";
+    const restoreRuntimeFetch = setRuntimeFetchForTests(async () => new Response(
+      JSON.stringify({
+        ok: true,
+        ready: true,
+        planner_mode: "session",
+        manifest: { valid: true },
+        vllm: { health: { ok: true } }
+      }),
+      { status: 200, headers: { "Content-Type": "application/json" } }
+    ));
 
     try {
       process.env.NODE_ENV = "production";
@@ -1099,7 +1116,9 @@ describe("runtime and catalog", () => {
       });
       process.env.APP_ALLOW_JSON_STORE = "1";
       process.env.APP_PUBLIC_ORIGIN = "https://app.example.com";
-      process.env.TCAR_ENGINE_MODE = "simulator";
+      process.env.TCAR_ENGINE_MODE = "real";
+      process.env.TCAR_RUNTIME_API_URL = "https://semantic-runtime.prod.test";
+      process.env.TCAR_RUNTIME_API_KEY = "test_semantic_runtime_key_2026_strong";
       const prodApp = await createApp({
         dbPath: path.join(prodTmp, "db.json"),
         uploadRoot: prodTmp,
@@ -1126,6 +1145,7 @@ describe("runtime and catalog", () => {
       expect(session.body.created_by).toBe("bearer_user");
       expect(session.body.workspace_id).toBe("workspace_bearer");
     } finally {
+      restoreRuntimeFetch();
       for (const [key, value] of Object.entries(previous)) {
         if (value === undefined) {
           delete process.env[key];
@@ -1150,10 +1170,16 @@ describe("runtime and catalog", () => {
       APP_UNAUTHENTICATED_WORKSPACE_ID: process.env.APP_UNAUTHENTICATED_WORKSPACE_ID,
       APP_UNAUTHENTICATED_ROLE: process.env.APP_UNAUTHENTICATED_ROLE,
       APP_PUBLIC_ORIGIN: process.env.APP_PUBLIC_ORIGIN,
-      TCAR_ENGINE_MODE: process.env.TCAR_ENGINE_MODE
+      TCAR_ENGINE_MODE: process.env.TCAR_ENGINE_MODE,
+      TCAR_RUNTIME_API_URL: process.env.TCAR_RUNTIME_API_URL,
+      TCAR_RUNTIME_API_KEY: process.env.TCAR_RUNTIME_API_KEY
     };
     const prodTmp = await fs.mkdtemp(path.join(os.tmpdir(), "tcar-chat-public-identity-"));
     let prodApp;
+    const restoreRuntimeFetch = setRuntimeFetchForTests(async () => new Response(
+      JSON.stringify({ ok: true, ready: true, planner_mode: "session" }),
+      { status: 200, headers: { "Content-Type": "application/json" } }
+    ));
 
     try {
       process.env.NODE_ENV = "production";
@@ -1167,7 +1193,9 @@ describe("runtime and catalog", () => {
       process.env.APP_UNAUTHENTICATED_WORKSPACE_ID = "workspace_public_chat";
       process.env.APP_UNAUTHENTICATED_ROLE = "user";
       process.env.APP_PUBLIC_ORIGIN = "https://public-chat.prod.test";
-      process.env.TCAR_ENGINE_MODE = "simulator";
+      process.env.TCAR_ENGINE_MODE = "real";
+      process.env.TCAR_RUNTIME_API_URL = "https://semantic-runtime.prod.test";
+      process.env.TCAR_RUNTIME_API_KEY = "test_semantic_runtime_key_2026_strong";
       expect(() => requireRuntimeConfigured()).not.toThrow();
       prodApp = await createApp({
         dbPath: path.join(prodTmp, "db.json"),
@@ -1192,6 +1220,7 @@ describe("runtime and catalog", () => {
       expect(session.body.created_by).toBe("public_chat_user");
       expect(session.body.workspace_id).toBe("workspace_public_chat");
     } finally {
+      restoreRuntimeFetch();
       await prodApp?.locals?.store?.close?.();
       for (const [key, value] of Object.entries(previous)) {
         if (value === undefined) {
@@ -3038,6 +3067,11 @@ describe("chat execution", () => {
       .post(`/api/chat/sessions/${session.session_id}/messages`)
       .send({
         content: "Review a clinic patient newsletter signup flow for consent and patient privacy, suggest health-safe wording, and draft a customer support FAQ.",
+        requested_agent_ids: [
+          "legal_privacy_lora",
+          "health_safety_lora",
+          "customer_support_lora"
+        ],
         options: { parallel_workers: 2 }
       })
       .expect(202);
@@ -3047,8 +3081,7 @@ describe("chat execution", () => {
     expect(run.plan.steps.map((step) => step.adapter)).toEqual([
       "legal_privacy_lora",
       "health_safety_lora",
-      "customer_support_lora",
-      "writing_synthesis_lora"
+      "customer_support_lora"
     ]);
     expect(run.parallel.batches[0].width).toBe(2);
     expect(run.final_answer).toContain("Signup wording");
@@ -3098,7 +3131,10 @@ describe("chat execution", () => {
       const queued = await request(app)
         .post(`/api/chat/sessions/${session.body.session_id}/messages`)
         .set("Authorization", "Bearer explicit_user_token")
-        .send({ content: "Ask @private_numbers for the private 2026 target." })
+        .send({
+          content: "Ask @private_numbers for the private 2026 target.",
+          requested_agent_ids: ["private_numbers"]
+        })
         .expect(202);
       const run = await waitForRunAs(queued.body.run_id, "Bearer explicit_user_token");
       expect(run.status).toBe("completed");
@@ -3169,7 +3205,10 @@ describe("chat execution", () => {
     const session = await createSession("Agent contract proof");
     const queued = await request(app)
       .post(`/api/chat/sessions/${session.session_id}/messages`)
-      .send({ content: "Ask @contract_analysis_agent to analyze the approved catalog color." })
+      .send({
+        content: "Ask @contract_analysis_agent to analyze the approved catalog color.",
+        requested_agent_ids: ["contract_analysis_agent"]
+      })
       .expect(202);
     const run = await waitForRun(queued.body.run_id);
 
@@ -3557,7 +3596,7 @@ describe("chat execution", () => {
       .expect(202);
     const tcandonRun = await waitForRun(tcandonQueued.body.run_id);
     expect(tcandonRun.status).toBe("completed");
-    expect(app.locals.store.read().runs.find((item) => item.run_id === tcandonQueued.body.run_id).planner_mode).toBe("tcandon");
+    expect(app.locals.store.read().runs.find((item) => item.run_id === tcandonQueued.body.run_id).planner_mode).toBe("session");
 
     const sessionQueued = await request(app)
       .post(`/api/chat/sessions/${session.session_id}/messages`)
@@ -3587,7 +3626,10 @@ describe("chat execution", () => {
       const queued = await request(app)
         .post(`/api/chat/sessions/${session.body.session_id}/messages`)
         .set("Authorization", "Bearer token_route_user")
-        .send({ content: "Plan a secure support workflow with privacy review." })
+        .send({
+          content: "Plan a secure support workflow with privacy review.",
+          requested_agent_ids: ["security_review_lora"]
+        })
         .expect(202);
 
       const run = await waitForRunAs(queued.body.run_id, "Bearer token_route_user");
@@ -3787,7 +3829,8 @@ describe("chat execution", () => {
             orchestrator: {
               contract_version: "session-orchestrator-v3",
               decision: "delegate",
-              final_synthesis_required: true,
+      final_synthesis_required: true,
+      semantic_adjudication: null,
               outcome_contract: {
                 contract_version: "session-outcome-v1",
                 route_admission_contract_version: "session-route-admission-v1",
@@ -4544,7 +4587,10 @@ describe("chat execution", () => {
       sessions.map((session, index) =>
         request(app)
           .post(`/api/chat/sessions/${session.session_id}/messages`)
-          .send({ content: `Plan a secure support workflow with timeline and checklist ${index}.` })
+          .send({
+            content: `Plan a secure support workflow with timeline and checklist ${index}.`,
+            requested_agent_ids: ["project_planning_lora"]
+          })
           .expect(202)
       )
     );
@@ -4604,7 +4650,10 @@ describe("documents and sources", () => {
     const session = await createSession("Attached knowledge handoff");
     const queued = await request(app)
       .post(`/api/chat/sessions/${session.session_id}/messages`)
-      .send({ content: "Ask @launch_risk_lora what material risk is in the attached launch brief." })
+      .send({
+        content: "Ask @launch_risk_lora what material risk is in the attached launch brief.",
+        requested_agent_ids: ["launch_risk_lora"]
+      })
       .expect(202);
     const run = await waitForRun(queued.body.run_id);
     const parentRoute = run.expert_outputs.find((route) => route.adapter === "launch_risk_lora");
@@ -4655,7 +4704,10 @@ describe("documents and sources", () => {
     const session = await createSession("Doc question");
     const queued = await request(app)
       .post(`/api/chat/sessions/${session.session_id}/messages`)
-      .send({ content: "Using the uploaded Linear Algebra Notes, explain rank-nullity with dim(V)=8 and nullity 3." })
+      .send({
+        content: "Using the uploaded Linear Algebra Notes, explain rank-nullity with dim(V)=8 and nullity 3.",
+        requested_agent_ids: [upload.body.agent_id]
+      })
       .expect(202);
     const run = await waitForRun(queued.body.run_id);
     expect(run.status).toBe("completed");
@@ -4725,7 +4777,10 @@ describe("documents and sources", () => {
 
     const chatAQueued = await request(app)
       .post(`/api/chat/sessions/${sessionA.session_id}/messages`)
-      .send({ content: '@"Chat A Notes source agent" use this chat file.' })
+      .send({
+        content: '@"Chat A Notes source agent" use this chat file.',
+        requested_agent_ids: [chatOnly.body.agent_id]
+      })
       .expect(202);
     const chatBQueued = await request(app)
       .post(`/api/chat/sessions/${sessionB.session_id}/messages`)
@@ -4737,7 +4792,10 @@ describe("documents and sources", () => {
     ]);
     const knowledgeQueued = await request(app)
       .post(`/api/chat/sessions/${sessionB.session_id}/messages`)
-      .send({ content: '@“Reusable README source agent” use the reusable file.' })
+      .send({
+        content: '@“Reusable README source agent” use the reusable file.',
+        requested_agent_ids: [knowledge.body.agent_id]
+      })
       .expect(202);
     const knowledgeRun = await waitForRun(knowledgeQueued.body.run_id);
     expect(chatARun.plan.steps.map((step) => step.adapter)).toContain(chatOnly.body.agent_id);
@@ -4804,7 +4862,7 @@ describe("documents and sources", () => {
       .expect(404);
   });
 
-  it("fails closed when an attached-file reference is ambiguous within one chat", async () => {
+  it("passes multiple authenticated chat files without classifying the request text", async () => {
     const session = await createSession("Attachment ambiguity");
     const uploads = [];
     for (const title of ["Candidate Resume", "Manager Resume"]) {
@@ -4829,8 +4887,16 @@ describe("documents and sources", () => {
           document_id: upload.document_id
         }))
       })
-      .expect(409);
-    expect(response.body.message).toMatch(/more than one chat file/i);
+      .expect(202);
+    const run = await waitForRun(response.body.run_id);
+    expect(run.status).toBe("completed");
+    expect(run.attachment_document_ids).toEqual(uploads.map((upload) => upload.document_id));
+    expect(new Set(run.attachment_agent_ids)).toEqual(
+      new Set(uploads.map((upload) => upload.agent_id))
+    );
+    expect(new Set(run.plan.steps.map((step) => step.adapter))).toEqual(
+      new Set(uploads.map((upload) => upload.agent_id))
+    );
   });
 
   it("keeps a deleted document agent inspectable as an owner-scoped tombstone after Runtime purge", async () => {
@@ -5148,7 +5214,10 @@ describe("documents and sources", () => {
       const queued = await request(app)
         .post(`/api/chat/sessions/${session.body.session_id}/messages`)
         .set("Authorization", "Bearer doc_user_token")
-        .send({ content: "Using the uploaded User Safe Manual, what does launch proof require?" })
+        .send({
+          content: "Using the uploaded User Safe Manual, what does launch proof require?",
+          requested_agent_ids: [upload.body.agent_id]
+        })
         .expect(202);
       const run = await waitForRunAs(queued.body.run_id, "Bearer doc_user_token");
       expect(run.status).toBe("completed");

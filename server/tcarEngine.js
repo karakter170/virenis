@@ -3,7 +3,7 @@ import crypto from "node:crypto";
 import { approvedSourceSnippets, BASE_MODEL, DEFAULT_VLLM_BASE_URL } from "./catalog.js";
 import { releaseRunReservation, settleRunCredits } from "./billing.js";
 import { makeId, nowIso } from "./store.js";
-import { assertStoredDocumentIntegrity, scoreChunks, slugify } from "./documents.js";
+import { assertStoredDocumentIntegrity, scoreChunks } from "./documents.js";
 import { normalizeDiagnosticError } from "./diagnostics.js";
 import { agentIsRoutingReady } from "./agentContract.js";
 import {
@@ -138,35 +138,171 @@ function agentOwnsSemanticContext(agent = {}) {
   );
 }
 
-function producedContractSupportsInferredEdge(sourceAgent = {}, destinationAgent = {}) {
-  const produces = (sourceAgent?.produces || []).map((value) => String(value || "").trim()).filter(Boolean);
-  const consumes = (destinationAgent?.consumes || []).map((value) => String(value || "").trim()).filter(Boolean);
-  const consumed = new Set(consumes);
+/**
+ * Compile a semantic model decision into an executable route graph.
+ *
+ * This public entry point deliberately does not interpret natural language.
+ * The caller must supply `semanticSelections` from the Qwen session router, or
+ * an authenticated workflow/file binding.  Authorization, lifecycle, route
+ * limits, and saved dependency edges remain deterministic because they are
+ * execution invariants rather than intent classifiers.
+ */
+export function planRoutes({
+  semanticSelections = [],
+  semanticAgentIds = [],
+  ...input
+}) {
+  const requestedWorkflowIds = Array.isArray(input.requiredAgentIds)
+    ? input.requiredAgentIds
+    : [];
+  const requestedAttachmentIds = Array.isArray(input.attachmentAgentIds)
+    ? input.attachmentAgentIds
+    : [];
+  if (requestedWorkflowIds.length || requestedAttachmentIds.length) {
+    return compileContractInputEdges(
+      compileAuthorizedRouteGraph(input),
+      input.agents || []
+    );
+  }
 
-  // A named artifact is an intentional contract and can safely compile to an
-  // edge. Semantic aliases are different: for a document-backed agent,
-  // `document_context` describes its own retrieval input, not another selected
-  // document agent's output.
-  if (produces.some((name) => consumed.has(name))) return true;
-  if (agentOwnsSemanticContext(destinationAgent)) return false;
-  return producedContractSupportsContext(produces, consumes);
+  const suppliedSelections = Array.isArray(semanticSelections)
+    ? semanticSelections
+    : [];
+  const normalizedSelections = suppliedSelections.length
+    ? suppliedSelections.map((selection) => (
+      typeof selection === "string"
+        ? { adapter: selection }
+        : { ...selection, adapter: selection?.adapter || selection?.agent_id }
+    ))
+    : (Array.isArray(semanticAgentIds) ? semanticAgentIds : []).map((adapter) => ({ adapter }));
+  const uniqueSelections = [];
+  const seen = new Set();
+  for (const selection of normalizedSelections) {
+    const adapter = String(selection?.adapter || "").trim();
+    if (!adapter || seen.has(adapter)) continue;
+    seen.add(adapter);
+    uniqueSelections.push({
+      ...selection,
+      adapter,
+      source: "semantic_model",
+      confidence: Number.isFinite(Number(selection?.confidence))
+        ? Math.max(0, Math.min(1, Number(selection.confidence)))
+        : null,
+      reason: String(selection?.reason || "Selected by semantic Qwen adjudication.").trim(),
+      task: String(selection?.task || "Apply this specialist's declared capability to the user's complete request.").trim()
+    });
+  }
+
+  if (!uniqueSelections.length) {
+    return {
+      steps: [],
+      routing: {
+        mode: "semantic_direct",
+        candidate_trace: [],
+        explicit_adapters: [],
+        selected: [],
+        reason: "The semantic model selected a direct base-model response."
+      }
+    };
+  }
+
+  const eligibleIds = new Set((Array.isArray(input.agents) ? input.agents : [])
+    .filter((agent) => agentIsRoutingReady(agent) && agent.runtime_sync_pending !== true)
+    .map((agent) => agent.id));
+  const unknown = uniqueSelections
+    .map((selection) => selection.adapter)
+    .filter((adapter) => !eligibleIds.has(adapter));
+  if (unknown.length) {
+    const error = new Error(`Semantic routing selected unavailable specialists: ${unknown.join(", ")}.`);
+    error.code = "semantic_agent_unavailable";
+    throw error;
+  }
+
+  const specialistLimit = Math.max(1, Math.min(Number(input.maxRoutingAdapters) || 16, 16));
+  if (uniqueSelections.length > specialistLimit) {
+    const error = new Error(`Semantic routing exceeds the ${specialistLimit}-specialist route limit.`);
+    error.code = "semantic_route_limit_exceeded";
+    throw error;
+  }
+
+  const compiled = compileAuthorizedRouteGraph({
+    ...input,
+    requiredAgentIds: uniqueSelections.map((selection) => selection.adapter)
+  });
+  compileContractInputEdges(compiled, input.agents || []);
+  const selectionByAdapter = new Map(uniqueSelections.map((selection) => [selection.adapter, selection]));
+  compiled.steps = compiled.steps.map((step) => {
+    const selection = selectionByAdapter.get(step.adapter);
+    return selection ? { ...step, task: selection.task } : step;
+  });
+  compiled.routing = {
+    ...compiled.routing,
+    mode: "semantic_qwen",
+    explicit_adapters: [],
+    selected: compiled.steps.map((step) => {
+      const selection = selectionByAdapter.get(step.adapter);
+      if (selection) {
+        const { task: _task, ...routingSelection } = selection;
+        return routingSelection;
+      }
+      return {
+        adapter: step.adapter,
+        source: "configured_handoff",
+        confidence: 1,
+        reality_rank: rankingScore(input.agentRankings?.[step.adapter]),
+        reason: "Included by a semantically selected specialist's saved dependency contract."
+      };
+    })
+  };
+  return compiled;
 }
 
-export function planRoutes({
-  query,
+function compileContractInputEdges(plan, agents) {
+  const steps = Array.isArray(plan?.steps) ? plan.steps : [];
+  const agentById = new Map((Array.isArray(agents) ? agents : []).map((agent) => [agent.id, agent]));
+  for (const [destinationIndex, destinationStep] of steps.entries()) {
+    const destinationAgent = agentById.get(destinationStep.adapter) || {};
+    const consumes = (destinationAgent.consumes || []).map((value) => String(value || "").trim());
+    const consumedNames = new Set(consumes);
+    const consumesAggregate = consumes.some((value) => AGGREGATE_CONTEXT_INPUTS.has(value));
+    const hasConfiguredProducerScope = configuredHandoffDependencies(destinationAgent).length > 0;
+    const inferredIds = steps.slice(0, destinationIndex).filter((sourceStep) => {
+      const sourceAgent = agentById.get(sourceStep.adapter) || {};
+      const produces = (sourceAgent.produces || []).map((value) => String(value || "").trim()).filter(Boolean);
+      if (hasConfiguredProducerScope) {
+        return produces.some((name) => consumedNames.has(name));
+      }
+      if (consumesAggregate) return true;
+      if (produces.some((name) => consumedNames.has(name))) return true;
+      if (agentOwnsSemanticContext(destinationAgent)) return false;
+      return producedContractSupportsContext(produces, consumes);
+    }).map((sourceStep) => sourceStep.id);
+    destinationStep.depends_on = [...new Set([
+      ...(destinationStep.depends_on || []),
+      ...inferredIds
+    ])].filter((dependencyId) => dependencyId !== destinationStep.id);
+  }
+  return plan;
+}
+
+function compileAuthorizedRouteGraph({
   agents,
-  documents = [],
   agentRankings = {},
   maxRoutingAdapters = 16,
   maxResourceSupportAdapters = 8,
   requiredAgentIds = [],
   attachmentAgentIds = []
 }) {
+  if (!(Array.isArray(requiredAgentIds) && requiredAgentIds.length)
+    && !(Array.isArray(attachmentAgentIds) && attachmentAgentIds.length)) {
+    const error = new Error("Route compilation requires a semantic decision, approved workflow, or bound attachment.");
+    error.code = "semantic_decision_required";
+    throw error;
+  }
   const enabled = agents.filter((agent) => (
     agentIsRoutingReady(agent) && agent.runtime_sync_pending !== true
   ));
   const hasAgent = (id) => enabled.some((agent) => agent.id === id);
-  const lower = query.toLowerCase();
   const steps = [];
   const idByAdapter = new Map();
   const selections = new Map();
@@ -174,7 +310,6 @@ export function planRoutes({
   const resourceSupportLimit = Math.max(0, Math.min(Number(maxResourceSupportAdapters) || 0, 24));
   const enabledById = new Map(enabled.map((agent) => [agent.id, agent]));
 
-  const contains = (...terms) => terms.some((term) => lower.includes(term));
   const wouldCreateCycle = (dependencyId, destinationId) => {
     if (!dependencyId || !destinationId || dependencyId === destinationId) return true;
     const downstream = new Map();
@@ -414,220 +549,14 @@ export function planRoutes({
     };
   }
 
-  for (const agent of resolveExplicitAgentMentions(query, enabled)) {
-    if (agent.id === "writing_synthesis_lora") continue;
-    const explicitStep = add(agent.id, `Execute the explicitly requested @${agent.id} agent within its declared capability and boundary.`, [], {
-      adapter: agent.id,
-      source: "explicit",
-      confidence: 1,
-      reality_rank: rankingScore(agentRankings[agent.id]),
-      reason: "Explicit authorized agent reference."
-    });
-    if (!explicitStep) {
-      const error = new Error(`@${agent.id} cannot fit its complete configured handoff graph within the current specialist limit and active team.`);
-      error.code = "explicit_agent_dependency_closure_unavailable";
-      throw error;
-    }
-  }
-
-  const matchingDocuments = documents.filter((doc) => {
-    const cues = [doc.title, doc.agent_id, ...(doc.routing_cues || [])].filter(Boolean).join(" ").toLowerCase();
-    return contains("uploaded", "document", "textbook", "source") || cues.split(/\s+/).some((cue) => cue.length > 3 && lower.includes(cue));
-  });
-
-  for (const doc of matchingDocuments.slice(0, 2)) {
-    add(doc.agent_id, `Retrieve approved chunks from ${doc.title} and answer only from cited document evidence.`);
-  }
-
-  if (contains("privacy", "consent", "legal", "records", "policy risk")) {
-    add("legal_privacy_lora", "Review consent, privacy boundaries, records needed, and legal-information caveats.");
-  }
-  if (contains("health", "patient", "clinic", "medical", "symptom", "care")) {
-    add("health_safety_lora", "Suggest health-safe, patient-facing wording and escalation boundaries.");
-  }
-  if (contains("refund", "return", "replacement", "damaged")) {
-    add("finance_risk_lora", "Identify refund, billing, and financial-risk assumptions.");
-    add("refund_policy_lora", "Use the approved refund policy source to determine policy boundaries.");
-  }
-  if (contains("software", "api", "backend", "frontend", "web app", "architecture", "database")) {
-    add("software_architect_lora", "Plan the software architecture, APIs, data model, and implementation risks.");
-  }
-  if (contains("security", "auth", "abuse", "hardening", "threat")) {
-    add("security_review_lora", "Review abuse cases, auth boundaries, data protection, and hardening tests.");
-  }
-  if (contains("sql", "warehouse", "analytics", "metric", "dashboard")) {
-    add("sql_analytics_lora", "Define analytics checks, metric logic, and query validation plan.");
-  }
-  if (contains("calculate", "csv", "table", "numbers", "formula", "rank-nullity", "rank nullity")) {
-    add("data_math_tool_lora", "Verify calculations and formulas with a visible arithmetic trace.");
-  }
-  if (contains("research", "literature", "evidence", "study", "paper")) {
-    add("research_literature_lora", "Summarize evidence quality, caveats, and research terms.");
-  }
-  if (contains("lesson", "curriculum", "student", "teach", "worksheet")) {
-    add("education_curriculum_lora", "Adapt the response for teaching, learning outcomes, and assessment.");
-  }
-  if (contains("chart", "visualization", "graph", "plot")) {
-    add("visualization_lora", "Recommend chart and dashboard presentation choices.");
-  }
-  if (contains("launch", "product", "customer segment", "value proposition", "positioning")) {
-    add("product_strategy_lora", "Frame product strategy, customer segments, and launch assumptions.");
-  }
-  if (contains("plan", "timeline", "milestone", "rollout", "checklist")) {
-    add("project_planning_lora", "Sequence the work into milestones, owners, and checklist items.");
-  }
-
-  const metadataCandidates = enabled
-    .filter((agent) => agent.id !== "writing_synthesis_lora" && !idByAdapter.has(agent.id))
-    .map((agent) => ({ agent, score: agentMetadataScore(agent, lower) }))
-    .filter((match) => match.score > 0)
-    .sort((left, right) =>
-      right.score - left.score
-      || routingRankingScore(agentRankings[right.agent.id]) - routingRankingScore(agentRankings[left.agent.id])
-      || left.agent.id.localeCompare(right.agent.id)
-    );
-  const metadataMatches = metadataCandidates.slice(0, Math.min(2, specialistLimit));
-  for (const { agent, score } of metadataMatches) {
-    const rank = rankingScore(agentRankings[agent.id]);
-    const rankApplied = agentRankings[agent.id]?.routing_eligible === true
-      && metadataCandidates.some((candidate) => candidate.agent.id !== agent.id && candidate.score === score);
-    add(agent.id, `Apply ${agent.title || agent.id} to the request using only its declared tools and approved sources.`, [], {
-      adapter: agent.id,
-      source: rankApplied ? "cue+reality_rank" : "cue",
-      confidence: Number((score / (score + 4)).toFixed(4)),
-      reality_rank: rank,
-      reason: rankApplied
-        ? "Capability cues matched; settled outcomes broke an equally relevant tie."
-        : "Agent metadata matched the request."
-    });
-  }
-
-  const currentAdapters = steps.map((step) => step.adapter);
-  if (contains("support", "faq", "customer", "reply", "message") || currentAdapters.includes("refund_policy_lora") || currentAdapters.includes("health_safety_lora")) {
-    add("customer_support_lora", "Draft support-ready language using upstream constraints.", [
-      "legal_privacy_lora",
-      "health_safety_lora",
-      "finance_risk_lora",
-      "refund_policy_lora"
-    ]);
-  }
-
-  // Compile the same semantic input contracts used by the Qwen executor.
-  // Explicit graph/resource connections were already added above; this adds
-  // safe inferred edges for aggregate, structured, and exact artifact inputs.
-  for (const [destinationIndex, destinationStep] of [...steps].entries()) {
-    const destinationAgent = enabled.find((agent) => agent.id === destinationStep.adapter);
-    const consumes = destinationAgent?.consumes || [];
-    const consumedNames = new Set(consumes.map((value) => String(value || "").trim()).filter(Boolean));
-    const consumesAggregate = consumes.some((value) => AGGREGATE_CONTEXT_INPUTS.has(value));
-    const hasConfiguredProducerScope = configuredHandoffDependencies(destinationAgent).length > 0;
-    const inferredDependencies = steps
-      .slice(0, destinationIndex)
-      .filter((sourceStep) => {
-        const sourceAgent = enabled.find((agent) => agent.id === sourceStep.adapter);
-        if (hasConfiguredProducerScope) {
-          return (sourceAgent?.produces || []).some((name) => consumedNames.has(String(name || "").trim()));
-        }
-        return consumesAggregate || producedContractSupportsInferredEdge(sourceAgent, destinationAgent);
-      })
-      .map((sourceStep) => sourceStep.adapter);
-    if (inferredDependencies.length > 0) {
-      addStep(destinationStep.adapter, destinationStep.task, inferredDependencies);
-    }
-  }
-
-  if (steps.length === 0) {
-    add("product_strategy_lora", "Clarify the request and identify the most useful product-facing answer.");
-    add("project_planning_lora", "Turn the request into practical next steps.", ["product_strategy_lora"]);
-  }
-
-  add("writing_synthesis_lora", "Synthesize one concise final answer while preserving source and safety boundaries.", steps.map((step) => step.adapter));
-
-  const dependencyGaps = configuredPlanGaps(steps, enabled);
-  if (dependencyGaps.length) {
-    const error = new Error(`The route is missing configured handoffs: ${dependencyGaps.join(", ")}.`);
-    error.code = "plan_missing_configured_dependency";
-    throw error;
-  }
-
-  return {
-    steps,
-    routing: {
-      mode: "simulator",
-      candidate_trace: metadataCandidates.slice(0, 256).map(({ agent, score }) => ({
-        adapter: agent.id,
-        cue_score: score,
-        reality_rank: rankingScore(agentRankings[agent.id]),
-        rank_sample_size: Math.max(0, Number(agentRankings[agent.id]?.sample_size) || 0),
-        rank_supplied: agentRankings[agent.id]?.routing_eligible === true,
-        agent_revision: agentRankings[agent.id]?.agent_revision || agentRevision(agent)
-      })),
-      explicit_adapters: [...selections.values()]
-        .filter((selection) => selection.source === "explicit")
-        .map((selection) => selection.adapter),
-      selected: steps
-        .filter((step) => step.adapter !== "writing_synthesis_lora")
-        .map((step) => selections.get(step.adapter) || {
-          adapter: step.adapter,
-          source: "cue",
-          confidence: null,
-          reality_rank: rankingScore(agentRankings[step.adapter]),
-          reason: "Deterministic capability rule matched the request."
-        })
-    }
-  };
+  const error = new Error("The bound route contains no available specialist to compile.");
+  error.code = "bound_route_unavailable";
+  throw error;
 }
 
 function rankingScore(value) {
   const score = Number(value?.score ?? value);
   return Number.isFinite(score) && score >= 0 && score <= 1 ? score : 0.5;
-}
-
-function routingRankingScore(value) {
-  if (value?.routing_eligible !== true) return 0.5;
-  const score = Number(value.routing_score ?? value.score);
-  return Number.isFinite(score) && score >= 0 && score <= 1 ? score : 0.5;
-}
-
-function resolveExplicitAgentMentions(query, agents) {
-  const aliases = new Map();
-  for (const agent of agents) {
-    const values = [
-      agent.id,
-      String(agent.id || "").replace(/_lora$/, ""),
-      agent.title,
-      agent.document?.title
-    ].filter(Boolean);
-    for (const value of values) {
-      aliases.set(slugify(value), agent);
-    }
-  }
-  const selected = [];
-  const seen = new Set();
-  const mentionPattern = /@(?:"([^"\r\n]+)"|'([^'\r\n]+)'|“([^”\r\n]+)”|‘([^’\r\n]+)’|([a-z0-9][a-z0-9_-]*))/gi;
-  for (const match of String(query || "").matchAll(mentionPattern)) {
-    const reference = match.slice(1).find((value) => value !== undefined);
-    const agent = aliases.get(slugify(reference));
-    if (agent && !seen.has(agent.id)) {
-      selected.push(agent);
-      seen.add(agent.id);
-    }
-  }
-  return selected;
-}
-
-function agentMetadataScore(agent, lowerQuery) {
-  const phrases = [agent.title, agent.id, agent.document?.title, ...(agent.routing_cues || [])]
-    .map((value) => String(value || "").toLowerCase().trim())
-    .filter((value) => value.length >= 4);
-  let score = 0;
-  for (const phrase of phrases) {
-    const normalized = phrase.replace(/_lora$/, "").replaceAll("_", " ").replaceAll("-", " ");
-    if (lowerQuery.includes(phrase) || lowerQuery.includes(normalized)) {
-      score += phrase.includes(" ") ? 4 : 2;
-    }
-  }
-  return score;
 }
 
 export function scopedRoutingContext({ session, agents = [], documents = [], agentWorkspace = null }) {
@@ -2818,6 +2747,7 @@ export function assertRuntimePlan(plan, {
         "activation_policy", "boundary", "write_policy", "tool_policy",
         "source_policy", "escalation_policy"
       ]);
+      const semanticModelLed = outcomeContract.semantic_authority === "qwen_model_led";
       for (const step of normalizedSteps) {
         const proof = proofById.get(step.id);
         const admission = proof?.route_admission;
@@ -2853,7 +2783,14 @@ export function assertRuntimePlan(plan, {
           `route admission constraints for step ${step.id}`,
           24
         ));
-        if ([...requiredChecks].some((name) => !checked.has(name))) {
+        // Qwen and the independent semantic adjudicator own membership for a
+        // semantic-first plan. The compiler's prose-policy pass is audit data,
+        // not an English lexical veto that may be reintroduced by the web
+        // boundary after every GPU worker has already completed.
+        const requiredChecksPresent = semanticModelLed
+          ? checked.has("semantic_policy_diagnostics_only")
+          : [...requiredChecks].every((name) => checked.has(name));
+        if (!requiredChecksPresent) {
           fail(`runtime step ${step.id} route admission omits a strict constraint`);
         }
         const downstream = normalizedSteps.filter((candidate) => candidate.depends_on.includes(step.id));
@@ -3005,6 +2942,7 @@ export function normalizeRuntimeRouting(routing) {
       discovered_candidate_count: Math.max(0, Math.min(Number(rawOrchestrator.discovered_candidate_count) || 0, 100000)),
       catalog_checked: boundedStringList(rawOrchestrator.catalog_checked, 64, 240),
       contract_protected_candidates: boundedStringList(rawOrchestrator.contract_protected_candidates, 16, 240),
+      mentioned_agent_adapters: boundedStringList(rawOrchestrator.mentioned_agent_adapters, 16, 240),
       configured_agents_added: boundedStringList(rawOrchestrator.configured_agents_added, 64, 240),
       rejected_adapters: boundedStringList(rawOrchestrator.rejected_adapters, 24, 240),
       fallback_used: boundedText(rawOrchestrator.fallback_used, 120),
@@ -3025,6 +2963,37 @@ export function normalizeRuntimeRouting(routing) {
           stage: boundedText(rawOrchestrator.planning_provider_failure.stage, 80),
           error_type: boundedText(rawOrchestrator.planning_provider_failure.error_type, 120),
           fallback_allowed: rawOrchestrator.planning_provider_failure.fallback_allowed === true
+        }
+        : null,
+      semantic_adjudication: rawOrchestrator.semantic_adjudication
+        && typeof rawOrchestrator.semantic_adjudication === "object"
+        && !Array.isArray(rawOrchestrator.semantic_adjudication)
+        ? {
+          contract_version: boundedText(rawOrchestrator.semantic_adjudication.contract_version, 120),
+          attempted: rawOrchestrator.semantic_adjudication.attempted === true,
+          accepted: rawOrchestrator.semantic_adjudication.accepted === true,
+          authority: boundedText(rawOrchestrator.semantic_adjudication.authority, 80),
+          final_authority: boundedText(rawOrchestrator.semantic_adjudication.final_authority, 80),
+          decision: boundedText(rawOrchestrator.semantic_adjudication.decision, 40),
+          selected_adapters: boundedStringList(rawOrchestrator.semantic_adjudication.selected_adapters, 16, 240),
+          changed_decision: rawOrchestrator.semantic_adjudication.changed_decision === true,
+          changed_adapters: rawOrchestrator.semantic_adjudication.changed_adapters === true,
+          primary_retained: rawOrchestrator.semantic_adjudication.primary_retained === true,
+          repair_attempted: rawOrchestrator.semantic_adjudication.repair_attempted === true,
+          repair_succeeded: rawOrchestrator.semantic_adjudication.repair_succeeded === true,
+          errors: boundedStringList(rawOrchestrator.semantic_adjudication.errors, 24, 240),
+          proposal: rawOrchestrator.semantic_adjudication.proposal
+            && typeof rawOrchestrator.semantic_adjudication.proposal === "object"
+            && !Array.isArray(rawOrchestrator.semantic_adjudication.proposal)
+            ? {
+              decision: boundedText(rawOrchestrator.semantic_adjudication.proposal.decision, 40),
+              selected_adapters: boundedStringList(
+                rawOrchestrator.semantic_adjudication.proposal.selected_adapters,
+                16,
+                240
+              )
+            }
+            : null
         }
         : null,
       direct_decision_audit: rawOrchestrator.direct_decision_audit && typeof rawOrchestrator.direct_decision_audit === "object"
@@ -4048,6 +4017,9 @@ function selectSourceExcerpt(sourceText, query) {
 }
 
 function synthesizeFinalAnswer(query, outputs) {
+  if (!Array.isArray(outputs) || outputs.length === 0) {
+    return "The local graph simulator does not classify natural-language requests. Configure the semantic Qwen runtime for a real direct or agent-team response.";
+  }
   const adapters = outputs.map((output) => output.adapter);
   const sourceCount = outputs.reduce((total, output) => total + output.citations.length, 0);
   const lines = [];
@@ -4117,7 +4089,7 @@ export function runtimeHealth(data) {
       base_url: process.env.VLLM_BASE_URL || DEFAULT_VLLM_BASE_URL,
       models_endpoint_ok: false,
       base_model: process.env.VLLM_BASE_MODEL || BASE_MODEL,
-      mode: "local deterministic TCAR simulator"
+      mode: "local graph simulator (semantic selection disabled)"
     },
     manifest: {
       path: process.env.PHASE222_ADAPTER_MANIFEST || "configs/router_agent_library.json",

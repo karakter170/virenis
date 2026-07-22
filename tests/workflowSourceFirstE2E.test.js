@@ -727,7 +727,8 @@ describe("source-first workflow end-to-end proof", () => {
         const intakeArtifact = intakeNode.produces[0];
 
         const execution = await sendMessage(app, session.session_id,
-          `Ask @${synthesisId} to synthesize the latest classified support request.`);
+          `Ask @${synthesisId} to synthesize the latest classified support request.`,
+          [synthesisId]);
         const run = await waitForRun(app, execution.body.run_id);
         expect(run.status).toBe("completed");
         expect(run.plan.steps.map((step) => step.adapter)).toEqual([intakeId, synthesisId]);
@@ -1006,11 +1007,11 @@ async function createSession(app, title) {
     .expect(201)).body;
 }
 
-function sendMessage(app, sessionId, content) {
+function sendMessage(app, sessionId, content, requestedAgentIds = []) {
   return request(app)
     .post(`/api/chat/sessions/${sessionId}/messages`)
     .set(auth())
-    .send({ content })
+    .send({ content, requested_agent_ids: requestedAgentIds })
     .expect(202);
 }
 

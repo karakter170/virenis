@@ -222,6 +222,7 @@ describe("Virenis curated Marketplace teams", () => {
       const bounded = planRoutes({
         query: `Ask @${convergingAgent.id} to continue the earlier conclusion.`,
         agents: team.agents,
+        semanticAgentIds: [convergingAgent.id],
         maxRoutingAdapters: convergingClosure.size
       });
       expect(new Set(bounded.steps.map((step) => step.adapter)), team.name).toEqual(convergingClosure);
@@ -235,6 +236,7 @@ describe("Virenis curated Marketplace teams", () => {
       const complete = planRoutes({
         query: `Ask @${leadAgent.id} to continue the earlier conclusion.`,
         agents: team.agents,
+        semanticAgentIds: [leadAgent.id],
         maxRoutingAdapters: 6
       });
       expect(new Set(complete.steps.map((step) => step.adapter)), team.name).toEqual(
@@ -245,6 +247,7 @@ describe("Virenis curated Marketplace teams", () => {
       expect(() => planRoutes({
         query: `Ask @${leadAgent.id} to continue the earlier conclusion.`,
         agents: team.agents,
+        semanticAgentIds: [leadAgent.id],
         maxRoutingAdapters: 5
       }), team.name).toThrow(/complete configured handoff graph/i);
     }

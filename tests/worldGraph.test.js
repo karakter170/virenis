@@ -844,7 +844,7 @@ describe("WorldGraph validity and selective replay", () => {
     const base = fixture();
     const run = { ...base.run, run_id: "run_fresh" };
     const outputs = base.plan.steps.map((step) => routeOutput(step, step.id === "s1" ? "conflict" : "v1", {}, base.plan));
-    recordWorldGraphRun({ data: base.data, run, session: base.session, plan: base.plan, outputs, agents: base.agents, documents: [], sharedMemory: [], options: { max_tokens: 1024, temperature: 0 } });
+    recordWorldGraphRun({ data: base.data, run, session: base.session, plan: base.plan, outputs, agents: base.agents, documents: [], sharedMemory: [], options: { max_tokens: 1024, temperature: 0 }, createdAt: "2026-07-15T10:00:02.000Z" });
     expect(publicWorldGraphSnapshot({
       data: base.data,
       run,
@@ -875,7 +875,8 @@ describe("WorldGraph validity and selective replay", () => {
       agents: base.agents,
       documents: [],
       sharedMemory: [],
-      options: { max_tokens: 1024, temperature: 0 }
+      options: { max_tokens: 1024, temperature: 0 },
+      createdAt: "2026-07-15T10:00:02.000Z"
     });
     expect(base.data.worldGraphArtifacts.filter((artifact) => artifact.adapter === "research_agent")).toHaveLength(1);
     expect(base.data.worldGraphEvents).toHaveLength(0);
@@ -1017,7 +1018,8 @@ describe("WorldGraph validity and selective replay", () => {
         agents: base.agents,
         documents: [],
         sharedMemory: [],
-        options: { max_tokens: 1024, temperature: 0 }
+        options: { max_tokens: 1024, temperature: 0 },
+        createdAt: "2026-07-15T10:00:02.000Z"
       });
       expect(base.data.worldGraphArtifacts.filter((artifact) => artifact.adapter === "research_agent")).toHaveLength(1);
       expect(base.data.worldGraphEvents).toHaveLength(0);
@@ -1038,7 +1040,8 @@ describe("WorldGraph validity and selective replay", () => {
       agents: base.agents,
       documents: [],
       sharedMemory: [],
-      options: { max_tokens: 1024, temperature: 0 }
+      options: { max_tokens: 1024, temperature: 0 },
+      createdAt: "2026-07-15T10:00:02.000Z"
     });
     const disputed = base.data.worldGraphArtifacts.filter((artifact) => artifact.adapter === "research_agent");
     expect(disputed).toHaveLength(2);

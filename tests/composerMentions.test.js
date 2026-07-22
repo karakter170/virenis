@@ -28,7 +28,7 @@ describe("composer specialist suggestions", () => {
     expect(west.caret).toBe("Please ask the team @support_triage_west ".length);
   });
 
-  it("preserves the chosen duplicate-title id through simulator routing", () => {
+  it("preserves the chosen duplicate-title id through semantic graph compilation", () => {
     const specialists = [
       { id: "alpha_route", title: "Shared Specialist", enabled: true, consumes: ["user_request"], produces: ["answer"] },
       { id: "beta_route", title: "Shared Specialist", enabled: true, consumes: ["user_request"], produces: ["answer"] }
@@ -40,10 +40,17 @@ describe("composer specialist suggestions", () => {
       specialists[1]
     );
 
-    const plan = planRoutes({ query: selection.value, agents: specialists });
+    const plan = planRoutes({
+      query: selection.value,
+      agents: specialists,
+      semanticAgentIds: ["beta_route"]
+    });
 
     expect(selection.token).toBe("@beta_route");
-    expect(plan.routing.explicit_adapters).toEqual(["beta_route"]);
+    expect(plan.routing.explicit_adapters).toEqual([]);
+    expect(plan.routing.selected).toEqual([
+      expect.objectContaining({ adapter: "beta_route", source: "semantic_model" })
+    ]);
     expect(plan.steps.map((step) => step.adapter)).toContain("beta_route");
     expect(plan.steps.map((step) => step.adapter)).not.toContain("alpha_route");
   });

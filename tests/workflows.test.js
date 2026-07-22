@@ -49,7 +49,7 @@ afterEach(async () => {
 });
 
 describe("explicit workflow Auto-Composer", () => {
-  it("falls back to the deterministic safe composer for a transient Runtime failure", async () => {
+  it("uses a semantic-neutral schema fallback for a transient Runtime failure", async () => {
     const previousUrl = process.env.TCAR_RUNTIME_API_URL;
     process.env.TCAR_RUNTIME_API_URL = "http://runtime.test";
     const restoreFetch = setRuntimeFetchForTests(async () => new Response(
@@ -67,8 +67,8 @@ describe("explicit workflow Auto-Composer", () => {
         execution_context: {}
       });
       expect(proposal.nodes.some((node) => node.type === "agent")).toBe(true);
-      expect(proposal.composer).toMatchObject({ provider: "deterministic_fallback" });
-      expect(proposal.safety.at(-1)).toContain("deterministic safe composer");
+      expect(proposal.composer).toMatchObject({ provider: "schema_fallback" });
+      expect(proposal.safety.at(-1)).toContain("unclassified role");
       const tableProposal = await composeRuntimeWorkflowWithFallback({
         command: "agent",
         mode: "agent_team",
@@ -78,14 +78,11 @@ describe("explicit workflow Auto-Composer", () => {
         conversation_context: [],
         execution_context: {}
       });
-      expect(tableProposal.nodes.find((node) => node.id === "inventory").tools).toEqual([
-        "data_table",
-        "calculator"
-      ]);
-      expect(tableProposal.nodes.find((node) => node.id === "analysis").tools).toEqual([
-        "data_table",
-        "calculator"
-      ]);
+      expect(tableProposal.nodes.find((node) => node.id === "task")).toMatchObject({
+        candidate_id: null,
+        tools: [],
+        task: "Analyze supplied inventory from a CSV table."
+      });
       const documentProposal = await composeRuntimeWorkflowWithFallback({
         command: "workflow",
         mode: "workflow",
@@ -95,10 +92,11 @@ describe("explicit workflow Auto-Composer", () => {
         conversation_context: [],
         execution_context: {}
       });
-      expect(documentProposal.nodes.find((node) => node.id === "analysis").tools).toEqual([
-        "document_search",
-        "document_read"
-      ]);
+      expect(documentProposal.nodes.find((node) => node.id === "task")).toMatchObject({
+        candidate_id: null,
+        tools: [],
+        task: "Compare the supplied PDF documents."
+      });
       const generalReportProposal = await composeRuntimeWorkflowWithFallback({
         command: "agent",
         mode: "agent_team",
@@ -108,7 +106,7 @@ describe("explicit workflow Auto-Composer", () => {
         conversation_context: [],
         execution_context: {}
       });
-      expect(generalReportProposal.nodes.find((node) => node.id === "analysis").tools).toEqual([]);
+      expect(generalReportProposal.nodes.find((node) => node.id === "task").tools).toEqual([]);
     } finally {
       restoreFetch();
       if (previousUrl === undefined) delete process.env.TCAR_RUNTIME_API_URL;
@@ -378,7 +376,7 @@ describe("explicit workflow Auto-Composer", () => {
     });
   });
 
-  it("bounds and relevance-ranks large agent, Marketplace, connection, and tool catalogs", async () => {
+  it("bounds agent catalogs without lexical request ranking", async () => {
     const session = await createSession();
     await app.locals.store.mutate((data) => {
       for (let index = 0; index < 48; index += 1) {
@@ -446,10 +444,17 @@ describe("explicit workflow Auto-Composer", () => {
       expect(input.candidates.length).toBeLessThanOrEqual(24);
       expect(input.candidates.filter((candidate) => candidate.source === "workspace").length).toBeLessThanOrEqual(16);
       expect(input.candidates.filter((candidate) => candidate.source === "marketplace").length).toBeLessThanOrEqual(8);
-      expect(input.candidates).toEqual(expect.arrayContaining([
-        expect.objectContaining({ candidate_id: "workspace:bulk_workspace_47" }),
-        expect.objectContaining({ candidate_id: "marketplace:listing_bulk019" })
-      ]));
+      expect(input.candidates.every((candidate) => candidate.match_score === 0)).toBe(true);
+      const workspaceIds = input.candidates
+        .filter((candidate) => candidate.source === "workspace")
+        .map((candidate) => candidate.candidate_id);
+      const marketplaceIds = input.candidates
+        .filter((candidate) => candidate.source === "marketplace")
+        .map((candidate) => candidate.candidate_id);
+      expect(workspaceIds).toEqual([...workspaceIds].sort());
+      expect(marketplaceIds).toEqual([...marketplaceIds].sort());
+      expect(input.candidates.some((candidate) => candidate.candidate_id === "workspace:bulk_workspace_47")).toBe(false);
+      expect(input.candidates.some((candidate) => candidate.candidate_id === "marketplace:listing_bulk019")).toBe(false);
       expect(input.connections.length).toBeLessThanOrEqual(24);
       expect(input.connections.every((connection) => connection.tools.length <= 12)).toBe(true);
       expect(input.connections[0]).toEqual(expect.objectContaining({
@@ -691,7 +696,7 @@ describe("explicit workflow Auto-Composer", () => {
     expect(workflow.permissions).toContain("Read relevant email and create drafts; do not send automatically.");
   });
 
-  it("prefers a suitable private workspace agent over a requested Marketplace candidate", async () => {
+  it("preserves the model's exact authorized Marketplace candidate selection", async () => {
     await app.locals.store.mutate((data) => {
       data.agents.push(
         agentRecord({
@@ -761,7 +766,11 @@ describe("explicit workflow Auto-Composer", () => {
     await waitForRun(queued.body.run_id);
     const loaded = await getSession(session.session_id);
     const selected = loaded.body.workflows[0].nodes.find((node) => node.type === "agent");
-    expect(selected).toMatchObject({ source: "workspace", agent_id: "alice_orchid_research" });
+    expect(selected).toMatchObject({
+      source: "marketplace",
+      listing_id: "listing_orchid123",
+      candidate_id: "marketplace:listing_orchid123"
+    });
   });
 
   it("never collapses distinct team roles onto one agent candidate", async () => {
@@ -830,9 +839,10 @@ describe("explicit workflow Auto-Composer", () => {
     const agents = workflow.nodes.filter((node) => node.type === "agent");
     expect(agents).toEqual([
       expect.objectContaining({ source: "workspace", agent_id: "alice_amber_writer" }),
-      expect.objectContaining({ source: "marketplace", listing_id: "listing_amberreview" })
+      expect.objectContaining({ source: "generated", generated_agent: expect.any(Object) })
     ]);
-    expect(new Set(agents.map((node) => node.candidate_id)).size).toBe(agents.length);
+    expect(agents.filter((node) => node.candidate_id).map((node) => node.candidate_id))
+      .toEqual(["workspace:alice_amber_writer"]);
 
     // Existing drafts from an older release may still contain a duplicated
     // workspace assignment. Activation must repair it instead of creating a
@@ -1436,10 +1446,10 @@ describe("explicit workflow Auto-Composer", () => {
           type: "agent",
           title: "Math Tutor",
           task: "Teach algebra step by step and check current public curriculum sources when needed.",
-          // Reproduce a model copying the stale catalog description even
-          // though the visible role and task are unrelated.
-          capability: staleBusinessCapability,
-          candidate_id: previousWorkflowAgent.candidate_id,
+          // The semantic assignment adjudicator rejects reuse of the unrelated
+          // workflow-generated business agent and keeps this role independent.
+          capability: "Teach algebra step by step and check current public curriculum sources when needed.",
+          candidate_id: null,
           produces: ["lesson"]
         }],
         edges: []

@@ -71,7 +71,6 @@ const INTENT_STOP_TOKENS = new Set([
   "the", "and", "then", "with", "from", "into", "that", "this", "when", "will", "should",
   "agent", "workflow", "prepare", "create", "read", "user"
 ]);
-const CANDIDATE_SEMANTIC_CACHE = new WeakMap();
 
 // Source-informed workflows deliberately persist only these reusable role
 // categories. The controller may infer a category from private source data,
@@ -569,151 +568,41 @@ async function completeWorkflowHelpRun({ store, bus, run, command }) {
 }
 
 export function composeWorkflowFallback(input) {
-  const lower = input.intent.toLowerCase();
-  const roles = [];
-  const addRole = (key, title, capability, cues, providers = [], toolKeywords = [], builtInTools = []) => {
-    if (roles.some((item) => item.key === key)) return;
-    roles.push({
-      key,
-      title,
-      capability,
-      task: capability,
-      cues,
-      provider_ids: providers,
-      tool_keywords: toolKeywords,
-      tools: builtInTools
-    });
-  };
-  if (/(complaint|customer|support|apology|reply|email)/.test(lower)) {
-    const needsMailbox = workflowIntentRequiresGmail(lower);
-    addRole(
-      "customer_support",
-      "Customer Support Agent",
-      "Understand customer requests, apply support policy, and prepare a helpful response draft.",
-      ["customer", "support", "complaint", "reply"],
-      needsMailbox ? ["gmail"] : [],
-      ["search", "message", "thread", "draft"]
-    );
-  }
-  if (/(shopify|inventory|stock|product availability)/.test(lower)) {
-    const needsShopify = workflowIntentRequiresShopify(lower);
-    const tableTools = /\b(csv|spreadsheet|table|tabular|dataset)\b/.test(lower)
-      ? ["data_table", "calculator"]
-      : [];
-    addRole(
-      "inventory",
-      "Inventory Agent",
-      "Look up product and inventory availability without modifying store data.",
-      ["shopify", "inventory", "stock", "product"],
-      needsShopify ? ["shopify"] : [],
-      ["inventory", "stock", "product", "variant"],
-      tableTools
-    );
-  }
-  if (/(textile|fabric|garment)/.test(lower)) {
-    addRole("textile", "Textile Agent", "Extract textile-industry constraints, terminology, and operating considerations.", ["textile", "fabric", "garment"]);
-  }
-  if (/(business plan|go-to-market|company plan)/.test(lower)) {
-    addRole("business_plan", "Business Plan Agent", "Turn specialist findings into a clear, practical business plan.", ["business plan", "strategy", "operations"]);
-  }
-  if (/(document|report|pdf|spreadsheet|table|analysis)/.test(lower)) {
-    const usesSuppliedDocuments = /\b(?:supplied|attached|uploaded|provided|workspace)\b[^.;\n]{0,80}\b(?:document|documents|report|reports|pdf|pdfs|file|files)\b/.test(lower)
-      || /\b(?:document analysis|compare\b[^.;\n]{0,60}\bdocuments?|search\s+(?:the\s+)?documents?|read\s+(?:the\s+)?documents?)\b/.test(lower);
-    const analysisTools = [
-      ...(usesSuppliedDocuments ? ["document_search", "document_read"] : []),
-      ...(/\b(csv|spreadsheet|table|tabular|dataset)\b/.test(lower) ? ["data_table", "calculator"] : [])
-    ];
-    addRole(
-      "analysis",
-      "Analysis Agent",
-      usesSuppliedDocuments
-        ? "Combine supplied evidence into a clear analysis while preserving source boundaries."
-        : "Structure the requested information into a clear analysis or report without inventing sources.",
-      ["document", "analysis", "report"],
-      [],
-      [],
-      analysisTools
-    );
-  }
-  for (const providerId of detectExplicitProviderIds(lower)) {
-    if (roles.some((role) => role.provider_ids.includes(providerId))) continue;
-    addRole(
-      `${providerId}_tools`,
-      `${providerName(providerId)} Agent`,
-      providerReason(providerId, lower),
-      [providerName(providerId), providerId, ...providerToolKeywords(providerId)],
-      [providerId],
-      providerToolKeywords(providerId)
-    );
-  }
-  if (!roles.length) {
-    addRole("task", input.mode === "agent_team" ? "Task Agent" : "Workflow Agent", bounded(input.intent, 500), intentKeywords(input.intent));
-  }
-
-  const nodes = [{
-    id: "trigger",
-    type: "trigger",
-    title: input.mode === "agent_team" ? "Manual request" : triggerTitle(input.intent),
-    task: input.intent,
-    depends_on: []
-  }];
-  const edges = [];
-  let previous = "trigger";
-  for (const role of roles) {
-    const node = {
-      id: role.key,
-      type: "agent",
-      title: role.title,
-      capability: role.capability,
-      task: role.task,
-      candidate_id: bestCandidateId(input.candidates, role.cues),
-      provider_ids: role.provider_ids,
-      tool_keywords: role.tool_keywords,
-      tools: role.tools,
-      produces: [`${role.key}_output`],
-      depends_on: [previous]
-    };
-    nodes.push(node);
-    edges.push({ source: previous, target: role.key, label: "handoff" });
-    previous = role.key;
-  }
-  if (/\bif\b/.test(lower) && roles.length > 1) {
-    nodes.splice(2, 0, {
-      id: "condition",
-      type: "decision",
-      title: decisionTitle(input.intent),
-      task: bounded(input.intent.match(/\bif\b[^;,]*/i)?.[0] || "Evaluate the requested condition.", 500),
-      depends_on: [roles[0].key]
-    });
-    const second = roles[1]?.key;
-    if (second) {
-      const edge = edges.find((item) => item.target === second);
-      if (edge) edge.source = "condition";
-      edges.push({ source: roles[0].key, target: "condition", label: "evaluate" });
-      const secondNode = nodes.find((item) => item.id === second);
-      if (secondNode) secondNode.depends_on = ["condition"];
-    }
-  }
-  if (/draft|prepare (?:a |an )?(?:reply|email|message)/.test(lower)) {
-    nodes.push({
-      id: "human_review",
-      type: "approval",
-      title: "Human review",
-      task: "Review the prepared draft before anything is sent.",
-      depends_on: [previous]
-    });
-    edges.push({ source: previous, target: "human_review", label: "review" });
-  }
+  // This is a transport/schema fallback, not an intent classifier. If Qwen
+  // returns no usable graph, preserve the complete request in one reviewable
+  // generated role and let the user refine it before activation. Never guess
+  // an existing agent from words in the request.
+  const title = input.mode === "agent_team" ? "Task Agent" : "Workflow Agent";
   return {
     title: workflowTitle(input.intent),
     summary: bounded(input.intent, 700),
-    nodes,
-    edges,
-    permissions: permissionHints(lower),
-    safety: safetyHints(lower)
+    nodes: [
+      {
+        id: "trigger",
+        type: "trigger",
+        title: "Manual request",
+        task: bounded(input.intent, 1600),
+        depends_on: []
+      },
+      {
+        id: "task",
+        type: "agent",
+        title,
+        capability: bounded(input.intent, 1200),
+        task: bounded(input.intent, 1600),
+        candidate_id: null,
+        provider_ids: [],
+        tool_keywords: [],
+        tools: [],
+        produces: ["task_output"],
+        depends_on: ["trigger"]
+      }
+    ],
+    edges: [{ source: "trigger", target: "task", label: "handoff" }],
+    permissions: [],
+    safety: ["Review the generated role and permissions before activation."]
   };
 }
-
 export function publicWorkflow(workflow) {
   if (!workflow) return null;
   return {
@@ -1273,16 +1162,11 @@ function normalizeWorkflowProposal(raw, context) {
   const sourceDiscovery = context.sourceDiscovery || proposal.source_discovery || null;
   const sourceInformed = sourceDiscovery?.status === "completed";
   const evidenceRoleIds = sourceInformed ? sourceEvidenceRoleIds(context.input.source_observations) : [];
-  const eligibleCandidates = sourceInformed
-    ? context.input.candidates.filter((candidate) => sourceCandidateAuthorized(candidate, context.input.intent))
-    : context.input.candidates;
+  const eligibleCandidates = context.input.candidates;
   const candidateMap = new Map(eligibleCandidates.map((candidate) => [candidate.candidate_id, candidate]));
   const usedCandidateKeys = new Set();
   let rawNodes = Array.isArray(proposal.nodes) ? proposal.nodes.slice(0, MAX_WORKFLOW_NODES) : [];
   if (!rawNodes.length) rawNodes = composeWorkflowFallback(context.input).nodes;
-  const reservedCandidateIds = new Set(rawNodes
-    .map((node) => String(node?.candidate_id || ""))
-    .filter((candidateId) => candidateMap.has(candidateId)));
   const idMap = new Map();
   const nodes = [];
   for (let index = 0; index < rawNodes.length; index += 1) {
@@ -1323,12 +1207,9 @@ function normalizeWorkflowProposal(raw, context) {
       const candidate = resolveAgentCandidate(
         normalizedRawNode,
         candidateMap,
-        eligibleCandidates,
-        usedCandidateKeys,
-        reservedCandidateIds
+        usedCandidateKeys
       );
-      reservedCandidateIds.delete(String(rawNode.candidate_id || ""));
-      const proposedCapability = workflowRoleCapability(normalizedRawNode, candidate, eligibleCandidates, task);
+      const proposedCapability = workflowRoleCapability(normalizedRawNode, candidate, task);
       const roleCapability = sourceInformed
         ? sanitizeReusableAgentText(proposedCapability, 1200)
         : proposedCapability;
@@ -1709,7 +1590,7 @@ function workflowCandidates(data, session, actor, intent, agentWorkspaceId = nul
       workspace.push(candidateFromWorkspaceAgent(agent, intent, actor));
     }
     if (!agent.document && agent.marketplace?.published === true && agent.marketplace?.snapshot) {
-      marketplace.push(candidateFromMarketplaceAgent(data, agent, ratingsByListing, intent));
+      marketplace.push(candidateFromMarketplaceAgent(data, agent, ratingsByListing));
     }
   }
   workspace.sort(candidateSort);
@@ -1802,11 +1683,11 @@ function candidateFromWorkspaceAgent(agent, intent, actor) {
       && String(agent.workspace_id || "") === String(actor?.workspace_id || "")
       && agent.created_by === actor?.user_id
     ),
-    match_score: lexicalScore(intent, [agent.title, agent.capability, ...(agent.routing_cues || [])])
+    match_score: 0
   };
 }
 
-function candidateFromMarketplaceAgent(data, agent, ratingsByListing, intent) {
+function candidateFromMarketplaceAgent(data, agent, ratingsByListing) {
   const snapshot = agent.marketplace.snapshot || {};
   const listingId = safeListingId(agent.marketplace.listing_id) || `listing_${digest(agent.id).slice(0, 16)}`;
   const publisher = publicPublisher(data, agent.marketplace);
@@ -1839,13 +1720,12 @@ function candidateFromMarketplaceAgent(data, agent, ratingsByListing, intent) {
     publisher_display_name: publisher.display_name,
     publisher_status: publisher.status,
     rating: { average: Number(average.toFixed(2)), count: ratingAggregate.count },
-    match_score: lexicalScore(intent, [snapshot.title, snapshot.capability, agent.marketplace.description, ...(snapshot.routing_cues || [])])
+    match_score: 0
   };
 }
 
 function candidateSort(left, right) {
-  return right.match_score - left.match_score
-    || (right.rating?.count || 0) - (left.rating?.count || 0)
+  return (right.rating?.count || 0) - (left.rating?.count || 0)
     || (right.rating?.average || 0) - (left.rating?.average || 0)
     || left.candidate_id.localeCompare(right.candidate_id);
 }
@@ -1853,99 +1733,19 @@ function candidateSort(left, right) {
 function resolveAgentCandidate(
   rawNode,
   candidateMap,
-  candidates,
-  usedCandidateKeys = new Set(),
-  reservedCandidateIds = new Set()
+  usedCandidateKeys = new Set()
 ) {
   const requestedId = String(rawNode.candidate_id || "");
-  const available = candidates.filter((candidate) => (
-    !usedCandidateKeys.has(candidateReuseKey(candidate))
-    && (candidate.candidate_id === requestedId || !reservedCandidateIds.has(candidate.candidate_id))
-  ));
-  const requestedCandidate = candidateMap.get(String(rawNode.candidate_id || ""));
-  const scored = available.map((candidate) => ({
-    candidate,
-    score: candidateCompatibilityScore(rawNode, candidate),
-    requested: requestedCandidate?.candidate_id === candidate.candidate_id
-  })).filter((item) => item.score > 0).sort((left, right) => {
-    return right.score - left.score
-      || Number(right.requested) - Number(left.requested)
-      || candidateSort(left.candidate, right.candidate);
-  });
-  const workspaceMatch = scored.find((item) => item.candidate.source === "workspace");
-  const marketplaceMatch = scored.find((item) => item.candidate.source === "marketplace");
-  // Prefer the workspace when it is genuinely competitive. A Marketplace role
-  // that is materially more specific is a better fallback than forcing a
-  // generic local agent into a job it was not designed to perform.
-  if (workspaceMatch && (!marketplaceMatch || workspaceMatch.score + 2 >= marketplaceMatch.score)) {
-    return workspaceMatch.candidate;
-  }
-  if (marketplaceMatch) return marketplaceMatch.candidate;
-  return workspaceMatch?.candidate || null;
+  if (!requestedId) return null;
+  const requestedCandidate = candidateMap.get(requestedId);
+  if (!requestedCandidate) return null;
+  if (usedCandidateKeys.has(candidateReuseKey(requestedCandidate))) return null;
+  return requestedCandidate;
 }
 
-function candidateCompatibilityScore(rawNode, candidate) {
-  const nodeTitle = semanticTokenSet(rawNode.title);
-  const nodeIdentity = semanticTokenSet(rawNode.title, ...(rawNode.routing_cues || []));
-  // Capability text may itself have been copied from a catalog entry. Select
-  // candidates from the visible role, task, and routing cues so a stale model
-  // field cannot make an unrelated candidate appear compatible.
-  const nodeContext = semanticTokenSet(rawNode.title, rawNode.task, ...(rawNode.routing_cues || []));
-  const profile = candidateSemanticProfile(candidate);
-  const candidateTitle = profile.title;
-  const candidateIdentity = profile.identity;
-  const candidateContext = profile.context;
-  const titleOverlap = tokenOverlap(nodeTitle, candidateTitle);
-  const identityOverlap = tokenOverlap(nodeIdentity, candidateIdentity);
-  const cueOverlap = tokenOverlap(nodeContext, candidateIdentity);
-  const contextOverlap = tokenOverlap(nodeContext, candidateContext);
-  const exactSingleTitle = titleOverlap === 1 && nodeTitle.size === 1 && candidateTitle.size === 1;
-  const exactSingleIdentity = identityOverlap === 1 && nodeIdentity.size === 1 && candidateIdentity.size === 1;
-  const compatible = titleOverlap >= 2
-    || identityOverlap >= 2
-    || exactSingleTitle
-    || exactSingleIdentity
-    || cueOverlap >= 2
-    || contextOverlap >= 3;
-  if (!compatible) return 0;
-  const workflowReusePenalty = candidate.workflow_generated && titleOverlap === 0 ? 1 : 0;
-  return Math.max(1, titleOverlap * 6 + identityOverlap * 4 + cueOverlap * 2 + contextOverlap - workflowReusePenalty);
-}
-
-function candidateSemanticProfile(candidate) {
-  const cached = CANDIDATE_SEMANTIC_CACHE.get(candidate);
-  if (cached) return cached;
-  const profile = {
-    title: semanticTokenSet(candidate.title),
-    identity: semanticTokenSet(candidate.title, ...(candidate.routing_cues || [])),
-    context: semanticTokenSet(candidate.title, candidate.capability, ...(candidate.routing_cues || []))
-  };
-  CANDIDATE_SEMANTIC_CACHE.set(candidate, profile);
-  return profile;
-}
-
-function workflowRoleCapability(rawNode, candidate, candidates, task) {
+function workflowRoleCapability(rawNode, candidate, task) {
   const proposed = bounded(rawNode?.capability, 1200);
-  if (!proposed) return bounded(candidate?.capability || task, 1200);
-  const canonicalProposed = canonicalCapabilityText(proposed);
-  const copiedFromUnrelatedCandidate = candidates.some((catalogCandidate) => (
-    canonicalCapabilityText(catalogCandidate.capability) === canonicalProposed
-    && candidateCompatibilityScore({ ...rawNode, capability: "" }, catalogCandidate) === 0
-  ));
-  // A session-scoped workspace can intentionally hide the catalog record from
-  // which a controller copied stale text. Do not depend on that record being
-  // present to detect contamination: when candidate resolution rejected the
-  // requested agent and the proposed capability shares no role identity with
-  // the visible title/cues, the task is the safer role-specific source.
-  const roleIdentity = semanticTokenSet(rawNode?.title, ...(rawNode?.routing_cues || []));
-  const proposedIdentity = semanticTokenSet(proposed);
-  const rejectedCandidateContamination = !candidate
-    && roleIdentity.size > 0
-    && proposedIdentity.size > 0
-    && tokenOverlap(roleIdentity, proposedIdentity) === 0;
-  return copiedFromUnrelatedCandidate || rejectedCandidateContamination
-    ? bounded(task, 1200)
-    : proposed;
+  return proposed || bounded(candidate?.capability || task, 1200);
 }
 
 function canonicalCapabilityText(value) {
@@ -2124,17 +1924,6 @@ function sourceBoundedNode(rawNode, profile, type) {
     knowledge_candidate_ids: [],
     side_effect: false
   };
-}
-
-function sourceCandidateAuthorized(candidate, intent) {
-  if (!candidate?.knowledge_attached) return true;
-  const text = String(intent || "").toLowerCase();
-  const id = String(candidate.agent_id || "").trim().toLowerCase();
-  const title = String(candidate.title || "").trim().toLowerCase();
-  return Boolean(
-    (id && (text.includes(`@${id}`) || text.includes(`agent:${id}`)))
-    || (title.length >= 4 && text.includes(title))
-  );
 }
 
 function workflowIntentAllowsWriteTools(intent, providerIds = []) {
@@ -2536,11 +2325,6 @@ function triggerTitle(intent) {
   return "Manual request";
 }
 
-function decisionTitle(intent) {
-  const match = String(intent || "").match(/\bif\s+([^,;]+?)(?:,|;|\bthen\b|$)/i);
-  return bounded(match ? `Check whether ${match[1]}` : "Evaluate the condition", 160);
-}
-
 function permissionHints(lower) {
   const permissions = [];
   if (detectExplicitProviderIds(lower).includes("gmail")) {
@@ -2624,16 +2408,6 @@ function providerToolKeywords(providerId) {
     shopify: ["inventory", "stock", "product", "variant"]
   };
   return keywords[providerId] || [];
-}
-
-function bestCandidateId(candidates, cues) {
-  const scored = candidates.map((candidate) => ({ candidate, score: lexicalScore(cues.join(" "), [candidate.title, candidate.capability, ...(candidate.routing_cues || [])]) }))
-    .filter((item) => item.score >= 2)
-    .sort((left, right) => {
-      if (left.candidate.source !== right.candidate.source) return left.candidate.source === "workspace" ? -1 : 1;
-      return right.score - left.score || candidateSort(left.candidate, right.candidate);
-    });
-  return scored[0]?.candidate.candidate_id || null;
 }
 
 function lexicalScore(query, values) {

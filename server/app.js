@@ -1903,7 +1903,6 @@ export async function createApp({
         agentWorkspace
       });
       const attachmentBinding = resolveChatAttachmentBinding({
-        query: req.body.content,
         attachments,
         session,
         routingScope
@@ -1917,20 +1916,6 @@ export async function createApp({
         if (requestedAgentIds.length > runOptions.max_routing_adapters) {
           throwStatus(400, `This workflow exceeds the ${runOptions.max_routing_adapters}-specialist run limit.`);
         }
-      }
-      const requestedSet = new Set(requestedAgentIds);
-      if (
-        requestedAgentIds.length
-        && attachmentBinding.agent_ids.some((agentId) => !requestedSet.has(agentId))
-      ) {
-        throwStatus(409, "The approved workflow does not include the file explicitly referenced by this message. Add its source agent to the workflow or send the file request separately.");
-      }
-      const routedAgentCount = new Set([
-        ...requestedAgentIds,
-        ...attachmentBinding.agent_ids
-      ]).size;
-      if (routedAgentCount > runOptions.max_routing_adapters) {
-        throwStatus(400, `This request exceeds the ${runOptions.max_routing_adapters}-specialist run limit after binding its chat files.`);
       }
       const executionOptions = {
         ...runOptions,
@@ -4392,10 +4377,10 @@ export async function composeRuntimeWorkflowWithFallback(input) {
     const fallback = composeWorkflowFallback(input);
     fallback.safety = [
       ...(fallback.safety || []),
-      "The session model was temporarily unavailable, so this draft used the deterministic safe composer. Review every step before activation."
+      "The session model was temporarily unavailable, so this draft preserves the request in one unclassified role. Review and refine it before activation."
     ];
     fallback.composer = {
-      provider: "deterministic_fallback",
+      provider: "schema_fallback",
       model: null,
       reason: String(error?.code || `runtime_${status || "unavailable"}`).slice(0, 120)
     };
@@ -7271,10 +7256,11 @@ function normalizeChatOptions(options = {}, { outputSettings = null } = {}) {
   if (unknown.length > 0) {
     throwStatus(400, `Unknown chat option(s): ${unknown.join(", ")}.`);
   }
-  const plannerMode = String(options.planner_mode || process.env.TCAR_PLANNER_MODE || "session").toLowerCase();
-  if (!["cue", "llm", "session", "tcandon"].includes(plannerMode)) {
+  const requestedPlannerMode = String(options.planner_mode || process.env.TCAR_PLANNER_MODE || "session").toLowerCase();
+  if (!["cue", "llm", "session", "tcandon"].includes(requestedPlannerMode)) {
     throwStatus(400, "planner_mode must be 'cue', 'llm', 'session', or 'tcandon'.");
   }
+  const plannerMode = "session";
   const agentOutputTokens = Number(outputSettings?.agent_output_tokens)
     || Number(process.env.TCAR_MAX_TOKENS || 4096);
   const finalOutputTokens = Number(outputSettings?.final_output_tokens)
@@ -7291,7 +7277,7 @@ function normalizeChatOptions(options = {}, { outputSettings = null } = {}) {
     show_route_details: options.show_route_details !== false,
     run_fresh: options.run_fresh === true,
     planner_mode: plannerMode,
-    planner_max_tokens: boundedInt(options.planner_max_tokens, Number(process.env.TCAR_PLANNER_MAX_TOKENS || 768), plannerMode === "session" ? 256 : 32, Number(process.env.TCAR_CLIENT_MAX_PLANNER_TOKENS || 4096)),
+    planner_max_tokens: boundedInt(options.planner_max_tokens, Number(process.env.TCAR_PLANNER_MAX_TOKENS || 768), 256, Number(process.env.TCAR_CLIENT_MAX_PLANNER_TOKENS || 4096)),
     max_routing_adapters: boundedInt(options.max_routing_adapters, Math.min(Number(process.env.TCAR_MAX_ROUTING_ADAPTERS || 16), 16), 1, Math.min(Number(process.env.TCAR_CLIENT_MAX_ROUTING_ADAPTERS || 16), 16)),
     parallel_workers: boundedInt(options.parallel_workers, Number(process.env.TCAR_PARALLEL_WORKERS || 2), 1, Number(process.env.TCAR_CLIENT_MAX_PARALLEL_WORKERS || 4)),
     max_tokens: boundedInt(options.max_tokens, agentOutputTokens, 16, maximumAgentOutputTokens),
@@ -7311,9 +7297,7 @@ function normalizeRequestedAgentIds(value) {
   return normalized;
 }
 
-const CHAT_ATTACHMENT_REFERENCE_RE = /\b(?:attach(?:ed|ment|ments)?|uploaded|chat[- ]scoped|chat\s+file)\b/i;
-
-function resolveChatAttachmentBinding({ query, attachments, session, routingScope }) {
+function resolveChatAttachmentBinding({ attachments, session, routingScope }) {
   const visibleDocuments = Array.isArray(routingScope?.documents) ? routingScope.documents : [];
   const visibleById = new Map(visibleDocuments
     .filter((document) => document?.document_id)
@@ -7328,54 +7312,39 @@ function resolveChatAttachmentBinding({ query, attachments, session, routingScop
     throwStatus(404, "One or more attached chat files are unavailable in this session.");
   }
 
-  if (!CHAT_ATTACHMENT_REFERENCE_RE.test(String(query || ""))) {
+  if (!referencedDocumentIds.length) {
     return { document_ids: [], agent_ids: [] };
   }
 
-  const sessionChatDocuments = visibleDocuments.filter((document) => (
-    document?.scope === "chat"
-    && String(document.session_id || "") === String(session?.session_id || "")
-  ));
-  let candidates = referencedDocumentIds.length
-    ? referencedDocumentIds.map((documentId) => visibleById.get(documentId)).filter((document) => (
+  const candidates = referencedDocumentIds
+    .map((documentId) => visibleById.get(documentId))
+    .filter((document) => (
       document?.scope === "chat"
       && String(document.session_id || "") === String(session?.session_id || "")
-    ))
-    : sessionChatDocuments;
+    ));
   if (!candidates.length) {
-    // Preserve ordinary Knowledge routing for prompts such as "the uploaded
-    // handbook" when no chat-scoped file exists. Knowledge sources are not
-    // per-message attachment bindings.
+    // Knowledge sources remain members of their configured agent contracts;
+    // per-message attachment availability applies only to chat-scoped files.
     return { document_ids: [], agent_ids: [] };
   }
 
-  if (candidates.length > 1) {
-    const normalizedQuery = String(query || "").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
-    const named = candidates.filter((document) => {
-      const title = String(document?.title || "").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
-      return title.length >= 3 && normalizedQuery.includes(title);
-    });
-    if (named.length === 1) {
-      candidates = named;
-    } else {
-      throwStatus(409, "More than one chat file is attached. Name the file in the message so its source agent can be bound unambiguously.");
+  const availableAgentIds = [];
+  for (const document of candidates) {
+    const agentId = String(document?.agent_id || "").trim();
+    const agent = (routingScope?.agents || []).find((candidate) => candidate?.id === agentId);
+    if (
+      !agentId
+      || !agent
+      || agent.scope !== "chat"
+      || String(agent.session_id || "") !== String(session?.session_id || "")
+    ) {
+      throwStatus(409, "An attached chat file does not have an available session source agent.");
     }
-  }
-
-  const [document] = candidates;
-  const agentId = String(document?.agent_id || "").trim();
-  const agent = (routingScope?.agents || []).find((candidate) => candidate?.id === agentId);
-  if (
-    !agentId
-    || !agent
-    || agent.scope !== "chat"
-    || String(agent.session_id || "") !== String(session?.session_id || "")
-  ) {
-    throwStatus(409, "The referenced chat file does not have an available session source agent.");
+    if (!availableAgentIds.includes(agentId)) availableAgentIds.push(agentId);
   }
   return {
-    document_ids: [String(document.document_id)],
-    agent_ids: [agentId]
+    document_ids: candidates.map((document) => String(document.document_id)),
+    agent_ids: availableAgentIds
   };
 }
 

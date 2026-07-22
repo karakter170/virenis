@@ -78,7 +78,7 @@ async function execute(sessionId, options = {}, content = PROMPT, expectedAdapte
   const queued = await request(app)
     .post(`/api/chat/sessions/${sessionId}/messages`)
     .set("Authorization", OWNER_AUTH)
-    .send({ content, options })
+    .send({ content, options, requested_agent_ids: EXPECTED_ADAPTERS })
     .expect(202);
   await app.locals.drainBackgroundTasks({ timeoutMs: 5000 });
   const completed = await request(app)
@@ -204,7 +204,7 @@ describe.sequential("WorldGraph app integration", () => {
   it("returns the safe original settings so a selective refresh uses the previewed contract", async () => {
     const session = await createSession();
     const options = {
-      planner_mode: "cue",
+      planner_mode: "session",
       planner_max_tokens: 300,
       max_routing_adapters: 6,
       parallel_workers: 3,
@@ -229,7 +229,7 @@ describe.sequential("WorldGraph app integration", () => {
       .post(`/api/chat/sessions/${session.session_id}/messages`)
       .set("Authorization", OWNER_AUTH)
       .set("Idempotency-Key", `worldgraph-concurrent-${suffix}`)
-      .send({ content: PROMPT })
+      .send({ content: PROMPT, requested_agent_ids: EXPECTED_ADAPTERS })
       .expect(202);
     const left = await submit("left");
     expect((await app.locals.drainBackgroundTasks({ timeoutMs: 5000 })).ok).toBe(true);
@@ -253,7 +253,7 @@ describe.sequential("WorldGraph app integration", () => {
       .post(`/api/chat/sessions/${session.session_id}/messages`)
       .set("Authorization", OWNER_AUTH)
       .set("Idempotency-Key", "worldgraph-cold-singleflight-0001")
-      .send({ content: PROMPT })
+      .send({ content: PROMPT, requested_agent_ids: EXPECTED_ADAPTERS })
       .expect(202);
     const [left, right] = await Promise.all([submit(), submit()]);
     expect(left.body.run_id).toBe(right.body.run_id);

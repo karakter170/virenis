@@ -96,11 +96,11 @@ async function waitForRun(runId) {
   throw new Error(`Run ${runId} did not finish.`);
 }
 
-async function sendMessage(sessionId, content) {
+async function sendMessage(sessionId, content, requestedAgentIds = []) {
   const queued = await request(app)
     .post(`/api/chat/sessions/${sessionId}/messages`)
     .set(auth())
-    .send({ content })
+    .send({ content, requested_agent_ids: requestedAgentIds })
     .expect(202);
   return waitForRun(queued.body.run_id);
 }
@@ -231,10 +231,11 @@ describe("curated Discover teams", () => {
       .send({ agent_workspace_id: copiedWorkspaceId })
       .expect(200);
 
-    const first = await sendMessage(session.body.session_id, scenario.prompt);
+    const leadId = copiedDetail.body.agents.find((agent) => agent.title === scenario.lead).id;
+    const first = await sendMessage(session.body.session_id, scenario.prompt, [leadId]);
     expect(first.status).toBe("completed");
     expect(new Set(first.plan.steps.map((step) => step.adapter))).toEqual(copiedIds);
-    expect(first.plan.routing.mode).toBe("simulator");
+    expect(first.plan.routing.mode).toBe("approved_workflow");
     expect(first.parallel.maxBatchWidth).toBe(scenario.maxBatchWidth);
     expect(first.expert_outputs).toHaveLength(6);
     expect(first.expert_outputs.every((route) => route.artifact_validation?.valid === true)).toBe(true);
@@ -244,13 +245,12 @@ describe("curated Discover teams", () => {
         route.handoff_artifacts?.some((entry) => entry.name === artifact && entry.verified === true)
       ))).toBe(true);
     }
-    const leadId = copiedDetail.body.agents.find((agent) => agent.title === scenario.lead).id;
     const firstLead = first.expert_outputs.find((route) => route.adapter === leadId);
     expect(firstLead.consumption_validation).toMatchObject({ valid: true });
     expect(firstLead.consumed_artifacts.length).toBeGreaterThanOrEqual(5);
     expect(first.final_answer).toBeTruthy();
 
-    const second = await sendMessage(session.body.session_id, scenario.followUp);
+    const second = await sendMessage(session.body.session_id, scenario.followUp, [leadId]);
     expect(second.status).toBe("completed");
     expect(new Set(second.plan.steps.map((step) => step.adapter))).toEqual(copiedIds);
     expect(second.expert_outputs).toHaveLength(6);

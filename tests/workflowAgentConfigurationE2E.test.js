@@ -261,7 +261,8 @@ describe("comprehensive workflow agent configuration end-to-end", () => {
       const recommendationId = activated.activation.node_agents.find((item) => item.node_id === "recommendation").agent_id;
 
       const execution = await sendMessage(app, session.session_id,
-        `Ask @${recommendationId} to recommend the best next step from my saved preference.`);
+        `Ask @${recommendationId} to recommend the best next step from my saved preference.`,
+        [recommendationId]);
       const run = await waitForRun(app, execution.body.run_id);
       expect(run.status).toBe("completed");
       expect(run.plan.steps.map((step) => step.adapter)).toEqual([briefingId, recommendationId]);
@@ -344,11 +345,11 @@ async function createSession(app, title) {
     .expect(201)).body;
 }
 
-function sendMessage(app, sessionId, content) {
+function sendMessage(app, sessionId, content, requestedAgentIds = []) {
   return request(app)
     .post(`/api/chat/sessions/${sessionId}/messages`)
     .set(auth())
-    .send({ content })
+    .send({ content, requested_agent_ids: requestedAgentIds })
     .expect(202);
 }
 

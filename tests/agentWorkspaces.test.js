@@ -317,7 +317,10 @@ describe("agent workspaces", () => {
     const firstRun = await request(app)
       .post(`/api/chat/sessions/${session.session_id}/messages`)
       .set("Authorization", as("alice"))
-      .send({ content: "@first_team_specialist answer this first request." })
+      .send({
+        content: "@first_team_specialist answer this first request.",
+        requested_agent_ids: ["first_team_specialist"]
+      })
       .expect(202);
     const firstResult = await waitForRun(firstRun.body.run_id);
     expect(firstResult.plan.steps.map((step) => step.adapter)).toContain("first_team_specialist");
@@ -354,7 +357,10 @@ describe("agent workspaces", () => {
     const secondRun = await request(app)
       .post(`/api/chat/sessions/${session.session_id}/messages`)
       .set("Authorization", as("alice"))
-      .send({ content: "@second_team_specialist answer this second request." })
+      .send({
+        content: "@second_team_specialist answer this second request.",
+        requested_agent_ids: ["second_team_specialist"]
+      })
       .expect(202);
     const secondResult = await waitForRun(secondRun.body.run_id);
     expect(secondResult.plan.steps.map((step) => step.adapter)).toContain("second_team_specialist");

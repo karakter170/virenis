@@ -271,6 +271,7 @@ describe("canonical Agent Studio execution contract", () => {
     const plan = planRoutes({
       query: "Use @source_agent and @analysis_agent.",
       agents,
+      semanticAgentIds: ["source_agent", "analysis_agent"],
       maxRoutingAdapters: 4
     });
     const analysis = plan.steps.find((step) => step.adapter === "analysis_agent");
@@ -318,6 +319,7 @@ describe("canonical Agent Studio execution contract", () => {
     const plan = planRoutes({
       query: "Ask @configured_source, @independent_source, and @scoped_consumer.",
       agents,
+      semanticAgentIds: ["configured_source", "independent_source", "scoped_consumer"],
       maxRoutingAdapters: 3
     });
     const configured = plan.steps.find((step) => step.adapter === "configured_source");
@@ -366,7 +368,8 @@ describe("canonical Agent Studio execution contract", () => {
     const plan = planRoutes({
       query: "Ask @policy_document and @telemetry_document, then compare their evidence.",
       agents,
-      maxRoutingAdapters: 2
+      semanticAgentIds: ["policy_document", "telemetry_document", "writing_synthesis_lora"],
+      maxRoutingAdapters: 3
     });
     const policy = plan.steps.find((step) => step.adapter === "policy_document");
     const telemetry = plan.steps.find((step) => step.adapter === "telemetry_document");
@@ -467,6 +470,7 @@ describe("canonical Agent Studio execution contract", () => {
     const supportOnly = planRoutes({
       query: "Ask @answer_writer.",
       agents,
+      semanticAgentIds: ["answer_writer"],
       maxRoutingAdapters: 1
     });
     expect(supportOnly.steps.find((step) => step.adapter === "knowledge_helper")?.resource_support).toBe(true);
@@ -475,21 +479,22 @@ describe("canonical Agent Studio execution contract", () => {
     expect(() => planRoutes({
       query: "Ask @answer_writer and @knowledge_helper.",
       agents,
+      semanticAgentIds: ["answer_writer", "knowledge_helper"],
       maxRoutingAdapters: 1
-    })).toThrow(/complete configured handoff graph/i);
+    })).toThrow(/semantic routing exceeds/i);
 
     const promoted = planRoutes({
       query: "Ask @answer_writer and @knowledge_helper.",
       agents,
+      semanticAgentIds: ["answer_writer", "knowledge_helper"],
       maxRoutingAdapters: 2
     });
     const helper = promoted.steps.find((step) => step.adapter === "knowledge_helper");
     expect(helper.resource_support).toBeUndefined();
-    expect(helper.task).toContain("explicitly requested @knowledge_helper");
-    expect(promoted.routing.explicit_adapters).toEqual(expect.arrayContaining([
-      "answer_writer",
-      "knowledge_helper"
-    ]));
+    expect(helper.task).toContain("declared capability");
+    expect(promoted.routing.explicit_adapters).toEqual([]);
+    expect(promoted.routing.selected.filter((entry) => entry.source === "semantic_model").map((entry) => entry.adapter))
+      .toEqual(["knowledge_helper", "answer_writer"]);
     expect(configuredPlanGaps(promoted.steps, agents)).toEqual([]);
   });
 
@@ -518,6 +523,7 @@ describe("canonical Agent Studio execution contract", () => {
     expect(() => planRoutes({
       query: "Ask @resource_consumer.",
       agents,
+      semanticAgentIds: ["resource_consumer"],
       maxRoutingAdapters: 1,
       maxResourceSupportAdapters: 1
     })).toThrow(/complete configured handoff graph/i);
@@ -525,6 +531,7 @@ describe("canonical Agent Studio execution contract", () => {
     const complete = planRoutes({
       query: "Ask @resource_consumer.",
       agents,
+      semanticAgentIds: ["resource_consumer"],
       maxRoutingAdapters: 1,
       maxResourceSupportAdapters: 2
     });
@@ -974,6 +981,57 @@ describe("canonical Agent Studio execution contract", () => {
       expected_outputs: ["evidence"]
     });
     expect(validate(normalized).steps).toHaveLength(2);
+    const semanticPlan = {
+      ...plan,
+      routing: {
+        ...plan.routing,
+        orchestrator: {
+          ...plan.routing.orchestrator,
+          outcome_contract: {
+            ...plan.routing.orchestrator.outcome_contract,
+            semantic_authority: "qwen_model_led",
+            steps: proofRows.map((row) => ({
+              ...row,
+              route_admission: {
+                ...row.route_admission,
+                strict_constraints_checked: ["semantic_policy_diagnostics_only"]
+              }
+            }))
+          }
+        }
+      }
+    };
+    const normalizedSemantic = {
+      ...semanticPlan,
+      routing: normalizeRuntimeRouting(semanticPlan.routing)
+    };
+    expect(
+      normalizedSemantic.routing.orchestrator.outcome_contract.semantic_authority
+    ).toBe("qwen_model_led");
+    expect(validate(normalizedSemantic).steps).toHaveLength(2);
+    expect(() => validate({
+      ...normalizedSemantic,
+      routing: {
+        ...normalizedSemantic.routing,
+        orchestrator: {
+          ...normalizedSemantic.routing.orchestrator,
+          outcome_contract: {
+            ...normalizedSemantic.routing.orchestrator.outcome_contract,
+            steps: normalizedSemantic.routing.orchestrator.outcome_contract.steps.map((row, index) => (
+              index === 0
+                ? {
+                  ...row,
+                  route_admission: {
+                    ...row.route_admission,
+                    strict_constraints_checked: []
+                  }
+                }
+                : row
+            ))
+          }
+        }
+      }
+    })).toThrow(/route admission/i);
     for (const badProofRows of [
       proofRows.slice(1),
       proofRows.map((row) => row.step_id === "s1"

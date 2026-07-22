@@ -16,12 +16,14 @@ import { activeSessionViewReady } from "../e2e/pipelineSessionBinding.js";
 const PROJECT_ROOT = path.resolve(import.meta.dirname, "../../..");
 const RUNTIME_KEY_FILE = process.env.TCAR_RUNTIME_API_KEY_FILE
   || path.join(PROJECT_ROOT, "outputs", "tcar_api_key.txt");
-const PROMPT = "I'm going to do some marketing for my Match 3 game. Where should I start? How should I begin? Can you guide me?";
+const GREETING_PROMPT = "Hi, how are you?";
+const PROMPT = "Good thank you. I'm going to create a match 3 game. Advertising is crucial in match 3 games, so I wanted to ask for your help with the marketing and advertising aspects. What approach do you think I should take? What should I pay attention to?";
 const TOKEN = `marketing_ui_${crypto.randomBytes(24).toString("hex")}`;
 const AUTHORIZATION = `Bearer ${TOKEN}`;
 const ACTOR = { user_id: "marketing_ui_user", workspace_id: "marketing_ui_workspace", role: "admin" };
 const SCREENSHOT = path.join(PROJECT_ROOT, "outputs", "marketing_answer_ui_proof.png");
 const RUN_EVIDENCE = path.join(PROJECT_ROOT, "outputs", "marketing_answer_ui_run.json");
+const GREETING_EVIDENCE = path.join(PROJECT_ROOT, "outputs", "marketing_answer_ui_greeting_run.json");
 const EXTERNAL_BASE_URL = String(process.env.MARKETING_UI_BASE_URL || "").trim();
 const STORAGE_STATE = process.env.MARKETING_UI_STORAGE_STATE || "/tmp/virenis-auth-5174.json";
 const CLERK_TEST_USER_ID = process.env.MARKETING_UI_CLERK_USER_ID || "";
@@ -61,6 +63,20 @@ async function waitForRun(page, runId) {
     await page.waitForTimeout(800);
   }
   throw new Error(`Run ${runId} did not finish.`);
+}
+
+async function sendThroughComposer(page, sessionId, content) {
+  const composer = page.locator('textarea[role="combobox"]');
+  await composer.fill(content);
+  const messageResponse = page.waitForResponse((response) => (
+    response.request().method() === "POST"
+    && new URL(response.url()).pathname === `/api/chat/sessions/${sessionId}/messages`
+  ));
+  await page.getByRole("button", { name: "Send message" }).click();
+  const queuedResponse = await messageResponse;
+  requireCondition(queuedResponse.ok(), `Submitting the Marketing prompt failed with ${queuedResponse.status()}`);
+  const queued = await queuedResponse.json();
+  return waitForRun(page, queued.run_id);
 }
 
 async function main() {
@@ -105,7 +121,7 @@ async function main() {
     }
     const baseURL = EXTERNAL_BASE_URL || `http://127.0.0.1:${listener.address().port}`;
     browser = await chromium.launch({ headless: true });
-    const context = await browser.newContext(EXTERNAL_BASE_URL
+    const context = await browser.newContext(EXTERNAL_BASE_URL && !process.env.CLERK_SECRET_KEY
       ? { baseURL, viewport: { width: 1440, height: 1100 }, storageState: STORAGE_STATE }
       : { baseURL, viewport: { width: 1440, height: 1100 } });
     if (!EXTERNAL_BASE_URL) {
@@ -123,7 +139,7 @@ async function main() {
     }
     page = await context.newPage();
     let appEntryUrl = `${baseURL}/app`;
-    if (!EXTERNAL_BASE_URL && process.env.CLERK_SECRET_KEY) {
+    if (process.env.CLERK_SECRET_KEY) {
       clerkClient = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY });
       const clerkUserId = CLERK_TEST_USER_ID
         || (await clerkClient.users.getUserList({ limit: 1 })).data?.[0]?.id;
@@ -199,17 +215,35 @@ async function main() {
     }
     await page.keyboard.press("Escape");
 
-    const composer = page.locator('textarea[role="combobox"]');
-    await composer.fill(PROMPT);
-    const messageResponse = page.waitForResponse((response) => (
-      response.request().method() === "POST"
-      && new URL(response.url()).pathname === `/api/chat/sessions/${session.session_id}/messages`
-    ));
-    await page.getByRole("button", { name: "Send message" }).click();
-    const queuedResponse = await messageResponse;
-    requireCondition(queuedResponse.ok(), `Submitting the Marketing prompt failed with ${queuedResponse.status()}`);
-    const queued = await queuedResponse.json();
-    const run = await waitForRun(page, queued.run_id);
+    const greetingRun = await sendThroughComposer(page, session.session_id, GREETING_PROMPT);
+    await fs.mkdir(path.dirname(GREETING_EVIDENCE), { recursive: true });
+    await fs.writeFile(GREETING_EVIDENCE, `${JSON.stringify(greetingRun, null, 2)}\n`, "utf8");
+    requireCondition(greetingRun.status === "completed", `Greeting run failed: ${JSON.stringify(greetingRun.error || {})}`);
+    requireCondition(
+      greetingRun.plan?.routing?.orchestrator?.decision === "direct"
+      && (greetingRun.expert_outputs || []).length === 0,
+      `The social greeting incorrectly activated Marketing agents: ${JSON.stringify({
+        decision: greetingRun.plan?.routing?.orchestrator?.decision,
+        adapters: greetingRun.plan?.adapters || [],
+        completed: (greetingRun.expert_outputs || []).map((output) => output.adapter),
+        semantic_adjudication: greetingRun.plan?.routing?.orchestrator?.semantic_adjudication
+      })}`
+    );
+    requireCondition(
+      greetingRun.plan?.routing?.orchestrator?.semantic_adjudication?.accepted === true,
+      "The greeting route was not finalized by semantic adjudication"
+    );
+    const sessionAfterGreeting = await pageApi(page, `/api/chat/sessions/${session.session_id}`);
+    requireCondition(
+      sessionAfterGreeting.agent_workspace_id === copiedWorkspaceId,
+      "The Marketing team binding was lost after the direct greeting turn"
+    );
+    requireCondition(
+      (sessionAfterGreeting.inactive_agent_ids || []).every((agentId) => !copiedAgentIds.includes(agentId)),
+      "The greeting turn unexpectedly deactivated a Marketing team member"
+    );
+
+    const run = await sendThroughComposer(page, session.session_id, PROMPT);
     // Persist the complete backend result before any UI assertion. Marketing
     // runs are intentionally substantial; retaining this evidence makes a
     // validation failure reproducible even though the isolated test database
@@ -217,6 +251,10 @@ async function main() {
     await fs.mkdir(path.dirname(RUN_EVIDENCE), { recursive: true });
     await fs.writeFile(RUN_EVIDENCE, `${JSON.stringify(run, null, 2)}\n`, "utf8");
     requireCondition(run.status === "completed", `Marketing run failed: ${JSON.stringify(run.error || {})}`);
+    requireCondition(
+      run.plan?.routing?.orchestrator?.semantic_adjudication?.accepted === true,
+      "The substantive Marketing route was not finalized by semantic adjudication"
+    );
     requireCondition(
       run.expert_outputs.length === 6,
       `The Marketing run did not complete all six agents: ${JSON.stringify({
@@ -312,6 +350,9 @@ async function main() {
     await page.screenshot({ path: SCREENSHOT, fullPage: true, animations: "disabled" });
     console.log(JSON.stringify({
       ok: true,
+      greeting_prompt: GREETING_PROMPT,
+      greeting_decision: greetingRun.plan?.routing?.orchestrator?.decision,
+      greeting_agents_completed: greetingRun.expert_outputs?.length || 0,
       prompt: PROMPT,
       run_id: run.run_id,
       agents_completed: run.expert_outputs.length,
@@ -326,6 +367,7 @@ async function main() {
       stitched_fan_in_fallback_used: false,
       raw_runtime_ids_visible: false,
       run_evidence: RUN_EVIDENCE,
+      greeting_evidence: GREETING_EVIDENCE,
       screenshot: SCREENSHOT
     }, null, 2));
   } finally {

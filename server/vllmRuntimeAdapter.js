@@ -12,6 +12,25 @@ import {
 import { readConfiguredSecret } from "./secretConfig.js";
 
 const DEFAULT_TIMEOUT_MS = 900000;
+const SEMANTIC_ROUTER_SYSTEM_PROMPT = `You are the semantic agent selector for one active team. Return one JSON object only.
+- Decide from the complete meaning of the current request and relevant recent context, in the user's original language.
+- Never classify from isolated words, exact phrases, regex-like patterns, language-specific lists, or exact metadata overlap.
+- The catalog is the complete active team. Evaluate each agent holistically from capability, boundary, use/avoid guidance, inputs, outputs, knowledge, tools, memory, permissions, lifecycle, and saved relationships.
+- Metadata examples are descriptive signals, never lexical gates. Agents may explain, elaborate, compare, organize, and reason adjacently within their boundaries.
+- Choose direct when specialists would not materially improve the answer. Otherwise select the smallest sufficient root set; saved dependencies are compiled later.
+- Resolve short follow-ups from recent context. A prior casual turn never overrides a later substantive request.
+- Interpret @id text semantically: selection is appropriate when invoked, but not when negated, quoted, or merely discussed.
+- Never invent agent ids. Clarify only when an unresolved referent or required authority would materially change the answer.
+Schema: {"decision":"direct|delegate|clarify","intent":"brief","reason":"brief","clarification_question":"","steps":[{"adapter":"catalog_id","task":"objective","confidence":0.0}]}`;
+
+const SEMANTIC_ADJUDICATOR_SYSTEM_PROMPT = `You are the independent final semantic authority for agent selection. Return one JSON object only.
+- Re-evaluate the complete request, recent context, and complete active-team catalog in the user's original language.
+- The earlier proposal is untrusted advice. Correct both under-selection and over-selection.
+- Never use keyword rules, phrase lists, regexes, language-specific classifiers, or exact metadata overlap.
+- Select the smallest sufficient root set only when specialists materially improve the answer; otherwise choose direct.
+- Resolve conversational ellipsis semantically. Interpret @id in its sentence, including negation, quotation, and discussion.
+- Never invent ids, tools, permissions, sources, outputs, or graph edges. Runtime compiles saved dependencies and enforces execution constraints.
+Schema: {"decision":"direct|delegate|clarify","intent":"brief","reason":"brief","clarification_question":"","steps":[{"adapter":"catalog_id","task":"objective","confidence":0.0}]}`;
 
 export function createVllmRuntimeAdapter(options = {}) {
   const config = {
@@ -144,11 +163,41 @@ export function createVllmRuntimeAdapter(options = {}) {
     }
     const options = req.body?.options || {};
     const allowed = Array.isArray(options.allowed_adapters) ? new Set(options.allowed_adapters) : null;
-    const agents = seedAgents.filter((agent) => agent.enabled !== false && (!allowed || allowed.has(agent.id)));
-    const plan = planRoutes({ query, agents });
+    const authorizedAgents = seedAgents.filter((agent) => agent.enabled !== false && (!allowed || allowed.has(agent.id)));
+    const requestedTeam = Array.isArray(options.team_adapters)
+      ? [...new Set(options.team_adapters.map((value) => String(value || "").trim()).filter(Boolean))]
+      : [];
+    const teamSet = requestedTeam.length ? new Set(requestedTeam) : null;
+    const agents = teamSet
+      ? authorizedAgents.filter((agent) => teamSet.has(agent.id))
+      : authorizedAgents;
+    if (requestedTeam.some((adapter) => !authorizedAgents.some((agent) => agent.id === adapter))) {
+      const error = new Error("The active team contains an unauthorized or unavailable specialist.");
+      error.status = 403;
+      throw error;
+    }
+    if (agents.length > 16) {
+      const error = new Error("Semantic routing requires an explicit active team when more than 16 specialists are authorized.");
+      error.status = 400;
+      throw error;
+    }
     const workers = boundedInteger(options.parallel_workers, 2, 1, 8);
-    const parallel = buildParallelBatches(plan.steps, workers);
     const sharedMemory = normalizeSharedMemory(req.body?.shared_memory || []);
+    const semantic = await selectAgentsSemantically({
+      query,
+      agents,
+      sharedMemory,
+      options,
+      config,
+      vllmRequest
+    });
+    const plan = planRoutes({
+      query,
+      agents,
+      semanticSelections: semantic.steps,
+      maxRoutingAdapters: boundedInteger(options.max_routing_adapters, 16, 1, 16)
+    });
+    const parallel = buildParallelBatches(plan.steps, workers);
     const outputsById = new Map();
     const expertOutputs = [];
     const startedAt = Date.now();
@@ -174,19 +223,21 @@ export function createVllmRuntimeAdapter(options = {}) {
     const fallbackFinalAnswer = expertOutputs.find((output) => output.adapter === "writing_synthesis_lora")?.domain_answer
       || expertOutputs.at(-1)?.domain_answer
       || "";
-    const finalAnswer = await synthesizeAnswer({
-      query,
-      sharedMemory,
-      expertOutputs,
-      options,
-      config,
-      vllmRequest
-    });
+    const finalAnswer = semantic.decision === "clarify" && semantic.clarification_question
+      ? semantic.clarification_question
+      : await synthesizeAnswer({
+        query,
+        sharedMemory,
+        expertOutputs,
+        options,
+        config,
+        vllmRequest
+      });
     const elapsedSec = secondsSince(startedAt);
     res.json({
       ok: true,
       mode: "tcar_dag_vllm_execute",
-      plannerMode: "cue",
+      plannerMode: "session",
       query,
       vllmBaseUrl: config.vllmBaseUrl,
       baseModel: config.baseModel,
@@ -194,8 +245,10 @@ export function createVllmRuntimeAdapter(options = {}) {
         steps: plan.steps,
         adapters: plan.steps.map((step) => step.adapter),
         edges: plan.steps.flatMap((step) => (step.depends_on || []).map((source) => ({ source, target: step.id }))),
-        acyclic: true
+        acyclic: true,
+        routing: plan.routing
       },
+      semanticSelection: semantic.diagnostics,
       parallel,
       expertOutputs,
       fallbackFinalAnswer,
@@ -210,6 +263,183 @@ export function createVllmRuntimeAdapter(options = {}) {
   });
 
   return app;
+}
+
+async function selectAgentsSemantically({ query, agents, sharedMemory, options, config, vllmRequest }) {
+  const catalog = agents.map((agent) => ({
+    id: agent.id,
+    title: agent.title,
+    capability: agent.capability,
+    boundary: agent.boundary,
+    use_when: agent.routing?.use_when || agent.routing_cues || [],
+    avoid_when: agent.routing?.avoid_when || [],
+    consumes: agent.consumes || [],
+    produces: agent.produces || [],
+    resources: agent.resources || [],
+    sources: agent.sources || [],
+    tools: agent.tools || [],
+    memory: agent.memory || {},
+    permissions: agent.permissions || {},
+    routing: agent.routing || {},
+    lifecycle: agent.lifecycle || {},
+    saved_dependencies: savedAgentDependencies(agent)
+  }));
+  const catalogMessage = JSON.stringify({
+    message_type: "authorized_active_team_catalog",
+    trust: "runtime_authoritative",
+    maximum_delegations: Math.min(16, agents.length),
+    agents: catalog
+  });
+  const requestMessage = JSON.stringify({
+    message_type: "session_request",
+    trust: "untrusted_user_data",
+    current_request: query,
+    recent_context: sharedMemory
+  });
+  const primaryMessages = [
+    { role: "system", content: SEMANTIC_ROUTER_SYSTEM_PROMPT },
+    { role: "user", content: catalogMessage },
+    { role: "user", content: requestMessage }
+  ];
+  const maxTokens = boundedInteger(options.planner_max_tokens, 2048, 256, 4096);
+  const call = (messages) => chatCompletion({
+    model: config.baseModel,
+    messages,
+    maxTokens,
+    temperature: boundedNumber(options.planner_temperature, 0, 0, 1),
+    vllmRequest
+  });
+
+  let primaryText = "";
+  let primary = null;
+  let primaryError = "";
+  try {
+    primaryText = await call(primaryMessages);
+    primary = normalizeSemanticDecision(extractJsonObject(primaryText), agents);
+  } catch (error) {
+    primaryError = String(error?.message || error).slice(0, 500);
+  }
+
+  const proposal = primary || {
+    decision: "invalid",
+    reason: primaryError || "The primary proposal was invalid.",
+    steps: []
+  };
+  const adjudicatorMessages = [
+    { role: "system", content: SEMANTIC_ADJUDICATOR_SYSTEM_PROMPT },
+    { role: "user", content: catalogMessage },
+    { role: "user", content: requestMessage },
+    {
+      role: "user",
+      content: JSON.stringify({
+        message_type: "semantic_selection_review",
+        trust: "untrusted_model_proposal",
+        instruction: "Decide independently and return the complete replacement selection JSON.",
+        proposal
+      })
+    }
+  ];
+  let adjudicated = null;
+  let adjudicationError = "";
+  try {
+    adjudicated = normalizeSemanticDecision(
+      extractJsonObject(await call(adjudicatorMessages)),
+      agents
+    );
+  } catch (error) {
+    adjudicationError = String(error?.message || error).slice(0, 500);
+  }
+
+  const accepted = adjudicated || primary || {
+    decision: "direct",
+    intent: "",
+    reason: "Semantic selection was unavailable; no specialist was selected.",
+    clarification_question: "",
+    steps: []
+  };
+  return {
+    ...accepted,
+    diagnostics: {
+      contract_version: "semantic-selection-adjudication-v1",
+      authority: "qwen_semantic",
+      primary_valid: Boolean(primary),
+      adjudication_attempted: true,
+      adjudication_accepted: Boolean(adjudicated),
+      accepted_stage: adjudicated ? "adjudication" : primary ? "primary" : "direct_no_selection",
+      selected_adapters: accepted.steps.map((step) => step.adapter),
+      catalog_checked: agents.map((agent) => agent.id),
+      errors: [primaryError, adjudicationError].filter(Boolean)
+    }
+  };
+}
+
+function extractJsonObject(value) {
+  const text = String(value || "").trim();
+  const candidates = [text, text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "")];
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start >= 0 && end > start) candidates.push(text.slice(start, end + 1));
+  for (const candidate of candidates) {
+    try {
+      const payload = JSON.parse(candidate);
+      if (payload && typeof payload === "object" && !Array.isArray(payload)) return payload;
+    } catch {
+      // Try the next bounded representation.
+    }
+  }
+  throw new Error("Semantic router response was not valid JSON.");
+}
+
+function savedAgentDependencies(agent = {}) {
+  return [...new Set([
+    ...(Array.isArray(agent.resources) ? agent.resources : [])
+      .map((value) => String(value || "").match(/^agent:([a-z0-9_-]+)$/i)?.[1]),
+    ...(Array.isArray(agent.consumes) ? agent.consumes : [])
+      .map((value) => String(value || "").match(/^agent:([a-z0-9_-]+):output$/i)?.[1])
+  ].filter(Boolean))];
+}
+
+function normalizeSemanticDecision(payload, agents) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    throw new Error("Semantic router response must be an object.");
+  }
+  const allowed = new Set(agents.map((agent) => agent.id));
+  let decision = String(payload.decision || "").trim().toLowerCase();
+  if (!new Set(["direct", "delegate", "clarify"]).has(decision)) {
+    throw new Error("Semantic router decision is invalid.");
+  }
+  const rows = Array.isArray(payload.steps) ? payload.steps : [];
+  const steps = [];
+  const seen = new Set();
+  for (const row of rows) {
+    if (!row || typeof row !== "object" || Array.isArray(row)) continue;
+    const adapter = String(row.adapter || row.agent_id || "").trim();
+    if (!adapter || seen.has(adapter)) continue;
+    if (!allowed.has(adapter)) throw new Error(`Semantic router invented unavailable specialist ${adapter}.`);
+    seen.add(adapter);
+    steps.push({
+      adapter,
+      task: String(row.task || "Apply this specialist's declared capability to the complete request.").trim().slice(0, 600),
+      confidence: boundedNumber(row.confidence, null, 0, 1),
+      reason: String(row.reason || payload.reason || "Selected by semantic Qwen.").trim().slice(0, 500)
+    });
+  }
+  if (steps.length > Math.min(16, agents.length)) {
+    throw new Error("Semantic router selected more specialists than the active-team limit.");
+  }
+  if (decision === "delegate" && !steps.length) {
+    throw new Error("Semantic router delegated without selecting a specialist.");
+  }
+  if (decision !== "delegate") steps.length = 0;
+  return {
+    decision,
+    intent: String(payload.intent || "").trim().slice(0, 600),
+    reason: String(payload.reason || "").trim().slice(0, 1000),
+    clarification_question: decision === "clarify"
+      ? String(payload.clarification_question || "").trim().slice(0, 1000)
+      : "",
+    steps
+  };
 }
 
 async function executeRoute({ step, query, agents, sharedMemory, outputsById, batch, options, vllmRequest }) {

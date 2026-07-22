@@ -283,7 +283,10 @@ describe("Clerk identity integration", () => {
     const queued = await request(app)
       .post(`/api/chat/sessions/${exportedSession.body.session_id}/messages`)
       .set(headers)
-      .send({ content: "@delete_me_agent prepare the fixed export test response." })
+      .send({
+        content: "@delete_me_agent prepare the fixed export test response.",
+        requested_agent_ids: ["delete_me_agent"]
+      })
       .expect(202);
     const storedRun = app.locals.store.read().runs.find((item) => item.run_id === queued.body.run_id);
     expect(app.locals.scheduleChatRun(queued.body.run_id, storedRun.execution_options)).toBe(true);

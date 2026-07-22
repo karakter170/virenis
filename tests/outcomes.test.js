@@ -72,11 +72,11 @@ async function createSession(title = "Outcome test", headers = {}) {
   return (await request(app).post("/api/chat/sessions").set(headers).send({ title }).expect(201)).body;
 }
 
-async function runMessage(sessionId, content, options = {}, headers = {}) {
+async function runMessage(sessionId, content, options = {}, headers = {}, requestedAgentIds = []) {
   const queued = await request(app)
     .post(`/api/chat/sessions/${sessionId}/messages`)
     .set(headers)
-    .send({ content, options })
+    .send({ content, options, requested_agent_ids: requestedAgentIds })
     .expect(202);
   for (let attempt = 0; attempt < 400; attempt += 1) {
     const response = await request(app).get(`/api/chat/runs/${queued.body.run_id}`).set(headers).expect(200);
@@ -127,7 +127,9 @@ async function settledCompetition() {
   const run = await runMessage(
     session.session_id,
     "Ask @rules_first_disposition and @legacy_conservative_disposition for the shipment disposition.",
-    { max_routing_adapters: 3 }
+    { max_routing_adapters: 3 },
+    {},
+    ["rules_first_disposition_lora", "legacy_conservative_disposition_lora"]
   );
   const rules = run.expert_outputs.find((step) => step.adapter === "rules_first_disposition_lora");
   const legacy = run.expert_outputs.find((step) => step.adapter === "legacy_conservative_disposition_lora");
@@ -384,7 +386,10 @@ describe("execution provenance and Outcome Contracts", () => {
     const queued = await request(app)
       .post(`/api/chat/sessions/${session.session_id}/messages`)
       .set(auth)
-      .send({ content: "Ask @alice_forecast for the alice forecast." })
+      .send({
+        content: "Ask @alice_forecast for the alice forecast.",
+        requested_agent_ids: ["alice_forecast_lora"]
+      })
       .expect(202);
     let run;
     for (let attempt = 0; attempt < 400; attempt += 1) {
@@ -419,10 +424,12 @@ describe("execution provenance and Outcome Contracts", () => {
       "Failed route probability is 0.2."
     );
     const session = await createSession("Mixed route outcome");
-    const run = await runMessage(
+  const run = await runMessage(
       session.session_id,
       "Ask @completed_forecast and @failed_forecast for the mixed route forecast.",
-      { max_routing_adapters: 3 }
+      { max_routing_adapters: 3 },
+      {},
+      ["completed_forecast_lora", "failed_forecast_lora"]
     );
     const completedStep = run.expert_outputs.find((step) => step.adapter === "completed_forecast_lora");
     const failedStep = run.expert_outputs.find((step) => step.adapter === "failed_forecast_lora");
@@ -511,8 +518,8 @@ describe("execution provenance and Outcome Contracts", () => {
     const aliceSession = await createSession("Alice collision", aliceAuth);
     const bobSession = await createSession("Bob collision", bobAuth);
     const query = "Ask @shared_forecast for the shared collision forecast.";
-    const aliceRun = await runMessage(aliceSession.session_id, query, {}, aliceAuth);
-    const bobRun = await runMessage(bobSession.session_id, query, {}, bobAuth);
+    const aliceRun = await runMessage(aliceSession.session_id, query, {}, aliceAuth, ["shared_forecast_lora"]);
+    const bobRun = await runMessage(bobSession.session_id, query, {}, bobAuth, ["shared_forecast_lora"]);
     const dueAt = futureIso(1000);
     const payload = {
       title: "Shared collision outcome",
@@ -556,7 +563,13 @@ describe("execution provenance and Outcome Contracts", () => {
       "The approved batch count is 10."
     );
     const session = await createSession("Boundary checks");
-    const run = await runMessage(session.session_id, "Ask @boundary_number for the boundary number forecast.");
+    const run = await runMessage(
+      session.session_id,
+      "Ask @boundary_number for the boundary number forecast.",
+      {},
+      {},
+      ["boundary_number_lora"]
+    );
     const base = {
       title: "Boundary outcome",
       claim: "The approved batch count will be observed.",
@@ -605,7 +618,13 @@ describe("execution provenance and Outcome Contracts", () => {
       "Receipt integrity probability is 0.6."
     );
     const session = await createSession("Receipt integrity");
-    const run = await runMessage(session.session_id, "Ask @receipt_guard for the receipt integrity forecast.");
+    const run = await runMessage(
+      session.session_id,
+      "Ask @receipt_guard for the receipt integrity forecast.",
+      {},
+      {},
+      ["receipt_guard_lora"]
+    );
     await app.locals.store.mutate((data) => {
       const execution = data.executionRecords.find((record) => record.execution_id === run.execution.execution_id);
       execution.query_digest = "sha256:" + "0".repeat(64);
@@ -664,7 +683,8 @@ describe("execution provenance and Outcome Contracts", () => {
       historicalSession.session_id,
       "Ask @tracking_alpha for the tracking-only forecast.",
       {},
-      auth
+      auth,
+      ["tracking_alpha_lora"]
     );
     const dueAt = futureIso();
     const resolver = { type: "human", authority: "Unverified tracker", reference: "tracking:1" };
@@ -709,9 +729,10 @@ describe("execution provenance and Outcome Contracts", () => {
       routingSession.session_id,
       "Provide the tracking-only forecast.",
       { max_routing_adapters: 1 },
-      auth
+      auth,
+      ["tracking_alpha_lora"]
     );
-    expect(routed.plan.routing.selected[0].source).toBe("cue");
+    expect(routed.plan.routing.selected[0].source).toBe("approved_workflow");
   });
 
   it("keeps an authenticated admin without the frozen resolver binding tracking-only", async () => {
@@ -740,7 +761,8 @@ describe("execution provenance and Outcome Contracts", () => {
       session.session_id,
       "Ask @unbound_admin_forecast for the unbound admin forecast.",
       {},
-      auth
+      auth,
+      ["unbound_admin_forecast_lora"]
     );
     const dueAt = futureIso();
     const resolver = {
@@ -1029,7 +1051,7 @@ describe("execution provenance and Outcome Contracts", () => {
     expect(revised.body.versions.some((version) => version.sample_size === 1)).toBe(true);
   });
 
-  it("uses settled outcomes only to break capability ties and preserves explicit overrides", async () => {
+  it("keeps settled outcomes as semantic metadata and preserves explicit workflow choices", async () => {
     await settledCompetition();
     const provisionalRank = await request(app)
       .get("/api/agents/rules_first_disposition_lora/reality-rank")
@@ -1044,39 +1066,44 @@ describe("execution provenance and Outcome Contracts", () => {
     const provisionalRoute = await runMessage(
       session.session_id,
       "Provide a cold chain shipment disposition decision.",
-      { max_routing_adapters: 1 }
+      { max_routing_adapters: 1 },
+      {},
+      ["legacy_conservative_disposition_lora"]
     );
-    expect(provisionalRoute.plan.routing.selected[0].source).toBe("cue");
-    expect(provisionalRoute.plan.routing.candidate_trace.every((candidate) => candidate.rank_supplied === false)).toBe(true);
+    expect(provisionalRoute.plan.routing.selected[0]).toMatchObject({
+      adapter: "legacy_conservative_disposition_lora",
+      source: "approved_workflow"
+    });
 
     process.env.VIRENIS_REALITY_RANK_MIN_VERIFIED_SAMPLES = "1";
     const controlledSession = await createSession("Controlled threshold proof");
     const routed = await runMessage(
       controlledSession.session_id,
       "Provide a cold chain shipment disposition decision.",
-      { max_routing_adapters: 1 }
+      { max_routing_adapters: 1 },
+      {},
+      ["rules_first_disposition_lora"]
     );
     expect(routed.plan.steps.map((step) => step.adapter)).toContain("rules_first_disposition_lora");
     expect(routed.plan.steps.map((step) => step.adapter)).not.toContain("legacy_conservative_disposition_lora");
     expect(routed.plan.routing.selected[0]).toMatchObject({
       adapter: "rules_first_disposition_lora",
-      source: "cue+reality_rank"
+      source: "approved_workflow"
     });
-    const routedCandidate = routed.plan.routing.candidate_trace.find((candidate) =>
-      candidate.adapter === "rules_first_disposition_lora"
-    );
-    expect(routedCandidate).toMatchObject({ rank_sample_size: 1, rank_supplied: true });
+    expect(routed.plan.routing.selected[0].reality_rank).toBeGreaterThanOrEqual(0);
 
     const explicitSession = await createSession("Explicit override");
     const explicit = await runMessage(
       explicitSession.session_id,
       "Ask @legacy_conservative_disposition for the cold chain shipment disposition.",
-      { max_routing_adapters: 1 }
+      { max_routing_adapters: 1 },
+      {},
+      ["legacy_conservative_disposition_lora"]
     );
     expect(explicit.plan.steps.map((step) => step.adapter)).toContain("legacy_conservative_disposition_lora");
     expect(explicit.plan.routing.selected[0]).toMatchObject({
       adapter: "legacy_conservative_disposition_lora",
-      source: "explicit"
+      source: "approved_workflow"
     });
   });
 });

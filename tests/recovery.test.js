@@ -174,7 +174,7 @@ describe("durable background recovery", () => {
     const dbPath = path.join(tmpDir, "db.json");
     app = await createApp({ dbPath, uploadRoot: tmpDir, autoRun: false });
     const { runId } = await seedQueuedChat(app, {
-      planner_mode: "cue",
+      planner_mode: "session",
       parallel_workers: 3,
       max_routing_adapters: 7,
       max_tokens: 173,
@@ -224,7 +224,7 @@ describe("durable background recovery", () => {
     expect(chatCalls).toHaveBeenCalledTimes(1);
     expect(validationCalls).toHaveBeenCalledTimes(1);
     expect(chatCalls.mock.calls[0][0].options).toMatchObject({
-      planner_mode: "cue",
+      planner_mode: "session",
       parallel_workers: 3,
       max_routing_adapters: 7,
       max_tokens: 173,

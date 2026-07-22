@@ -15,6 +15,7 @@ const PERMISSIONS_DEFAULT = Object.freeze({
 });
 const LIFECYCLE_STATES = new Set(["draft", "provisioning", "ready", "error", "disabled", "archived"]);
 const HEALTH_STATES = new Set(["healthy", "degraded", "unhealthy", "unknown"]);
+const CITATION_COVERAGE = new Set(["each_source_claim", "at_least_one_verified_source"]);
 const WORKFLOW_RESPONSE_STYLES = new Set(["direct", "thorough", "careful", "custom"]);
 const WORKFLOW_TONES = new Set([
   "calm", "clear", "concise", "direct", "diplomatic", "educational", "empathetic",
@@ -230,6 +231,11 @@ export function canonicalAgentContract(agent = {}) {
   const permissions = normalizePermissions(agent, existing, tools);
   const lifecycle = normalizeLifecycle(agent, existing);
   const topLevelRouting = objectValue(agent.routing);
+  let citationCoverage = text(
+    topLevelRouting.citation_coverage || previousRouting.citation_coverage,
+    48
+  ).toLowerCase();
+  if (!CITATION_COVERAGE.has(citationCoverage)) citationCoverage = "each_source_claim";
   const previousSummary = text(previousRouting.summary, 2400);
   const requestedCapabilities = list(
     Object.keys(topLevelRouting).length ? topLevelRouting.capabilities : previousRouting.capabilities,
@@ -255,6 +261,7 @@ export function canonicalAgentContract(agent = {}) {
       role_kind: roleKind(agent, ""),
       required_inputs: consumes,
       required_knowledge: requirements,
+      citation_coverage: citationCoverage,
       evidence_modes: evidenceModes,
       metadata_trust: CANONICAL_ROUTING_METADATA_TRUST
     },

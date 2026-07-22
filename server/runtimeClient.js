@@ -83,6 +83,9 @@ export function realRuntimeEnabled() {
 export function requireRuntimeConfigured() {
   const isProduction = process.env.NODE_ENV === "production";
   validateClerkEnvironment(process.env);
+  if (isProduction && !realRuntimeEnabled()) {
+    throw new Error("Production requires TCAR_ENGINE_MODE=real so Qwen owns semantic agent selection; the local graph simulator cannot route user language.");
+  }
   const configuredRuntimeApiKey = realRuntimeEnabled() ? runtimeApiKey() : "";
   if (realRuntimeEnabled() && !process.env.TCAR_RUNTIME_API_URL) {
     throw new Error("TCAR_ENGINE_MODE=real requires TCAR_RUNTIME_API_URL.");
