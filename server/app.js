@@ -1982,6 +1982,7 @@ export async function createApp({
         plan: { steps: [] },
         parallel: { workers: runOptions.parallel_workers, batches: [], maxBatchWidth: 0, parallelizable: false },
         expert_outputs: [],
+        answer_attributions: null,
         sources: [],
         policy_events: [],
         events: [],
@@ -6590,6 +6591,7 @@ function readRunResult(store, runId, req) {
     attachment_document_ids: Array.isArray(run.attachment_document_ids) ? run.attachment_document_ids : [],
     attachment_agent_ids: Array.isArray(run.attachment_agent_ids) ? run.attachment_agent_ids : [],
     final_answer: run.final_answer || "",
+    answer_attributions: run.answer_attributions || null,
     plan: run.plan,
     parallel: run.parallel,
     expert_outputs: data.runSteps

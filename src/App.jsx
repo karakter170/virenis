@@ -1449,6 +1449,7 @@ function Workspace({ onHome, onSignedOut }) {
         query: content,
         status: queued.status || "queued",
         expert_outputs: [],
+        answer_attributions: null,
         sources: [],
         outcome_contracts: [],
         events: []
@@ -1760,6 +1761,7 @@ function Workspace({ onHome, onSignedOut }) {
         query: content,
         status: queued.status || "queued",
         expert_outputs: [],
+        answer_attributions: null,
         sources: [],
         outcome_contracts: [],
         world_graph: { kept: 0, refreshed: 0, total: 0, decisions: [] },
@@ -3818,7 +3820,9 @@ export function AnswerSourceControl({ reference, onOpen = () => undefined }) {
       aria-label={`Open answer source: ${reference.title}`}
       onClick={() => onOpen(reference)}
     >
-      <BookOpen size={13} aria-hidden="true" />
+      {reference.kind === "agent"
+        ? <Bot size={13} aria-hidden="true" />
+        : <BookOpen size={13} aria-hidden="true" />}
       <span>{reference.label}</span>
       <span className="answer-source-popover" role="tooltip">
         <strong>{reference.title}</strong>

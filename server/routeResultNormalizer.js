@@ -1,3 +1,5 @@
+import crypto from "node:crypto";
+
 import { agentRevision, digestValue, normalizeSha256Digest } from "./outcomes.js";
 import { agentRuntimeOutputModelId } from "./agentRuntimeResponseCompatibility.js";
 import {
@@ -60,6 +62,105 @@ export function sanitizeRuntimeFinalAnswer(result = {}) {
     return fallback;
   }
   return primary || fallback;
+}
+
+const PUBLIC_ANSWER_ATTRIBUTION_CONTRACT = "public-answer-attributions-v1";
+const PUBLIC_ANSWER_ATTRIBUTION_SUPPORT = new Set([
+  "validated_inline_evidence",
+  "deterministic_semantic_support"
+]);
+
+function answerTextDigest(value) {
+  return `sha256:${crypto.createHash("sha256").update(String(value || ""), "utf8").digest("hex")}`;
+}
+
+function codePointSlice(value, start, end) {
+  return [...String(value || "")].slice(start, end).join("");
+}
+
+function codePointOffsetToCodeUnit(value, offset) {
+  return [...String(value || "")].slice(0, offset).join("").length;
+}
+
+/**
+ * Validate Runtime's private-id-free span → specialist sidecar.
+ *
+ * Offsets are accepted only when they are bound to this exact answer, the
+ * cited route completed successfully, and the claim digest matches the
+ * visible substring. Malformed attribution is discarded without withholding
+ * an otherwise valid answer.
+ */
+export function normalizeRuntimeAnswerAttributions(value, answer, outputs = []) {
+  const text = String(answer || "");
+  const empty = {
+    contract_version: PUBLIC_ANSWER_ATTRIBUTION_CONTRACT,
+    answer_sha256: answerTextDigest(text),
+    offset_encoding: "utf16_code_units",
+    items: []
+  };
+  if (
+    !value
+    || typeof value !== "object"
+    || Array.isArray(value)
+    || value.contract_version !== PUBLIC_ANSWER_ATTRIBUTION_CONTRACT
+    || value.offset_encoding !== "unicode_code_points"
+    || normalizeSha256Digest(value.answer_sha256) !== empty.answer_sha256
+    || !Array.isArray(value.items)
+  ) {
+    return empty;
+  }
+
+  const routeByStep = new Map((Array.isArray(outputs) ? outputs : []).flatMap((output) => {
+    if (!output || typeof output !== "object" || Array.isArray(output)) return [];
+    const stepId = String(output.id || output.step_id || "").trim();
+    const agentId = String(output.adapter || "").trim();
+    return stepId && agentId ? [[stepId, { stepId, agentId }]] : [];
+  }));
+  const codePointLength = [...text].length;
+  const items = [];
+  const seen = new Set();
+  for (const item of value.items.slice(0, 256)) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const start = Number(item.start);
+    const end = Number(item.end);
+    const stepId = String(item.step_id || "").trim();
+    const agentId = String(item.agent_id || "").trim();
+    const support = String(item.support || "").trim();
+    const route = routeByStep.get(stepId);
+    if (
+      !Number.isSafeInteger(start)
+      || !Number.isSafeInteger(end)
+      || start < 0
+      || end <= start
+      || end > codePointLength
+      || !route
+      || route.agentId !== agentId
+      || !PUBLIC_ANSWER_ATTRIBUTION_SUPPORT.has(support)
+    ) {
+      continue;
+    }
+    const claim = codePointSlice(text, start, end);
+    if (
+      !claim.trim()
+      || normalizeSha256Digest(item.claim_sha256) !== answerTextDigest(claim)
+    ) {
+      continue;
+    }
+    const normalizedStart = codePointOffsetToCodeUnit(text, start);
+    const normalizedEnd = codePointOffsetToCodeUnit(text, end);
+    const key = `${normalizedStart}:${normalizedEnd}:${stepId}:${agentId}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    items.push({
+      start: normalizedStart,
+      end: normalizedEnd,
+      step_id: stepId,
+      agent_id: agentId,
+      support,
+      claim_sha256: normalizeSha256Digest(item.claim_sha256)
+    });
+  }
+  return { ...empty, items };
 }
 
 export function parseRouteSections(text) {

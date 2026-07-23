@@ -331,17 +331,23 @@ export function prepareAssistantAnswer(text, run, agents = []) {
   const exactTokens = [...index.exact.keys()].sort((left, right) => right.length - left.length);
   const routePatterns = index.routePrefixes.map(({ prefix }) => `${escapePattern(prefix)}[a-z0-9._-]+`);
   const alternatives = [...exactTokens.map(escapePattern), ...routePatterns];
-  if (!alternatives.length) return { markdown: formatted, references: new Map() };
+  const normalizedInput = String(text || "").replace(/\r\n?/g, "\n").trim();
+  const attributionItems = (
+    formatted === normalizedInput
+    && run?.answer_attributions?.contract_version === "public-answer-attributions-v1"
+    && Array.isArray(run.answer_attributions.items)
+  )
+    ? run.answer_attributions.items
+    : [];
+  if (!alternatives.length && !attributionItems.length) {
+    return { markdown: formatted, references: new Map() };
+  }
 
-  const tokenPattern = alternatives.join("|");
-  const matcher = new RegExp(`\\[(${tokenPattern})\\]|["'](${tokenPattern})["']|(${tokenPattern})`, "gi");
   const references = new Map();
   const keysBySource = new Map();
   let sequence = 0;
-  const markdown = codeAwareReplace(formatted, (segment) => segment.replace(matcher, (_match, bracketed, quoted, bare) => {
-    const token = bracketed || quoted || bare;
-    const reference = resolveReference(token, index);
-    if (!reference) return _match;
+
+  const registerReference = (reference) => {
     const sourceKey = [reference.kind, reference.stepId, reference.agentId, reference.source?.chunk_id || "", reference.artifact?.name || ""].join(":");
     let key = keysBySource.get(sourceKey);
     if (!key) {
@@ -351,7 +357,52 @@ export function prepareAssistantAnswer(text, run, agents = []) {
       references.set(`#${key}`, { ...reference, id: key });
     }
     return `[${escapeMarkdownLabel(reference.label)}](#${key})`;
-  })).replace(/\bartifact\s+(?=\[[^\]]+\]\(#answer-source-)/gi, "work from ");
+  };
+
+  const routeByStep = new Map((run?.expert_outputs || []).flatMap((route) => {
+    const stepId = String(route?.step_id || route?.id || "");
+    return stepId ? [[stepId, route]] : [];
+  }));
+  const insertions = new Map();
+  for (const item of attributionItems) {
+    const start = Number(item?.start);
+    const end = Number(item?.end);
+    const stepId = String(item?.step_id || "");
+    const agentId = String(item?.agent_id || "");
+    const route = routeByStep.get(stepId);
+    if (
+      !Number.isSafeInteger(start)
+      || !Number.isSafeInteger(end)
+      || start < 0
+      || end <= start
+      || end > formatted.length
+      || !formatted.slice(start, end).trim()
+      || !route
+      || String(route.adapter || "") !== agentId
+    ) {
+      continue;
+    }
+    const reference = makeReference({ kind: "agent", route, agents });
+    const link = registerReference(reference);
+    const existing = insertions.get(end) || [];
+    if (!existing.includes(link)) existing.push(link);
+    insertions.set(end, existing);
+  }
+
+  let markdown = formatted;
+  for (const [offset, links] of [...insertions.entries()].sort((left, right) => right[0] - left[0])) {
+    markdown = `${markdown.slice(0, offset)} ${links.join(" ")}${markdown.slice(offset)}`;
+  }
+
+  if (alternatives.length) {
+    const tokenPattern = alternatives.join("|");
+    const matcher = new RegExp(`\\[(${tokenPattern})\\]|["'](${tokenPattern})["']|(${tokenPattern})`, "gi");
+    markdown = codeAwareReplace(markdown, (segment) => segment.replace(matcher, (_match, bracketed, quoted, bare) => {
+      const token = bracketed || quoted || bare;
+      const reference = resolveReference(token, index);
+      return reference ? registerReference(reference) : _match;
+    })).replace(/\bartifact\s+(?=\[[^\]]+\]\(#answer-source-)/gi, "work from ");
+  }
   return { markdown, references };
 }
 

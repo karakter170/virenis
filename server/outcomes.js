@@ -177,6 +177,7 @@ export function recordExecution(data, {
     plan_digest: digestValue(run.plan || { steps: [] }),
     result_digest: digestValue({
       final_answer: run.final_answer || "",
+      answer_attributions: run.answer_attributions || null,
       sources: run.sources || [],
       policy_events: run.policy_events || []
     }),

@@ -115,6 +115,98 @@ final_answer: "Start with the audience and creative tests."`;
     expect(markup).not.toContain("7eeff07ec7cee557b6733b46");
   });
 
+  it("renders Final Router specialist provenance on the exact contributed lines", () => {
+    const answer = `# Engineering Recommendation: Data Leakage Prevention
+
+## 1. Architectural Recommendation
+
+Adopt a Hybrid Client-Server Architecture with strict data minimization.
+
+## 2. Implementation Plan
+
+Build offline-capable alpha with zero external data transmission.
+
+Verify 60 FPS performance on mid-tier devices.
+
+## 3. Quality Gates & Verification
+
+Consent Logic: Verify analytics SDKs remain dormant until explicit consent.
+
+Rollback: Trigger rollback on any unauthorized data transmission or App Store rejection.`;
+    const engineeringAgents = [
+      { id: "systems_architecture", title: "Systems Architecture Agent" },
+      { id: "delivery_planning", title: "Delivery Planning Agent" },
+      { id: "verification_rollout", title: "Verification & Rollout Agent" }
+    ];
+    const routes = [{
+      step_id: "s2",
+      adapter: "systems_architecture",
+      domain_answer: "Adopt a Hybrid Client-Server Architecture with strict data minimization."
+    }, {
+      step_id: "s3",
+      adapter: "delivery_planning",
+      domain_answer: "Build the offline alpha and verify performance."
+    }, {
+      step_id: "s4",
+      adapter: "verification_rollout",
+      domain_answer: "Verify consent logic and define rollback gates."
+    }];
+    const attributedClaims = [
+      ["Adopt a Hybrid Client-Server Architecture with strict data minimization.", "s2", "systems_architecture"],
+      ["Build offline-capable alpha with zero external data transmission.", "s3", "delivery_planning"],
+      ["Verify 60 FPS performance on mid-tier devices.", "s3", "delivery_planning"],
+      ["Consent Logic: Verify analytics SDKs remain dormant until explicit consent.", "s4", "verification_rollout"],
+      ["Rollback: Trigger rollback on any unauthorized data transmission or App Store rejection.", "s4", "verification_rollout"]
+    ];
+    const attributedRun = {
+      ...run,
+      expert_outputs: routes,
+      answer_attributions: {
+        contract_version: "public-answer-attributions-v1",
+        offset_encoding: "utf16_code_units",
+        items: attributedClaims.map(([claim, stepId, agentId]) => ({
+          start: answer.indexOf(claim),
+          end: answer.indexOf(claim) + claim.length,
+          step_id: stepId,
+          agent_id: agentId,
+          support: "validated_inline_evidence"
+        }))
+      }
+    };
+    const presentation = prepareAssistantAnswer(answer, attributedRun, engineeringAgents);
+
+    expect(presentation.markdown).toContain(
+      "strict data minimization. [Systems Architecture Agent](#answer-source-"
+    );
+    expect(presentation.markdown).toContain(
+      "external data transmission. [Delivery Planning Agent](#answer-source-"
+    );
+    expect(presentation.markdown).toContain(
+      "explicit consent. [Verification & Rollout Agent](#answer-source-"
+    );
+
+    const markup = renderToStaticMarkup(createElement(ChatMessage, {
+      message: {
+        message_id: "message_engineering",
+        role: "assistant",
+        run_id: attributedRun.run_id,
+        content: answer
+      },
+      run: attributedRun,
+      agents: engineeringAgents,
+      connections: [],
+      canWrite: true,
+      onCopy: () => undefined,
+      onRetry: () => undefined,
+      onFeedback: () => undefined,
+      onDetails: () => undefined
+    }));
+    expect(markup).toContain("Systems Architecture Agent");
+    expect(markup).toContain("Delivery Planning Agent");
+    expect(markup).toContain("Verification &amp; Rollout Agent");
+    expect(markup).not.toContain("Answer sources");
+  });
+
   it("opens Answer details on the exact specialist and displays an answer source summary", () => {
     const reference = [...prepareAssistantAnswer(
       "Audience premise [route:s1:7eeff07ec7cee557b6733b46].",

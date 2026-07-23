@@ -14,6 +14,7 @@ import {
   runtimePlanSafeProjectionDigest
 } from "../server/runtimePlanValidator.js";
 import {
+  normalizeRuntimeAnswerAttributions,
   runtimeRouteFailureObservability,
   runtimeRouteFailureDetails,
   validateRuntimeRouteResults
@@ -393,6 +394,56 @@ afterEach(async () => {
 });
 
 describe.sequential("Runtime early-plan stream", () => {
+  it("accepts only answer-bound specialist span attributions and converts Unicode offsets", () => {
+    const answer = "🎯 Adopt a hybrid architecture. Verify consent gates.";
+    const claim = "Adopt a hybrid architecture.";
+    const start = [...answer.slice(0, answer.indexOf(claim))].length;
+    const end = start + [...claim].length;
+    const sha256 = (value) => `sha256:${crypto.createHash("sha256").update(value, "utf8").digest("hex")}`;
+    const value = {
+      contract_version: "public-answer-attributions-v1",
+      answer_sha256: sha256(answer),
+      offset_encoding: "unicode_code_points",
+      items: [{
+        start,
+        end,
+        step_id: "s2",
+        agent_id: "systems_architecture",
+        support: "validated_inline_evidence",
+        claim_sha256: sha256(claim)
+      }, {
+        start,
+        end,
+        step_id: "s2",
+        agent_id: "wrong_agent",
+        support: "validated_inline_evidence",
+        claim_sha256: sha256(claim)
+      }]
+    };
+
+    expect(normalizeRuntimeAnswerAttributions(value, answer, [{
+      id: "s2",
+      adapter: "systems_architecture"
+    }])).toEqual({
+      contract_version: "public-answer-attributions-v1",
+      answer_sha256: sha256(answer),
+      offset_encoding: "utf16_code_units",
+      items: [{
+        start: answer.indexOf(claim),
+        end: answer.indexOf(claim) + claim.length,
+        step_id: "s2",
+        agent_id: "systems_architecture",
+        support: "validated_inline_evidence",
+        claim_sha256: sha256(claim)
+      }]
+    });
+
+    expect(normalizeRuntimeAnswerAttributions({
+      ...value,
+      answer_sha256: sha256("different answer")
+    }, answer, [{ id: "s2", adapter: "systems_architecture" }]).items).toEqual([]);
+  });
+
   it("classifies structurally matched v3 route failures before requiring a success outcome contract", () => {
     const failedOutput = coveredDocumentRouteOutput({
       domain_answer: "uncited worker text must not enter synthesis",
@@ -1732,6 +1783,19 @@ describe.sequential("Runtime early-plan stream", () => {
         plan,
         expertOutputs: [routeOutput],
         finalAnswer: "The concise validated note.",
+        answerAttributions: {
+          contract_version: "public-answer-attributions-v1",
+          answer_sha256: `sha256:${crypto.createHash("sha256").update("The concise validated note.", "utf8").digest("hex")}`,
+          offset_encoding: "unicode_code_points",
+          items: [{
+            start: 0,
+            end: "The concise validated note.".length,
+            step_id: "s1",
+            agent_id: "writing_synthesis_lora",
+            support: "validated_inline_evidence",
+            claim_sha256: `sha256:${crypto.createHash("sha256").update("The concise validated note.", "utf8").digest("hex")}`
+          }]
+        },
         worldGraph: {
           kept: 0,
           refreshed: 1,
@@ -1861,7 +1925,21 @@ describe.sequential("Runtime early-plan stream", () => {
     expect(completed.events.filter((item) => item.type === "planner.completed")).toHaveLength(1);
     expect(completed.events.filter((item) => item.type === "route.started")).toHaveLength(1);
     expect(completed.events.filter((item) => item.type === "route.completed")).toHaveLength(1);
+    expect(completed.answer_attributions.items).toEqual([
+      expect.objectContaining({
+        start: 0,
+        end: "The concise validated note.".length,
+        step_id: "s1",
+        agent_id: "writing_synthesis_lora"
+      })
+    ]);
     expect(completed.events.findIndex((item) => item.type === "planner.completed"))
       .toBeLessThan(completed.events.findIndex((item) => item.type === "route.completed"));
+
+    const publicRun = await request(app)
+      .get(`/api/chat/runs/${queued.body.run_id}`)
+      .set("Authorization", AUTH)
+      .expect(200);
+    expect(publicRun.body.answer_attributions.items).toHaveLength(1);
   });
 });

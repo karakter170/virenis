@@ -16,6 +16,7 @@ import {
 } from "./worldGraph.js";
 import {
   enrichRuntimeRoutingTrace,
+  normalizeRuntimeAnswerAttributions,
   normalizeArtifactValue,
   runtimeCitations,
   runtimeOutputToRunStep,
@@ -600,6 +601,11 @@ export async function processRemoteChatRun({ store, bus, run_id, options = {} })
       error.code = "model_invalid_response";
       throw error;
     }
+    const answerAttributions = normalizeRuntimeAnswerAttributions(
+      result.answerAttributions,
+      finalAnswer,
+      successfulOutputs
+    );
     const orchestratorDecision = String(plan?.routing?.orchestrator?.decision || "");
     if (orchestratorDecision === "clarify") {
       const clarificationQuestion = String(plan.routing.orchestrator.clarification_question || "").trim();
@@ -670,6 +676,7 @@ export async function processRemoteChatRun({ store, bus, run_id, options = {} })
       run.events.push({ type: "synthesis.started", at: completedAt });
       run.status = "completed";
       run.final_answer = finalAnswer;
+      run.answer_attributions = answerAttributions;
       run.expert_outputs = [];
       run.sources = citations;
       run.policy_events = policyEvents;
