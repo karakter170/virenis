@@ -21,6 +21,7 @@ const RUNTIME_STREAM_CONTENT_TYPE = "application/x-ndjson";
 // identifiers on the wire. They are an explicit transport-compatibility seam,
 // separate from the canonical AGENT_RUNTIME_* application configuration.
 export const RUNTIME_STREAM_PROTOCOL = "heartbeat-v1";
+export const RUNTIME_ROUTE_PROGRESS_PROTOCOL = "route-progress-v1";
 export const RUNTIME_TERMINAL_RECOVERY_PROTOCOL = "chat-recover-v1";
 export const RUNTIME_PLAN_CONTRACT_VERSIONS = Object.freeze([
   "tcar-runtime-plan-contract-v5",
@@ -30,7 +31,10 @@ export const RUNTIME_PLAN_CONTRACT_VERSIONS = Object.freeze([
 // limit (360 records). Keep a finite margin for scheduling jitter/config
 // changes while retaining a strict parser bound.
 const MAX_RUNTIME_STREAM_HEARTBEATS = 512;
-const MAX_RUNTIME_STREAM_EVENTS = MAX_RUNTIME_STREAM_HEARTBEATS + 2;
+const MAX_RUNTIME_STREAM_ROUTE_EVENTS = 80;
+const MAX_RUNTIME_STREAM_EVENTS = (
+  MAX_RUNTIME_STREAM_HEARTBEATS + MAX_RUNTIME_STREAM_ROUTE_EVENTS + 2
+);
 // A team contributes at most 16 selected specialists. Runtime may add up to
 // 24 separately authorized dependency/resource routes, so the public stream
 // parser accepts the resulting 40-step hard ceiling.
@@ -38,6 +42,7 @@ const MAX_RUNTIME_STREAM_PLAN_STEPS = 40;
 const MAX_RUNTIME_STREAM_TASK_CHARS = 600;
 const MAX_RUNTIME_STREAM_PLAN_EVENT_BYTES = 256 * 1024;
 const MAX_RUNTIME_STREAM_HEARTBEAT_BYTES = 1024;
+const MAX_RUNTIME_STREAM_ROUTE_EVENT_BYTES = 2048;
 const MAX_REQUEST_TIMEOUT_MS = 1800000;
 const MAX_CONNECT_TIMEOUT_MS = 120000;
 const MAX_BODY_IDLE_TIMEOUT_MS = 300000;
@@ -535,6 +540,7 @@ async function runtimeStreamRequest(path, {
   body,
   expectedRunId,
   onPlannerCompleted,
+  onRouteProgress,
   timeoutMs = DEFAULT_TIMEOUT_MS
 } = {}) {
   const requestTimeoutMs = boundedInteger(timeoutMs, "runtime stream timeout", 1, MAX_REQUEST_TIMEOUT_MS);
@@ -577,7 +583,8 @@ async function runtimeStreamRequest(path, {
     "Content-Type": "application/json",
     "Content-Length": String(encodedBody.length),
     "X-TCAR-Stream-Protocol": RUNTIME_STREAM_PROTOCOL,
-    "X-TCAR-Plan-Contract-Versions": RUNTIME_PLAN_CONTRACT_VERSIONS.join(",")
+    "X-TCAR-Plan-Contract-Versions": RUNTIME_PLAN_CONTRACT_VERSIONS.join(","),
+    "X-Agent-Runtime-Route-Progress-Protocol": RUNTIME_ROUTE_PROGRESS_PROTOCOL
   };
   const configuredRuntimeApiKey = runtimeApiKey();
   if (configuredRuntimeApiKey) headers["X-TCAR-API-Key"] = configuredRuntimeApiKey;
@@ -592,7 +599,8 @@ async function runtimeStreamRequest(path, {
     bodyIdleTimeoutMs,
     maxResponseBytes,
     expectedRunId,
-    onPlannerCompleted
+    onPlannerCompleted,
+    onRouteProgress
   };
   const requestUrl = `${runtimeBaseUrl()}${path}`;
   return testFetchTransport
@@ -616,7 +624,8 @@ async function boundedTestStreamFetch(url, options, fetchImpl) {
       body: response.body,
       maxResponseBytes: options.maxResponseBytes,
       expectedRunId: options.expectedRunId,
-      onPlannerCompleted: options.onPlannerCompleted
+      onPlannerCompleted: options.onPlannerCompleted,
+      onRouteProgress: options.onRouteProgress
     });
   } catch (error) {
     if (error.name === "AbortError") throw runtimeTimeoutError(options.requestTimeoutMs);
@@ -729,7 +738,8 @@ function boundedHttpStreamRequest(urlValue, options) {
         body: timedBody,
         maxResponseBytes: options.maxResponseBytes,
         expectedRunId: options.expectedRunId,
-        onPlannerCompleted: options.onPlannerCompleted
+        onPlannerCompleted: options.onPlannerCompleted,
+        onRouteProgress: options.onRouteProgress
       }).then(
         (value) => finish(null, value),
         (error) => {
@@ -757,10 +767,12 @@ async function consumeRuntimeStreamResponse({
   body,
   maxResponseBytes,
   expectedRunId,
-  onPlannerCompleted
+  onPlannerCompleted,
+  onRouteProgress
 }) {
   const contentType = responseContentType(headers);
   const heartbeatsNegotiated = validateRuntimeStreamProtocol(headers);
+  const routeProgressNegotiated = validateRuntimeRouteProgressProtocol(headers);
   const selectedPlanContractVersion = validateRuntimePlanContractVersion(headers);
   if (status < 200 || status >= 300) {
     const responseBody = await readBoundedStreamBody(body, maxResponseBytes);
@@ -780,7 +792,12 @@ async function consumeRuntimeStreamResponse({
     const responseBody = await readBoundedStreamBody(body, maxResponseBytes);
     const payload = parseJsonObject(responseBody.toString("utf8"));
     if (!payload) throw invalidRuntimeStream("the compatibility response was not valid JSON");
-    return { result: payload, streamedPlan: null, legacy: true };
+    return {
+      result: payload,
+      streamedPlan: null,
+      routeProgressNegotiated: false,
+      legacy: true
+    };
   }
   if (contentType !== RUNTIME_STREAM_CONTENT_TYPE) {
     throw invalidRuntimeStream(`unexpected content type ${contentType || "missing"}`);
@@ -790,7 +807,9 @@ async function consumeRuntimeStreamResponse({
     expectedRunId,
     maxResponseBytes,
     onPlannerCompleted,
+    onRouteProgress,
     heartbeatsNegotiated,
+    routeProgressNegotiated,
     selectedPlanContractVersion
   });
   if (body) {
@@ -805,7 +824,9 @@ function createRuntimeNdjsonParser({
   expectedRunId,
   maxResponseBytes,
   onPlannerCompleted,
+  onRouteProgress,
   heartbeatsNegotiated,
+  routeProgressNegotiated,
   selectedPlanContractVersion
 }) {
   const decoder = new TextDecoder("utf-8", { fatal: true });
@@ -815,6 +836,7 @@ function createRuntimeNdjsonParser({
   let eventCount = 0;
   let heartbeatCount = 0;
   let streamedPlan = null;
+  const routeStates = new Map();
   let terminal = null;
 
   const consumeLine = async (rawLine) => {
@@ -902,8 +924,74 @@ function createRuntimeNdjsonParser({
       }
       return;
     }
+    if (
+      event.type === "route.started"
+      || event.type === "route.completed"
+      || event.type === "route.reused"
+      || event.type === "route.failed"
+    ) {
+      if (!routeProgressNegotiated) {
+        throw invalidRuntimeStream("route progress arrived without protocol negotiation");
+      }
+      if (!streamedPlan) {
+        throw invalidRuntimeStream("route progress arrived before planner.completed");
+      }
+      if (lineBytes > MAX_RUNTIME_STREAM_ROUTE_EVENT_BYTES) {
+        throw invalidRuntimeStream("a route progress event exceeded its size limit");
+      }
+      const expectedKeys = event.type === "route.failed"
+        ? ["adapter", "status", "step_id"]
+        : ["adapter", "step_id"];
+      assertExactObjectKeys(event.data, expectedKeys, "route progress event data");
+      const stepId = String(event.data.step_id || "");
+      const adapter = String(event.data.adapter || "");
+      if (!safeIdentifier(stepId) || !safeIdentifier(adapter)) {
+        throw invalidRuntimeStream("a route progress identity was malformed");
+      }
+      const plannedStep = streamedPlan.steps.find((step) => step.id === stepId);
+      if (!plannedStep || plannedStep.adapter !== adapter) {
+        throw invalidRuntimeStream("route progress did not match the streamed plan");
+      }
+      const previousState = routeStates.get(stepId);
+      if (event.type === "route.started") {
+        if (previousState) {
+          throw invalidRuntimeStream("route.started was duplicated or arrived after completion");
+        }
+        routeStates.set(stepId, "started");
+      } else {
+        if (event.type !== "route.reused" && previousState !== "started") {
+          throw invalidRuntimeStream(`${event.type} arrived before route.started`);
+        }
+        if (event.type === "route.reused" && previousState && previousState !== "started") {
+          throw invalidRuntimeStream("route.reused was duplicated or arrived after completion");
+        }
+        if (event.type === "route.failed" && !["blocked", "failed"].includes(event.data.status)) {
+          throw invalidRuntimeStream("route.failed carried an unsupported status");
+        }
+        routeStates.set(stepId, event.type);
+      }
+      if (typeof onRouteProgress === "function") {
+        await onRouteProgress({
+          type: event.type,
+          step_id: stepId,
+          adapter,
+          ...(event.type === "route.failed" ? { status: event.data.status } : {})
+        });
+      }
+      return;
+    }
     if (event.type === "run.completed") {
       if (!streamedPlan) throw invalidRuntimeStream("run.completed arrived before planner.completed");
+      if (
+        routeProgressNegotiated
+        && streamedPlan.steps.some((step) => ![
+          "route.completed",
+          "route.reused",
+          "route.failed"
+        ].includes(routeStates.get(step.id)))
+      ) {
+        throw invalidRuntimeStream("run.completed arrived before every route reached a terminal state");
+      }
       assertExactObjectKeys(event.data, ["result"], "completion event data");
       if (!isPlainObject(event.data.result)) throw invalidRuntimeStream("the terminal result was malformed");
       terminal = { type: event.type, result: event.data.result };
@@ -981,6 +1069,7 @@ function createRuntimeNdjsonParser({
         result: terminal.result,
         streamedPlan,
         planContractVersion: selectedPlanContractVersion || null,
+        routeProgressNegotiated,
         legacy: false
       };
     }
@@ -1078,6 +1167,18 @@ function validateRuntimeStreamProtocol(headers) {
   if (!protocol) return false;
   if (protocol !== RUNTIME_STREAM_PROTOCOL) {
     throw invalidRuntimeStream("the response selected an unsupported stream protocol");
+  }
+  return true;
+}
+
+function validateRuntimeRouteProgressProtocol(headers) {
+  const value = headers?.["x-agent-runtime-route-progress-protocol"]
+    ?? headers?.["X-Agent-Runtime-Route-Progress-Protocol"]
+    ?? "";
+  const protocol = String(Array.isArray(value) ? value[0] : value).trim();
+  if (!protocol) return false;
+  if (protocol !== RUNTIME_ROUTE_PROGRESS_PROTOCOL) {
+    throw invalidRuntimeStream("the response selected an unsupported route progress protocol");
   }
   return true;
 }
@@ -1247,6 +1348,7 @@ export function runtimeProtocolCompatibility(payload = {}) {
   const protocol = isPlainObject(payload?.protocol) ? payload.protocol : {};
   const service = String(payload?.service || "").trim();
   const streamProtocol = String(protocol.chat_stream || "").trim();
+  const routeProgressProtocol = String(protocol.route_progress || "").trim();
   const recoveryProtocol = String(protocol.terminal_recovery || "").trim();
   const advertisedPlanContracts = Array.isArray(protocol.plan_contract_versions)
     ? [...new Set(protocol.plan_contract_versions
@@ -1264,6 +1366,9 @@ export function runtimeProtocolCompatibility(payload = {}) {
       && selectedPlanContract !== null,
     service,
     chat_stream: streamProtocol || null,
+    route_progress: routeProgressProtocol || null,
+    route_progress_compatible:
+      routeProgressProtocol === RUNTIME_ROUTE_PROGRESS_PROTOCOL,
     terminal_recovery: recoveryProtocol || null,
     selected_plan_contract: selectedPlanContract,
     advertised_plan_contract_versions: advertisedPlanContracts
@@ -1442,7 +1547,8 @@ export async function executeRuntimeChatStream({
   options = {},
   executionContext = {},
   worldGraph = null,
-  onPlannerCompleted
+  onPlannerCompleted,
+  onRouteProgress
 }) {
   const timeoutMs = Number(runtimeSetting("AGENT_RUNTIME_CHAT_TIMEOUT_MS") || DEFAULT_TIMEOUT_MS);
   const body = {
@@ -1457,6 +1563,7 @@ export async function executeRuntimeChatStream({
       body,
       expectedRunId: executionContext.run_id,
       onPlannerCompleted,
+      onRouteProgress,
       timeoutMs
     });
     return {
@@ -1471,6 +1578,7 @@ export async function executeRuntimeChatStream({
       return {
         result: await executeRuntimeChat({ query, sharedMemory, options, executionContext, worldGraph }),
         streamedPlan: null,
+        routeProgressNegotiated: false,
         legacy: true
       };
     }
@@ -1483,6 +1591,7 @@ export async function executeRuntimeChatStream({
         return {
           result: normalizeAgentRuntimeExecutionResult(recovered),
           streamedPlan: null,
+          routeProgressNegotiated: false,
           legacy: false,
           recovered: true
         };

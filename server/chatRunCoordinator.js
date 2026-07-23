@@ -377,6 +377,10 @@ export async function processRemoteChatRun({ store, bus, run_id, options = {} })
     let streamedExactPlanDigest = null;
     let streamedExactPlanContractVersion = null;
     let plannerCompletedPersisted = false;
+    const streamedRouteEventKeys = new Set();
+    const routeLifecycleEventKey = (event) => (
+      `${String(event?.type || "")}|${String(event?.step_id || "")}`
+    );
     const streamed = await executeRuntimeChatStream({
       query,
       sharedMemory,
@@ -437,6 +441,21 @@ export async function processRemoteChatRun({ store, bus, run_id, options = {} })
           { type: "planner.completed", steps: earlyPlan.steps }
         );
         plannerCompletedPersisted = true;
+      },
+      onRouteProgress: async (event) => {
+        if (!plannerCompletedPersisted) {
+          const error = new Error("Runtime streamed route progress before planner.completed.");
+          error.code = "runtime_stream_invalid";
+          throw error;
+        }
+        const eventKey = routeLifecycleEventKey(event);
+        if (streamedRouteEventKeys.has(eventKey)) {
+          const error = new Error("Runtime streamed duplicate route progress.");
+          error.code = "runtime_stream_invalid";
+          throw error;
+        }
+        await updateRun(store, bus, run_id, { status: "running" }, event);
+        streamedRouteEventKeys.add(eventKey);
       }
     });
     const result = streamed.result;
@@ -594,6 +613,9 @@ export async function processRemoteChatRun({ store, bus, run_id, options = {} })
     const assistantMessageId = makeId("msg");
     const completedAt = nowIso();
     const elapsedSec = Number(((Date.now() - started) / 1000).toFixed(3));
+    const terminalRouteEventsToPublish = terminalRoutes.flatMap((terminalRoute) => (
+      [terminalRoute.startedEvent, terminalRoute.terminalEvent].filter(Boolean)
+    )).filter((event) => !streamedRouteEventKeys.has(routeLifecycleEventKey(event)));
 
     await store.mutate((data) => {
       const run = data.runs.find((item) => item.run_id === run_id);
@@ -620,16 +642,30 @@ export async function processRemoteChatRun({ store, bus, run_id, options = {} })
         replayCandidateIds: worldGraphReplayCandidateIds(replayCapsule),
         createdAt: completedAt
       });
-      for (const terminalRoute of terminalRoutes) {
-        if (terminalRoute.startedEvent) {
-          run.events.push({ ...terminalRoute.startedEvent, at: completedAt });
+      const reconcileRouteEvent = (event) => {
+        if (!event) return;
+        const eventKey = routeLifecycleEventKey(event);
+        const existingIndex = run.events.findIndex(
+          (storedEvent) => routeLifecycleEventKey(storedEvent) === eventKey
+        );
+        if (existingIndex >= 0) {
+          run.events[existingIndex] = {
+            ...run.events[existingIndex],
+            ...event,
+            at: run.events[existingIndex].at || completedAt
+          };
+        } else {
+          run.events.push({ ...event, at: completedAt });
         }
+      };
+      for (const terminalRoute of terminalRoutes) {
+        reconcileRouteEvent(terminalRoute.startedEvent);
         const index = data.runSteps.findIndex((item) => (
           item.run_id === run_id && item.step_id === terminalRoute.runStep.step_id
         ));
         if (index >= 0) data.runSteps[index] = terminalRoute.runStep;
         else data.runSteps.push(terminalRoute.runStep);
-        run.events.push({ ...terminalRoute.terminalEvent, at: completedAt });
+        reconcileRouteEvent(terminalRoute.terminalEvent);
       }
       run.events.push({ type: "synthesis.started", at: completedAt });
       run.status = "completed";
@@ -646,6 +682,7 @@ export async function processRemoteChatRun({ store, bus, run_id, options = {} })
       run.reality_rank_snapshot = agentRankings;
       run.runtime_result_admin_only = {
         streamRecovered: streamed.recovered === true,
+        routeProgressNegotiated: streamed.routeProgressNegotiated === true,
         mode: result.mode,
         sessionController: normalizeArtifactValue(result.sessionController || null),
         planOutcomeValidation: normalizeArtifactValue(result.planOutcomeValidation || null),
@@ -696,10 +733,7 @@ export async function processRemoteChatRun({ store, bus, run_id, options = {} })
       });
       return run;
     });
-    for (const terminalRoute of terminalRoutes) {
-      if (terminalRoute.startedEvent) bus.publish(run_id, terminalRoute.startedEvent);
-      bus.publish(run_id, terminalRoute.terminalEvent);
-    }
+    for (const event of terminalRouteEventsToPublish) bus.publish(run_id, event);
     bus.publish(run_id, { type: "synthesis.started" });
     bus.publish(run_id, { type: "final.completed", message_id: assistantMessageId, elapsed_sec: elapsedSec });
   } catch (error) {

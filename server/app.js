@@ -110,6 +110,7 @@ import {
   registerRuntimeAgent,
   registerRuntimeDocument,
   RUNTIME_PLAN_CONTRACT_VERSIONS,
+  RUNTIME_ROUTE_PROGRESS_PROTOCOL,
   RUNTIME_STREAM_PROTOCOL,
   RUNTIME_TERMINAL_RECOVERY_PROTOCOL,
   runRuntimeValidation,
@@ -747,6 +748,7 @@ export async function createApp({
       runtime_mode: realRuntimeEnabled() ? "real" : "simulator",
       runtime_protocol: {
         chat_stream: RUNTIME_STREAM_PROTOCOL,
+        route_progress: RUNTIME_ROUTE_PROGRESS_PROTOCOL,
         plan_contract_versions: [...RUNTIME_PLAN_CONTRACT_VERSIONS],
         terminal_recovery: RUNTIME_TERMINAL_RECOVERY_PROTOCOL
       }

@@ -702,6 +702,7 @@ describe("runtime and catalog", () => {
 
     const health = await request(app).get("/healthz").expect(200);
     expect(health.headers["cache-control"]).toBeUndefined();
+    expect(health.body.runtime_protocol.route_progress).toBe("route-progress-v1");
   });
 
   it("keeps liveness healthy while readiness fails when durable storage is unavailable", async () => {
@@ -770,6 +771,7 @@ describe("runtime and catalog", () => {
         runtime_mode: "real",
         runtime_protocol: {
           compatible: true,
+          route_progress_compatible: false,
           selected_plan_contract: "tcar-runtime-plan-contract-v5"
         }
       });

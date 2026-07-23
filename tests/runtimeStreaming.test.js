@@ -218,13 +218,16 @@ function event(type, sequence, data, runId = RUN_ID) {
   };
 }
 
-function ndjsonResponse(records) {
+function ndjsonResponse(records, { routeProgress = false } = {}) {
   return new Response(
     records.map((record) => `${JSON.stringify(record)}\n`).join(""),
     {
       headers: {
         "Content-Type": "application/x-ndjson",
-        "X-TCAR-Stream-Protocol": "heartbeat-v1"
+        "X-TCAR-Stream-Protocol": "heartbeat-v1",
+        ...(routeProgress
+          ? { "X-Agent-Runtime-Route-Progress-Protocol": "route-progress-v1" }
+          : {})
       }
     }
   );
@@ -725,6 +728,99 @@ describe.sequential("Runtime early-plan stream", () => {
       code: "runtime_stream_plan_mismatch",
       component: "runtime_plan_safe_projection"
     });
+  });
+
+  it("negotiates and validates live route lifecycle events", async () => {
+    const routeEvents = [];
+    let requestedProgressProtocol = "";
+    restoreFetch = setRuntimeFetchForTests(async (_url, options = {}) => {
+      requestedProgressProtocol =
+        options.headers["X-Agent-Runtime-Route-Progress-Protocol"];
+      return ndjsonResponse([
+        event("planner.completed", 1, {
+          plan: safePlan,
+          contract_digest: contractDigest(safePlan)
+        }),
+        event("route.started", 2, {
+          step_id: "s1",
+          adapter: "writing_synthesis_lora"
+        }),
+        event("route.completed", 3, {
+          step_id: "s1",
+          adapter: "writing_synthesis_lora"
+        }),
+        event("run.completed", 4, {
+          result: { ok: true, plan: safePlan, finalAnswer: "Ready." }
+        })
+      ], { routeProgress: true });
+    });
+
+    await expect(executeRuntimeChatStream({
+      query: "Prepare a note.",
+      executionContext: { run_id: RUN_ID },
+      onRouteProgress: async (eventRecord) => {
+        routeEvents.push(eventRecord);
+      }
+    })).resolves.toMatchObject({
+      legacy: false,
+      routeProgressNegotiated: true,
+      result: { ok: true, finalAnswer: "Ready." }
+    });
+    expect(requestedProgressProtocol).toBe("route-progress-v1");
+    expect(routeEvents).toEqual([
+      {
+        type: "route.started",
+        step_id: "s1",
+        adapter: "writing_synthesis_lora"
+      },
+      {
+        type: "route.completed",
+        step_id: "s1",
+        adapter: "writing_synthesis_lora"
+      }
+    ]);
+
+    restoreFetch();
+    restoreFetch = setRuntimeFetchForTests(async () => ndjsonResponse([
+      event("planner.completed", 1, {
+        plan: safePlan,
+        contract_digest: contractDigest(safePlan)
+      }),
+      event("route.started", 2, {
+        step_id: "s1",
+        adapter: "writing_synthesis_lora"
+      }),
+      event("run.completed", 3, {
+        result: { ok: true, plan: safePlan, finalAnswer: "Must fail closed." }
+      })
+    ], { routeProgress: true }));
+    await expect(executeRuntimeChatStream({
+      query: "Prepare a note.",
+      executionContext: { run_id: RUN_ID }
+    })).rejects.toMatchObject({ code: "runtime_stream_invalid", status: 502 });
+
+    restoreFetch();
+    restoreFetch = setRuntimeFetchForTests(async () => ndjsonResponse([
+      event("planner.completed", 1, {
+        plan: safePlan,
+        contract_digest: contractDigest(safePlan)
+      }),
+      event("route.started", 2, {
+        step_id: "s1",
+        adapter: "writing_synthesis_lora"
+      }),
+      event("route.completed", 3, {
+        step_id: "s1",
+        adapter: "writing_synthesis_lora"
+      }),
+      event("run.completed", 4, {
+        result: { ok: true, plan: safePlan, finalAnswer: "Must fail closed." }
+      })
+    ]));
+    await expect(executeRuntimeChatStream({
+      query: "Prepare a note.",
+      executionContext: { run_id: RUN_ID }
+    })).rejects.toMatchObject({ code: "runtime_stream_invalid", status: 502 });
   });
 
   it("accepts dependency-expanded plans while retaining the 48-step wire bound", async () => {
@@ -1536,6 +1632,8 @@ describe.sequential("Runtime early-plan stream", () => {
 
     restoreFetch = setRuntimeFetchForTests(async (url, options = {}) => {
       expect(new URL(url).pathname).toBe("/chat/execute/stream");
+      expect(options.headers["X-Agent-Runtime-Route-Progress-Protocol"])
+        .toBe("route-progress-v1");
       const requestBody = JSON.parse(options.body);
       const runId = requestBody.execution_context.run_id;
       const plan = {
@@ -1671,16 +1769,34 @@ describe.sequential("Runtime early-plan stream", () => {
             runId
           ))}\n`));
           controller.enqueue(encoder.encode(`${JSON.stringify(event(
-            "run.heartbeat",
+            "route.started",
             3,
+            {
+              step_id: "s1",
+              adapter: "writing_synthesis_lora"
+            },
+            runId
+          ))}\n`));
+          controller.enqueue(encoder.encode(`${JSON.stringify(event(
+            "run.heartbeat",
+            4,
             {},
             runId
           ))}\n`));
           plannerTransported.resolve();
           void releaseTerminal.promise.then(() => {
             controller.enqueue(encoder.encode(`${JSON.stringify(event(
+              "route.completed",
+              5,
+              {
+                step_id: "s1",
+                adapter: "writing_synthesis_lora"
+              },
+              runId
+            ))}\n`));
+            controller.enqueue(encoder.encode(`${JSON.stringify(event(
               "run.completed",
-              4,
+              6,
               { result },
               runId
             ))}\n`));
@@ -1690,7 +1806,8 @@ describe.sequential("Runtime early-plan stream", () => {
       }), {
         headers: {
           "Content-Type": "application/x-ndjson; charset=utf-8",
-          "X-TCAR-Stream-Protocol": "heartbeat-v1"
+          "X-TCAR-Stream-Protocol": "heartbeat-v1",
+          "X-Agent-Runtime-Route-Progress-Protocol": "route-progress-v1"
         }
       });
     });
@@ -1724,11 +1841,12 @@ describe.sequential("Runtime early-plan stream", () => {
     await plannerTransported.promise;
     const running = await waitFor(() => {
       const run = app.locals.store.read().runs.find((item) => item.run_id === queued.body.run_id);
-      return run?.events?.some((item) => item.type === "planner.completed") ? run : null;
+      return run?.events?.some((item) => item.type === "route.started") ? run : null;
     });
     expect(running.status).toBe("running");
     expect(running.plan.steps).toEqual(streamedSafePlan.steps);
     expect(running.events.filter((item) => item.type === "planner.completed")).toHaveLength(1);
+    expect(running.events.filter((item) => item.type === "route.started")).toHaveLength(1);
     expect(running.events.some((item) => item.type === "route.completed")).toBe(false);
     expect(running.events.some((item) => item.type === "final.completed")).toBe(false);
     expect(running.events.some((item) => item.type === "run.heartbeat")).toBe(false);
@@ -1741,6 +1859,8 @@ describe.sequential("Runtime early-plan stream", () => {
     const completed = app.locals.store.read().runs.find((item) => item.run_id === queued.body.run_id);
     expect(completed.status).toBe("completed");
     expect(completed.events.filter((item) => item.type === "planner.completed")).toHaveLength(1);
+    expect(completed.events.filter((item) => item.type === "route.started")).toHaveLength(1);
+    expect(completed.events.filter((item) => item.type === "route.completed")).toHaveLength(1);
     expect(completed.events.findIndex((item) => item.type === "planner.completed"))
       .toBeLessThan(completed.events.findIndex((item) => item.type === "route.completed"));
   });

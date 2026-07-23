@@ -2212,19 +2212,33 @@ summary:focus-visible,
 }
 
 .run-progress-agent {
+  --run-progress-agent-delay: calc(var(--run-progress-agent-index, 0) * 170ms);
+  --run-progress-state-color: var(--text-faint);
   min-width: 0;
   display: inline-grid;
   grid-template-columns: auto auto auto;
   align-items: center;
   gap: 6px;
   color: var(--text-soft);
+  opacity: 0;
+  transform: translateY(7px);
+  animation: run-progress-agent-reveal 720ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  animation-delay: var(--run-progress-agent-delay);
 }
 
 .run-progress-agent-dot {
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: var(--text-faint);
+  background: var(--run-progress-state-color);
+  box-shadow: 0 0 0 0 color-mix(in srgb, var(--run-progress-state-color) 0%, transparent);
+  opacity: 0;
+  transform: scale(0.6);
+  transition:
+    background-color 420ms ease,
+    box-shadow 420ms ease;
+  animation: run-progress-state-reveal 480ms ease both;
+  animation-delay: calc(var(--run-progress-agent-delay) + 440ms);
 }
 
 .run-progress-agent strong {
@@ -2239,16 +2253,70 @@ summary:focus-visible,
 .run-progress-agent small {
   color: var(--text-faint);
   font-size: 9px;
+  opacity: 0;
+  transition: color 320ms ease;
+  animation: run-progress-state-reveal 480ms ease both;
+  animation-delay: calc(var(--run-progress-agent-delay) + 440ms);
 }
 
-.run-progress-agent.working .run-progress-agent-dot { background: var(--accent); }
-.run-progress-agent.working small { color: var(--accent); }
-.run-progress-agent.ready .run-progress-agent-dot { background: #25845f; }
-.run-progress-agent.reused .run-progress-agent-dot { background: #657487; }
+.run-progress-agent.working {
+  --run-progress-state-color: #e0a11a;
+}
+
+.run-progress-agent.working .run-progress-agent-dot {
+  box-shadow: 0 0 0 3px color-mix(in srgb, #e0a11a 22%, transparent);
+}
+
+.run-progress-agent.working small { color: var(--warning); }
+.run-progress-agent.ready,
+.run-progress-agent.reused {
+  --run-progress-state-color: #25845f;
+}
+.run-progress-agent.ready small,
+.run-progress-agent.reused small { color: var(--accent); }
+.run-progress-agent.blocked,
+.run-progress-agent.failed {
+  --run-progress-state-color: var(--danger);
+}
+.run-progress-agent.blocked small,
+.run-progress-agent.failed small { color: var(--danger); }
+
+@keyframes run-progress-agent-reveal {
+  from {
+    opacity: 0;
+    transform: translateY(7px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes run-progress-state-reveal {
+  from {
+    opacity: 0;
+    transform: scale(0.6);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
 
 @media (max-width: 640px) {
   .run-progress { width: 100%; }
   .run-progress-agents { margin-left: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .run-progress-agent,
+  .run-progress-agent-dot,
+  .run-progress-agent small {
+    opacity: 1;
+    transform: none;
+    animation: none;
+    transition: none;
+  }
 }
 
 .spin {

@@ -165,6 +165,19 @@ describe("Agent Studio product surfaces", () => {
     expect(JSON.stringify(working.plan)).not.toContain("internal_note");
     expect(JSON.stringify(working)).not.toContain("hidden chain of thought");
     expect(JSON.stringify(working)).not.toContain("internal_note");
+    const blocked = mergeLiveRunEvent(working, {
+      type: "route.failed",
+      step_id: "s1",
+      adapter: "renault_specialist",
+      status: "blocked",
+      private_failure: "must not become browser state"
+    });
+    expect(blocked.events.at(-1)).toEqual({
+      type: "route.failed",
+      step_id: "s1",
+      adapter: "renault_specialist",
+      status: "blocked"
+    });
   });
 
   it("shows selected and active specialists in a compact accessible status list", () => {
@@ -219,15 +232,17 @@ describe("Agent Studio product surfaces", () => {
     expect(renderToStaticMarkup(createElement(RunProgress, { run: partialRun, agents }))).toContain("Blocked");
 
     const markup = renderToStaticMarkup(createElement(RunProgress, { run, agents }));
-    expect(markup).toContain("1 working · 2 selected");
+    expect(markup).toContain("1 generating · 2 selected");
     expect(markup).toContain("Renault Specialist");
     expect(markup).toContain("Business Idea Specialist");
-    expect(markup).toContain("Working");
-    expect(markup).toContain("Done");
+    expect(markup).toContain("Generating");
+    expect(markup).toContain("Completed");
     expect(markup).toContain("run-progress-agents");
+    expect(markup).toContain("--run-progress-agent-index:0");
+    expect(markup).toContain("--run-progress-agent-index:1");
     expect(markup).toContain('role="list"');
     expect(markup).toContain('role="listitem"');
-    expect(markup).toContain("Working after Renault Specialist");
+    expect(markup).toContain("Generating after Renault Specialist");
     expect(markup).toContain("Private model reasoning is not displayed");
     expect(markup).not.toContain("Why selected:");
     expect(markup).not.toContain("Receives work from");
@@ -240,6 +255,11 @@ describe("Agent Studio product surfaces", () => {
     expect(progressStyles).not.toContain("border:");
     expect(progressStyles).not.toContain("background:");
     expect(styles).toContain(".run-progress-agents");
+    expect(styles).toContain("@keyframes run-progress-agent-reveal");
+    expect(styles).toContain("@keyframes run-progress-state-reveal");
+    expect(styles).toContain("--run-progress-state-color: #e0a11a");
+    expect(styles).toContain("--run-progress-state-color: #25845f");
+    expect(styles).toContain("@media (prefers-reduced-motion: reduce)");
     expect(styles).not.toContain(".run-progress-dag");
   });
 

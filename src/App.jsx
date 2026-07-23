@@ -385,6 +385,12 @@ function safeLiveRunEvent(event = {}) {
     ...(event.message_id ? { message_id: String(event.message_id) } : {})
   };
   if (safe.type === "planner.completed") safe.steps = safeLivePlanSteps(event.steps);
+  if (
+    safe.type === "route.failed"
+    && ["blocked", "failed"].includes(String(event.status || ""))
+  ) {
+    safe.status = String(event.status);
+  }
   return safe;
 }
 
@@ -4140,8 +4146,8 @@ export function runProgressSpecialists(run, agents = []) {
 }
 
 function runProgressStateLabel(state) {
-  if (state === "working") return "Working";
-  if (state === "ready") return "Done";
+  if (state === "working") return "Generating";
+  if (state === "ready") return "Completed";
   if (state === "reused") return "Reused";
   if (state === "blocked") return "Blocked";
   if (state === "failed") return "Failed";
@@ -4233,7 +4239,7 @@ export function RunProgress({ run, agents = [] }) {
   const title = synthesizing
     ? "Preparing the answer"
     : graph.activeAgentCount
-      ? `${graph.activeAgentCount} working · ${graph.agentCount} selected`
+      ? `${graph.activeAgentCount} generating · ${graph.agentCount} selected`
       : graph.agentCount
         ? `${graph.agentCount} ${graph.agentCount === 1 ? "specialist" : "specialists"} selected`
         : selectionComplete
@@ -4250,8 +4256,14 @@ export function RunProgress({ run, agents = [] }) {
       </div>
       {graph.nodes.length > 0 && (
         <div className="run-progress-agents" role="list" aria-label={graph.accessibleSummary}>
-          {graph.nodes.map((node) => (
-            <span className={`run-progress-agent ${node.state}`} role="listitem" key={node.id}>
+          {graph.nodes.map((node, index) => (
+            <span
+              className={`run-progress-agent ${node.state}`}
+              role="listitem"
+              aria-label={`${node.name}: ${node.state_label}`}
+              key={node.id}
+              style={{ "--run-progress-agent-index": index }}
+            >
               <span className="run-progress-agent-dot" aria-hidden="true" />
               <strong>{node.name}</strong>
               <small>{node.state_label}</small>
