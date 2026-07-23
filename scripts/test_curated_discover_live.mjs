@@ -61,6 +61,9 @@ const CASES = requestedTeams.size
   : ALL_CASES;
 const promptOverride = String(process.env.CURATED_LIVE_PROMPT || "").trim();
 if (promptOverride && CASES.length === 1) CASES[0] = { ...CASES[0], prompt: promptOverride };
+const MARKETING_FOLLOWUP_PROMPT = "What if i choice tiktok for platform, how can i do the marketing plan?";
+const MARKETING_FOLLOWUP_EVIDENCE = String(process.env.CURATED_LIVE_MARKETING_FOLLOWUP_EVIDENCE || "").trim();
+const INITIAL_RUN_EVIDENCE = String(process.env.CURATED_LIVE_INITIAL_RUN_EVIDENCE || "").trim();
 const MANAGED_ENV = [
   "NODE_ENV",
   "WEB_STORE_DRIVER",
@@ -218,6 +221,11 @@ async function main() {
         .send({ content: scenario.prompt })
         .expect(202);
       const run = await waitForRun(app, queued.body.run_id);
+      if (INITIAL_RUN_EVIDENCE) {
+        const initialEvidencePath = path.resolve(INITIAL_RUN_EVIDENCE);
+        await fs.mkdir(path.dirname(initialEvidencePath), { recursive: true });
+        await fs.writeFile(initialEvidencePath, `${JSON.stringify(run, null, 2)}\n`, "utf8");
+      }
       requireCondition(run.status === "completed", `${scenario.team} run failed: ${JSON.stringify(run.error || run.route_failure_summary || {})}`);
       requireCondition(Number(run.execution_options?.max_tokens) >= 1536, `${scenario.team} used the retired 1,024-token specialist ceiling`);
       const plannedIds = new Set((run.plan?.steps || []).map((step) => step.adapter));
@@ -324,6 +332,37 @@ async function main() {
       }
 
       let followupProof = null;
+      if (scenario.team === "Marketing" && MARKETING_FOLLOWUP_EVIDENCE) {
+        stage = "Marketing: answer an exact TikTok platform follow-up";
+        const followupQueued = await auth(request(app).post(`/api/chat/sessions/${session.body.session_id}/messages`))
+          .set("Idempotency-Key", `curated-live-marketing-followup-${crypto.randomBytes(12).toString("hex")}`)
+          .send({ content: MARKETING_FOLLOWUP_PROMPT })
+          .expect(202);
+        const followup = await waitForRun(app, followupQueued.body.run_id);
+        const evidencePath = path.resolve(MARKETING_FOLLOWUP_EVIDENCE);
+        await fs.mkdir(path.dirname(evidencePath), { recursive: true });
+        await fs.writeFile(evidencePath, `${JSON.stringify(followup, null, 2)}\n`, "utf8");
+        requireCondition(followup.status === "completed", `Marketing TikTok follow-up failed: ${JSON.stringify(followup.error || {})}`);
+        requireCondition(
+          followup.plan?.routing?.orchestrator?.semantic_adjudication?.accepted === true,
+          "Marketing TikTok follow-up was not finalized by semantic adjudication"
+        );
+        requireCondition((followup.route_failure_summary || []).length === 0, "Marketing TikTok follow-up reported a route failure");
+        requireCondition(
+          String(followup.final_answer || "").length >= 300
+          && !/I could not complete .* from the validated information available in this run\./i.test(String(followup.final_answer || "")),
+          "Marketing TikTok follow-up returned the unresolved-deliverable fallback"
+        );
+        followupProof = {
+          kind: "tiktok_marketing_plan",
+          selected_agents: (followup.plan?.steps || []).length,
+          agents_completed: (followup.expert_outputs || []).length,
+          route_failures: (followup.route_failure_summary || []).length,
+          total_tokens: followup.usage_receipt?.total_tokens || 0,
+          final_answer_chars: String(followup.final_answer || "").length,
+          evidence: evidencePath
+        };
+      }
       if (scenario.team === "Engineering" && process.env.CURATED_LIVE_AWS_FOLLOWUP === "1") {
         stage = "Engineering: reuse prior architecture context in an AWS follow-up";
         const followupQueued = await auth(request(app).post(`/api/chat/sessions/${session.body.session_id}/messages`))
@@ -359,7 +398,9 @@ async function main() {
         terminal_recovery_used: leadOutput?.terminal_fan_in_recovery?.valid === true,
         total_tokens: run.usage_receipt.total_tokens,
         final_answer_chars: String(run.final_answer).length,
-        ...(followupProof ? { aws_followup: followupProof } : {})
+        ...(followupProof
+          ? { [followupProof.kind === "tiktok_marketing_plan" ? "marketing_followup" : "aws_followup"]: followupProof }
+          : {})
       });
       console.log(JSON.stringify({ stage: "team_complete", ...proofs.at(-1) }));
     }
