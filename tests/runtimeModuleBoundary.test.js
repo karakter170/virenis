@@ -9,12 +9,20 @@ import * as simulator from "./fixtures/agentRuntimeSimulator.js";
 const PROJECT_ROOT = fileURLToPath(new URL("../", import.meta.url));
 const SERVER_ROOT = path.join(PROJECT_ROOT, "server");
 const SIMULATOR_FIXTURE = path.join(PROJECT_ROOT, "tests", "fixtures", "agentRuntimeSimulator.js");
+const APPROVED_SHARED_CONTRACTS = [
+  path.join(PROJECT_ROOT, "shared", "agentRuntimeStateContract.js"),
+  path.join(PROJECT_ROOT, "shared", "persistedStorageCompatibility.js")
+].sort();
 
 describe("runtime module boundary", () => {
   it("keeps test-only simulation outside the production import graph", async () => {
     const reachable = await staticModuleGraph(path.join(SERVER_ROOT, "index.js"));
     expect(reachable).not.toContain(SIMULATOR_FIXTURE);
-    expect([...reachable].every((filename) => filename.startsWith(SERVER_ROOT))).toBe(true);
+    expect(
+      [...reachable]
+        .filter((filename) => !filename.startsWith(SERVER_ROOT))
+        .sort()
+    ).toEqual(APPROVED_SHARED_CONTRACTS);
   });
 
   it("keeps the local processor explicit and fixture-only", () => {

@@ -1,28 +1,35 @@
 #!/usr/bin/env node
-/* global console, fetch, process, URL */
+/* global console, fetch, process, URL, window */
 
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { createClerkClient } from "@clerk/backend";
 import { chromium } from "@playwright/test";
 import express from "express";
 
 import { createApp } from "../server/app.js";
+import {
+  activateClerkTestTicket,
+  createClerkTestTicket,
+  revokeClerkTestSession
+} from "./clerkTestSession.mjs";
 import { activeSessionViewReady } from "../e2e/pipelineSessionBinding.js";
 
 const PROJECT_ROOT = path.resolve(import.meta.dirname, "../../..");
-const RUNTIME_KEY_FILE = process.env.AGENT_RUNTIME_API_KEY_FILE
-  || path.join(PROJECT_ROOT, "outputs", "tcar_api_key.txt");
+const RUNTIME_URL = String(process.env.AGENT_RUNTIME_API_URL || "").trim();
+const RUNTIME_KEY_FILE = String(process.env.AGENT_RUNTIME_API_KEY_FILE || "").trim();
 const INITIAL_PROMPT_BODY = "Use only this supplied hypothetical context; no current facts or web research are needed: a neighborhood library with a fixed small budget wants more teenagers to participate after school. Frame the challenge and explain the core users, constraints, assumptions, and success criteria.";
 const FOLLOWUP_PROMPT = "Look the other perspectives. And explain more.";
 const TOKEN = `brainstorm_ui_${crypto.randomBytes(24).toString("hex")}`;
 const AUTHORIZATION = `Bearer ${TOKEN}`;
 const ACTOR = { user_id: "brainstorm_ui_user", workspace_id: "brainstorm_ui_workspace", role: "admin" };
-const SCREENSHOT = path.join(PROJECT_ROOT, "outputs", "brainstorm_followup_ui_proof.png");
+const SCREENSHOT = process.env.BRAINSTORM_UI_SCREENSHOT_PATH
+  ? path.resolve(process.env.BRAINSTORM_UI_SCREENSHOT_PATH)
+  : "";
 const EXTERNAL_BASE_URL = String(process.env.BRAINSTORM_UI_BASE_URL || "").trim();
-const STORAGE_STATE = process.env.BRAINSTORM_UI_STORAGE_STATE || "/tmp/virenis-auth-5174.json";
+const STORAGE_STATE = String(process.env.BRAINSTORM_UI_STORAGE_STATE || "").trim();
+const ALLOW_PERSISTED_TEST_STATE = process.env.BRAINSTORM_UI_ALLOW_PERSISTED_TEST_STATE === "1";
 const APP_BOOT_TIMEOUT_MS = Number(process.env.BRAINSTORM_UI_BOOT_TIMEOUT_MS || 60_000);
 const CLERK_TEST_USER_ID = process.env.BRAINSTORM_UI_CLERK_USER_ID || "";
 const CAPABILITY_ERROR = /selected team cannot yet produce every required outcome|enable a compatible capability|could not complete/i;
@@ -56,6 +63,23 @@ async function pageApi(page, endpoint, { method = "GET", body, headers = {} } = 
   return response.payload;
 }
 
+async function directApi(baseURL, endpoint, { method = "GET", body, headers = {} } = {}) {
+  const response = await fetch(`${baseURL}${endpoint}`, {
+    method,
+    headers: {
+      Authorization: AUTHORIZATION,
+      ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+      ...headers
+    },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) })
+  });
+  const payload = await response.json().catch(() => null);
+  if (!response.ok) {
+    throw new Error(`${method} ${endpoint} failed (${response.status}): ${JSON.stringify(payload)}`);
+  }
+  return payload;
+}
+
 async function waitForRun(page, runId) {
   const deadline = Date.now() + 30 * 60 * 1000;
   while (Date.now() < deadline) {
@@ -81,16 +105,37 @@ async function sendThroughComposer(page, sessionId, prompt) {
 }
 
 async function main() {
+  requireCondition(SCREENSHOT, "BRAINSTORM_UI_SCREENSHOT_PATH is required; live evidence must use an explicit disposable path");
+  requireCondition(
+    !EXTERNAL_BASE_URL || ALLOW_PERSISTED_TEST_STATE,
+    "BRAINSTORM_UI_ALLOW_PERSISTED_TEST_STATE=1 is required for an external run because chat, run, and billing evidence persists"
+  );
+  requireCondition(
+    !EXTERNAL_BASE_URL || process.env.CLERK_SECRET_KEY || STORAGE_STATE,
+    "BRAINSTORM_UI_STORAGE_STATE is required for an external base URL when no explicit Clerk test session is configured"
+  );
+  if (!EXTERNAL_BASE_URL) {
+    requireCondition(RUNTIME_URL, "AGENT_RUNTIME_API_URL is required for the local live Brainstorm proof");
+    requireCondition(RUNTIME_KEY_FILE, "AGENT_RUNTIME_API_KEY_FILE is required for the local live Brainstorm proof");
+  }
   const previousEnv = Object.fromEntries(MANAGED_ENV.map((name) => [name, process.env[name]]));
   const tempRoot = EXTERNAL_BASE_URL ? "" : await fs.mkdtemp(path.join(os.tmpdir(), "virenis-brainstorm-ui-"));
   let app;
   let listener;
   let browser;
   let page;
+  let baseURL = "";
   let copiedWorkspaceId = "";
   let copiedAgentIds = [];
+  let copyListingId = "";
+  let copyListingItemId = "";
+  let copyIdempotencyKey = "";
   let clerkClient;
   let clerkSignInTokenId = "";
+  let clerkSignInTicket = "";
+  let clerkSessionId = "";
+  let clerkCleanupError = null;
+  const resourceCleanup = [];
   try {
     if (!EXTERNAL_BASE_URL) {
       process.env.NODE_ENV = "development";
@@ -101,7 +146,7 @@ async function main() {
       // correctly reject this browser's state-changing requests.
       delete process.env.APP_PUBLIC_ORIGIN;
       process.env.AGENT_RUNTIME_MODE = "real";
-      process.env.AGENT_RUNTIME_API_URL = process.env.AGENT_RUNTIME_API_URL || "http://127.0.0.1:9000";
+      process.env.AGENT_RUNTIME_API_URL = RUNTIME_URL;
       delete process.env.AGENT_RUNTIME_API_KEY;
       process.env.AGENT_RUNTIME_API_KEY_FILE = RUNTIME_KEY_FILE;
       process.env.AGENT_RUNTIME_CHAT_TIMEOUT_MS = "1800000";
@@ -124,9 +169,9 @@ async function main() {
       });
     }
 
-    const baseURL = EXTERNAL_BASE_URL || `http://127.0.0.1:${listener.address().port}`;
+    baseURL = EXTERNAL_BASE_URL || `http://127.0.0.1:${listener.address().port}`;
     browser = await chromium.launch({ headless: true });
-    const context = await browser.newContext(EXTERNAL_BASE_URL
+    const context = await browser.newContext(EXTERNAL_BASE_URL && !process.env.CLERK_SECRET_KEY
       ? { baseURL, viewport: { width: 1440, height: 1100 }, storageState: STORAGE_STATE }
       : { baseURL, viewport: { width: 1440, height: 1100 } });
     if (!EXTERNAL_BASE_URL) {
@@ -164,18 +209,28 @@ async function main() {
     });
     let appEntryUrl = `${baseURL}/app`;
     if (process.env.CLERK_SECRET_KEY) {
-      clerkClient = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY });
-      const clerkUserId = CLERK_TEST_USER_ID
-        || (await clerkClient.users.getUserList({ limit: 1 })).data?.[0]?.id;
-      requireCondition(clerkUserId, "No Clerk user is available for the browser sign-in proof");
-      const signInToken = await clerkClient.signInTokens.createSignInToken({
-        userId: clerkUserId,
-        expiresInSeconds: 300
+      const clerkTicket = await createClerkTestTicket({
+        secretKey: process.env.CLERK_SECRET_KEY,
+        userId: CLERK_TEST_USER_ID,
+        userIdVariable: "BRAINSTORM_UI_CLERK_USER_ID"
       });
-      clerkSignInTokenId = signInToken.id;
-      appEntryUrl = `${baseURL}/login?__clerk_ticket=${encodeURIComponent(signInToken.token)}`;
+      clerkClient = clerkTicket.client;
+      clerkSignInTokenId = clerkTicket.signInTokenId;
+      clerkSignInTicket = clerkTicket.ticket;
+      appEntryUrl = `${baseURL}/login`;
     }
     await page.goto(appEntryUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    if (clerkSignInTicket) {
+      try {
+        clerkSessionId = await activateClerkTestTicket(page, clerkSignInTicket);
+      } catch (error) {
+        clerkSessionId = error.clerkSessionId || "";
+        throw error;
+      }
+      await page.waitForFunction(() => (
+        window.location.pathname === "/app" && Boolean(window.Clerk?.session)
+      ), null, { timeout: 60_000 });
+    }
     try {
       await page.locator('textarea[role="combobox"]').waitFor({ state: "visible", timeout: APP_BOOT_TIMEOUT_MS });
     } catch {
@@ -202,10 +257,13 @@ async function main() {
     const marketplace = await pageApi(page, "/api/marketplace?type=workspace");
     const listing = marketplace.items.find((item) => item.title === "Brainstorming");
     requireCondition(listing, "Discover did not contain the Brainstorming team");
-    const copied = await pageApi(page, `/api/marketplace/items/${listing.id}/copy`, {
+    copyListingId = listing.listing_id;
+    copyListingItemId = listing.id;
+    copyIdempotencyKey = `brainstorm-ui-${crypto.randomBytes(12).toString("hex")}`;
+    const copied = await pageApi(page, `/api/marketplace/items/${encodeURIComponent(copyListingItemId)}/copy`, {
       method: "POST",
-      headers: { "Idempotency-Key": `brainstorm-ui-${crypto.randomBytes(12).toString("hex")}` },
-      body: { listing_id: listing.listing_id }
+      headers: { "Idempotency-Key": copyIdempotencyKey },
+      body: { listing_id: copyListingId }
     });
     copiedWorkspaceId = copied.agent_workspace.agent_workspace_id;
     const workspace = await pageApi(page, `/api/agent-workspaces/${copiedWorkspaceId}`);
@@ -302,17 +360,61 @@ async function main() {
       screenshot: SCREENSHOT
     }, null, 2));
   } finally {
-    if (page && copiedWorkspaceId) {
-      await pageApi(page, `/api/agent-workspaces/${copiedWorkspaceId}`, { method: "DELETE" }).catch(() => undefined);
-      for (const agentId of copiedAgentIds.reverse()) {
-        await pageApi(page, `/api/agents/${agentId}`, { method: "DELETE" }).catch(() => undefined);
-        await pageApi(page, `/api/agents/${agentId}/permanent`, { method: "DELETE" }).catch(() => undefined);
+    const cleanupRequest = !EXTERNAL_BASE_URL && baseURL
+      ? (endpoint, options) => directApi(baseURL, endpoint, options)
+      : page
+        ? (endpoint, options) => pageApi(page, endpoint, options)
+        : null;
+    if (!copiedWorkspaceId && copyListingId && copyListingItemId && copyIdempotencyKey) {
+      if (!cleanupRequest) {
+        resourceCleanup.push({ type: "copy_receipt", id: copyListingItemId, purged: false, error: "no authenticated cleanup channel is available" });
+      } else {
+        try {
+          const recovered = await cleanupRequest(`/api/marketplace/items/${encodeURIComponent(copyListingItemId)}/copy`, {
+            method: "POST",
+            headers: { "Idempotency-Key": copyIdempotencyKey },
+            body: { listing_id: copyListingId }
+          });
+          copiedWorkspaceId = recovered.agent_workspace.agent_workspace_id;
+          const workspace = await cleanupRequest(`/api/agent-workspaces/${encodeURIComponent(copiedWorkspaceId)}`);
+          copiedAgentIds = workspace.agents.map((agent) => agent.id);
+        } catch (error) {
+          resourceCleanup.push({ type: "copy_receipt", id: copyListingItemId, purged: false, error: error.message });
+        }
       }
     }
-    if (browser) await browser.close().catch(() => undefined);
-    if (clerkClient && clerkSignInTokenId) {
-      await clerkClient.signInTokens.revokeSignInToken(clerkSignInTokenId).catch(() => undefined);
+    if (copiedWorkspaceId) {
+      if (!cleanupRequest) {
+        resourceCleanup.push({ type: "workspace", id: copiedWorkspaceId, purged: false, error: "no authenticated cleanup channel is available" });
+      } else {
+        try {
+          await cleanupRequest(`/api/agent-workspaces/${encodeURIComponent(copiedWorkspaceId)}`, { method: "DELETE" });
+          resourceCleanup.push({ type: "workspace", id: copiedWorkspaceId, purged: true });
+        } catch (error) {
+          resourceCleanup.push({ type: "workspace", id: copiedWorkspaceId, purged: false, error: error.message });
+        }
+      }
+      for (const agentId of copiedAgentIds.reverse()) {
+        if (!cleanupRequest) {
+          resourceCleanup.push({ type: "agent", id: agentId, purged: false, error: "no authenticated cleanup channel is available" });
+        } else {
+          try {
+            await cleanupRequest(`/api/agents/${encodeURIComponent(agentId)}`, { method: "DELETE" });
+            await cleanupRequest(`/api/agents/${encodeURIComponent(agentId)}/permanent`, { method: "DELETE" });
+            resourceCleanup.push({ type: "agent", id: agentId, purged: true });
+          } catch (error) {
+            resourceCleanup.push({ type: "agent", id: agentId, purged: false, error: error.message });
+          }
+        }
+      }
     }
+    if (resourceCleanup.length) console.log(JSON.stringify({ cleanup: resourceCleanup }));
+    if (browser) await browser.close().catch(() => undefined);
+    await revokeClerkTestSession({
+      client: clerkClient,
+      sessionId: clerkSessionId,
+      signInTokenId: clerkSignInTokenId
+    }).catch((error) => { clerkCleanupError = error; });
     if (listener) await new Promise((resolve) => listener.close(resolve));
     if (app?.locals) {
       await app.locals.drainBackgroundTasks({ timeoutMs: 60_000 }).catch(() => undefined);
@@ -322,6 +424,15 @@ async function main() {
     for (const [name, value] of Object.entries(previousEnv)) {
       if (value === undefined) delete process.env[name];
       else process.env[name] = value;
+    }
+    if (clerkCleanupError) {
+      console.error(JSON.stringify({ ok: false, cleanup_error: clerkCleanupError.message }));
+      process.exitCode = 1;
+    }
+    const failedResourceCleanup = resourceCleanup.filter((item) => item.purged !== true);
+    if (failedResourceCleanup.length > 0) {
+      console.error(JSON.stringify({ ok: false, resource_cleanup_failed: failedResourceCleanup }));
+      process.exitCode = 1;
     }
   }
 }

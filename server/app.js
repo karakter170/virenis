@@ -8,6 +8,15 @@ import { basicAuthPassword, parseConfiguredApiTokens, secretConfigured } from ".
 import { readConfiguredSecret } from "./secretConfig.js";
 import { readAgentRuntimeEnv } from "./agentRuntimeConfig.js";
 import {
+  AGENT_DOCUMENT_SOURCE_ROOT,
+  AGENT_SOURCE_ROOT,
+  agentSourcePath
+} from "../shared/agentRuntimeStateContract.js";
+import {
+  PERSISTED_AGENT_SOURCE_ROOT,
+  PERSISTED_DOCUMENT_SOURCE_ROOT
+} from "./persistedStorageCompatibility.js";
+import {
   LEGACY_PERSISTED_PLANNER_MODE_V1,
   normalizePersistedAgentRuntimeOptions
 } from "./agentRuntimeResponseCompatibility.js";
@@ -5763,7 +5772,7 @@ function assertSessionMutationAccess(session, req) {
 }
 
 function ownedAgentSourcePath(agentId) {
-  return `sources/router_agents/${agentId}/source.md`;
+  return agentSourcePath(agentId);
 }
 
 function activeAgentDependents(data, agent) {
@@ -6111,11 +6120,24 @@ async function reconcileRuntimeLifecycleIntents({ store, intentId = null, intent
 }
 
 function assertOwnedAgentSources(req, agentId, sources, agent = null) {
+  const persistedAgentPrefix = `${PERSISTED_AGENT_SOURCE_ROOT}/${agentId}/`;
   const prefixes = [
-    `sources/router_agents/${agentId}/`
+    `${AGENT_SOURCE_ROOT}/${agentId}/`
   ];
+  if ((agent?.sources || []).some((sourcePath) => (
+    String(sourcePath).replaceAll("\\", "/").startsWith(persistedAgentPrefix)
+  ))) {
+    prefixes.push(persistedAgentPrefix);
+  }
   if (agent?.document?.slug) {
-    prefixes.push(`sources/tcar_documents/${agent.document.slug}/`);
+    const currentDocumentPrefix = `${AGENT_DOCUMENT_SOURCE_ROOT}/${agent.document.slug}/`;
+    const persistedDocumentPrefix = `${PERSISTED_DOCUMENT_SOURCE_ROOT}/${agent.document.slug}/`;
+    prefixes.push(currentDocumentPrefix);
+    if ((agent.sources || []).some((sourcePath) => (
+      String(sourcePath).replaceAll("\\", "/").startsWith(persistedDocumentPrefix)
+    ))) {
+      prefixes.push(persistedDocumentPrefix);
+    }
   }
   for (const sourcePath of sources || []) {
     const normalized = String(sourcePath).replaceAll("\\", "/");

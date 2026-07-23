@@ -1,5 +1,13 @@
 import { agentRevision, digestValue, normalizeSha256Digest } from "./outcomes.js";
 import { agentRuntimeOutputModelId } from "./agentRuntimeResponseCompatibility.js";
+import {
+  AGENT_DOCUMENT_SOURCE_ROOT,
+  AGENT_SOURCE_ROOT
+} from "../shared/agentRuntimeStateContract.js";
+import {
+  PERSISTED_AGENT_SOURCE_ROOT,
+  PERSISTED_DOCUMENT_SOURCE_ROOT
+} from "./persistedStorageCompatibility.js";
 import { makeId, nowIso } from "./store.js";
 import { worldGraphRouteOutputMatchesOutcomeContract } from "./worldGraph.js";
 
@@ -996,10 +1004,16 @@ function normalizeRuntimeCitation(citation, output) {
 
 export function isApprovedCitationPath(sourcePath, approvedSources) {
   const normalized = String(sourcePath || "").replaceAll("\\", "/");
+  const approvedRoots = [
+    AGENT_DOCUMENT_SOURCE_ROOT,
+    AGENT_SOURCE_ROOT,
+    PERSISTED_DOCUMENT_SOURCE_ROOT,
+    PERSISTED_AGENT_SOURCE_ROOT
+  ];
   if (
     normalized.startsWith("/") ||
     normalized.includes("..") ||
-    !(normalized.startsWith("sources/tcar_documents/") || normalized.startsWith("sources/router_agents/"))
+    !approvedRoots.some((root) => normalized.startsWith(`${root}/`))
   ) {
     return false;
   }

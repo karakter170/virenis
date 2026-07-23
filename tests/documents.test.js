@@ -168,6 +168,53 @@ describe("authoritative Runtime document chunks", () => {
     expect(() => assertStoredDocumentIntegrity(cachedDocument)).toThrow(/chunk snapshot does not match/);
   });
 
+  it("accepts the neutral managed path for new Runtime registrations", () => {
+    const body = "Neutral Runtime document state remains independently verifiable.";
+    const record = runtimeChunkRecord({
+      slug: "neutral_manual",
+      body,
+      sourceRoot: "sources/agent_documents"
+    });
+    const result = runtimeDocumentResult({
+      agentId: "neutral_manual_lora",
+      slug: "neutral_manual",
+      records: [record],
+      sourceText: body,
+      sourceRoot: "sources/agent_documents"
+    });
+
+    expect(validateRuntimeDocumentResult(result, {
+      agentId: "neutral_manual_lora",
+      slug: "neutral_manual",
+      text: body
+    })).toMatchObject({
+      document_root: "sources/agent_documents/neutral_manual",
+      index_path: "sources/agent_documents/neutral_manual/index.jsonl"
+    });
+  });
+
+  it("rejects a legacy path in a new Runtime registration receipt", () => {
+    const body = "New registrations must not extend the legacy namespace.";
+    const record = runtimeChunkRecord({
+      slug: "legacy_write",
+      body,
+      sourceRoot: "sources/tcar_documents"
+    });
+    const result = runtimeDocumentResult({
+      agentId: "legacy_write_lora",
+      slug: "legacy_write",
+      records: [record],
+      sourceText: body,
+      sourceRoot: "sources/tcar_documents"
+    });
+
+    expect(() => validateRuntimeDocumentResult(result, {
+      agentId: "legacy_write_lora",
+      slug: "legacy_write",
+      text: body
+    })).toThrow(/managed source root/);
+  });
+
   it.each([
     ["count mismatch", (result) => { result.chunks = 2; }],
     ["duplicate id", (result) => { result.chunk_records.push({ ...result.chunk_records[0] }); result.chunks = 2; }],
@@ -275,7 +322,14 @@ describe("stored document retrieval integrity", () => {
   });
 });
 
-function runtimeChunkRecord({ slug, body, pageStart = null, pageEnd = null, chunkIndex = 1 }) {
+function runtimeChunkRecord({
+  slug,
+  body,
+  pageStart = null,
+  pageEnd = null,
+  chunkIndex = 1,
+  sourceRoot = "sources/agent_documents"
+}) {
   const chunkId = `${slug}_${String(chunkIndex).padStart(4, "0")}`;
   return {
     chunk_id: chunkId,
@@ -283,7 +337,7 @@ function runtimeChunkRecord({ slug, body, pageStart = null, pageEnd = null, chun
     page_start: pageStart,
     page_end: pageEnd,
     tags: ["authoritative", "runtime"],
-    path: `sources/tcar_documents/${slug}/chunks/${chunkId}.md`,
+    path: `${sourceRoot}/${slug}/chunks/${chunkId}.md`,
     summary: body,
     token_count_approx: body.split(/\s+/).length,
     content_digest: crypto.createHash("sha256").update(body, "utf8").digest("hex"),
@@ -291,12 +345,18 @@ function runtimeChunkRecord({ slug, body, pageStart = null, pageEnd = null, chun
   };
 }
 
-function runtimeDocumentResult({ agentId, slug, records, sourceText }) {
+function runtimeDocumentResult({
+  agentId,
+  slug,
+  records,
+  sourceText,
+  sourceRoot = "sources/agent_documents"
+}) {
   return {
     status: "added",
     id: agentId,
-    document_root: `sources/tcar_documents/${slug}`,
-    index_path: `sources/tcar_documents/${slug}/index.jsonl`,
+    document_root: `${sourceRoot}/${slug}`,
+    index_path: `${sourceRoot}/${slug}/index.jsonl`,
     chunks: records.length,
     chunk_records: records,
     source_digest: crypto.createHash("sha256").update(sourceText, "utf8").digest("hex"),

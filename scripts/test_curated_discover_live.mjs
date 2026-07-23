@@ -15,10 +15,8 @@ import request from "supertest";
 
 import { createApp } from "../server/app.js";
 
-const PROJECT_ROOT = path.resolve(import.meta.dirname, "../../..");
-const RUNTIME_KEY_FILE = process.env.AGENT_RUNTIME_API_KEY_FILE
-  || path.join(PROJECT_ROOT, "outputs", "tcar_api_key.txt");
-const RUNTIME_URL = process.env.AGENT_RUNTIME_API_URL || "http://127.0.0.1:9000";
+const RUNTIME_KEY_FILE = String(process.env.AGENT_RUNTIME_API_KEY_FILE || "").trim();
+const RUNTIME_URL = String(process.env.AGENT_RUNTIME_API_URL || "").trim();
 const LIVE_TOKEN = `curated_live_${crypto.randomBytes(24).toString("hex")}`;
 const AUTH = { Authorization: `Bearer ${LIVE_TOKEN}` };
 const ACTOR = {
@@ -138,6 +136,8 @@ async function cleanup(app, workspaces, agents) {
 
 async function main() {
   requireCondition(CASES.length > 0, "CURATED_LIVE_TEAMS did not match a Discover team");
+  requireCondition(RUNTIME_URL, "AGENT_RUNTIME_API_URL is required for the curated live proof");
+  requireCondition(RUNTIME_KEY_FILE, "AGENT_RUNTIME_API_KEY_FILE is required for the curated live proof");
   await fs.access(RUNTIME_KEY_FILE);
   const previousEnv = Object.fromEntries(MANAGED_ENV.map((name) => [name, process.env[name]]));
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "virenis-curated-live-"));
@@ -236,6 +236,10 @@ async function main() {
       requireCondition(plannedIds.size === teamIds.length, `${scenario.team} route included an agent outside the active team`);
       requireCondition(run.plan?.routing?.orchestrator?.all_primary_agents_visible === true, `${scenario.team} did not expose all six agents to Qwen`);
       requireCondition((run.expert_outputs || []).length === 6, `${scenario.team} did not return six route outputs`);
+      requireCondition(
+        Number(run.parallel?.maxBatchWidth) > 1,
+        `${scenario.team} validated DAG was not parallelizable: ${JSON.stringify(run.parallel || {})}`
+      );
       const invalidArtifacts = run.expert_outputs.filter((output) => output.artifact_validation?.valid !== true);
       const invalidConsumption = run.expert_outputs.filter((output) => output.consumption_validation?.valid !== true);
       if (invalidArtifacts.length > 0 || invalidConsumption.length > 0 || (run.route_failure_summary || []).length > 0) {
@@ -350,7 +354,7 @@ async function main() {
         agents_visible_to_qwen: run.plan.routing.orchestrator.active_primary_agent_count,
         selected_agents: plannedIds.size,
         valid_outputs: run.expert_outputs.filter((output) => output.artifact_validation?.valid === true).length,
-        maximum_parallel_width: run.parallel?.maxBatchWidth || 0,
+        maximum_parallelizable_dag_width: run.parallel?.maxBatchWidth || 0,
         agent_output_token_ceiling: run.execution_options.max_tokens,
         terminal_recovery_used: leadOutput?.terminal_fan_in_recovery?.valid === true,
         total_tokens: run.usage_receipt.total_tokens,

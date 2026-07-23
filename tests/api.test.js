@@ -2660,6 +2660,19 @@ describe("runtime and catalog", () => {
 
       await request(app)
         .post("/api/agents")
+        .set("Authorization", "Bearer private_source_admin")
+        .send({
+          id: "new_legacy_source",
+          title: "New legacy source",
+          capability: "Must write only to neutral Runtime state.",
+          boundary: "Use owned sources only.",
+          sources: "sources/router_agents/new_legacy_source/source.md",
+          source_text: "This new source must never enter the legacy namespace."
+        })
+        .expect(403);
+
+      await request(app)
+        .post("/api/agents")
         .set("Authorization", "Bearer private_source_user")
         .send({
           id: "owned_source",
@@ -2670,7 +2683,7 @@ describe("runtime and catalog", () => {
         })
         .expect(201);
       const stored = app.locals.store.read().agents.find((agent) => agent.id === "owned_source");
-      expect(stored.sources).toEqual(["sources/router_agents/owned_source/source.md"]);
+      expect(stored.sources).toEqual(["sources/agents/owned_source/source.md"]);
 
       await request(app)
         .patch("/api/agents/owned_source")
@@ -6000,7 +6013,7 @@ function authoritativeRuntimeDocumentResponse(requestBody, {
     page_start: pageStart,
     page_end: pageEnd,
     tags: ["authoritative", "runtime"],
-    path: `sources/tcar_documents/${slug}/chunks/${chunkId}.md`,
+    path: `sources/agent_documents/${slug}/chunks/${chunkId}.md`,
     summary: body,
     token_count_approx: body.split(/\s+/).length,
     content_digest: runtimeSha256(body),
@@ -6013,8 +6026,8 @@ function authoritativeRuntimeDocumentResponse(requestBody, {
     result: {
       status: "added",
       id: requestBody.id,
-      document_root: `sources/tcar_documents/${slug}`,
-      index_path: `sources/tcar_documents/${slug}/index.jsonl`,
+      document_root: `sources/agent_documents/${slug}`,
+      index_path: `sources/agent_documents/${slug}/index.jsonl`,
       chunks: 1,
       chunk_records: [record],
       source_digest: runtimeSha256(requestBody.text),

@@ -3,6 +3,11 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import {
+  AGENT_DOCUMENT_SOURCE_ROOT,
+  AGENT_SOURCE_ROOT,
+  agentDocumentRoot
+} from "../shared/agentRuntimeStateContract.js";
+import {
   PERSISTED_AGENT_SOURCE_ROOT,
   PERSISTED_DOCUMENT_SOURCE_ROOT,
   persistedDocumentChunkPath,
@@ -31,7 +36,9 @@ export function slugify(value) {
 
 export function assertSafeSourcePath(sourcePath) {
   const normalized = sourcePath.replaceAll("\\", "/");
-  const allowed = normalized.startsWith(`${PERSISTED_DOCUMENT_SOURCE_ROOT}/`)
+  const allowed = normalized.startsWith(`${AGENT_DOCUMENT_SOURCE_ROOT}/`)
+    || normalized.startsWith(`${AGENT_SOURCE_ROOT}/`)
+    || normalized.startsWith(`${PERSISTED_DOCUMENT_SOURCE_ROOT}/`)
     || normalized.startsWith(`${PERSISTED_AGENT_SOURCE_ROOT}/`);
   if (!allowed || normalized.includes("..")) {
     const error = new Error("Source path must stay under approved document or agent source roots.");
@@ -392,9 +399,13 @@ export function validateRuntimeDocumentResult(result, {
     throw runtimeDocumentContractError("chunk_records must match the declared chunk count");
   }
 
-  const documentRoot = persistedDocumentRoot(slug);
-  const indexPath = persistedDocumentIndexPath(slug);
-  if (result.document_root !== documentRoot || result.index_path !== indexPath) {
+  const documentRoot = exactBoundedString(result.document_root, 512);
+  const indexPath = exactBoundedString(result.index_path, 512);
+  if (
+    !documentRoot
+    || documentRoot !== agentDocumentRoot(slug)
+    || indexPath !== `${documentRoot}/index.jsonl`
+  ) {
     throw runtimeDocumentContractError("document paths do not match the managed source root");
   }
   const sourceText = typeof text === "string" ? text : "";

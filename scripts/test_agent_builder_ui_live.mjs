@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-/* global console, document, fetch, process, URL */
+/* global console, document, fetch, process, URL, window */
 
 // Browser + web API + live GPU Runtime proof for every Agent Studio execution
 // field. The script creates only temporary resources and purges them in finally.
@@ -10,16 +10,19 @@ import fs from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { createClerkClient } from "@clerk/backend";
 import { chromium } from "@playwright/test";
 import express from "express";
 
 import { createApp } from "../server/app.js";
+import {
+  activateClerkTestTicket,
+  createClerkTestTicket,
+  revokeClerkTestSession
+} from "./clerkTestSession.mjs";
 
 const PROJECT_ROOT = path.resolve(import.meta.dirname, "../../..");
-const RUNTIME_URL = process.env.AGENT_RUNTIME_API_URL || "http://127.0.0.1:9000";
-const RUNTIME_KEY_FILE = process.env.AGENT_RUNTIME_API_KEY_FILE
-  || path.join(PROJECT_ROOT, "outputs", "tcar_api_key.txt");
+const RUNTIME_URL = String(process.env.AGENT_RUNTIME_API_URL || "").trim();
+const RUNTIME_KEY_FILE = String(process.env.AGENT_RUNTIME_API_KEY_FILE || "").trim();
 const TOKEN = `agent_builder_live_${crypto.randomBytes(24).toString("hex")}`;
 const AUTHORIZATION = `Bearer ${TOKEN}`;
 const ACTOR = {
@@ -28,7 +31,9 @@ const ACTOR = {
   role: "admin"
 };
 const CLERK_TEST_USER_ID = process.env.AGENT_BUILDER_CLERK_USER_ID || "";
-const SCREENSHOT = path.join(PROJECT_ROOT, "outputs", "agent_builder_ui_live_proof.png");
+const SCREENSHOT = process.env.AGENT_BUILDER_SCREENSHOT_PATH
+  ? path.resolve(process.env.AGENT_BUILDER_SCREENSHOT_PATH)
+  : "";
 const MANAGED_ENV = [
   "NODE_ENV",
   "WEB_STORE_DRIVER",
@@ -181,6 +186,9 @@ async function checkChoice(container, text) {
 }
 
 async function main() {
+  requireCondition(SCREENSHOT, "AGENT_BUILDER_SCREENSHOT_PATH is required; live evidence must use an explicit disposable path");
+  requireCondition(RUNTIME_URL, "AGENT_RUNTIME_API_URL is required for the live Agent Studio proof");
+  requireCondition(RUNTIME_KEY_FILE, "AGENT_RUNTIME_API_KEY_FILE is required for the live Agent Studio proof");
   const runtimeKey = (await fs.readFile(RUNTIME_KEY_FILE, "utf8")).trim();
   requireCondition(runtimeKey, "The Runtime API key file is empty");
   const previousEnv = Object.fromEntries(MANAGED_ENV.map((name) => [name, process.env[name]]));
@@ -191,6 +199,9 @@ async function main() {
   let mcpServer;
   let clerkClient;
   let clerkSignInTokenId = "";
+  let clerkSignInTicket = "";
+  let clerkSessionId = "";
+  let clerkCleanupError = null;
   let baseURL = "";
   let createdAgentId = "";
   let connectionId = "";
@@ -241,18 +252,28 @@ async function main() {
     const page = await context.newPage();
     let appEntryUrl = `${baseURL}/app`;
     if (process.env.CLERK_SECRET_KEY) {
-      clerkClient = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY });
-      const clerkUserId = CLERK_TEST_USER_ID
-        || (await clerkClient.users.getUserList({ limit: 1 })).data?.[0]?.id;
-      requireCondition(clerkUserId, "No Clerk user is available for the browser sign-in proof");
-      const signInToken = await clerkClient.signInTokens.createSignInToken({
-        userId: clerkUserId,
-        expiresInSeconds: 300
+      const clerkTicket = await createClerkTestTicket({
+        secretKey: process.env.CLERK_SECRET_KEY,
+        userId: CLERK_TEST_USER_ID,
+        userIdVariable: "AGENT_BUILDER_CLERK_USER_ID"
       });
-      clerkSignInTokenId = signInToken.id;
-      appEntryUrl = `${baseURL}/login?__clerk_ticket=${encodeURIComponent(signInToken.token)}`;
+      clerkClient = clerkTicket.client;
+      clerkSignInTokenId = clerkTicket.signInTokenId;
+      clerkSignInTicket = clerkTicket.ticket;
+      appEntryUrl = `${baseURL}/login`;
     }
     await page.goto(appEntryUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    if (clerkSignInTicket) {
+      try {
+        clerkSessionId = await activateClerkTestTicket(page, clerkSignInTicket);
+      } catch (error) {
+        clerkSessionId = error.clerkSessionId || "";
+        throw error;
+      }
+      await page.waitForFunction(() => (
+        window.location.pathname === "/app" && Boolean(window.Clerk?.session)
+      ), null, { timeout: 60_000 });
+    }
     try {
       await appReady(page);
     } catch {
@@ -393,6 +414,10 @@ async function main() {
       response.request().method() === "POST"
       && new URL(response.url()).pathname === "/api/agents"
     ));
+    const knowledgeDocumentResponse = page.waitForResponse((response) => (
+      response.request().method() === "POST"
+      && new URL(response.url()).pathname === "/api/documents"
+    ), { timeout: 300_000 });
     await builder.getByRole("button", { name: "Add to team" }).click();
     const createdHttpResponse = await createAgentResponse;
     const createdPayload = await createdHttpResponse.json();
@@ -400,6 +425,12 @@ async function main() {
     requireCondition(
       createdHttpResponse.ok(),
       `Agent ${submittedAgentId} creation failed with ${createdHttpResponse.status()}: ${JSON.stringify(createdPayload)}`
+    );
+    const knowledgeHttpResponse = await knowledgeDocumentResponse;
+    const knowledgePayload = await knowledgeHttpResponse.json();
+    requireCondition(
+      knowledgeHttpResponse.ok(),
+      `Agent ${submittedAgentId} knowledge provisioning failed with ${knowledgeHttpResponse.status()}: ${JSON.stringify(knowledgePayload)}`
     );
     createdAgentId = createdPayload.id;
     const createdAgentBeforeKnowledge = createdPayload.runtime?.agent || {};
@@ -563,13 +594,24 @@ async function main() {
     await app?.locals?.drainBackgroundTasks?.({ timeoutMs: 5000 }).catch(() => undefined);
     await app?.locals?.store?.close?.().catch(() => undefined);
     await new Promise((resolve) => mcpServer?.close(resolve) || resolve());
-    if (clerkClient && clerkSignInTokenId) {
-      await clerkClient.signInTokens.revokeSignInToken(clerkSignInTokenId).catch(() => undefined);
-    }
+    await revokeClerkTestSession({
+      client: clerkClient,
+      sessionId: clerkSessionId,
+      signInTokenId: clerkSignInTokenId
+    }).catch((error) => { clerkCleanupError = error; });
     await fs.rm(tempRoot, { recursive: true, force: true });
     for (const [name, value] of Object.entries(previousEnv)) {
       if (value === undefined) delete process.env[name];
       else process.env[name] = value;
+    }
+    if (clerkCleanupError) {
+      console.error(JSON.stringify({ ok: false, cleanup_error: clerkCleanupError.message }));
+      process.exitCode = 1;
+    }
+    const failedResourceCleanup = cleanup.filter((item) => item.purged !== true);
+    if (failedResourceCleanup.length > 0) {
+      console.error(JSON.stringify({ ok: false, resource_cleanup_failed: failedResourceCleanup }));
+      process.exitCode = 1;
     }
   }
 }

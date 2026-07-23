@@ -104,6 +104,11 @@ import {
   copyableAssistantAnswer,
   prepareAssistantAnswer
 } from "./answerPresentation.js";
+import { agentSourceRoot } from "../shared/agentRuntimeStateContract.js";
+import {
+  agentSourcePathIsOwned,
+  hasOwnedLegacyAgentSource
+} from "./agentSourcePaths.js";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const UPLOAD_REQUEST_TIMEOUT_MS = 120_000;
@@ -8171,7 +8176,8 @@ function AgentDialog({ auth, runtime, agent, agents, documents, mcpConnections =
     && form.tools.includes("repo_inspector")
     && repositoryRoots.length === 0
   );
-  const approvedSourcePrefix = `sources/router_agents/${form.id}/`;
+  const approvedSourcePrefix = `${agentSourceRoot(form.id)}/`;
+  const allowLegacySourcePath = editing && hasOwnedLegacyAgentSource(agent.id, agent.sources);
   const configuredSourcePaths = String(form.sources || "")
     .split(/[\n,]+/)
     .map((value) => value.replaceAll("\\", "/").trim())
@@ -8179,8 +8185,7 @@ function AgentDialog({ auth, runtime, agent, agents, documents, mcpConnections =
   const sourceConfigurationInvalid = Boolean(
     auth?.is_admin
     && configuredSourcePaths.some((sourcePath) => (
-      !sourcePath.startsWith(approvedSourcePrefix)
-      || sourcePath.includes("..")
+      !agentSourcePathIsOwned(form.id, sourcePath, { allowLegacy: allowLegacySourcePath })
     ))
   );
   const dirty = JSON.stringify(form) !== initialFormSignature.current || newFiles.length > 0 || Boolean(createdAgentId);

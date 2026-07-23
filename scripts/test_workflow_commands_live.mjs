@@ -14,11 +14,11 @@ import request from "supertest";
 
 import { createApp } from "../server/app.js";
 
-const PROJECT_ROOT = path.resolve(import.meta.dirname, "../../..");
-const RUNTIME_KEY_FILE = process.env.AGENT_RUNTIME_API_KEY_FILE
-  || path.join(PROJECT_ROOT, "outputs", "tcar_api_key.txt");
-const RUNTIME_URL = process.env.AGENT_RUNTIME_API_URL || "http://127.0.0.1:9000";
-const RUN_EVIDENCE_FILE = path.join(PROJECT_ROOT, "outputs", "workflow_commands_live_run.json");
+const RUNTIME_KEY_FILE = String(process.env.AGENT_RUNTIME_API_KEY_FILE || "").trim();
+const RUNTIME_URL = String(process.env.AGENT_RUNTIME_API_URL || "").trim();
+const RUN_EVIDENCE_FILE = process.env.WORKFLOW_LIVE_EVIDENCE_PATH
+  ? path.resolve(process.env.WORKFLOW_LIVE_EVIDENCE_PATH)
+  : "";
 const LIVE_TOKEN = `workflow_live_${crypto.randomBytes(24).toString("hex")}`;
 const AUTH = { Authorization: `Bearer ${LIVE_TOKEN}` };
 const ACTOR = { user_id: "workflow_live_user", workspace_id: "workflow_live_workspace", role: "admin" };
@@ -169,6 +169,12 @@ async function cleanupWorkflowAgents(app) {
 }
 
 async function main() {
+  requireCondition(
+    RUN_EVIDENCE_FILE,
+    "WORKFLOW_LIVE_EVIDENCE_PATH is required; live evidence must use an explicit disposable path"
+  );
+  requireCondition(RUNTIME_URL, "AGENT_RUNTIME_API_URL is required for the live workflow-command proof");
+  requireCondition(RUNTIME_KEY_FILE, "AGENT_RUNTIME_API_KEY_FILE is required for the live workflow-command proof");
   await fs.access(RUNTIME_KEY_FILE);
   const previousEnv = Object.fromEntries(MANAGED_ENV.map((name) => [name, process.env[name]]));
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "virenis-workflow-live-"));

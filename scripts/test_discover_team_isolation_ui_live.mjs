@@ -1,16 +1,20 @@
 #!/usr/bin/env node
-/* global console, document, fetch, process, URL */
+/* global console, document, fetch, process, URL, window */
 
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { createClerkClient } from "@clerk/backend";
 import { chromium } from "@playwright/test";
 import express from "express";
 
 import { createApp } from "../server/app.js";
 import { processLocalChatRun } from "../tests/fixtures/agentRuntimeSimulator.js";
+import {
+  activateClerkTestTicket,
+  createClerkTestTicket,
+  revokeClerkTestSession
+} from "./clerkTestSession.mjs";
 
 const PROJECT_ROOT = path.resolve(import.meta.dirname, "../../..");
 const TOKEN = `discover_team_isolation_${crypto.randomBytes(24).toString("hex")}`;
@@ -27,7 +31,9 @@ const PUBLISHER = {
   role: "user"
 };
 const CLERK_TEST_USER_ID = process.env.DISCOVER_TEAM_CLERK_USER_ID || "";
-const SCREENSHOT = path.join(PROJECT_ROOT, "outputs", "discover_team_isolation_ui_proof.png");
+const SCREENSHOT = process.env.DISCOVER_TEAM_ISOLATION_SCREENSHOT_PATH
+  ? path.resolve(process.env.DISCOVER_TEAM_ISOLATION_SCREENSHOT_PATH)
+  : "";
 const MANAGED_ENV = [
   "NODE_ENV",
   "WEB_STORE_DRIVER",
@@ -85,6 +91,7 @@ async function appReady(page) {
 }
 
 async function main() {
+  requireCondition(SCREENSHOT, "DISCOVER_TEAM_ISOLATION_SCREENSHOT_PATH is required; live evidence must use an explicit disposable path");
   const previousEnv = Object.fromEntries(MANAGED_ENV.map((name) => [name, process.env[name]]));
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "virenis-discover-team-isolation-"));
   let app;
@@ -92,6 +99,9 @@ async function main() {
   let browser;
   let clerkClient;
   let clerkSignInTokenId = "";
+  let clerkSignInTicket = "";
+  let clerkSessionId = "";
+  let clerkCleanupError = null;
   try {
     process.env.NODE_ENV = "development";
     process.env.WEB_STORE_DRIVER = "json";
@@ -162,26 +172,46 @@ async function main() {
         await route.continue();
         return;
       }
-      await route.continue({ headers: { ...request.headers(), Authorization: AUTHORIZATION } });
+      await route.continue({ headers: { ...request.headers(), authorization: AUTHORIZATION } });
     });
     const page = await context.newPage();
     let appEntryUrl = `${baseURL}/app`;
     if (process.env.CLERK_SECRET_KEY) {
-      clerkClient = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY });
-      const clerkUserId = CLERK_TEST_USER_ID
-        || (await clerkClient.users.getUserList({ limit: 1 })).data?.[0]?.id;
-      requireCondition(clerkUserId, "No Clerk user is available for the browser sign-in proof");
-      const signInToken = await clerkClient.signInTokens.createSignInToken({
-        userId: clerkUserId,
-        expiresInSeconds: 300
+      const clerkTicket = await createClerkTestTicket({
+        secretKey: process.env.CLERK_SECRET_KEY,
+        userId: CLERK_TEST_USER_ID,
+        userIdVariable: "DISCOVER_TEAM_CLERK_USER_ID"
       });
-      clerkSignInTokenId = signInToken.id;
-      appEntryUrl = `${baseURL}/login?__clerk_ticket=${encodeURIComponent(signInToken.token)}`;
+      clerkClient = clerkTicket.client;
+      clerkSignInTokenId = clerkTicket.signInTokenId;
+      clerkSignInTicket = clerkTicket.ticket;
+      appEntryUrl = `${baseURL}/login`;
     }
     await page.goto(appEntryUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    if (clerkSignInTicket) {
+      try {
+        clerkSessionId = await activateClerkTestTicket(page, clerkSignInTicket);
+      } catch (error) {
+        clerkSessionId = error.clerkSessionId || "";
+        throw error;
+      }
+      await page.waitForFunction(() => (
+        window.location.pathname === "/app" && Boolean(window.Clerk?.session)
+      ), null, { timeout: 60_000 });
+    }
     try {
       await appReady(page);
-    } catch {
+    } catch (initialError) {
+      if (clerkSignInTicket) {
+        const initialUrl = new URL(page.url());
+        initialUrl.search = "";
+        initialUrl.hash = "";
+        const initialBody = await page.locator("body").innerText().catch(() => "");
+        throw new Error(
+          `The ticket-authenticated app shell did not expose the composer at ${initialUrl}. `
+          + `Visible page: ${initialBody.slice(0, 500)}. ${initialError.message}`
+        );
+      }
       await page.reload({ waitUntil: "domcontentloaded", timeout: 60_000 });
       try {
         await appReady(page);
@@ -407,13 +437,19 @@ async function main() {
     await new Promise((resolve) => listener?.close(resolve) || resolve());
     await app?.locals?.drainBackgroundTasks?.({ timeoutMs: 5000 }).catch(() => undefined);
     await app?.locals?.store?.close?.().catch(() => undefined);
-    if (clerkClient && clerkSignInTokenId) {
-      await clerkClient.signInTokens.revokeSignInToken(clerkSignInTokenId).catch(() => undefined);
-    }
+    await revokeClerkTestSession({
+      client: clerkClient,
+      sessionId: clerkSessionId,
+      signInTokenId: clerkSignInTokenId
+    }).catch((error) => { clerkCleanupError = error; });
     await fs.rm(tempRoot, { recursive: true, force: true });
     for (const [name, value] of Object.entries(previousEnv)) {
       if (value === undefined) delete process.env[name];
       else process.env[name] = value;
+    }
+    if (clerkCleanupError) {
+      console.error(JSON.stringify({ ok: false, cleanup_error: clerkCleanupError.message }));
+      process.exitCode = 1;
     }
   }
 }
