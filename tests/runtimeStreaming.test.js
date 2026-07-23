@@ -444,6 +444,55 @@ describe.sequential("Runtime early-plan stream", () => {
     }, answer, [{ id: "s2", adapter: "systems_architecture" }]).items).toEqual([]);
   });
 
+  it("derives exact inline attribution from validated compatibility-route markers", () => {
+    const answer = [
+      "Adopt a Hybrid Client-Server Architecture with strict data minimization.",
+      "Build offline-capable alpha with zero external data transmission.",
+      "Verify analytics SDKs remain dormant until explicit consent."
+    ].join("\n\n");
+    const outputs = [{
+      id: "s2",
+      adapter: "systems_architecture",
+      domain_answer: "Architecture analysis."
+    }, {
+      id: "s3",
+      adapter: "delivery_planning",
+      domain_answer: "Delivery analysis."
+    }, {
+      id: "s4",
+      adapter: "verification_rollout",
+      domain_answer: "Verification analysis."
+    }, {
+      id: "s5",
+      adapter: "engineering_synthesis",
+      domain_answer: [
+        "Adopt a Hybrid Client-Server Architecture with strict data minimization [route:s2:aaaaaaaaaaaaaaaaaaaaaaaa].",
+        "Build offline-capable alpha with zero external data transmission [route:s3:bbbbbbbbbbbbbbbbbbbbbbbb].",
+        "Verify analytics SDKs remain dormant until explicit consent [route:s4:cccccccccccccccccccccccc]."
+      ].join("\n\n")
+    }];
+
+    const normalized = normalizeRuntimeAnswerAttributions(null, answer, outputs);
+    expect(normalized.items).toEqual([
+      expect.objectContaining({
+        step_id: "s2",
+        agent_id: "systems_architecture",
+        start: answer.indexOf("Adopt")
+      }),
+      expect.objectContaining({
+        step_id: "s3",
+        agent_id: "delivery_planning",
+        start: answer.indexOf("Build")
+      }),
+      expect.objectContaining({
+        step_id: "s4",
+        agent_id: "verification_rollout",
+        start: answer.indexOf("Verify")
+      })
+    ]);
+    expect(JSON.stringify(normalized)).not.toContain("aaaaaaaaaaaaaaaaaaaaaaaa");
+  });
+
   it("classifies structurally matched v3 route failures before requiring a success outcome contract", () => {
     const failedOutput = coveredDocumentRouteOutput({
       domain_answer: "uncited worker text must not enter synthesis",

@@ -82,6 +82,106 @@ function codePointOffsetToCodeUnit(value, offset) {
   return [...String(value || "")].slice(0, offset).join("").length;
 }
 
+const RUNTIME_EVIDENCE_MARKER = /\[([A-Za-z0-9][A-Za-z0-9_.:/-]{0,199})\]/g;
+const RESERVED_RUNTIME_EVIDENCE_ID = /^(?:(?:query|route|memory|artifact|tool):|s\d+(?::|$))/i;
+
+function compatibilityAnswerAttributions(answer, outputs = []) {
+  const text = String(answer || "");
+  const empty = {
+    contract_version: PUBLIC_ANSWER_ATTRIBUTION_CONTRACT,
+    answer_sha256: answerTextDigest(text),
+    offset_encoding: "utf16_code_units",
+    items: []
+  };
+  const routeByStep = new Map();
+  const ownerByEvidence = new Map();
+  const registerOwner = (token, route) => {
+    const evidenceId = String(token || "").trim();
+    if (!evidenceId || !route) return;
+    const owner = {
+      stepId: String(route.id || route.step_id || "").trim(),
+      agentId: String(route.adapter || "").trim()
+    };
+    if (!owner.stepId || !owner.agentId) return;
+    const existing = ownerByEvidence.get(evidenceId);
+    if (!existing) ownerByEvidence.set(evidenceId, owner);
+    else if (existing.stepId !== owner.stepId || existing.agentId !== owner.agentId) {
+      ownerByEvidence.set(evidenceId, null);
+    }
+  };
+  for (const output of Array.isArray(outputs) ? outputs : []) {
+    if (!output || typeof output !== "object" || Array.isArray(output)) continue;
+    const stepId = String(output.id || output.step_id || "").trim();
+    const agentId = String(output.adapter || "").trim();
+    if (!stepId || !agentId) continue;
+    routeByStep.set(stepId, output);
+    for (const artifact of Array.isArray(output.handoff_artifacts) ? output.handoff_artifacts : []) {
+      if (artifact && typeof artifact === "object" && artifact.verified !== false) {
+        registerOwner(artifact.artifact_id, output);
+      }
+    }
+  }
+
+  const resolveOwner = (evidenceId) => {
+    const exact = ownerByEvidence.get(evidenceId);
+    if (exact) return exact;
+    const routeMatch = String(evidenceId || "").match(/^route:([^:]+):[A-Za-z0-9._-]+$/i);
+    const route = routeMatch ? routeByStep.get(routeMatch[1]) : null;
+    return route ? {
+      stepId: String(route.id || route.step_id || ""),
+      agentId: String(route.adapter || "")
+    } : null;
+  };
+  const items = [];
+  const seen = new Set();
+  for (const output of Array.isArray(outputs) ? outputs : []) {
+    const markedAnswer = String(output?.domain_answer || output?.answer || "");
+    if (!markedAnswer || !RUNTIME_EVIDENCE_MARKER.test(markedAnswer)) {
+      RUNTIME_EVIDENCE_MARKER.lastIndex = 0;
+      continue;
+    }
+    RUNTIME_EVIDENCE_MARKER.lastIndex = 0;
+    const segments = markedAnswer
+      .replace(/\r\n?/g, "\n")
+      .split(/\n+/)
+      .flatMap((line) => line.trim().split(/(?<!\d)(?<=[.!?])\s+/))
+      .map((segment) => segment.trim())
+      .filter(Boolean);
+    for (const segment of segments) {
+      const evidenceIds = [...segment.matchAll(RUNTIME_EVIDENCE_MARKER)]
+        .map((match) => match[1]);
+      const owners = evidenceIds.map(resolveOwner).filter(Boolean);
+      if (!owners.length) continue;
+      const visibleClaim = segment
+        .replace(RUNTIME_EVIDENCE_MARKER, (marker, evidenceId) => (
+          RESERVED_RUNTIME_EVIDENCE_ID.test(evidenceId) ? "" : marker
+        ))
+        .replace(/[ \t]+([,.;:!?])/g, "$1")
+        .replace(/[ \t]{2,}/g, " ")
+        .trim();
+      if (!visibleClaim) continue;
+      const start = text.indexOf(visibleClaim);
+      if (start < 0) continue;
+      const end = start + visibleClaim.length;
+      for (const owner of owners) {
+        const key = `${start}:${end}:${owner.stepId}:${owner.agentId}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        items.push({
+          start,
+          end,
+          step_id: owner.stepId,
+          agent_id: owner.agentId,
+          support: "validated_inline_evidence",
+          claim_sha256: answerTextDigest(visibleClaim)
+        });
+        if (items.length >= 256) return { ...empty, items };
+      }
+    }
+  }
+  return { ...empty, items };
+}
+
 /**
  * Validate Runtime's private-id-free span → specialist sidecar.
  *
@@ -92,22 +192,17 @@ function codePointOffsetToCodeUnit(value, offset) {
  */
 export function normalizeRuntimeAnswerAttributions(value, answer, outputs = []) {
   const text = String(answer || "");
-  const empty = {
-    contract_version: PUBLIC_ANSWER_ATTRIBUTION_CONTRACT,
-    answer_sha256: answerTextDigest(text),
-    offset_encoding: "utf16_code_units",
-    items: []
-  };
+  const compatibility = compatibilityAnswerAttributions(text, outputs);
   if (
     !value
     || typeof value !== "object"
     || Array.isArray(value)
     || value.contract_version !== PUBLIC_ANSWER_ATTRIBUTION_CONTRACT
     || value.offset_encoding !== "unicode_code_points"
-    || normalizeSha256Digest(value.answer_sha256) !== empty.answer_sha256
+    || normalizeSha256Digest(value.answer_sha256) !== compatibility.answer_sha256
     || !Array.isArray(value.items)
   ) {
-    return empty;
+    return compatibility;
   }
 
   const routeByStep = new Map((Array.isArray(outputs) ? outputs : []).flatMap((output) => {
@@ -160,7 +255,7 @@ export function normalizeRuntimeAnswerAttributions(value, answer, outputs = []) 
       claim_sha256: normalizeSha256Digest(item.claim_sha256)
     });
   }
-  return { ...empty, items };
+  return items.length ? { ...compatibility, items } : compatibility;
 }
 
 export function parseRouteSections(text) {
