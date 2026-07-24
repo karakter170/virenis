@@ -134,6 +134,30 @@ afterEach(async () => {
 });
 
 describe("agent workspaces", () => {
+  it("auto-assigns durable colors and lets owners choose an accessible palette color", async () => {
+    const general = await listWorkspaces("alice");
+    expect(general.body.workspaces[0].color).toBeTruthy();
+
+    const first = await createWorkspace("Color one");
+    const second = await createWorkspace("Color two");
+    expect(first.color).toBeTruthy();
+    expect(second.color).toBeTruthy();
+    expect(second.color).not.toBe(first.color);
+
+    const updated = await request(app)
+      .patch(`/api/agent-workspaces/${first.agent_workspace_id}`)
+      .set("Authorization", as("alice"))
+      .send({ color: "violet" })
+      .expect(200);
+    expect(updated.body.color).toBe("violet");
+
+    await request(app)
+      .patch(`/api/agent-workspaces/${first.agent_workspace_id}`)
+      .set("Authorization", as("alice"))
+      .send({ color: "invisible" })
+      .expect(400);
+  });
+
   it("quarantines unscoped legacy agents unless they are explicit global system catalog entries", async () => {
     await app.locals.store.mutate((data) => {
       data.agents.push(
@@ -611,6 +635,61 @@ describe("agent workspaces", () => {
       .expect(200);
     expect(finalSession.body.agent_workspace_id).toBe(workspace.agent_workspace_id);
     expect(finalSession.body.agent_workspace.agent_ids).toEqual(expect.arrayContaining(createdIds));
+  });
+
+  it("can create a workflow as another team without switching the originating chat", async () => {
+    const currentWorkspace = await createWorkspace("Current chat team");
+    const anotherWorkspace = await createWorkspace("Separate workflow team");
+    const session = await createSession(currentWorkspace.agent_workspace_id);
+    const queued = await request(app)
+      .post(`/api/chat/sessions/${session.session_id}/messages`)
+      .set("Authorization", as("alice"))
+      .send({ content: "/workflow Build a separate poetry review team." })
+      .expect(202);
+    expect((await waitForRun(queued.body.run_id)).status).toBe("completed");
+    const draft = await request(app)
+      .get(`/api/chat/sessions/${session.session_id}`)
+      .set("Authorization", as("alice"))
+      .expect(200);
+    const workflow = draft.body.workflows[0];
+
+    const decision = await request(app)
+      .post(`/api/workflows/${workflow.workflow_id}/decision`)
+      .set("Authorization", as("alice"))
+      .send({
+        decision: "approve",
+        revision: workflow.revision,
+        agent_workspace_id: anotherWorkspace.agent_workspace_id,
+        attach_to_session: false
+      })
+      .expect(200);
+    expect(decision.body.attach_to_session).toBe(false);
+
+    let activated;
+    for (let attempt = 0; attempt < 300; attempt += 1) {
+      activated = await request(app)
+        .get(`/api/workflows/${workflow.workflow_id}`)
+        .set("Authorization", as("alice"))
+        .expect(200);
+      if (["active", "activation_failed"].includes(activated.body.status)) break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    expect(activated.body.status).toBe("active");
+    expect(activated.body.agent_workspace_id).toBe(anotherWorkspace.agent_workspace_id);
+
+    const finalSession = await request(app)
+      .get(`/api/chat/sessions/${session.session_id}`)
+      .set("Authorization", as("alice"))
+      .expect(200);
+    expect(finalSession.body.agent_workspace_id).toBe(currentWorkspace.agent_workspace_id);
+
+    const separateTeam = await request(app)
+      .get(`/api/agent-workspaces/${anotherWorkspace.agent_workspace_id}`)
+      .set("Authorization", as("alice"))
+      .expect(200);
+    expect(separateTeam.body.agent_ids).toEqual(expect.arrayContaining(
+      activated.body.activation.node_agents.map((item) => item.agent_id)
+    ));
   });
 
   it("publishes, rates, and copies a sanitized workspace with remapped handoffs", async () => {

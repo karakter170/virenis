@@ -42,6 +42,29 @@ afterEach(async () => {
 });
 
 describe("Agent Runtime HTTP transport", () => {
+  it("omits newer optional workflow fields during initial design for older tunneled Runtime contracts", async () => {
+    let observed = null;
+    const runtime = await startHttpServer(async (incoming, response) => {
+      observed = await readRequest(incoming);
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ title: "Compatible", nodes: [] }));
+    });
+    configureRuntime(runtime.url, { AGENT_RUNTIME_WORKFLOW_TIMEOUT_MS: "2000" });
+    await composeRuntimeWorkflow({
+      command: "workflow",
+      mode: "workflow",
+      intent: "Build a compatible team.",
+      execution_context: {
+        session_id: "session_compatible",
+        workspace_id: "workspace_compatible",
+        user_id: "alice"
+      }
+    });
+    expect(observed).not.toHaveProperty("composition_phase");
+    expect(observed).not.toHaveProperty("workflow_contract");
+    expect(observed).not.toHaveProperty("workflow_contract_digest");
+  });
+
   it("uses dedicated runtime contracts for workflow composition and tool continuation", async () => {
     const observed = [];
     const runtime = await startHttpServer(async (incoming, response) => {

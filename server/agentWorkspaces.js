@@ -3,6 +3,16 @@ import { normalizePublicMarketplaceRatings } from "./marketplaceRatingIdentity.j
 
 export const AGENT_WORKSPACE_MAX_AGENTS = 16;
 export const AGENT_WORKSPACE_MAX_PER_USER = 50;
+export const AGENT_WORKSPACE_COLORS = [
+  "emerald",
+  "cyan",
+  "blue",
+  "violet",
+  "magenta",
+  "rose",
+  "amber",
+  "lime"
+];
 
 const GENERAL_NAME = "General";
 const RESERVATION_TTL_MS = 15 * 60 * 1000;
@@ -24,6 +34,29 @@ function nowIso() {
 
 function boundedText(value, max) {
   return String(value || "").replaceAll("\0", "").trim().slice(0, max);
+}
+
+function legacyWorkspaceColor(workspaceId) {
+  const digest = crypto.createHash("sha256").update(String(workspaceId || "general"), "utf8").digest();
+  return AGENT_WORKSPACE_COLORS[digest[0] % AGENT_WORKSPACE_COLORS.length];
+}
+
+function normalizedWorkspaceColor(value, workspaceId, { strict = false } = {}) {
+  const color = boundedText(value, 24).toLowerCase();
+  if (AGENT_WORKSPACE_COLORS.includes(color)) return color;
+  if (strict && color) {
+    throw workspaceError(400, "Choose one of the available team colors.", "agent_workspace_color_invalid");
+  }
+  return legacyWorkspaceColor(workspaceId);
+}
+
+function nextWorkspaceColor(workspaces = []) {
+  const counts = new Map(AGENT_WORKSPACE_COLORS.map((color) => [color, 0]));
+  for (const workspace of workspaces) {
+    const color = normalizedWorkspaceColor(workspace?.color, workspace?.agent_workspace_id);
+    counts.set(color, (counts.get(color) || 0) + 1);
+  }
+  return [...AGENT_WORKSPACE_COLORS].sort((left, right) => counts.get(left) - counts.get(right))[0];
 }
 
 function actorOwnsWorkspace(workspace, actor) {
@@ -117,6 +150,7 @@ export function normalizeAgentWorkspaceCollections(data) {
       .map((id) => String(id || "").trim())
       .filter(Boolean))].slice(0, AGENT_WORKSPACE_MAX_AGENTS);
     workspace.is_general = workspace.is_general === true;
+    workspace.color = normalizedWorkspaceColor(workspace.color, workspace.agent_workspace_id);
     workspace.visibility = "private";
     workspace.reservations = Array.isArray(workspace.reservations) ? workspace.reservations : [];
     workspace.copy_status = ["copying", "ready", "cleanup_required"].includes(workspace.copy_status)
@@ -204,6 +238,7 @@ export function ensureGeneralAgentWorkspace(data, actor) {
     created_by: actor.user_id,
     visibility: "private",
     is_general: true,
+    color: "emerald",
     agent_ids: defaultAgentIds(data, actor),
     reservations: [],
     marketplace: null,
@@ -249,6 +284,7 @@ export function publicAgentWorkspace(workspace, data = null) {
     name: workspace.name,
     description: workspace.description || "",
     is_general: workspace.is_general === true,
+    color: normalizedWorkspaceColor(workspace.color, workspace.agent_workspace_id),
     agent_ids: agentIds,
     agent_count: agentIds.length,
     available_agent_count: availableIds ? agentIds.filter((id) => availableIds.has(id)).length : agentIds.length,
@@ -297,6 +333,9 @@ export function createAgentWorkspace(data, actor, body = {}) {
     created_by: actor.user_id,
     visibility: "private",
     is_general: false,
+    color: body.color
+      ? normalizedWorkspaceColor(body.color, "new", { strict: true })
+      : nextWorkspaceColor(owned),
     agent_ids: requestedAgentIds,
     reservations: [],
     marketplace: null,
@@ -328,6 +367,9 @@ export function updateAgentWorkspace(data, workspaceId, actor, body = {}) {
     workspace.name = name;
   }
   if ("description" in body) workspace.description = boundedText(body.description, 1200);
+  if ("color" in body) {
+    workspace.color = normalizedWorkspaceColor(body.color, workspace.agent_workspace_id, { strict: true });
+  }
   workspace.updated_at = nowIso();
   return workspace;
 }

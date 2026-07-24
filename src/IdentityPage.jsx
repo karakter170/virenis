@@ -6,6 +6,7 @@ import {
   Gauge,
   KeyRound,
   LoaderCircle,
+  Plug,
   RefreshCw,
   ShieldCheck,
   Trash2,
@@ -270,6 +271,10 @@ export function AdminUsersPanel() {
   const [pricingMutationKey, setPricingMutationKey] = useState("");
   const [outputSettings, setOutputSettings] = useState(null);
   const [outputDraft, setOutputDraft] = useState(() => outputSettingsDraftFrom(null));
+  const [runtimeModel, setRuntimeModel] = useState(null);
+  const [runtimeModelDraft, setRuntimeModelDraft] = useState(() => runtimeModelDraftFrom(null));
+  const [mcpProviders, setMcpProviders] = useState([]);
+  const [mcpDrafts, setMcpDrafts] = useState({});
   const [adjustments, setAdjustments] = useState({});
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
@@ -282,11 +287,13 @@ export function AdminUsersPanel() {
     setLoadState("loading");
     setError("");
     try {
-      const [userResult, accountResult, pricingResult, outputResult] = await Promise.all([
+      const [userResult, accountResult, pricingResult, outputResult, runtimeModelResult, mcpProviderResult] = await Promise.all([
         identityRequest("/api/admin/users"),
         identityRequest("/api/admin/billing/accounts"),
         identityRequest("/api/admin/billing/pricing"),
-        identityRequest("/api/admin/model-output-settings")
+        identityRequest("/api/admin/model-output-settings"),
+        identityRequest("/api/admin/runtime-model"),
+        identityRequest("/api/admin/mcp-providers")
       ]);
       setUsers(userResult.users || []);
       setAccounts(Object.fromEntries((accountResult.accounts || []).map((account) => [account.user_id, account])));
@@ -294,6 +301,13 @@ export function AdminUsersPanel() {
       setPricingDraft(pricingDraftFrom(pricingResult.pricing));
       setOutputSettings(outputResult.settings || null);
       setOutputDraft(outputSettingsDraftFrom(outputResult.settings));
+      setRuntimeModel(runtimeModelResult.settings || null);
+      setRuntimeModelDraft(runtimeModelDraftFrom(runtimeModelResult.settings));
+      setMcpProviders(mcpProviderResult.providers || []);
+      setMcpDrafts(Object.fromEntries((mcpProviderResult.providers || []).map((provider) => [
+        provider.id,
+        { client_id: provider.client_id || "", client_secret: "" }
+      ])));
       setPricingMutationKey("");
       setLoadState("ready");
     } catch (requestError) {
@@ -430,6 +444,62 @@ export function AdminUsersPanel() {
     }
   }
 
+  async function saveRuntimeModel(event) {
+    event.preventDefault();
+    setBusy("runtime-model");
+    setError("");
+    setNotice("");
+    try {
+      const result = await identityRequest("/api/admin/runtime-model", {
+        method: "PATCH",
+        body: {
+          provider: runtimeModelDraft.provider,
+          base_url: runtimeModelDraft.base_url,
+          model: runtimeModelDraft.model,
+          revision: runtimeModelDraft.revision,
+          context_tokens: Number(runtimeModelDraft.context_tokens),
+          ...(runtimeModelDraft.api_key ? { api_key: runtimeModelDraft.api_key } : {})
+        }
+      });
+      setRuntimeModel(result.settings);
+      setRuntimeModelDraft(runtimeModelDraftFrom(result.settings));
+      setNotice(result.applied_immediately
+        ? "The global model provider was updated. New work from every user uses it immediately."
+        : "The global model provider was saved. It will apply when the real Runtime is enabled.");
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function saveMcpProvider(event, provider) {
+    event.preventDefault();
+    const draft = mcpDrafts[provider.id] || {};
+    setBusy(`mcp:${provider.id}`);
+    setError("");
+    setNotice("");
+    try {
+      const result = await identityRequest(`/api/admin/mcp-providers/${encodeURIComponent(provider.id)}`, {
+        method: "PATCH",
+        body: {
+          client_id: draft.client_id,
+          ...(draft.client_secret ? { client_secret: draft.client_secret } : {})
+        }
+      });
+      setMcpProviders((items) => items.map((item) => item.id === provider.id ? result.provider : item));
+      setMcpDrafts((current) => ({
+        ...current,
+        [provider.id]: { client_id: result.provider.client_id || "", client_secret: "" }
+      }));
+      setNotice(`${provider.name} is configured and available to users who grant access.`);
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setBusy("");
+    }
+  }
+
   return (
     <section className="admin-users" aria-labelledby="admin-users-heading">
       <div className="account-card-heading"><div><h4 id="admin-users-heading">Registered users</h4><p>Assign product roles, suspend access, or revoke Clerk sessions. Clerk manages identity verification.</p></div><button className="icon-button compact" type="button" aria-label="Refresh registered users" onClick={refresh} disabled={loadState === "loading"}><RefreshCw className={loadState === "loading" ? "spin" : ""} size={15} /></button></div>
@@ -483,6 +553,43 @@ export function AdminUsersPanel() {
         </button>
         <small className="admin-form-revision">Revision {outputSettings?.revision || 0}</small>
       </form>}
+      {loadState === "ready" && runtimeModel && runtimeModelDraft && (
+        <form className="admin-runtime-model-form" onSubmit={saveRuntimeModel}>
+          <div className="admin-form-intro">
+            <span><Gauge size={16} aria-hidden="true" /></span>
+            <div><strong>Global base model</strong><small>One server-owned provider for every user. Qwen remains the default; a new API, token, or model applies to new work immediately.</small></div>
+          </div>
+          <label><span>Provider</span><select value={runtimeModelDraft.provider} onChange={(event) => setRuntimeModelDraft({ ...runtimeModelDraft, provider: event.target.value })}><option value="vllm">Local / vLLM</option><option value="openai_compatible">OpenAI-compatible API</option></select></label>
+          <label><span>API base URL</span><input type="url" value={runtimeModelDraft.base_url} onChange={(event) => setRuntimeModelDraft({ ...runtimeModelDraft, base_url: event.target.value })} required /></label>
+          <label><span>Model</span><input value={runtimeModelDraft.model} onChange={(event) => setRuntimeModelDraft({ ...runtimeModelDraft, model: event.target.value })} required maxLength={240} /></label>
+          <label><span>API token</span><input type="password" value={runtimeModelDraft.api_key} onChange={(event) => setRuntimeModelDraft({ ...runtimeModelDraft, api_key: event.target.value })} placeholder={runtimeModel.api_key_configured ? "Configured · leave blank to keep" : "Optional for local vLLM"} autoComplete="new-password" /></label>
+          <label><span>Deployment revision</span><input value={runtimeModelDraft.revision} onChange={(event) => setRuntimeModelDraft({ ...runtimeModelDraft, revision: event.target.value })} maxLength={240} placeholder="Optional immutable revision" /></label>
+          <label><span>Context tokens</span><input type="number" min="2048" max="2000000" value={runtimeModelDraft.context_tokens} onChange={(event) => setRuntimeModelDraft({ ...runtimeModelDraft, context_tokens: event.target.value })} required /></label>
+          <button type="submit" disabled={busy === "runtime-model"}>{busy === "runtime-model" ? <LoaderCircle className="spin" size={14} /> : <Check size={14} />}Apply globally</button>
+          <small>Revision {runtimeModel.revision_number || 0}{runtimeModel.updated_at ? ` · updated ${formatIdentityDateTime(runtimeModel.updated_at)}` : ""}</small>
+        </form>
+      )}
+      {loadState === "ready" && (
+        <section className="admin-mcp-provider-settings" aria-labelledby="admin-mcp-provider-heading">
+          <div className="admin-form-intro">
+            <span><Plug size={16} aria-hidden="true" /></span>
+            <div><strong id="admin-mcp-provider-heading">MCP app plugins</strong><small>Configure OAuth once. The app becomes available only after a user grants its requested permissions; tokens remain encrypted and are never shown here.</small></div>
+          </div>
+          <div>
+            {mcpProviders.map((provider) => {
+              const draft = mcpDrafts[provider.id] || { client_id: "", client_secret: "" };
+              return (
+                <form key={provider.id} onSubmit={(event) => saveMcpProvider(event, provider)}>
+                  <header><span><strong>{provider.name}</strong><small>{provider.providers.join(" · ")}</small></span><em className={provider.client_secret_configured ? "configured" : ""}>{provider.client_secret_configured ? "Configured" : "Setup required"}</em></header>
+                  <label><span>OAuth client ID</span><input value={draft.client_id} onChange={(event) => setMcpDrafts({ ...mcpDrafts, [provider.id]: { ...draft, client_id: event.target.value } })} required maxLength={4096} /></label>
+                  <label><span>OAuth client secret</span><input type="password" value={draft.client_secret} onChange={(event) => setMcpDrafts({ ...mcpDrafts, [provider.id]: { ...draft, client_secret: event.target.value } })} placeholder={provider.client_secret_configured ? "Configured · leave blank to keep" : "Required"} required={!provider.client_secret_configured} autoComplete="new-password" /></label>
+                  <button type="submit" disabled={busy === `mcp:${provider.id}`}>{busy === `mcp:${provider.id}` ? <LoaderCircle className="spin" size={14} /> : <Check size={14} />}Save plugin</button>
+                </form>
+              );
+            })}
+          </div>
+        </section>
+      )}
       {loadState === "ready" && pricing && pricingDraft && (
         <form className="admin-pricing-form" onSubmit={savePricing}>
           <div><strong>Token pricing</strong><span>Credits per 1,000 provider-reported tokens. New rates apply only to new reservations.</span></div>
@@ -617,6 +724,18 @@ function outputSettingsDraftFrom(settings) {
     agent: String(settings?.agent_output_tokens ?? 4096),
     final: String(settings?.final_output_tokens ?? 8192),
     reason: "Administrator output-limit update"
+  };
+}
+
+function runtimeModelDraftFrom(settings) {
+  if (!settings) return null;
+  return {
+    provider: settings.provider || "vllm",
+    base_url: settings.base_url || "http://127.0.0.1:8000/v1",
+    model: settings.model || "qwen36-awq",
+    revision: settings.revision || "",
+    context_tokens: String(settings.context_tokens || 32768),
+    api_key: ""
   };
 }
 

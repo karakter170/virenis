@@ -113,6 +113,26 @@ import {
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const UPLOAD_REQUEST_TIMEOUT_MS = 120_000;
 
+export const TEAM_COLOR_OPTIONS = [
+  { id: "emerald", label: "Emerald", accent: "#087e5b", rgb: "8, 126, 91", soft: "#e7f5ef" },
+  { id: "cyan", label: "Cyan", accent: "#007b83", rgb: "0, 123, 131", soft: "#e3f5f6" },
+  { id: "blue", label: "Blue", accent: "#2864c7", rgb: "40, 100, 199", soft: "#eaf0fb" },
+  { id: "violet", label: "Violet", accent: "#7551c8", rgb: "117, 81, 200", soft: "#f0ebfa" },
+  { id: "magenta", label: "Magenta", accent: "#a43882", rgb: "164, 56, 130", soft: "#f8eaf3" },
+  { id: "rose", label: "Rose", accent: "#b7435f", rgb: "183, 67, 95", soft: "#f9eaee" },
+  { id: "amber", label: "Amber", accent: "#9b6400", rgb: "155, 100, 0", soft: "#faf1dc" },
+  { id: "lime", label: "Lime", accent: "#4f7a16", rgb: "79, 122, 22", soft: "#edf5e3" }
+];
+
+export function teamColorStyle(workspace = null) {
+  const color = TEAM_COLOR_OPTIONS.find((item) => item.id === workspace?.color) || TEAM_COLOR_OPTIONS[0];
+  return {
+    "--team-accent": color.accent,
+    "--team-rgb": color.rgb,
+    "--team-soft": color.soft
+  };
+}
+
 const api = {
   async get(path) {
     return request(path);
@@ -266,14 +286,8 @@ export function agentsWithWorkspaceSessionState(agents = [], workspace = null, i
 }
 
 export function agentsForCatalog(agents = [], workspace = null, auth = null) {
-  const workspaceAgents = agentsForWorkspace(agents, workspace)
+  return agentsForWorkspace(agents, workspace)
     .filter((agent) => auth?.is_admin || agent?.runtime_only !== true);
-  if (!auth?.is_admin) return workspaceAgents;
-  const includedIds = new Set(workspaceAgents.map((agent) => String(agent?.id || "")));
-  return [
-    ...workspaceAgents,
-    ...agents.filter((agent) => agent?.runtime_only === true && !includedIds.has(String(agent?.id || "")))
-  ];
 }
 
 export function workflowRunRequest(workflow = {}) {
@@ -634,20 +648,43 @@ export default function App() {
   if (recoveryPage) return recoveryPage;
   return (
     <Workspace
+      requestedSessionId={route.sessionId || ""}
+      onSessionPathChange={(sessionId, { replace = false } = {}) => {
+        const path = applicationSessionPath(sessionId);
+        if (window.location.pathname !== path) {
+          window.history[replace ? "replaceState" : "pushState"]({}, "", `${path}${window.location.search}`);
+        }
+        setRoute(applicationRoute(path));
+      }}
       onHome={() => navigate("home")}
       onSignedOut={() => navigate("home")}
     />
   );
 }
 
-function applicationRoute(pathname) {
-  if (pathname.startsWith("/app")) return { surface: "workspace", mode: null };
+export function applicationRoute(pathname) {
+  const workspaceMatch = String(pathname || "").match(/^\/app(?:\/chats\/([^/]+))?\/?$/);
+  if (workspaceMatch) {
+    let sessionId = "";
+    try {
+      sessionId = workspaceMatch[1] ? decodeURIComponent(workspaceMatch[1]) : "";
+    } catch {
+      sessionId = "";
+    }
+    return { surface: "workspace", mode: null, sessionId };
+  }
+  if (String(pathname || "").startsWith("/app")) return { surface: "workspace", mode: null, sessionId: "" };
   if (pathname.startsWith("/register")) return { surface: "identity", mode: "register" };
   if (pathname.startsWith("/forgot-password")) return { surface: "identity", mode: "login", legacyIdentity: true };
   if (pathname.startsWith("/reset-password")) return { surface: "identity", mode: "login", legacyIdentity: true };
   if (pathname.startsWith("/verify-email")) return { surface: "identity", mode: "login", legacyIdentity: true };
   if (pathname.startsWith("/login")) return { surface: "identity", mode: "login" };
   return { surface: "home", mode: null };
+}
+
+export function applicationSessionPath(sessionId) {
+  const normalized = String(sessionId || "").trim();
+  return normalized ? `/app/chats/${encodeURIComponent(normalized)}` : "/app";
 }
 
 function applicationPath(destination) {
@@ -660,7 +697,7 @@ function applicationPath(destination) {
   return paths[destination] || "/";
 }
 
-function Workspace({ onHome, onSignedOut }) {
+function Workspace({ requestedSessionId = "", onSessionPathChange = () => undefined, onHome, onSignedOut }) {
   const [sessions, setSessions] = useState([]);
   const [session, setSession] = useState(null);
   const [messages, setMessages] = useState([]);
@@ -801,6 +838,21 @@ function Workspace({ onHome, onSignedOut }) {
     bootstrap();
     return () => eventSourceRef.current?.close();
   }, []);
+
+  useEffect(() => {
+    const targetSessionId = String(requestedSessionId || "");
+    if (
+      loading
+      || !targetSessionId
+      || targetSessionId === displayedSessionIdRef.current
+      || targetSessionId === desiredSessionIdRef.current
+    ) return;
+    openSession(targetSessionId, { historyMode: "none" }).catch((openError) => {
+      setError(friendlyError(openError));
+      const currentSessionId = displayedSessionIdRef.current;
+      if (currentSessionId) onSessionPathChange(currentSessionId, { replace: true });
+    });
+  }, [loading, requestedSessionId]);
 
   useEffect(() => {
     if (!teamNotice) return undefined;
@@ -1007,8 +1059,10 @@ function Workspace({ onHome, onSignedOut }) {
       setAgentWorkspaces(agentWorkspaceList.workspaces || []);
       setMetrics(metricData);
       const oauthSessionId = oauthReturnRef.current.sessionId;
-      let nextSession = oauthSessionId
-        ? sessionList.sessions?.find((item) => item.session_id === oauthSessionId) || { session_id: oauthSessionId }
+      const routeSessionId = String(requestedSessionId || "");
+      const initialSessionId = oauthSessionId || routeSessionId;
+      let nextSession = initialSessionId
+        ? sessionList.sessions?.find((item) => item.session_id === initialSessionId) || { session_id: initialSessionId }
         : sessionList.sessions?.[0] || null;
       if (!nextSession && !me.is_viewer) {
         const generalWorkspace = (agentWorkspaceList.workspaces || []).find((workspace) => workspace.is_general)
@@ -1030,7 +1084,17 @@ function Workspace({ onHome, onSignedOut }) {
         }
       }
       setSessions(sessionList.sessions?.length ? sessionList.sessions : nextSession ? [nextSession] : []);
-      if (nextSession) await openSession(nextSession.session_id);
+      if (nextSession) {
+        try {
+          await openSession(nextSession.session_id, { historyMode: "none" });
+        } catch (sessionError) {
+          const fallback = sessionList.sessions?.find((item) => item.session_id !== nextSession.session_id) || null;
+          if (!fallback) throw sessionError;
+          nextSession = fallback;
+          await openSession(fallback.session_id, { historyMode: "none" });
+        }
+        onSessionPathChange(nextSession.session_id, { replace: true });
+      }
       if (optionalLoadFailed) {
         setError("Chat is available, but some Studio resources could not be loaded. Refresh to try those resources again.");
       }
@@ -1198,7 +1262,11 @@ function Workspace({ onHome, onSignedOut }) {
     return contract;
   }
 
-  async function openSession(sessionId, { hydrateRuns = true, navigation = true } = {}) {
+  async function openSession(sessionId, {
+    hydrateRuns = true,
+    navigation = true,
+    historyMode = navigation ? "push" : "none"
+  } = {}) {
     const targetSessionId = String(sessionId || "");
     if (!targetSessionId) return null;
     if (!navigation && desiredSessionIdRef.current && desiredSessionIdRef.current !== targetSessionId) {
@@ -1224,6 +1292,9 @@ function Workspace({ onHome, onSignedOut }) {
 
       displayedSessionIdRef.current = targetSessionId;
       setSession(payload);
+      if (historyMode !== "none") {
+        onSessionPathChange(targetSessionId, { replace: historyMode === "replace" });
+      }
       if (payload.agent_workspace) {
         setAgentWorkspaces((items) => {
           const exists = items.some((workspace) => workspace.agent_workspace_id === payload.agent_workspace.agent_workspace_id);
@@ -1303,7 +1374,7 @@ function Workspace({ onHome, onSignedOut }) {
         ...(activeAgentWorkspace ? { agent_workspace_id: activeAgentWorkspace.agent_workspace_id } : {})
       });
       setSessions((current) => [created, ...current.filter((item) => item.session_id !== created.session_id)]);
-      await openSession(created.session_id);
+      await openSession(created.session_id, { historyMode: "push" });
       setDraft("");
       setMobileSidebarOpen(false);
       setFocusComposer((value) => value + 1);
@@ -1848,7 +1919,7 @@ function Workspace({ onHome, onSignedOut }) {
     return current;
   }
 
-  async function submitWorkflowDecision(workflow, decision) {
+  async function submitWorkflowDecision(workflow, decision, placement = {}) {
     if (!workflow || workflowBusy) return;
     const originSessionId = workflow.session_id || session?.session_id || "";
     setWorkflowBusy(workflow.workflow_id);
@@ -1856,7 +1927,9 @@ function Workspace({ onHome, onSignedOut }) {
     try {
       const updated = await api.post(`/api/workflows/${encodeURIComponent(workflow.workflow_id)}/decision`, {
         decision,
-        revision: workflow.revision
+        revision: workflow.revision,
+        ...(placement.agentWorkspaceId ? { agent_workspace_id: placement.agentWorkspaceId } : {}),
+        ...(decision === "approve" ? { attach_to_session: placement.attachToSession !== false } : {})
       });
       await waitForWorkflowActivation(updated);
       await openSession(originSessionId, { hydrateRuns: false, navigation: false });
@@ -1873,14 +1946,8 @@ function Workspace({ onHome, onSignedOut }) {
   async function decideWorkflowDraft(workflow, decision) {
     if (!workflow || workflowBusy) return;
     if (decision === "approve") {
-      const requiredCapacity = workflowProposedNewSpecialists(workflow, activeAgentWorkspace);
-      if (
-        requiredCapacity > 0
-        && (!activeAgentWorkspace || !workflowWorkspaceHasCapacity(activeAgentWorkspace, requiredCapacity))
-      ) {
-        setWorkflowWorkspacePrompt(workflow);
-        return;
-      }
+      setWorkflowWorkspacePrompt(workflow);
+      return;
     }
     await submitWorkflowDecision(workflow, decision);
   }
@@ -2278,11 +2345,14 @@ function Workspace({ onHome, onSignedOut }) {
     <div
       className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}
       data-active-session-id={session?.session_id || ""}
+      data-team-color={activeAgentWorkspace?.color || "emerald"}
+      style={teamColorStyle(activeAgentWorkspace)}
     >
       <WorkspaceSidebar
         auth={auth}
         billing={billing}
         sessions={sessions}
+        workspaces={agentWorkspaces}
         activeSessionId={sessionSwitching && sessionSwitching !== "new-chat" ? sessionSwitching : session?.session_id}
         activeView={resourcesOpen ? resourceView : ""}
         canWrite={canWrite}
@@ -2752,16 +2822,20 @@ function Workspace({ onHome, onSignedOut }) {
           workflow={workflowWorkspacePrompt}
           activeWorkspaceId={activeAgentWorkspace?.agent_workspace_id || ""}
           onClose={() => setWorkflowWorkspacePrompt(null)}
-          onConfirm={async (workspaceId) => {
-            await switchAgentWorkspace(workspaceId, { refresh: false });
+          onConfirm={async ({ workspaceId, attachToSession }) => {
             setWorkflowWorkspacePrompt(null);
-            await submitWorkflowDecision(workflowWorkspacePrompt, "approve");
+            await submitWorkflowDecision(workflowWorkspacePrompt, "approve", {
+              agentWorkspaceId: workspaceId,
+              attachToSession
+            });
           }}
-          onCreated={async (workspace) => {
+          onCreated={async (workspace, { attachToSession }) => {
             setAgentWorkspaces((items) => [...items, workspace]);
-            await switchAgentWorkspace(workspace.agent_workspace_id, { refresh: false });
             setWorkflowWorkspacePrompt(null);
-            await submitWorkflowDecision(workflowWorkspacePrompt, "approve");
+            await submitWorkflowDecision(workflowWorkspacePrompt, "approve", {
+              agentWorkspaceId: workspace.agent_workspace_id,
+              attachToSession
+            });
           }}
         />
       )}
@@ -3154,6 +3228,7 @@ export function WorkspaceSidebar({
   auth,
   billing,
   sessions = [],
+  workspaces = [],
   activeSessionId = "",
   activeView = "",
   canWrite = false,
@@ -3174,6 +3249,9 @@ export function WorkspaceSidebar({
   const mobileCloseButtonRef = useRef(null);
   const onMobileCloseRef = useRef(onMobileClose);
   const filteredSessions = useMemo(() => sortedPastChats(sessions, query), [query, sessions]);
+  const workspacesById = useMemo(() => new Map(
+    workspaces.map((workspace) => [workspace.agent_workspace_id, workspace])
+  ), [workspaces]);
   const views = auth?.is_admin
     ? [...WORKSPACE_SIDEBAR_VIEWS, { id: "admin", label: "Admin", icon: ShieldCheck, secondary: true }]
     : WORKSPACE_SIDEBAR_VIEWS;
@@ -3302,20 +3380,25 @@ export function WorkspaceSidebar({
           />
         </label>
         <nav className="sidebar-chat-list" aria-label="Past Chats">
-          {filteredSessions.map((item) => (
+          {filteredSessions.map((item) => {
+            const itemWorkspace = workspacesById.get(item.agent_workspace_id);
+            return (
             <button
               type="button"
               className="sidebar-chat-row"
               key={item.session_id}
               data-session-id={item.session_id}
+              data-team-color={itemWorkspace?.color || "emerald"}
+              style={teamColorStyle(itemWorkspace)}
               aria-current={activeSessionId === item.session_id ? "page" : undefined}
               disabled={navigationDisabled}
               onClick={() => onOpenSession(item.session_id)}
             >
+              <i className="sidebar-team-marker" aria-hidden="true" />
               <span>{item.title || "Untitled chat"}</span>
               <small>{formatDate(item.last_message_at || item.updated_at)}</small>
             </button>
-          ))}
+          )})}
           {filteredSessions.length === 0 && (
             <p className="sidebar-empty-chats">{sessions.length ? "No chats found." : "Your conversations will appear here."}</p>
           )}
@@ -3495,6 +3578,11 @@ export function WorkflowDraftCard({
         <i className={status.tone}>{(busy || workflowStatusNeedsPolling(workflow.status)) && <LoaderCircle className="spin" size={13} aria-hidden="true" />}{status.label}</i>
       </header>
 
+      <div className="workflow-card-summary">
+        <span><Network size={17} aria-hidden="true" /></span>
+        <p><strong>{agentNodes.length} proposed {agentNodes.length === 1 ? "specialist" : "specialists"}</strong><small>{workflow.summary || workflow.intent || "A reviewable team plan created from your request."}</small></p>
+      </div>
+
       {sourceDiscovery && (
         <WorkflowSourceInspection
           discovery={sourceDiscovery}
@@ -3504,10 +3592,16 @@ export function WorkflowDraftCard({
         />
       )}
 
-      {!sourcePhase && <WorkflowMiniGraph nodes={workflow.nodes || []} edges={workflow.edges || []} />}
+      {!sourcePhase && (
+        <details className="workflow-flow-details">
+          <summary>Preview handoffs <span>{(workflow.edges || []).length} connection{(workflow.edges || []).length === 1 ? "" : "s"}</span></summary>
+          <WorkflowMiniGraph nodes={workflow.nodes || []} edges={workflow.edges || []} />
+        </details>
+      )}
 
       {!sourcePhase && agentNodes.length > 0 && (
         <div className="workflow-agent-sources" aria-label="Selected specialists">
+          <strong className="workflow-section-label">Team roles</strong>
           {agentNodes.map((node) => (
             <div key={node.id}>
               <span className={`workflow-source-dot ${node.source}`} />
@@ -4758,6 +4852,8 @@ export function Composer({
                     aria-checked={selected}
                     className={`team-picker-workspace ${selected ? "selected" : ""}`}
                     data-team-option="true"
+                    data-team-color={workspace.color || "emerald"}
+                    style={teamColorStyle(workspace)}
                     key={workspace.agent_workspace_id}
                     disabled={!canWrite || configurationBusy}
                     onClick={() => chooseWorkspace(workspace.agent_workspace_id, selected)}
@@ -6810,6 +6906,7 @@ export function AgentWorkspaceDialog({ workspace, onClose, onSaved }) {
   const editing = Boolean(workspace);
   const [name, setName] = useState(workspace?.name || "");
   const [description, setDescription] = useState(workspace?.description || "");
+  const [color, setColor] = useState(workspace?.color || "emerald");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   async function submit(event) {
@@ -6820,9 +6917,10 @@ export function AgentWorkspaceDialog({ workspace, onClose, onSaved }) {
       const saved = editing
         ? await api.patch(`/api/agent-workspaces/${encodeURIComponent(workspace.agent_workspace_id)}`, {
             ...(!workspace.is_general ? { name } : {}),
-            description
+            description,
+            color
           })
-        : await api.post("/api/agent-workspaces", { name, description });
+        : await api.post("/api/agent-workspaces", { name, description, color });
       await onSaved(saved);
     } catch (saveError) {
       setError(friendlyError(saveError));
@@ -6836,6 +6934,23 @@ export function AgentWorkspaceDialog({ workspace, onClose, onSaved }) {
         {error && <div className="form-error" role="alert">{error}</div>}
         <label><span>Team name</span><input data-autofocus value={name} onChange={(event) => setName(event.target.value)} disabled={workspace?.is_general} required maxLength={80} placeholder="Customer launch team" /></label>
         <label><span>Description</span><textarea value={description} onChange={(event) => setDescription(event.target.value)} maxLength={1200} placeholder="Describe when this team should be active and what its specialists accomplish together." /></label>
+        <fieldset className="team-color-fieldset">
+          <legend>Team color</legend>
+          <p>Used as an edge light and marker; team names remain visible for accessibility.</p>
+          <div className="team-color-options">
+            {TEAM_COLOR_OPTIONS.map((option) => (
+              <label
+                key={option.id}
+                className={color === option.id ? "selected" : ""}
+                style={teamColorStyle({ color: option.id })}
+              >
+                <input type="radio" name="team-color" value={option.id} checked={color === option.id} onChange={() => setColor(option.id)} />
+                <span aria-hidden="true" />
+                <em>{option.label}</em>
+              </label>
+            ))}
+          </div>
+        </fieldset>
         <div className="dialog-actions"><button type="button" className="text-button ghost" onClick={onClose} disabled={busy}>Cancel</button><button type="submit" className="text-button primary" disabled={busy || !name.trim()}>{busy ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}{editing ? "Save details" : "Create team"}</button></div>
       </form>
     </ModalSurface>
@@ -6945,14 +7060,12 @@ export function workflowWorkspaceHasCapacity(workspace, requiredCapacity = 0) {
 }
 
 export function WorkflowWorkspaceDialog({ workspaces, workflow, activeWorkspaceId, onClose, onConfirm, onCreated }) {
+  const activeWorkspace = workspaces.find((workspace) => workspace.agent_workspace_id === activeWorkspaceId) || null;
   const requiredFor = (workspace) => workflowProposedNewSpecialists(workflow, workspace);
-  const hasRoom = (workspace) => workflowWorkspaceHasCapacity(workspace, requiredFor(workspace));
-  const preferredWorkspace = workspaces.find((workspace) => workspace.agent_workspace_id === activeWorkspaceId && hasRoom(workspace))
-    || workspaces.find(hasRoom);
+  const currentHasRoom = activeWorkspace && workflowWorkspaceHasCapacity(activeWorkspace, requiredFor(activeWorkspace));
   const newTeamCapacity = workflowProposedNewSpecialists(workflow, { agent_workspace_id: "", agent_ids: [], agent_count: 0, max_agents: 16 });
-  const [selection, setSelection] = useState(preferredWorkspace?.agent_workspace_id || "");
-  const [creating, setCreating] = useState(!preferredWorkspace);
-  const [name, setName] = useState("");
+  const [selection, setSelection] = useState(currentHasRoom ? "current" : "chat");
+  const [name, setName] = useState(String(workflow?.title || "Workflow team").slice(0, 80));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   async function submit(event) {
@@ -6960,18 +7073,19 @@ export function WorkflowWorkspaceDialog({ workspaces, workflow, activeWorkspaceI
     setBusy(true);
     setError("");
     try {
-      if (creating) {
+      if (selection === "current") {
+        if (!activeWorkspace) throw new Error("This chat does not have a current team.");
+        const requiredCapacity = requiredFor(activeWorkspace);
+        if (!currentHasRoom) throw new Error(`The current team needs ${requiredCapacity} open ${requiredCapacity === 1 ? "place" : "places"}.`);
+        await onConfirm({ workspaceId: activeWorkspace.agent_workspace_id, attachToSession: true });
+      } else {
         const created = await api.post("/api/agent-workspaces", {
           name,
-          description: "Created for an agent workflow from chat."
+          description: selection === "chat"
+            ? `Created for this chat from ${workflow.title}.`
+            : `Created as a separate team from ${workflow.title}.`
         });
-        await onCreated(created);
-      } else {
-        if (!selection) throw new Error("Choose a team first.");
-        const selectedWorkspace = workspaces.find((workspace) => workspace.agent_workspace_id === selection);
-        const requiredCapacity = requiredFor(selectedWorkspace);
-        if (!hasRoom(selectedWorkspace)) throw new Error(`That team needs ${requiredCapacity} open ${requiredCapacity === 1 ? "place" : "places"} for the proposed specialists. Choose another team or create a new one.`);
-        await onConfirm(selection);
+        await onCreated(created, { attachToSession: selection === "chat" });
       }
     } catch (submitError) {
       setError(friendlyError(submitError));
@@ -6979,30 +7093,36 @@ export function WorkflowWorkspaceDialog({ workspaces, workflow, activeWorkspaceI
     }
   }
   return (
-    <ModalSurface title="Choose a team with room" description="Virenis checks the exact specialists in this draft and only asks for the open places it will actually use." onClose={onClose} closeDisabled={busy} className="form-dialog workflow-workspace-dialog">
+    <ModalSurface title="Where should this team live?" description="Choose what happens to this chat before Virenis creates any specialists." onClose={onClose} closeDisabled={busy} className="form-dialog workflow-workspace-dialog">
       <form className="dialog-form" onSubmit={submit}>
         {error && <div className="form-error" role="alert">{error}</div>}
-        <div className="workflow-workspace-options">
-          {workspaces.map((workspace) => {
-            const requiredCapacity = requiredFor(workspace);
-            const insufficientRoom = !hasRoom(workspace);
-            const current = Number(workspace.agent_count || 0);
-            const maximum = Number(workspace.max_agents || 16);
-            const remaining = Math.max(0, maximum - current);
-            return (
-              <label className={[!creating && selection === workspace.agent_workspace_id ? "selected" : "", insufficientRoom ? "disabled" : ""].filter(Boolean).join(" ")} key={workspace.agent_workspace_id}>
-                <input type="radio" name="workflow-workspace" disabled={insufficientRoom || busy} checked={!creating && selection === workspace.agent_workspace_id} onChange={() => { setCreating(false); setSelection(workspace.agent_workspace_id); }} />
-                <span><strong>{workspace.name}{workspace.agent_workspace_id === activeWorkspaceId && !insufficientRoom ? " · Recommended" : ""}{insufficientRoom ? " · Not enough room" : ""}</strong><small>{current} / {maximum} specialists · {remaining} open · draft adds {requiredCapacity} · {workspace.description || "Your team"}</small></span>
-              </label>
-            );
-          })}
-          <label className={creating ? "selected" : ""}>
-            <input type="radio" name="workflow-workspace" checked={creating} disabled={busy} onChange={() => setCreating(true)} />
-            <span><strong>Create a new team</strong><small>Keep all {newTeamCapacity} proposed {newTeamCapacity === 1 ? "specialist" : "specialists"} together in a separate team.</small></span>
-          </label>
+        <div className="workflow-placement-summary">
+          <span><WandSparkles size={18} /></span>
+          <p><strong>{workflow.title}</strong><small>{newTeamCapacity} new {newTeamCapacity === 1 ? "specialist" : "specialists"} will be created after you confirm.</small></p>
         </div>
-        {creating && <label><span>New team name</span><input value={name} onChange={(event) => setName(event.target.value)} required maxLength={80} placeholder="Support automation" /></label>}
-        <div className="dialog-actions"><button type="button" className="text-button ghost" onClick={onClose} disabled={busy}>Cancel</button><button type="submit" className="text-button primary" disabled={busy || (creating ? !name.trim() : !selection)}>{busy ? <LoaderCircle className="spin" size={16} /> : <WandSparkles size={16} />}Continue</button></div>
+        <div className="workflow-placement-options">
+          <label className={`${selection === "current" ? "selected" : ""} ${!currentHasRoom ? "disabled" : ""}`.trim()}>
+            <input type="radio" name="workflow-placement" value="current" checked={selection === "current"} disabled={!currentHasRoom || busy} onChange={() => setSelection("current")} />
+            <span className="workflow-placement-icon"><UserPlus size={18} /></span>
+            <span><strong>Add to current team <em>Recommended</em></strong><small>{activeWorkspace ? `${activeWorkspace.name} · ${activeWorkspace.agent_count || 0}/${activeWorkspace.max_agents || 16} specialists` : "No current team"}{!currentHasRoom ? " · not enough room" : " · this chat stays here"}</small></span>
+          </label>
+          <label className={selection === "chat" ? "selected" : ""}>
+            <input type="radio" name="workflow-placement" value="chat" checked={selection === "chat"} disabled={busy} onChange={() => setSelection("chat")} />
+            <span className="workflow-placement-icon"><Clock3 size={18} /></span>
+            <span><strong>Temporarily make it this chat’s team</strong><small>Create a separate team and switch only this conversation to it.</small></span>
+          </label>
+          <label className={selection === "another" ? "selected" : ""}>
+            <input type="radio" name="workflow-placement" value="another" checked={selection === "another"} disabled={busy} onChange={() => setSelection("another")} />
+            <span className="workflow-placement-icon"><Layers3 size={18} /></span>
+            <span><strong>Add as another team</strong><small>Create it in your workspace without changing this chat’s current team.</small></span>
+          </label>
+          <button type="button" className="workflow-placement-cancel" onClick={onClose} disabled={busy}>
+            <span className="workflow-placement-icon"><X size={18} /></span>
+            <span><strong>Cancel</strong><small>Keep the proposal saved and create nothing.</small></span>
+          </button>
+        </div>
+        {selection !== "current" && <label><span>New team name</span><input value={name} onChange={(event) => setName(event.target.value)} required maxLength={80} placeholder="Support automation" /></label>}
+        <div className="dialog-actions"><button type="button" className="text-button ghost" onClick={onClose} disabled={busy}>Back</button><button type="submit" className="text-button primary" disabled={busy || (selection !== "current" && !name.trim())}>{busy ? <LoaderCircle className="spin" size={16} /> : <WandSparkles size={16} />}Create team</button></div>
       </form>
     </ModalSurface>
   );

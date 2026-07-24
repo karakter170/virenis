@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 
 import { readAgentRuntimeEnv } from "./agentRuntimeConfig.js";
+import { findAgentWorkspace } from "./agentWorkspaces.js";
 import { releaseRunReservation, reserveRunCredits, settleRunCredits } from "./billing.js";
 import { PUBLISHER_ID_RE, publicPublisher } from "./marketplacePublisherIdentity.js";
 import { isManagedMcpProviderId } from "./mcpOAuth.js";
@@ -635,6 +636,7 @@ export function publicWorkflow(workflow) {
     workflow_id: workflow.workflow_id,
     session_id: workflow.session_id,
     agent_workspace_id: workflow.agent_workspace_id || null,
+    attach_to_session: workflow.attach_to_session !== false,
     schema_version: workflow.schema_version,
     mode: workflow.mode,
     command: workflow.command,
@@ -746,7 +748,15 @@ export function assertWorkflowAccess(data, workflowId, actor, { mutable = false 
   return workflow;
 }
 
-export async function decideWorkflow({ store, workflowId, actor, decision, expectedRevision }) {
+export async function decideWorkflow({
+  store,
+  workflowId,
+  actor,
+  decision,
+  expectedRevision,
+  targetAgentWorkspaceId = null,
+  attachToSession = true
+}) {
   if (!["approve", "deny"].includes(decision)) {
     throw workflowError(400, "decision must be approve or deny.", "workflow_decision_invalid");
   }
@@ -790,7 +800,13 @@ export async function decideWorkflow({ store, workflowId, actor, decision, expec
       return workflow;
     }
     const session = (data.sessions || []).find((item) => item.session_id === workflow.session_id);
-    if (session?.agent_workspace_id) workflow.agent_workspace_id = session.agent_workspace_id;
+    const requestedWorkspaceId = String(targetAgentWorkspaceId || "").trim();
+    if (requestedWorkspaceId) {
+      workflow.agent_workspace_id = findAgentWorkspace(data, requestedWorkspaceId, actor).agent_workspace_id;
+    } else if (session?.agent_workspace_id) {
+      workflow.agent_workspace_id = session.agent_workspace_id;
+    }
+    workflow.attach_to_session = attachToSession !== false;
     workflow.approved_at ||= now;
     workflow.updated_at = now;
     workflow.revision += 1;
@@ -892,7 +908,7 @@ export async function markWorkflowActivation({
         }
       }
       const session = data.sessions.find((item) => item.session_id === workflow.session_id);
-      if (session && workflow.agent_workspace_id) {
+      if (session && workflow.agent_workspace_id && workflow.attach_to_session !== false) {
         session.agent_workspace_id = workflow.agent_workspace_id;
         session.updated_at = now;
       }

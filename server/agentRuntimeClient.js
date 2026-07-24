@@ -1696,12 +1696,30 @@ export function composeRuntimeWorkflow({
       conversation_context,
       composition_dependencies,
       source_observations,
-      composition_phase,
-      workflow_contract,
-      workflow_contract_digest,
+      ...(composition_phase !== "authorization_and_design"
+        ? { composition_phase }
+        : {}),
+      ...(workflow_contract && Object.keys(workflow_contract).length
+        ? { workflow_contract }
+        : {}),
+      ...(workflow_contract_digest ? { workflow_contract_digest } : {}),
       execution_context
     },
     timeoutMs: Number(runtimeSetting("AGENT_RUNTIME_WORKFLOW_TIMEOUT_MS") || runtimeSetting("AGENT_RUNTIME_CHAT_TIMEOUT_MS") || DEFAULT_TIMEOUT_MS)
+  });
+}
+
+export function configureRuntimeModelProvider(settings) {
+  return runtimeRequest("/admin/model-provider", {
+    method: "PATCH",
+    body: settings,
+    timeoutMs: Number(runtimeSetting("AGENT_RUNTIME_ADMIN_TIMEOUT_MS") || 15_000)
+  });
+}
+
+export function fetchRuntimeModelProvider() {
+  return runtimeRequest("/admin/model-provider", {
+    timeoutMs: Number(runtimeSetting("AGENT_RUNTIME_ADMIN_TIMEOUT_MS") || 15_000)
   });
 }
 

@@ -114,6 +114,35 @@ describe("explicit workflow Auto-Composer", () => {
     }
   });
 
+  it.each([404, 405, 415, 422])(
+    "preserves workflow commands when a tunnel reaches an older Runtime contract (%s)",
+    async (status) => {
+      const previousUrl = process.env.AGENT_RUNTIME_API_URL;
+      process.env.AGENT_RUNTIME_API_URL = "http://runtime.test";
+      const restoreFetch = setRuntimeFetchForTests(async () => new Response(
+        JSON.stringify({ detail: "workflow compose contract is unavailable" }),
+        { status, headers: { "Content-Type": "application/json" } }
+      ));
+      try {
+        const proposal = await composeRuntimeWorkflowWithFallback({
+          command: "workflow",
+          mode: "workflow",
+          intent: "Build a launch review team.",
+          candidates: [],
+          connections: [],
+          conversation_context: [],
+          execution_context: {}
+        });
+        expect(proposal.composer).toMatchObject({ provider: "schema_fallback" });
+        expect(proposal.nodes.some((node) => node.type === "agent")).toBe(true);
+      } finally {
+        restoreFetch();
+        if (previousUrl === undefined) delete process.env.AGENT_RUNTIME_API_URL;
+        else process.env.AGENT_RUNTIME_API_URL = previousUrl;
+      }
+    }
+  );
+
   it("activates only for exact /workflow and /agent commands", async () => {
     expect(parseWorkflowCommand("Explain the /workflow command")).toBeNull();
     expect(parseWorkflowCommand("/workflowish do something")).toBeNull();

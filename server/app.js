@@ -95,12 +95,14 @@ import {
 } from "./outcomes.js";
 import {
   archiveRuntimeAgent,
+  configureRuntimeModelProvider,
   deleteArchivedRuntimeAgent,
   deleteRuntimeDocument,
   fetchRuntimeAgent,
   fetchRuntimeAgents,
   fetchRuntimeExecutionReceipt,
   fetchRuntimeHealth,
+  fetchRuntimeModelProvider,
   fetchRuntimeModels,
   fetchRuntimeSubjectReceipts,
   composeRuntimeWorkflow,
@@ -146,6 +148,8 @@ import {
   createMcpConnection,
   decideMcpApproval,
   disconnectMcpConnectionDurably,
+  decryptMcpValue,
+  encryptMcpValue,
   ensureMcpCredentialKey,
   executeMcpGatewayCall,
   executeWorkflowSourceDiscoveryRead,
@@ -306,6 +310,118 @@ class RunBus {
   }
 }
 
+const RUNTIME_MODEL_SETTINGS_AAD = "virenis:admin-runtime-model:v1";
+const MCP_ADMIN_PROVIDER_GROUPS = Object.freeze([
+  { id: "google", name: "Google apps", env_group: "GOOGLE", providers: ["Gmail", "Drive", "Calendar", "Chat", "Contacts"] },
+  { id: "github", name: "GitHub", env_group: "GITHUB", providers: ["GitHub"] },
+  { id: "slack", name: "Slack", env_group: "SLACK", providers: ["Slack"] }
+]);
+
+function boundedAdminText(value, maximum) {
+  return String(value || "").replaceAll("\0", "").trim().slice(0, maximum);
+}
+
+function validateAdminProviderUrl(value) {
+  const text = boundedAdminText(value, 2048).replace(/\/+$/, "");
+  let url;
+  try {
+    url = new URL(text);
+  } catch {
+    throwStatus(400, "Model API URL must be an absolute HTTP(S) URL.");
+  }
+  if (!["http:", "https:"].includes(url.protocol)) throwStatus(400, "Model API URL must use HTTP or HTTPS.");
+  if (url.protocol === "http:" && !["localhost", "127.0.0.1", "::1"].includes(url.hostname)) {
+    throwStatus(400, "Remote model APIs must use HTTPS.");
+  }
+  return text;
+}
+
+function storedRuntimeModelSettings(data) {
+  const stored = data.runtimeModelSettings && typeof data.runtimeModelSettings === "object"
+    ? data.runtimeModelSettings
+    : {};
+  return {
+    provider: ["vllm", "openai_compatible"].includes(stored.provider) ? stored.provider : "vllm",
+    base_url: boundedAdminText(stored.base_url, 2048) || "http://127.0.0.1:8000/v1",
+    model: boundedAdminText(stored.model, 240) || BASE_MODEL,
+    revision: boundedAdminText(stored.revision, 240),
+    context_tokens: Math.max(2048, Math.min(2_000_000, Number(stored.context_tokens) || 32768)),
+    api_key_envelope: stored.api_key_envelope || null,
+    revision_number: Number(stored.revision_number || 0),
+    updated_at: stored.updated_at || null,
+    updated_by: stored.updated_by || null
+  };
+}
+
+function publicRuntimeModelSettings(data) {
+  const settings = storedRuntimeModelSettings(data);
+  return {
+    provider: settings.provider,
+    base_url: settings.base_url,
+    model: settings.model,
+    revision: settings.revision,
+    context_tokens: settings.context_tokens,
+    api_key_configured: Boolean(settings.api_key_envelope),
+    revision_number: settings.revision_number,
+    updated_at: settings.updated_at,
+    updated_by: settings.updated_by
+  };
+}
+
+function runtimeModelProviderPayload(settings, key) {
+  const payload = {
+    provider: settings.provider,
+    base_url: settings.base_url,
+    model: settings.model,
+    revision: settings.revision,
+    context_tokens: settings.context_tokens
+  };
+  if (settings.api_key_envelope) {
+    payload.api_key = decryptMcpValue(settings.api_key_envelope, key, RUNTIME_MODEL_SETTINGS_AAD).api_key;
+  }
+  return payload;
+}
+
+function publicMcpAdminProviders(data) {
+  const configured = data.mcpAdminProviders && typeof data.mcpAdminProviders === "object"
+    ? data.mcpAdminProviders
+    : {};
+  return MCP_ADMIN_PROVIDER_GROUPS.map((group) => {
+    const current = configured[group.id] || {};
+    return {
+      id: group.id,
+      name: group.name,
+      providers: group.providers,
+      client_id: boundedAdminText(current.client_id, 4096),
+      client_secret_configured: Boolean(current.client_secret_envelope),
+      updated_at: current.updated_at || null,
+      updated_by: current.updated_by || null
+    };
+  });
+}
+
+function mcpAdminEnvironment(data, key) {
+  const env = { ...process.env };
+  const configured = data.mcpAdminProviders && typeof data.mcpAdminProviders === "object"
+    ? data.mcpAdminProviders
+    : {};
+  for (const group of MCP_ADMIN_PROVIDER_GROUPS) {
+    const current = configured[group.id];
+    if (!current) continue;
+    if (current.client_id) env[`APP_MCP_${group.env_group}_OAUTH_CLIENT_ID`] = current.client_id;
+    if (current.client_secret_envelope) {
+      const secret = decryptMcpValue(
+        current.client_secret_envelope,
+        key,
+        `virenis:admin-mcp-provider:${group.id}:v1`
+      );
+      env[`APP_MCP_${group.env_group}_OAUTH_CLIENT_SECRET`] = secret.client_secret;
+      delete env[`APP_MCP_${group.env_group}_OAUTH_CLIENT_SECRET_FILE`];
+    }
+  }
+  return env;
+}
+
 export async function createApp({
   dbPath = path.resolve("data/app-db.json"),
   uploadRoot = path.resolve("uploads"),
@@ -348,6 +464,18 @@ export async function createApp({
     enabled: resolvedClerkAdapter.enabled
   });
   const mcpCredentialKey = await ensureMcpCredentialKey({ dbPath });
+  if (realRuntimeEnabled() && store.read().runtimeModelSettings) {
+    try {
+      await configureRuntimeModelProvider(runtimeModelProviderPayload(
+        storedRuntimeModelSettings(store.read()),
+        mcpCredentialKey
+      ));
+    } catch (error) {
+      safeDiagnosticLog("runtime.model_provider_startup_sync_failed", {
+        operation: "runtime_model_provider_startup_sync"
+      }, error);
+    }
+  }
   const configuredMcpRecoveryGraceMs = Number(process.env.APP_MCP_OAUTH_RECOVERY_GRACE_MS || 20 * 60 * 1000);
   const mcpRecoveryGraceMs = Number.isFinite(configuredMcpRecoveryGraceMs)
     ? Math.max(20 * 60 * 1000, Math.min(configuredMcpRecoveryGraceMs, 60 * 60 * 1000))
@@ -1140,6 +1268,138 @@ export async function createApp({
     }
   });
 
+  app.get("/api/admin/runtime-model", async (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      requireAdmin(req);
+      const stored = publicRuntimeModelSettings(store.read());
+      let runtime = null;
+      if (realRuntimeEnabled()) {
+        try {
+          runtime = await fetchRuntimeModelProvider();
+        } catch {
+          runtime = null;
+        }
+      }
+      res.json({
+        settings: runtime ? {
+          ...stored,
+          provider: runtime.provider || stored.provider,
+          base_url: runtime.base_url || stored.base_url,
+          model: runtime.model || stored.model,
+          revision: runtime.revision || stored.revision,
+          context_tokens: runtime.context_tokens || stored.context_tokens,
+          api_key_configured: runtime.api_key_configured === true || stored.api_key_configured
+        } : stored,
+        runtime_reachable: runtime !== null
+      });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.patch("/api/admin/runtime-model", async (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      requireAdmin(req);
+      const current = storedRuntimeModelSettings(store.read());
+      const provider = boundedAdminText(req.body?.provider, 40).toLowerCase();
+      if (!["vllm", "openai_compatible"].includes(provider)) {
+        throwStatus(400, "Model provider must be Local / vLLM or OpenAI-compatible.");
+      }
+      const model = boundedAdminText(req.body?.model, 240);
+      if (!model) throwStatus(400, "Model name is required.");
+      const contextTokens = Number(req.body?.context_tokens);
+      if (!Number.isSafeInteger(contextTokens) || contextTokens < 2048 || contextTokens > 2_000_000) {
+        throwStatus(400, "Context tokens must be an integer between 2048 and 2000000.");
+      }
+      const apiKeyInput = boundedAdminText(req.body?.api_key, 16 * 1024);
+      const next = {
+        ...current,
+        provider,
+        base_url: validateAdminProviderUrl(req.body?.base_url),
+        model,
+        revision: boundedAdminText(req.body?.revision, 240),
+        context_tokens: contextTokens,
+        api_key_envelope: req.body?.clear_api_key === true
+          ? null
+          : apiKeyInput
+            ? encryptMcpValue({ api_key: apiKeyInput }, mcpCredentialKey, RUNTIME_MODEL_SETTINGS_AAD)
+            : current.api_key_envelope,
+        revision_number: current.revision_number + 1,
+        updated_at: nowIso(),
+        updated_by: req.auth.user_id
+      };
+      let runtimeResult = null;
+      if (realRuntimeEnabled()) {
+        runtimeResult = await configureRuntimeModelProvider(runtimeModelProviderPayload(next, mcpCredentialKey));
+      }
+      await store.mutate((data) => {
+        data.runtimeModelSettings = next;
+        return next;
+      });
+      res.json({
+        settings: publicRuntimeModelSettings({ runtimeModelSettings: next }),
+        applied_immediately: realRuntimeEnabled(),
+        runtime: runtimeResult
+      });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/api/admin/mcp-providers", (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      requireAdmin(req);
+      const data = store.read();
+      res.json({
+        providers: publicMcpAdminProviders(data),
+        templates: publicMcpTemplates(mcpAdminEnvironment(data, mcpCredentialKey))
+      });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.patch("/api/admin/mcp-providers/:provider_id", async (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      requireAdmin(req);
+      const group = MCP_ADMIN_PROVIDER_GROUPS.find((item) => item.id === req.params.provider_id);
+      if (!group) throwStatus(404, "MCP provider configuration not found.");
+      const clientId = boundedAdminText(req.body?.client_id, 4096);
+      if (!clientId) throwStatus(400, "OAuth client ID is required.");
+      const secretInput = boundedAdminText(req.body?.client_secret, 16 * 1024);
+      const provider = await store.mutate((data) => {
+        data.mcpAdminProviders = data.mcpAdminProviders && typeof data.mcpAdminProviders === "object"
+          ? data.mcpAdminProviders
+          : {};
+        const current = data.mcpAdminProviders[group.id] || {};
+        const clientSecretEnvelope = req.body?.clear_client_secret === true
+          ? null
+          : secretInput
+            ? encryptMcpValue(
+                { client_secret: secretInput },
+                mcpCredentialKey,
+                `virenis:admin-mcp-provider:${group.id}:v1`
+              )
+            : current.client_secret_envelope || null;
+        if (!clientSecretEnvelope) throwStatus(400, "OAuth client secret is required.");
+        data.mcpAdminProviders[group.id] = {
+          client_id: clientId,
+          client_secret_envelope: clientSecretEnvelope,
+          updated_at: nowIso(),
+          updated_by: req.auth.user_id
+        };
+        return publicMcpAdminProviders(data).find((item) => item.id === group.id);
+      });
+      res.json({ provider });
+    } catch (error) {
+      next(error);
+    }
+  });
+
   app.post("/api/admin/billing/accounts/:user_id/adjustments", async (req, res, next) => {
     res.setHeader("Cache-Control", "no-store");
     try {
@@ -1261,7 +1521,10 @@ export async function createApp({
   });
 
   app.get("/api/mcp/templates", (_req, res) => {
-    res.json({ protocol_version: "2025-11-25", templates: publicMcpTemplates() });
+    res.json({
+      protocol_version: "2025-11-25",
+      templates: publicMcpTemplates(mcpAdminEnvironment(store.read(), mcpCredentialKey))
+    });
   });
 
   app.post("/api/mcp/oauth/start", async (req, res, next) => {
@@ -1271,7 +1534,8 @@ export async function createApp({
         store,
         actor: req.auth,
         body: req.body,
-        key: mcpCredentialKey
+        key: mcpCredentialKey,
+        env: mcpAdminEnvironment(store.read(), mcpCredentialKey)
       });
       res.setHeader("Set-Cookie", started.cookie);
       res.json({
@@ -1558,8 +1822,9 @@ export async function createApp({
         res.json(response);
         return;
       }
+      const configuredBaseModel = storedRuntimeModelSettings(data).model;
       res.json({
-        models: [{ id: BASE_MODEL, type: "base" }]
+        models: [{ id: configuredBaseModel, type: "base" }]
       });
     } catch (error) {
       next(error);
@@ -1784,7 +2049,9 @@ export async function createApp({
         workflowId: req.params.workflow_id,
         actor: req.auth,
         decision: req.body?.decision,
-        expectedRevision: req.body?.revision
+        expectedRevision: req.body?.revision,
+        targetAgentWorkspaceId: req.body?.agent_workspace_id,
+        attachToSession: req.body?.attach_to_session !== false
       });
       if (workflow.status === "declined") {
         workflow = await cleanupDeclinedWorkflowAgents({
@@ -1971,7 +2238,7 @@ export async function createApp({
         assistant_message_id: null,
         status: "queued",
         planner_mode: LEGACY_PERSISTED_PLANNER_MODE_V1,
-        base_model: BASE_MODEL,
+        base_model: storedRuntimeModelSettings(data).model,
         parallel_workers: runOptions.parallel_workers,
         max_routing_adapters: runOptions.max_routing_adapters,
         execution_options: executionOptions,
@@ -4385,7 +4652,14 @@ export async function composeRuntimeWorkflowWithFallback(input) {
       throw error;
     }
     const status = Number(error?.status || 0);
-    const recoverable = !status || status === 408 || status === 429 || status >= 500;
+    // The web process and Runtime are deployed independently behind the
+    // tunnel. Treat endpoint/method/media/schema negotiation responses as a
+    // version skew signal and preserve the command with the local,
+    // semantic-neutral schema fallback. Authentication and authorization
+    // failures remain fail-closed.
+    const recoverable = !status
+      || [404, 405, 408, 415, 422, 429].includes(status)
+      || status >= 500;
     if (!recoverable) throw error;
     const fallback = composeWorkflowFallback(input);
     fallback.safety = [

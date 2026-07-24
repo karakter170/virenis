@@ -30,6 +30,9 @@ import {
   WorkspaceSidebar,
   WorldGraphChanges,
   WorkflowDraftCard,
+  WorkflowWorkspaceDialog,
+  applicationRoute,
+  applicationSessionPath,
   agentPayloadFromForm,
   createAgentForm,
   approvalActivityPresentation,
@@ -77,6 +80,32 @@ afterEach(() => {
 
 
 describe("Agent Studio product surfaces", () => {
+  it("gives every chat an isolated, reversible URL", () => {
+    expect(applicationSessionPath("sess_a/b")).toBe("/app/chats/sess_a%2Fb");
+    expect(applicationRoute("/app/chats/sess_a%2Fb")).toMatchObject({
+      surface: "workspace",
+      sessionId: "sess_a/b"
+    });
+    expect(applicationRoute("/app")).toMatchObject({ surface: "workspace", sessionId: "" });
+  });
+
+  it("offers the four explicit workflow placement choices before activation", () => {
+    const markup = renderToStaticMarkup(createElement(WorkflowWorkspaceDialog, {
+      workspaces: [{ agent_workspace_id: "team_1", name: "Launch Team", agent_count: 1, max_agents: 16 }],
+      activeWorkspaceId: "team_1",
+      workflow: {
+        workflow_id: "workflow_1",
+        title: "Launch review",
+        nodes: [{ id: "reviewer", type: "agent", title: "Reviewer", source: "generated" }]
+      }
+    }));
+    expect(markup).toContain("Add to current team");
+    expect(markup).toContain("Temporarily make it this chat’s team");
+    expect(markup).toContain("Add as another team");
+    expect(markup).toContain("Cancel");
+    expect(markup).toContain("Keep the proposal saved and create nothing.");
+  });
+
   it("serializes only bounded chat documents as message attachment identities", () => {
     expect(chatDocumentMessageAttachments([
       { document_id: "doc_chat", title: "Candidate Resume", scope: "chat", enabled: true },
@@ -1590,7 +1619,7 @@ describe("Agent Studio product surfaces", () => {
     ]);
   });
 
-  it("adds unowned runtime inventory only to the admin catalog", () => {
+  it("keeps unowned Runtime inventory out of every active team catalog", () => {
     const agents = [
       { id: "team_writer", title: "Team Writer", enabled: true },
       { id: "other_reviewer", title: "Other Reviewer", enabled: true },
@@ -1599,8 +1628,7 @@ describe("Agent Studio product surfaces", () => {
     const workspace = { agent_workspace_id: "team_first", agent_ids: ["team_writer"] };
 
     expect(agentsForCatalog(agents, workspace, { is_admin: true }).map((agent) => agent.id)).toEqual([
-      "team_writer",
-      "runtime_auditor"
+      "team_writer"
     ]);
     expect(agentsForCatalog(agents, workspace, { user_id: "ordinary_user" }).map((agent) => agent.id)).toEqual([
       "team_writer"
@@ -1611,7 +1639,7 @@ describe("Agent Studio product surfaces", () => {
     ]);
   });
 
-  it("renders runtime adoption inventory for admins but never for ordinary users", () => {
+  it("never renders Runtime adoption inventory inside a selected team", () => {
     const agents = [
       { id: "team_writer", title: "Team Writer", capability: "Drafts reports.", enabled: true },
       { id: "runtime_auditor", title: "Runtime Auditor", capability: "Audits model results.", enabled: true, runtime_only: true }
@@ -1638,10 +1666,10 @@ describe("Agent Studio product surfaces", () => {
       onAdopt: vi.fn()
     }));
 
-    expect(adminMarkup).toContain("Runtime Auditor");
-    expect(adminMarkup).toContain("Audits model results.");
-    expect(adminMarkup).toContain("Needs an owner");
-    expect(adminMarkup).toContain('aria-label="Adopt Runtime Auditor"');
+    expect(adminMarkup).not.toContain("Runtime Auditor");
+    expect(adminMarkup).not.toContain("Audits model results.");
+    expect(adminMarkup).not.toContain("Needs an owner");
+    expect(adminMarkup).not.toContain('aria-label="Adopt Runtime Auditor"');
     expect(adminMarkup).toContain('placeholder="Search this team"');
     expect(ordinaryMarkup).not.toContain("Runtime Auditor");
     expect(ordinaryMarkup).not.toContain("Audits model results.");
